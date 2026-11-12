@@ -1,7 +1,8 @@
 module QuickTest
 
 // What the Zig target compiles so far: numbers and booleans, let, if, loops, operators,
-// functions (also recursive and across files) and pattern matching on values.
+// functions (also recursive and across files), pattern matching, records, unions, tuples
+// and options.
 // The entry point returns the number of failed checks as the process exit code.
 
 let limit = 10
@@ -61,6 +62,235 @@ let check (ok: bool) : int =
     else
         1
 
+// ---- records ----
+type Vec =
+    {
+        Dx: int
+        Dy: int
+    }
+
+type Segment =
+    {
+        From: Helpers.Point
+        Delta: Vec
+        Weight: float
+    }
+
+let translate (p: Helpers.Point) (v: Vec) : Helpers.Point =
+    {
+        X = p.X + v.Dx
+        Y = p.Y + v.Dy
+    }
+
+let endOf (s: Segment) : Helpers.Point = translate s.From s.Delta
+
+let heavier (s: Segment) : Segment = { s with Weight = s.Weight * 2.0 }
+
+// ---- unions ----
+type Command =
+    | Move of Vec
+    | Scale of factor: int
+    | Reset
+    | Pair of Command2 * int
+
+and Command2 =
+    | Up
+    | Down
+
+let apply (p: Helpers.Point) (c: Command) : Helpers.Point =
+    match c with
+    | Move v -> translate p v
+    | Scale k ->
+        {
+            X = p.X * k
+            Y = p.Y * k
+        }
+    | Reset -> Helpers.origin ()
+    | Pair(Up, n) -> { p with Y = p.Y + n }
+    | Pair(Down, n) -> { p with Y = p.Y - n }
+
+let tagOf (c: Command) : int =
+    match c with
+    | Move _ -> 0
+    | Scale _ -> 1
+    | Reset -> 2
+    | Pair _ -> 3
+
+// ---- tuples ----
+let divMod (a: int) (b: int) : int * int = (a / b, a % b)
+
+let swap (pair: int * bool) : bool * int =
+    let (n, flag) = pair
+    (flag, n)
+
+let minMax (a: int) (b: int) (c: int) : int * int =
+    let lo =
+        if a < b then
+            (if a < c then
+                 a
+             else
+                 c)
+        else
+            (if b < c then
+                 b
+             else
+                 c)
+
+    let hi =
+        if a > b then
+            (if a > c then
+                 a
+             else
+                 c)
+        else
+            (if b > c then
+                 b
+             else
+                 c)
+
+    lo, hi
+
+// ---- options ----
+let safeDiv (a: int) (b: int) : int option =
+    if b = 0 then
+        None
+    else
+        Some(a / b)
+
+let orZero (o: int option) : int =
+    match o with
+    | Some v -> v
+    | None -> 0
+
+let firstPositive (a: int) (b: int) : Vec option =
+    if a > 0 then
+        Some
+            {
+                Dx = a
+                Dy = 0
+            }
+    elif b > 0 then
+        Some
+            {
+                Dx = 0
+                Dy = b
+            }
+    else
+        None
+
+let nested (o: int option option) : int =
+    match o with
+    | None -> -1
+    | Some None -> 0
+    | Some(Some v) -> v
+
+let lengthOf (v: Vec voption) : int =
+    match v with
+    | ValueSome d -> d.Dx + d.Dy
+    | ValueNone -> -1
+
+let typesWork () : int =
+    let p =
+        {
+            Helpers.X = 1
+            Helpers.Y = 2
+        }
+
+    let seg =
+        {
+            From = p
+            Delta =
+                {
+                    Dx = 10
+                    Dy = 20
+                }
+            Weight = 1.5
+        }
+
+    let q, r = divMod 17 5
+    let lo, hi = minMax 4 9 2
+
+    check (
+        endOf seg =
+            {
+                Helpers.X = 11
+                Helpers.Y = 22
+            }
+    )
+    + check ((heavier seg).Weight = 3.0 && (heavier seg).From = p)
+    + check (seg <> heavier seg)
+    + check (
+        apply
+            p
+            (Move
+                {
+                    Dx = 1
+                    Dy = 1
+                }) =
+            {
+                Helpers.X = 2
+                Helpers.Y = 3
+            }
+    )
+    + check (
+        apply p (Scale 3) =
+            {
+                Helpers.X = 3
+                Helpers.Y = 6
+            }
+    )
+    + check (apply p Reset = Helpers.origin ())
+    + check ((apply p (Pair(Down, 5))).Y = -3)
+    + check (tagOf (Pair(Up, 1)) = 3 && tagOf Reset = 2)
+    + check (
+        Move
+            {
+                Dx = 1
+                Dy = 2
+            }
+            =
+            Move
+                {
+                    Dx = 1
+                    Dy = 2
+                }
+        && Move
+            {
+                Dx = 1
+                Dy = 2
+            }
+           <> Scale 1
+    )
+    + check (Helpers.area (Helpers.Rect(2.0, 4.0)) = 8.0 && Helpers.area Helpers.Dot = 0.0)
+    + check (Helpers.area (Helpers.Circle 2.0) = 12.0)
+    + check (q = 3 && r = 2)
+    + check (swap (7, true) = (true, 7))
+    + check (lo = 2 && hi = 9)
+    + check (safeDiv 7 2 = Some 3 && safeDiv 7 0 = None)
+    + check (orZero (safeDiv 9 3) = 3 && orZero None = 0)
+    + check (
+        firstPositive 0 5 =
+            Some
+                {
+                    Dx = 0
+                    Dy = 5
+                }
+        && firstPositive 0 0 = None
+    )
+    + check (nested None = -1 && nested (Some None) = 0 && nested (Some(Some 42)) = 42)
+    + check (
+        lengthOf (
+            ValueSome
+                {
+                    Dx = 3
+                    Dy = 4
+                }
+        )
+            =
+            7
+        && lengthOf ValueNone = -1
+    )
+
 [<EntryPoint>]
 let main _ =
     check (add 3 4 = 7)
@@ -73,3 +303,4 @@ let main _ =
     + check (mean 1.0 4.0 = 2.5)
     + check (wrapsAround ())
     + check (Helpers.clamp 0 10 42 = 10 && Helpers.isEven 4 && not (Helpers.isEven 7))
+    + typesWork ()

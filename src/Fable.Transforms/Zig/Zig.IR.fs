@@ -30,6 +30,8 @@ type Ent =
         mutable Managed: bool
         mutable DropAlloc: bool
         mutable Copyable: bool
+        /// declared in the file being compiled (its declaration is emitted there)
+        IsLocal: bool
     }
 
 type Ty =
@@ -71,6 +73,21 @@ let rec isManaged (t: Ty) =
     | TOpt t -> isManaged t
     | TTuple ts -> List.exists isManaged ts
     | _ -> false
+
+/// The fields of a case: (name, type). Records have one case, named "".
+let caseFields (t: Ty) (case: string) : (string * Ty) list =
+    match t with
+    | TEnt e ->
+        match e.Cases |> List.tryFind (fun (c, _) -> c = case) with
+        | Some(_, fs) -> fs
+        | None -> fail None "internal: type %s has no case %s" e.Name case
+    | TTuple ts -> ts |> List.mapi (fun i t -> string<int> i, t)
+    | TOpt t ->
+        if case = "Some" then
+            [ ("Value", t) ]
+        else
+            []
+    | _ -> []
 
 type VarKind =
     | VLocal
@@ -222,7 +239,8 @@ let rec isPure (e: Expr) =
     | ELit _
     | EUnit -> true
     | EPrim(("div" | "mod"), _, _) -> false // may trap
-    | EPrim(_, xs, _) -> List.forall isPure xs
+    | EPrim(_, xs, _)
+    | ECon(_, _, xs, _) -> List.forall isPure xs
     | EGet(x, _, _)
     | ETest(x, _, _) -> isPure x
     | _ -> false
@@ -243,6 +261,10 @@ let rec assignedIn (e: Expr) : Set<int> =
 type FileState() =
     let mutable varCounter = 0
     member val Fns = List<FnInfo>()
+    /// record and union types seen so far, by full name
+    member val Ents = Dictionary<string, Ent>()
+    /// the ones this file declares, in the order they were first needed
+    member val LocalEnts = List<Ent>()
     /// module-level constants: name, type, literal text
     member val Consts = List<string * Ty * string>()
     /// imports of other files: path -> local alias

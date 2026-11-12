@@ -26,8 +26,21 @@ There is no separate Zig AST: the IR is the last structured form, and the emitte
 
 Module-level functions (also recursive, also across files), literal module-level values,
 numbers, booleans and chars, `let`, `let mutable`, `if`, `while`, `for .. to`, arithmetic,
-comparison, bitwise and boolean operators, pattern matching on values, and an `[<EntryPoint>]`
-whose result becomes the process exit code.
+comparison, bitwise and boolean operators, pattern matching, and an `[<EntryPoint>]` whose
+result becomes the process exit code.
+
+Types that are plain values, also when another file declares them:
+
+| F# | Zig |
+| --- | --- |
+| record without mutable fields | `struct` |
+| union | `union(enum)`, one payload struct per case |
+| tuple, struct tuple | `@Tuple(&.{ ... })` |
+| `option`, `voption` | `?T` |
+
+with construction, copy-and-update, field access, pattern matching and structural equality
+(`std.meta.eql`). Not yet: recursive types and records with mutable fields (they are heap
+cells and come with the runtime), generic types, members on types, ordering comparison.
 
 Everything else is reported as a compile error at the F# source location
 ("the Zig target does not support … yet").
@@ -36,9 +49,9 @@ Everything else is reported as a compile error at the F# source location
 
 ## What is next, in order
 
-1. Records and unions (value types first), tuples, options; the type model of the prototype.
-2. Heap values: reference-counted cells, the runtime library (`src/fable-library-zig`),
-   borrow inference and dup/drop insertion (Perceus), reuse.
+1. ~~Records and unions (value types first), tuples, options~~ (done).
+2. Heap values: recursive unions as reference-counted cells, the runtime library
+   (`src/fable-library-zig`), borrow inference and dup/drop insertion (Perceus), reuse.
 3. Per-function summaries across files (borrow modes, borrowed returns, raising, allocator
    needs). F# has no recursion across files, so a file only needs the finished summaries of
    the files before it. Fable already shares inline functions between file compilations
@@ -50,8 +63,10 @@ Everything else is reported as a compile error at the F# source location
 
 ## Notes for the shared code
 
-- Library calls currently fall through to the JavaScript replacements (as for PHP). A
-  `Zig/Replacements.fs` comes with step 6.
+- `Zig/Replacements.fs` only replaces operators on numbers, booleans and chars (the
+  JavaScript replacements wrap integer division and 64-bit arithmetic in JavaScript-specific
+  code). Every other library call still falls through to the JavaScript replacements; the
+  lowering recognises the structural-equality call they make. The rest comes with step 6.
 - Two places in `FSharp2Fable.fs` drop information this target needs and will need a
   Zig-specific branch: the address of anything but a variable or field is discarded, and a
   store through a byref that is not a plain variable is rejected.

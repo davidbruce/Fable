@@ -105,6 +105,15 @@ let topIdent (s: string) =
     else
         c
 
+/// The Zig name of a field or of a union case.
+let fieldIdent (s: string) =
+    let c = cleanIdent s
+
+    if isReservedIdent c then
+        $"@\"%s{c}\""
+    else
+        c
+
 type Dest =
     | DReturn
     | DBreak of string
@@ -174,10 +183,16 @@ let unparen (s: string) =
     else
         s
 
+/// A function or type of this file, or `alias.name` for one that another file declares.
+let callTarget (f: string) =
+    match f.IndexOf '.' with
+    | -1 -> topIdent f
+    | i -> f.Substring(0, i + 1) + topIdent (f.Substring(i + 1))
+
 let rec zigType (t: Ty) : string =
     match t with
     | TPrim s -> s
-    | TEnt e -> e.Name
+    | TEnt e -> callTarget e.Name
     | TOpt t -> "?" + zigType t
     | TTuple ts -> ts |> List.map zigType |> String.concat ", " |> sprintf "@Tuple(&.{ %s })"
     | TPtr(t, c) ->
@@ -195,12 +210,6 @@ let rec zigType (t: Ty) : string =
     | TArr(t, n) -> $"[%d{n}]%s{zigType t}"
     | TFn _ -> "anytype"
     | TTok(e, c) -> $"?*%s{e.Name}_%s{c}"
-
-/// The name a call goes to: a function of this file, or `alias.function` of another one.
-let callTarget (f: string) =
-    match f.IndexOf '.' with
-    | -1 -> topIdent f
-    | i -> f.Substring(0, i + 1) + topIdent (f.Substring(i + 1))
 
 let rec ex (em: Em) (e: Expr) : string =
     match e with
@@ -255,10 +264,50 @@ let rec ex (em: Em) (e: Expr) : string =
         | "bxor", [ x; y ] -> $"(%s{x} ^ %s{y})"
         | "shl", [ x; y ] -> $"(%s{x} << %s{shiftCount y})"
         | "shr", [ x; y ] -> $"(%s{x} >> %s{shiftCount y})"
+        | "eql", [ x; y ] -> $"std.meta.eql(%s{x}, %s{y})"
+        | "tag", [ x ] -> $"@as(i32, @intFromEnum(%s{x}))"
         | _ -> fail None "internal: unknown primitive %s/%d" op a.Length
     | ECall(f, xs, _) ->
         let args = xs |> List.map (ex em) |> String.concat ", "
         $"%s{callTarget f}(%s{args})"
+    | ECon(t, case, xs, _) ->
+        let args = xs |> List.map (ex em)
+
+        let inits (fs: (string * Ty) list) =
+            List.zip fs args
+            |> List.map (fun ((f, _), a) -> $".%s{fieldIdent f} = %s{a}")
+            |> String.concat ", "
+
+        match t with
+        | TEnt e when e.Kind = KRecord -> $"%s{zigType t}{{ %s{inits (caseFields t case)} }}"
+        | TEnt _ when args.IsEmpty -> $"@as(%s{zigType t}, .%s{fieldIdent case})"
+        | TEnt _ -> $"%s{zigType t}{{ .%s{fieldIdent case} = .{{ %s{inits (caseFields t case)} }} }}"
+        | TOpt _ ->
+            if case = "Some" then
+                $"@as(%s{zigType t}, %s{args.Head})"
+            else
+                $"@as(%s{zigType t}, null)"
+        | TTuple _ -> args |> String.concat ", " |> sprintf "@as(%s, .{ %s })" (zigType t)
+        | _ -> fail None "internal: bad constructor"
+    | EGet(x, p, _) ->
+        let o = ex em x
+
+        match p with
+        | PField f -> $"%s{o}.%s{fieldIdent f}"
+        | PCase(c, f) -> $"%s{o}.%s{fieldIdent c}.%s{fieldIdent f}"
+        | PItem i -> $"%s{o}[%d{i}]"
+        | PSome -> o + ".?"
+    | ETest(x, c, t) ->
+        match t with
+        | TOpt _ ->
+            let op =
+                if c = "Some" then
+                    "!="
+                else
+                    "=="
+
+            $"(%s{ex em x} %s{op} null)"
+        | _ -> $"(%s{ex em x} == .%s{fieldIdent c})"
     | EIf(c, t, f, _) when isFlat c && isFlat t && isFlat f -> simpleIf em c t f
     | _ -> fail None "internal: this expression is not part of the Zig target yet"
 
@@ -459,6 +508,31 @@ let emitFile (state: FileState) : string =
 
     for alias in state.Imports.Values do
         rootNames.Add alias |> ignore
+
+    for e in state.LocalEnts do
+        rootNames.Add(topIdent e.Name) |> ignore
+
+    for e in state.LocalEnts do
+        let fields (fs: (string * Ty) list) =
+            fs |> List.map (fun (f, t) -> $"%s{fieldIdent f}: %s{zigType t}")
+
+        match e.Kind with
+        | KRecord ->
+            out.AppendLine($"pub const %s{topIdent e.Name} = struct {{") |> ignore
+
+            for f in fields (caseFields (TEnt e) "") do
+                out.AppendLine($"    %s{f},") |> ignore
+        | _ ->
+            out.AppendLine($"pub const %s{topIdent e.Name} = union(enum) {{") |> ignore
+
+            for (c, fs) in e.Cases do
+                if fs.IsEmpty then
+                    out.AppendLine($"    %s{fieldIdent c},") |> ignore
+                else
+                    let payload = fields fs |> String.concat ", "
+                    out.AppendLine($"    %s{fieldIdent c}: struct {{ %s{payload} }},") |> ignore
+
+        out.AppendLine("};").AppendLine() |> ignore
 
     for (name, ty, text) in state.Consts do
         out.AppendLine($"pub const %s{topIdent name}: %s{zigType ty} = %s{text};")

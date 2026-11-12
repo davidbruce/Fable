@@ -42,7 +42,38 @@ let private exprKind (e: Fable.Expr) =
     | Fable.Extended _ -> "raise"
     | _ -> "this construct"
 
-let rec mapType (r: SourceLocation option) (t: Fable.Type) : Ty =
+/// Does a record or union contain itself, directly or through other records and unions?
+let private reachesSelf (com: Compiler) (start: Fable.Entity) : bool =
+    let seen = HashSet<string>()
+
+    let rec typeRefs (t: Fable.Type) : Fable.EntityRef list =
+        match t with
+        | Fable.DeclaredType(e, gen) -> e :: List.collect typeRefs gen
+        | _ -> List.collect typeRefs t.Generics
+
+    let fieldTypes (ent: Fable.Entity) =
+        if ent.IsFSharpUnion then
+            ent.UnionCases
+            |> List.collect (fun c -> c.UnionCaseFields |> List.map (fun f -> f.FieldType))
+        else
+            ent.FSharpFields |> List.map (fun f -> f.FieldType)
+
+    let rec go (ent: Fable.Entity) =
+        fieldTypes ent
+        |> List.collect typeRefs
+        |> List.exists (fun r ->
+            r.FullName = start.FullName
+            || (seen.Add r.FullName
+                && (
+                    match com.TryGetEntity r with
+                    | Some e when e.IsFSharpRecord || e.IsFSharpUnion -> go e
+                    | _ -> false
+                ))
+        )
+
+    go start
+
+let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
     | Fable.Unit -> tVoid
     | Fable.Boolean -> tBool
@@ -69,8 +100,108 @@ let rec mapType (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.String -> fail r "the Zig target does not support strings yet"
     | Fable.LambdaType _
     | Fable.DelegateType _ -> fail r "the Zig target does not support function values yet"
-    | Fable.DeclaredType(ent, _) -> fail r "the Zig target does not support the type %s yet" ent.FullName
+    | Fable.Tuple(ts, _) -> TTuple(ts |> List.map (mapType ctx r))
+    | Fable.Option(t, _) -> TOpt(mapType ctx r t)
+    | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent genArgs)
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
+
+/// The record or union behind an entity reference. Immutable, non-recursive records and
+/// unions are plain Zig values: a `struct`, or a `union(enum)` with one payload per case.
+and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) (genArgs: Fable.Type list) : Ent =
+    match ctx.State.Ents.TryGetValue entRef.FullName with
+    | true, e -> e
+    | _ ->
+        let ent =
+            match ctx.Com.TryGetEntity entRef with
+            | Some e -> e
+            | None -> fail r "the Zig target cannot find the type %s" entRef.FullName
+
+        if not (ent.IsFSharpRecord || ent.IsFSharpUnion) then
+            fail r "the Zig target does not support the type %s yet" entRef.FullName
+
+        if not genArgs.IsEmpty || not ent.GenericParameters.IsEmpty then
+            fail r "the Zig target does not support generic types yet (%s)" ent.DisplayName
+
+        if reachesSelf ctx.Com ent then
+            fail
+                r
+                "the Zig target does not support recursive types yet (%s): they need the reference-counting runtime"
+                ent.DisplayName
+
+        if
+            ent.IsFSharpRecord
+            && not ent.IsValueType
+            && ent.FSharpFields |> List.exists (fun f -> f.IsMutable)
+        then
+            fail
+                r
+                "the Zig target does not support records with mutable fields yet (%s): they need the reference-counting runtime"
+                ent.DisplayName
+
+        // a name in this file, or `alias.name` for a type another file declares
+        let name, isLocal =
+            match FSharp2Fable.Util.entityIdent ctx.Com entRef with
+            | Fable.IdentExpr id -> id.Name, true
+            | Fable.Import(imp, _, _) -> importAlias ctx imp.Path + "." + imp.Selector, false
+            | _ -> fail r "the Zig target cannot reference the type %s" entRef.FullName
+
+        let e =
+            {
+                Name = name
+                Ref = entRef
+                Kind =
+                    if ent.IsFSharpUnion then
+                        KValueUnion
+                    else
+                        KRecord
+                Cases = []
+                Managed = false
+                DropAlloc = false
+                Copyable = true
+                IsLocal = isLocal
+            }
+
+        ctx.State.Ents[entRef.FullName] <- e
+
+        try
+            e.Cases <-
+                if ent.IsFSharpUnion then
+                    ent.UnionCases
+                    |> List.map (fun c ->
+                        c.Name, c.UnionCaseFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
+                    )
+                else
+                    [
+                        "", ent.FSharpFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
+                    ]
+        with _ ->
+            ctx.State.Ents.Remove entRef.FullName |> ignore
+            reraise ()
+
+        if isLocal then
+            ctx.State.LocalEnts.Add e
+
+        e
+
+and importAlias (ctx: Ctx) (path: string) =
+    match ctx.State.Imports.TryGetValue path with
+    | true, alias -> alias
+    | _ ->
+        let fileName = System.IO.Path.GetFileNameWithoutExtension(path)
+
+        let baseName =
+            "m_"
+            + System.Text.RegularExpressions.Regex.Replace(fileName.Replace(".fs", ""), "[^A-Za-z0-9_]", "_")
+
+        let mutable alias = baseName
+        let mutable i = 1
+
+        while ctx.State.Imports.ContainsValue alias do
+            alias <- $"%s{baseName}_%d{i}"
+            i <- i + 1
+
+        ctx.State.Imports[path] <- alias
+        alias
 
 let private isUnit (t: Fable.Type) =
     match t with
@@ -144,26 +275,6 @@ let bindArgs (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr) : Expr =
 
         List.foldBack (fun (v, ir) acc -> ELet(v, ir, acc)) (List.ofSeq binds) (k (List.ofArray outs))
 
-let private importAlias (ctx: Ctx) (path: string) =
-    match ctx.State.Imports.TryGetValue path with
-    | true, alias -> alias
-    | _ ->
-        let fileName = System.IO.Path.GetFileNameWithoutExtension(path)
-
-        let baseName =
-            "m_"
-            + System.Text.RegularExpressions.Regex.Replace(fileName.Replace(".fs", ""), "[^A-Za-z0-9_]", "_")
-
-        let mutable alias = baseName
-        let mutable i = 1
-
-        while ctx.State.Imports.ContainsValue alias do
-            alias <- $"%s{baseName}_%d{i}"
-            i <- i + 1
-
-        ctx.State.Imports[path] <- alias
-        alias
-
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
     | Fable.Value(kind, r) ->
@@ -179,6 +290,21 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             )
         | Fable.NumberConstant(v, _) -> ELit(numberLit r v)
         | Fable.CharConstant c -> ELit(string<int>(int c), TPrim "u16")
+        | Fable.NewRecord(values, entRef, genArgs) ->
+            let ent = entOf ctx r entRef genArgs
+            bindArgs ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TEnt ent, "", xs, None))
+        | Fable.NewUnion(values, tag, entRef, genArgs) ->
+            let ent = entOf ctx r entRef genArgs
+            let case = fst (List.item tag ent.Cases)
+            bindArgs ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TEnt ent, case, xs, None))
+        | Fable.NewTuple(values, _) ->
+            bindArgs ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TTuple(xs |> List.map typeOf), "", xs, None))
+        | Fable.NewOption(value, t, _) ->
+            let ty = TOpt(mapType ctx r t)
+
+            match value with
+            | Some v -> bindArgs ctx [ lw ctx v ] (fun xs -> ECon(ty, "Some", xs, None))
+            | None -> ECon(ty, "None", [], None)
         | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
 
     | Fable.IdentExpr id ->
@@ -200,7 +326,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     | Fable.Let(id, value, body) ->
         let rhs = lw ctx value
-        let ty = mapType id.Range id.Type
+        let ty = mapType ctx id.Range id.Type
 
         if isVoid ty then
             ESeq(asStmt ctx rhs, lw ctx body)
@@ -217,11 +343,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             restRev |> List.fold (fun acc s -> ESeq(lwStmt ctx s, acc)) lastIr
 
     | Fable.IfThenElse(guard, thenExpr, elseExpr, r) ->
-        let ty = mapType r e.Type
+        let ty = mapType ctx r e.Type
         bindArgs ctx [ lw ctx guard ] (fun xs -> EIf(xs.Head, lw ctx thenExpr, lw ctx elseExpr, ty))
 
     | Fable.Operation(kind, _, t, r) ->
-        let ty = mapType r t
+        let ty = mapType ctx r t
 
         match kind with
         | Fable.Unary(op, x) ->
@@ -256,7 +382,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | BinaryExponent -> fail r "the Zig target does not support `**` yet"
 
             // (only numbers, booleans and chars get this far: anything else fails in mapType)
-            mapType a.Range a.Type |> ignore
+            mapType ctx a.Range a.Type |> ignore
             bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim(name, xs, ty))
         | Fable.Logical(op, a, b) ->
             let rhs = lw ctx b
@@ -270,8 +396,62 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     | LogicalOr -> EIf(xs.Head, ELit("true", tBool), rhs, tBool)
                 )
 
+    // Structural equality of records, unions, tuples and options. (It arrives as the library
+    // call the JavaScript replacements make; plain values are compared field by field in Zig.)
+    | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
+        (imp.Selector = "equals" || imp.Selector = "equalArrays")
+        && info.Args.Length = 2
+        && (
+            match imp.Kind with
+            | Fable.LibraryImport _ -> true
+            | _ -> false
+        )
+        ->
+        bindArgs ctx (info.Args |> List.map (lw ctx)) (fun xs -> EPrim("eql", xs, tBool))
+
+    | Fable.Get(x, kind, t, r) ->
+        let ty = mapType ctx r t
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                let v = xs.Head
+
+                match kind, typeOf v with
+                | Fable.FieldGet info, TEnt ent when ent.Kind = KRecord -> EGet(v, PField info.Name, ty)
+                | Fable.TupleIndex i, TTuple _ -> EGet(v, PItem i, ty)
+                | Fable.UnionField info, TEnt ent ->
+                    let case, fields = List.item info.CaseIndex ent.Cases
+                    EGet(v, PCase(case, fst (List.item info.FieldIndex fields)), ty)
+                | Fable.UnionTag, TEnt _ -> EPrim("tag", [ v ], tI32)
+                | Fable.OptionValue, TOpt _ -> EGet(v, PSome, ty)
+                | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
+            )
+
+    | Fable.Test(x, kind, r) ->
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                let v = xs.Head
+
+                match kind, typeOf v with
+                | Fable.UnionCaseTest tag, (TEnt ent as t) -> ETest(v, fst (List.item tag ent.Cases), t)
+                | Fable.OptionTest isSome, (TOpt _ as t) ->
+                    ETest(
+                        v,
+                        (if isSome then
+                             "Some"
+                         else
+                             "None"),
+                        t
+                    )
+                | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
+            )
+
     | Fable.Call(callee, info, t, r) ->
-        let ty = mapType r t
+        let ty = mapType ctx r t
 
         if info.ThisArg.IsSome then
             fail r "the Zig target does not support method calls yet"
@@ -304,14 +484,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             fail r "the Zig target does not support a `while` condition with control flow in it yet"
 
     | Fable.ForLoop(id, start, limit, body, isUp, _) ->
-        let iv = ctx.State.NewVar(id.Name, mapType id.Range id.Type, VLocal, false)
+        let iv = ctx.State.NewVar(id.Name, mapType ctx id.Range id.Type, VLocal, false)
         ctx.Vars[id.Name] <- iv
         bindArgs ctx [ lw ctx start; lw ctx limit ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, lwStmt ctx body))
 
     | Fable.TypeCast(x, t) ->
         let ir = lw ctx x
 
-        if typeOf ir = mapType e.Range t then
+        if typeOf ir = mapType ctx e.Range t then
             ir
         else
             fail e.Range "the Zig target does not support %s yet" (exprKind e)
@@ -345,6 +525,15 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
     let state = FileState()
     let members = Dictionary<string, MemberKind>()
 
+    let newCtx () =
+        {
+            Com = com
+            State = state
+            Vars = Dictionary()
+            Members = members
+            DecisionTargets = []
+        }
+
     let report (r: SourceLocation option) (msg: string) =
         com.AddLog(msg, Severity.Error, ?range = r, fileName = com.CurrentFile)
 
@@ -358,7 +547,17 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 report a.Body.Range "the Zig target does not support top-level statements yet"
                 []
             | Fable.ClassDeclaration c ->
-                report None $"the Zig target does not support type declarations yet (%s{c.Name})"
+                match com.TryGetEntity c.Entity with
+                | Some ent when ent.IsFSharpRecord || ent.IsFSharpUnion ->
+                    try
+                        entOf (newCtx ()) None c.Entity [] |> ignore
+
+                        if not c.AttachedMembers.IsEmpty then
+                            report None $"the Zig target does not support members of types yet (%s{c.Name})"
+                    with ZigError(msg, r) ->
+                        report r msg
+                | _ -> report None $"the Zig target does not support this kind of type declaration yet (%s{c.Name})"
+
                 []
         )
 
@@ -370,7 +569,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
         try
             if info.IsValue then
-                members[d.Name] <- MConst(mapType d.Body.Range d.Body.Type)
+                members[d.Name] <- MConst(mapType (newCtx ()) d.Body.Range d.Body.Type)
             else
                 members[d.Name] <- MFunction
         with ZigError(msg, r) ->
@@ -378,15 +577,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
     for d in decls do
         let info = com.GetMember d.MemberRef
-
-        let ctx =
-            {
-                Com = com
-                State = state
-                Vars = Dictionary()
-                Members = members
-                DecisionTargets = []
-            }
+        let ctx = newCtx ()
 
         try
             if info.IsValue then
@@ -405,12 +596,12 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         d.Args
                         |> List.filter (fun a -> not (isUnit a.Type))
                         |> List.map (fun a ->
-                            let v = state.NewVar(a.Name, mapType a.Range a.Type, VParam, false)
+                            let v = state.NewVar(a.Name, mapType ctx a.Range a.Type, VParam, false)
                             ctx.Vars[a.Name] <- v
                             v
                         )
 
-                let ret = mapType d.Body.Range d.Body.Type
+                let ret = mapType ctx d.Body.Range d.Body.Type
                 let body = lw ctx d.Body
 
                 state.Fns.Add
