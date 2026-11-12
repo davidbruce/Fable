@@ -22,6 +22,7 @@
     <Compile Include="Beam/Prelude.fs" />
     <Compile Include="Beam/Replacements.fs" />
     <Compile Include="Replacements.fs" />
+    <Compile Include="Zig/Replacements.fs" />
     <Compile Include="Replacements.Api.fs" />
     <Compile Include="QuotationEmitter.fs" />
     <Compile Include="FSharp2Fable.fsi" />

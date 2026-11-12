@@ -42,6 +42,7 @@
     <Compile Include="../../Fable.Transforms/Beam/Prelude.fs" />
     <Compile Include="../../Fable.Transforms/Beam/Replacements.fs" />
     <Compile Include="../../Fable.Transforms/Replacements.fs" />
+    <Compile Include="../../Fable.Transforms/Zig/Replacements.fs" />
     <Compile Include="../../Fable.Transforms/Replacements.Api.fs" />
     <Compile Include="../../Fable.Transforms/QuotationEmitter.fs" />
     <Compile Include="../../Fable.Transforms/FSharp2Fable.fsi" />
