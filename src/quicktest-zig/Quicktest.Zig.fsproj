@@ -8,6 +8,7 @@
     <Compile Include="Helpers.fs" />
     <Compile Include="Heap.fs" />
     <Compile Include="Stress.fs" />
+    <Compile Include="Functions.fs" />
     <Compile Include="QuickTest.fs" />
   </ItemGroup>
   <ItemGroup>

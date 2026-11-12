@@ -27,7 +27,9 @@ There is no separate Zig AST: the IR is the last structured form, and the emitte
 
 ## What compiles today
 
-Module-level functions (also recursive, also across files), literal module-level values,
+Module-level functions (also recursive, also across files), functions declared inside
+functions, lambdas and function values (see "Function values"), pipes and composition,
+literal module-level values,
 numbers, booleans and chars, `let`, `let mutable`, `if`, `while`, `for .. to`, arithmetic,
 comparison, bitwise and boolean operators, conversions between numbers (`int`, `byte`,
 `float`, ... with .NET's results), pattern matching, and an `[<EntryPoint>]` whose result
@@ -108,8 +110,41 @@ fable_rt.across(m_Helpers.sumList, m_Helpers.@"sumList$sig", .{ .keep }, .{ xs }
 `.keep` means the caller uses the value again, `.give` that this was its last use. `across`
 is resolved at compile time: a value the caller keeps and the callee borrows is passed as it
 is; one the caller gives and the callee borrows is dropped after the call; a borrowed result
-is made owned. The call costs what it would cost inside one file, except that a borrowed
-result is always dup'ed (inside a file it can stay a borrow).
+is made owned. The call costs what it would cost inside one file, with two exceptions: a
+borrowed result is always dup'ed (inside a file it can stay a borrow), and a parameter that
+a function passes on to a function of another file is inferred as owned, because inference
+has to assume the other function consumes it (assuming the opposite would cost in-place
+reuse, which is worth more). So the callers of such a forwarding function pay a dup and a
+drop where code in one file would pay nothing.
+
+## Function values
+
+Every lambda, and every function declared inside another function, is compiled as a function
+of the file that takes the variables it uses from its surroundings as extra, leading
+parameters (lambda lifting). Calling such a function by name is therefore a plain call: no
+environment is allocated, its parameters can be borrowed, and a `let rec loop` that calls
+itself last is a loop.
+
+Only where a function is used as a *value* is there a function value:
+
+```zig
+fable_rt.Func(*const fn (?*fable_rt.Env, i32) i32)   // F#: int -> int
+```
+
+a pointer to code and a pointer to a reference-counted environment that owns the captured
+values (no environment when nothing is captured, so passing `double` or `fun x -> x * 2`
+allocates nothing). The code is a small adapter generated per function: it reads the
+captures from the environment and calls the lifted function. A function value owns its
+arguments and its result; the adapter is where that convention meets whatever the function
+itself was inferred to borrow.
+
+`int -> int -> int` as a value is the uncurried form wherever Fable can uncurry it (a
+two-argument function value); where it cannot, it is a function that returns a function.
+Functions cannot capture `let mutable` variables (F# does not allow it either).
+
+Not yet: tail calls between different functions are calls, not jumps, so deeply mutually
+recursive functions use stack; a higher-order function is not specialised for the lambda it
+is given, so each call through a function value is an indirect call.
 
 `./build.sh quicktest zig` compiles `src/quicktest-zig` and runs it with `zig run`.
 
@@ -121,7 +156,7 @@ result is always dup'ed (inside a file it can stay a borrow).
    (done).
 3. ~~What functions of other files borrow~~ (done, at Zig compile time: see "Calls between
    files"). Whether a function of another file can raise will be stated the same way.
-4. Closures and function values, generics, exceptions, byrefs and spans.
+4. ~~Closures and function values~~ (done), generics, exceptions, byrefs and spans.
 5. Mutable reference records and the cycle collector.
 6. Strings, collections and the rest of FSharp.Core through `Replacements.fs` and the library.
 7. The test suite (`tests/Zig`), starting from the tests the other targets share.

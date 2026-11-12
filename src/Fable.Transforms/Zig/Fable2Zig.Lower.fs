@@ -9,8 +9,22 @@ open Fable.Transforms
 open Fable.Transforms.Zig.IR
 
 type MemberKind =
-    | MFunction
+    /// how many arguments the function takes (as Fable counts them), and its result type
+    | MFunction of arity: int * ret: Fable.Type
     | MConst of Ty
+
+/// A lambda, or a function declared inside another one. It is compiled as a function of the
+/// file that takes the variables it uses from its surroundings as extra, leading parameters,
+/// so calling it by name is a plain call: no environment is allocated, its parameters can be
+/// borrowed, and a self tail call is a loop.
+type LocalFn =
+    {
+        FnName: string
+        /// the surrounding variables it uses, by their names there
+        CaptureNames: string list
+        Arity: int
+        Ret: Fable.Type
+    }
 
 type Ctx =
     {
@@ -20,7 +34,24 @@ type Ctx =
         Vars: Dictionary<string, Var>
         /// the functions and constants this file declares
         Members: Dictionary<string, MemberKind>
+        /// the functions declared inside the function being lowered
+        LocalFns: Dictionary<string, LocalFn>
+        /// the name of the module-level function being lowered
+        FnBase: string
+        /// the names of the file's functions, to give the ones made here names of their own
+        Reserved: HashSet<string>
         DecisionTargets: (Fable.Ident list * Fable.Expr) list
+    }
+
+/// Something that is called by name.
+type Callable =
+    {
+        /// a function of this file, or `alias.name`
+        Target: string
+        /// the values it takes before its own arguments
+        Captures: Expr list
+        Arity: int
+        Ret: Fable.Type
     }
 
 let private exprKind (e: Fable.Expr) =
@@ -116,8 +147,24 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         | BigInt -> fail r "the Zig target does not support bigint yet"
         | Decimal -> fail r "the Zig target does not support decimal yet"
     | Fable.String -> fail r "the Zig target does not support strings yet"
-    | Fable.LambdaType _
-    | Fable.DelegateType _ -> fail r "the Zig target does not support function values yet"
+    | Fable.LambdaType(arg, ret) ->
+        TFn(
+            (match arg with
+             | Fable.Unit -> []
+             | _ -> [ mapType ctx r arg ]),
+            mapType ctx r ret
+        )
+    | Fable.DelegateType(args, ret) ->
+        TFn(
+            args
+            |> List.filter (fun a ->
+                match a with
+                | Fable.Unit -> false
+                | _ -> true
+            )
+            |> List.map (mapType ctx r),
+            mapType ctx r ret
+        )
     | Fable.Tuple(ts, _) -> TTuple(ts |> List.map (mapType ctx r))
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent genArgs)
@@ -278,6 +325,7 @@ let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr
                 match ir with
                 | ECall _
                 | ECallClo _
+                | EClosure _
                 | EEmit _ -> true
                 // (a constructor argument is an owning position)
                 | ECon(_, _, xs, _) -> not conArgs && not xs.IsEmpty
@@ -318,6 +366,119 @@ let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr
         List.foldBack (fun (v, ir) acc -> ELet(v, ir, acc)) (List.ofSeq binds) (k (List.ofArray outs))
 
 let bindArgs (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr) : Expr = bindArgsIn false ctx irs k
+
+/// The surrounding variables that `bodies` use, in the order they are first used. A use of a
+/// function declared in the surroundings counts as a use of what that function captures.
+let private freeNames (ctx: Ctx) (bodies: (Fable.Ident list * Fable.Expr) list) : string list =
+    let found = List<string>()
+    let seen = HashSet<string>()
+
+    let add (bound: Set<string>) (name: string) =
+        if not (bound.Contains name) && ctx.Vars.ContainsKey name && seen.Add name then
+            found.Add name
+
+    let names (ids: Fable.Ident list) =
+        ids |> List.map (fun i -> i.Name) |> Set.ofList
+
+    let rec walk (bound: Set<string>) (e: Fable.Expr) =
+        match e with
+        | Fable.IdentExpr id ->
+            if bound.Contains id.Name || ctx.Vars.ContainsKey id.Name then
+                add bound id.Name
+            else
+                match ctx.LocalFns.TryGetValue id.Name with
+                | true, fn -> fn.CaptureNames |> List.iter (add bound)
+                | _ -> ()
+        | Fable.Lambda(arg, body, _) -> walk (bound.Add arg.Name) body
+        | Fable.Delegate(args, body, _, _) -> walk (Set.union bound (names args)) body
+        | Fable.Let(id, value, body) ->
+            walk bound value
+            walk (bound.Add id.Name) body
+        | Fable.LetRec(bindings, body) ->
+            let bound = Set.union bound (names (bindings |> List.map fst))
+            bindings |> List.iter (snd >> walk bound)
+            walk bound body
+        | Fable.ForLoop(id, start, limit, body, _, _) ->
+            walk bound start
+            walk bound limit
+            walk (bound.Add id.Name) body
+        | Fable.DecisionTree(expr, targets) ->
+            walk bound expr
+
+            for (ids, target) in targets do
+                walk (Set.union bound (names ids)) target
+        | Fable.TryCatch(body, catch, finalizer, _) ->
+            walk bound body
+            catch |> Option.iter (fun (id, handler) -> walk (bound.Add id.Name) handler)
+            finalizer |> Option.iter (walk bound)
+        | _ -> AST.getSubExpressions e |> List.iter (walk bound)
+
+    for (args, body) in bodies do
+        walk (names args) body
+
+    List.ofSeq found
+
+let private uniqueName (ctx: Ctx) (wanted: string) =
+    let mutable name = wanted
+    let mutable i = 1
+
+    while not (ctx.Reserved.Add name) do
+        name <- $"%s{wanted}_%d{i}"
+        i <- i + 1
+
+    name
+
+let private captureExprs (ctx: Ctx) (r: SourceLocation option) (names: string list) : Expr list =
+    names
+    |> List.map (fun n ->
+        match ctx.Vars.TryGetValue n with
+        | true, v -> EVar v
+        | _ -> fail r "internal: the captured variable `%s` is not in scope" n
+    )
+
+/// What `e` is, if it names a function: one declared inside the function being lowered, one of
+/// this file, or one of another file.
+let private tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
+    match e with
+    | Fable.IdentExpr id when not (ctx.Vars.ContainsKey id.Name) ->
+        match ctx.LocalFns.TryGetValue id.Name with
+        | true, fn ->
+            Some
+                {
+                    Target = fn.FnName
+                    Captures = captureExprs ctx id.Range fn.CaptureNames
+                    Arity = fn.Arity
+                    Ret = fn.Ret
+                }
+        | _ ->
+            match ctx.Members.TryGetValue id.Name with
+            | true, MFunction(arity, ret) ->
+                Some
+                    {
+                        Target = id.Name
+                        Captures = []
+                        Arity = arity
+                        Ret = ret
+                    }
+            | _ -> None
+    | Fable.Import(imp, _, _) ->
+        match imp.Kind with
+        | Fable.MemberImport memberRef ->
+            match ctx.Com.TryGetMember memberRef with
+            | Some m when not m.IsValue ->
+                Some
+                    {
+                        Target = importAlias ctx imp.Path + "." + imp.Selector
+                        Captures = []
+                        Arity = max 1 (m.CurriedParameterGroups |> List.sumBy List.length)
+                        Ret = m.ReturnParameter.Type
+                    }
+            | _ -> None
+        | _ -> None
+    | _ -> None
+
+let private nonUnit (args: Fable.Expr list) =
+    args |> List.filter (fun a -> not (isUnit a.Type))
 
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
@@ -369,8 +530,38 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         Kind = VGlobal
                         FMutable = false
                     }
-            | true, MFunction -> fail id.Range "the Zig target does not support function values yet (`%s`)" id.Name
-            | _ -> fail id.Range "the Zig target cannot resolve `%s` yet" id.Name
+            | _ ->
+                match tryCallable ctx e with
+                | Some c -> fnValue ctx id.Range e c id.Type
+                | None -> fail id.Range "the Zig target cannot resolve `%s` yet" id.Name
+
+    // a function of another file, as a value
+    | Fable.Import(_, t, r) when (tryCallable ctx e).IsSome -> fnValue ctx r e (tryCallable ctx e).Value t
+
+    // A function declared inside this one becomes a function of the file (see `LocalFn`).
+    | Fable.Let(id, (Fable.Lambda _ | Fable.Delegate _ as fnExpr), body) when not id.IsMutable ->
+        liftGroup ctx id.Range [ Some id.Name, id.Name, fnExpr ] |> ignore
+        lw ctx body
+
+    | Fable.LetRec(bindings, body) ->
+        for (id, value) in bindings do
+            match value with
+            | Fable.Lambda _
+            | Fable.Delegate _ -> ()
+            | _ -> fail id.Range "the Zig target does not support recursive values yet (`%s`)" id.Name
+
+        liftGroup ctx e.Range (bindings |> List.map (fun (id, value) -> Some id.Name, id.Name, value))
+        |> ignore
+
+        lw ctx body
+
+    | Fable.Lambda _
+    | Fable.Delegate _ ->
+        let fn = liftGroup ctx e.Range [ None, "lambda", e ] |> List.head
+        EClosure(fn.FnName, captureExprs ctx e.Range fn.CaptureNames, mapType ctx e.Range e.Type)
+
+    // a function with several arguments that is used one argument at a time
+    | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
 
     | Fable.Let(id, value, body) ->
         let rhs = lw ctx value
@@ -520,19 +711,31 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         if info.ThisArg.IsSome then
             fail r "the Zig target does not support method calls yet"
 
-        let name =
-            match callee with
-            | Fable.IdentExpr id when ctx.Members.ContainsKey id.Name -> id.Name
-            | Fable.Import(imp, _, _) ->
-                match imp.Kind with
-                | Fable.MemberImport _ -> importAlias ctx imp.Path + "." + imp.Selector
-                | _ -> fail r "the Zig target does not support this library call yet (%s from %s)" imp.Selector imp.Path
-            | _ -> fail r "the Zig target does not support %s yet" (exprKind callee)
+        let args = nonUnit info.Args |> List.map (lw ctx)
 
-        let args =
-            info.Args |> List.filter (fun a -> not (isUnit a.Type)) |> List.map (lw ctx)
+        match tryCallable ctx callee, callee with
+        | Some c, _ -> bindArgs ctx args (fun xs -> ECall(c.Target, c.Captures @ xs, ty))
+        | None, Fable.Import(imp, _, _) ->
+            fail r "the Zig target does not support this library call yet (%s from %s)" imp.Selector imp.Path
+        // a function value: all its arguments at once
+        | None, _ -> bindArgs ctx (lw ctx callee :: args) (fun xs -> ECallClo(xs.Head, xs.Tail, ty))
 
-        bindArgs ctx args (fun xs -> ECall(name, xs, ty))
+    | Fable.CurriedApply(applied, args, t, r) ->
+        match tryCallable ctx applied with
+        | Some c when args.Length >= c.Arity ->
+            let now, rest = List.splitAt c.Arity args
+            let nowIr = nonUnit now |> List.map (lw ctx)
+
+            if rest.IsEmpty then
+                bindArgs ctx nowIr (fun xs -> ECall(c.Target, c.Captures @ xs, mapType ctx r t))
+            else
+                // the function returns a function, which gets the other arguments
+                let first =
+                    bindArgs ctx nowIr (fun xs -> ECall(c.Target, c.Captures @ xs, mapType ctx r c.Ret))
+
+                applyValue ctx r first c.Ret rest t
+        | Some c -> applyValue ctx r (fnValue ctx r applied c applied.Type) applied.Type args t
+        | None -> applyValue ctx r (lw ctx applied) applied.Type args t
 
     | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, r) ->
         match ctx.Vars.TryGetValue id.Name with
@@ -571,6 +774,174 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         |> lw ctx
 
     | _ -> fail e.Range "the Zig target does not support %s yet" (exprKind e)
+
+/// Apply a function value to arguments, as many at a time as its type takes.
+and applyValue
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (f: Expr)
+    (fTy: Fable.Type)
+    (args: Fable.Expr list)
+    (finalTy: Fable.Type)
+    : Expr
+    =
+    match args with
+    | [] -> f
+    | _ ->
+        let take, ret =
+            match fTy with
+            | Fable.LambdaType(_, ret) -> 1, ret
+            | Fable.DelegateType(ts, ret) -> max 1 ts.Length, ret
+            | _ -> fail r "the Zig target cannot apply a value of this type"
+
+        if args.Length < take then
+            fail r "the Zig target does not support applying a function to some of its arguments here yet"
+
+        let now, rest = List.splitAt take args
+
+        let resultTy =
+            if rest.IsEmpty then
+                finalTy
+            else
+                ret
+
+        let call =
+            bindArgs
+                ctx
+                (f :: (nonUnit now |> List.map (lw ctx)))
+                (fun xs -> ECallClo(xs.Head, xs.Tail, mapType ctx r resultTy))
+
+        applyValue ctx r call ret rest finalTy
+
+/// A function that is called by name, used as a value of type `valueTy`.
+and fnValue (ctx: Ctx) (r: SourceLocation option) (orig: Fable.Expr) (c: Callable) (valueTy: Fable.Type) : Expr =
+    let sameShape =
+        match valueTy with
+        | Fable.LambdaType _ -> c.Arity = 1
+        | Fable.DelegateType(ts, _) -> max 1 ts.Length = c.Arity
+        | _ -> false
+
+    if sameShape then
+        EClosure(c.Target, c.Captures, mapType ctx r valueTy)
+    else
+        // The value takes its arguments in other steps than the function does (`let add a b`
+        // used as `int -> int -> int`): lambdas that collect them, then the call.
+        // (a variable is made only for its number, which no other name of the file has)
+        let fresh (t: Fable.Type) =
+            let n = ctx.State.NewVar("eta", tVoid, VLocal, false).Id
+            AST.makeTypedIdent t $"eta%d{n}"
+
+        let rec build (t: Fable.Type) (acc: Fable.Expr list) : Fable.Expr =
+            if acc.Length >= c.Arity then
+                Fable.CurriedApply(orig, acc, t, r)
+            else
+                match t with
+                | Fable.LambdaType(a, ret) ->
+                    let x = fresh a
+                    Fable.Lambda(x, build ret (acc @ [ Fable.IdentExpr x ]), None)
+                | Fable.DelegateType(ts, ret) ->
+                    let xs = ts |> List.map fresh
+
+                    Fable.Delegate(xs, build ret (acc @ (xs |> List.map Fable.IdentExpr)), None, [])
+                | _ -> fail r "the Zig target cannot use this function as a value of this type"
+
+        let lambda = build valueTy []
+        lw ctx lambda
+
+/// Compile lambdas (one, or a group that refer to each other) as functions of the file.
+and liftGroup
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (bindings: (string option * string * Fable.Expr) list)
+    : LocalFn list
+    =
+    let parts =
+        bindings
+        |> List.map (fun (ident, hint, fnExpr) ->
+            match fnExpr with
+            | Fable.Lambda(arg, body, _) -> ident, hint, [ arg ], body
+            | Fable.Delegate(args, body, _, _) -> ident, hint, args, body
+            | _ -> fail r "internal: not a lambda"
+        )
+
+    let own = parts |> List.choose (fun (ident, _, _, _) -> ident) |> Set.ofList
+
+    let captureNames =
+        freeNames ctx (parts |> List.map (fun (_, _, args, body) -> args, body))
+        |> List.filter (fun n -> not (own.Contains n))
+
+    for n in captureNames do
+        if ctx.Vars[n].FMutable then
+            fail
+                r
+                "the Zig target does not support a function that uses the mutable variable `%s` of its surroundings"
+                n
+
+    let fns =
+        parts
+        |> List.map (fun (_, hint, args, body) ->
+            {
+                FnName = uniqueName ctx $"%s{ctx.FnBase}_%s{hint}"
+                CaptureNames = captureNames
+                Arity = max 1 args.Length
+                Ret = body.Type
+            }
+        )
+
+    // (the functions of a group see each other, and the code after them sees them)
+    let localFns = Dictionary<string, LocalFn>(ctx.LocalFns)
+
+    for ((ident, _, _, _), fn) in List.zip parts fns do
+        match ident with
+        | Some name ->
+            localFns[name] <- fn
+            ctx.LocalFns[name] <- fn
+        | None -> ()
+
+    for ((_, _, args, body), fn) in List.zip parts fns do
+        let vars = Dictionary<string, Var>()
+
+        let inner =
+            { ctx with
+                Vars = vars
+                LocalFns = Dictionary<string, LocalFn>(localFns)
+                DecisionTargets = []
+            }
+
+        let captured =
+            captureNames
+            |> List.map (fun n ->
+                let v = ctx.State.NewVar(n, ctx.Vars[n].Ty, VParam, false)
+                vars[n] <- v
+                v
+            )
+
+        let ps =
+            args
+            |> List.filter (fun a -> not (isUnit a.Type))
+            |> List.map (fun a ->
+                let v = ctx.State.NewVar(a.Name, mapType ctx a.Range a.Type, VParam, false)
+                vars[a.Name] <- v
+                v
+            )
+
+        let ret = mapType ctx body.Range body.Type
+        let bodyIr = lw inner body
+
+        ctx.State.Fns.Add
+            {
+                Name = fn.FnName
+                Params = captured @ ps
+                Modes = (captured @ ps) |> List.map (fun _ -> MPlain)
+                Ret = ret
+                Body = bodyIr
+                RetFrom = None
+                IsLocal = true
+                IsEntryPoint = false
+                Range = body.Range
+            }
+
+    fns
 
 /// What the target does for a .NET or FSharp.Core member. This table is keyed by .NET names
 /// only, so it does not depend on how any other target implements the same member.
@@ -637,12 +1008,17 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
     let state = FileState()
     let members = Dictionary<string, MemberKind>()
 
-    let newCtx () =
+    let reserved = HashSet<string>()
+
+    let newCtx (fnBase: string) =
         {
             Com = com
             State = state
             Vars = Dictionary()
             Members = members
+            LocalFns = Dictionary()
+            FnBase = fnBase
+            Reserved = reserved
             DecisionTargets = []
         }
 
@@ -662,7 +1038,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 match com.TryGetEntity c.Entity with
                 | Some ent when ent.IsFSharpRecord || ent.IsFSharpUnion ->
                     try
-                        entOf (newCtx ()) None c.Entity [] |> ignore
+                        entOf (newCtx c.Name) None c.Entity [] |> ignore
 
                         if not c.AttachedMembers.IsEmpty then
                             report None $"the Zig target does not support members of types yet (%s{c.Name})"
@@ -680,16 +1056,18 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
         let info = com.GetMember d.MemberRef
 
         try
+            reserved.Add d.Name |> ignore
+
             if info.IsValue then
-                members[d.Name] <- MConst(mapType (newCtx ()) d.Body.Range d.Body.Type)
+                members[d.Name] <- MConst(mapType (newCtx d.Name) d.Body.Range d.Body.Type)
             else
-                members[d.Name] <- MFunction
+                members[d.Name] <- MFunction(max 1 d.Args.Length, d.Body.Type)
         with ZigError(msg, r) ->
             report r msg
 
     for d in decls do
         let info = com.GetMember d.MemberRef
-        let ctx = newCtx ()
+        let ctx = newCtx d.Name
 
         try
             if info.IsValue then
@@ -724,6 +1102,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         Ret = ret
                         Body = body
                         RetFrom = None
+                        IsLocal = false
                         IsEntryPoint = entry
                         Range = d.Body.Range
                     }

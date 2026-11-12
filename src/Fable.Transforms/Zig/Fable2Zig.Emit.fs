@@ -136,6 +136,9 @@ type Em =
         Used: HashSet<string>
         Mutated: Set<int>
         Loop: LoopInfo option
+        /// the functions that are used as values: name -> (how many values they capture, the
+        /// type of the function value)
+        Adapters: Dictionary<string, int * Ty>
         mutable Counter: int
     }
 
@@ -226,8 +229,17 @@ let rec zigType (t: Ty) : string =
              "[]")
         + zigType t
     | TArr(t, n) -> $"[%d{n}]%s{zigType t}"
-    | TFn _ -> "anytype"
+    | TFn(args, ret) ->
+        let ps = "?*fable_rt.Env" :: (args |> List.map zigType) |> String.concat ", "
+        $"fable_rt.Func(*const fn (%s{ps}) %s{zigType ret})"
     | TTok(e, c) -> $"?*fable_rt.Cell(%s{callTarget e.Name}, .%s{fieldIdent c})"
+
+/// The code of a function value: it takes the environment and then the arguments, which it
+/// owns, and calls the function. (`$` cannot be part of a name that comes from F#.)
+let adapterName (target: string) = $"@\"%s{target}$call\""
+
+/// What a function value captures.
+let envName (target: string) = $"@\"%s{target}$env\""
 
 let dupCode (x: string) = $"fable_rt.dup(%s{x})"
 let dropCode (x: string) = $"fable_rt.drop(%s{x});"
@@ -329,6 +341,20 @@ let rec ex (em: Em) (e: Expr) : string =
         else
             let args = xs |> List.map (ex em) |> String.concat ", "
             $"%s{callTarget f}(%s{args})"
+    | ECallClo(f, xs, _) ->
+        let fn = ex em f
+        let args = $"%s{fn}.env" :: (xs |> List.map (ex em)) |> String.concat ", "
+        $"%s{fn}.code(%s{args})"
+    | EClosure(target, caps, ty) ->
+        em.Adapters[target] <- (caps.Length, ty)
+
+        if caps.IsEmpty then
+            $"%s{zigType ty}{{ .env = null, .code = %s{adapterName target} }}"
+        else
+            let inits =
+                caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
+
+            $"fable_rt.closure(%s{zigType ty}, %s{envName target}, .{{ %s{inits} }}, %s{adapterName target})"
     | EEmit(macro, xs, _) ->
         let args = xs |> List.map (ex em) |> Array.ofList
 
@@ -732,7 +758,12 @@ let ensureUsed (names: string list) (body: string) =
 let private hasManaged (fn: FnInfo) =
     isManaged fn.Ret || fn.Params |> List.exists (fun p -> isManaged p.Ty)
 
-let emitFunction (out: StringBuilder) (rootNames: HashSet<string>) (fn: FnInfo) =
+let emitFunction
+    (out: StringBuilder)
+    (rootNames: HashSet<string>)
+    (adapters: Dictionary<string, int * Ty>)
+    (fn: FnInfo)
+    =
     // Is there a self call, or `let r = self(..) in Case(.., r, ..)`, where the function ends?
     let sites = tailSites fn.Body
 
@@ -785,6 +816,7 @@ let emitFunction (out: StringBuilder) (rootNames: HashSet<string>) (fn: FnInfo) 
             Used = HashSet(rootNames)
             Mutated = assignedIn fn.Body
             Loop = loop
+            Adapters = adapters
             Counter = 0
         }
 
@@ -847,15 +879,21 @@ let emitFunction (out: StringBuilder) (rootNames: HashSet<string>) (fn: FnInfo) 
     elif selfTail then
         out.AppendLine("/// self tail call: a loop") |> ignore
 
+    let visibility =
+        if fn.IsLocal then
+            ""
+        else
+            "pub "
+
     out
-        .AppendLine($"pub fn %s{topIdent fn.Name}(%s{sigParams}) %s{zigType fn.Ret} {{")
+        .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{sigParams}) %s{zigType fn.Ret} {{")
         .Append(ensureUsed (ps |> List.map (fun (s, _, _) -> s)) bodyText)
         .Append(bodyText)
         .AppendLine("}")
     |> ignore
 
     // What the function borrows, for the calls from other files.
-    if hasManaged fn then
+    if hasManaged fn && not fn.IsLocal then
         let borrows =
             match fn.Modes with
             | [] -> ".{}"
@@ -883,10 +921,115 @@ let emitFunction (out: StringBuilder) (rootNames: HashSet<string>) (fn: FnInfo) 
 
     out.AppendLine() |> ignore
 
+/// The code of a function value that calls `target`. A function value owns its arguments and
+/// its result, and what it captured stays in its environment; the function it calls may have
+/// been inferred to borrow some of that, so this is where the two are brought together.
+let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (target: string) (nCaptures: int) (ty: Ty) =
+    let argTys, ret =
+        match ty with
+        | TFn(args, ret) -> args, ret
+        | _ -> fail None "internal: not a function type"
+
+    let ps = argTys |> List.mapi (fun i t -> $"a%d{i}", t)
+
+    let sigParams =
+        "env: ?*fable_rt.Env"
+        :: (ps |> List.map (fun (n, t) -> $"%s{n}: %s{zigType t}"))
+        |> String.concat ", "
+
+    let line (text: string) = out.AppendLine(text) |> ignore
+
+    let finish (call: string) (resultBorrowed: bool) (dropAfter: string list) =
+        if isVoid ret then
+            line $"    %s{call};"
+        elif resultBorrowed then
+            line $"    const r = %s{dupCode call};"
+        else
+            line $"    const r = %s{call};"
+
+        for name in dropAfter do
+            line ("    " + dropCode name)
+
+        if not (isVoid ret) then
+            line "    return r;"
+
+    match fns.TryGetValue target with
+    | true, fn ->
+        let captured, rest = List.splitAt nCaptures (List.zip fn.Params fn.Modes)
+
+        if nCaptures > 0 then
+            let fields =
+                captured
+                |> List.mapi (fun i (p, _) -> $"c%d{i}: %s{zigType p.Ty}")
+                |> String.concat ", "
+
+            line $"const %s{envName target} = struct {{ %s{fields} }};"
+
+        line $"fn %s{adapterName target}(%s{sigParams}) %s{zigType ret} {{"
+
+        if nCaptures > 0 then
+            line $"    const c = fable_rt.captured(%s{envName target}, env);"
+        else
+            line "    _ = env;"
+
+        // (the environment keeps what it captured: a function that takes ownership gets a
+        // reference of its own)
+        let capturedArgs =
+            captured
+            |> List.mapi (fun i (_, m) ->
+                if m = MOwned then
+                    dupCode $"c.c%d{i}"
+                else
+                    $"c.c%d{i}"
+            )
+
+        let args = capturedArgs @ (ps |> List.map fst) |> String.concat ", "
+
+        let dropAfter =
+            List.zip ps rest
+            |> List.choose (fun ((n, _), (_, m)) ->
+                if m = MBorrowed then
+                    Some n
+                else
+                    None
+            )
+
+        finish $"%s{topIdent target}(%s{args})" fn.RetFrom.IsSome dropAfter
+    | _ ->
+        // a function of another file: what it borrows is settled when the Zig is compiled
+        line $"fn %s{adapterName target}(%s{sigParams}) %s{zigType ret} {{"
+        line "    _ = env;"
+
+        let tuple (items: string list) =
+            match items with
+            | [] -> ".{}"
+            | _ -> items |> String.concat ", " |> sprintf ".{ %s }"
+
+        if isManaged ret || argTys |> List.exists isManaged then
+            let uses =
+                argTys
+                |> List.map (fun t ->
+                    if isManaged t then
+                        ".give"
+                    else
+                        ".plain"
+                )
+
+            finish
+                $"fable_rt.across(%s{callTarget target}, %s{sigName target}, %s{tuple uses}, %s{tuple (ps |> List.map fst)})"
+                false
+                []
+        else
+            let args = ps |> List.map fst |> String.concat ", "
+            finish $"%s{callTarget target}(%s{args})" false []
+
+    line "}"
+    line ""
+
 /// The text of one file, without its imports (their paths are only known to the writer).
 let emitFile (state: FileState) : string =
     let out = StringBuilder()
-    let rootNames = HashSet<string>([ "result"; "hole"; "tail" ])
+    let rootNames = HashSet<string>([ "result"; "hole"; "tail"; "env" ])
 
     for (name, _, _) in state.Consts do
         rootNames.Add(topIdent name) |> ignore
@@ -939,11 +1082,21 @@ let emitFile (state: FileState) : string =
     if state.Consts.Count > 0 then
         out.AppendLine() |> ignore
 
+    let adapters = Dictionary<string, int * Ty>()
+    let fns = Dictionary<string, FnInfo>()
+
+    for fn in state.Fns do
+        fns[fn.Name] <- fn
+
     for fn in state.Fns do
         try
-            emitFunction out rootNames fn
+            emitFunction out rootNames adapters fn
         with ZigError(msg, None) ->
             raise (ZigError(msg, fn.Range))
+
+    for kv in adapters do
+        let (nCaptures, ty) = kv.Value
+        emitAdapter out fns kv.Key nCaptures ty
 
     // The F# entry point returns the process exit code as an int; Zig's `main` returns a u8.
     // In builds that count cells, a program that ends with cells still allocated says so.

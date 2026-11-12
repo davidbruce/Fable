@@ -72,6 +72,8 @@ let rec isManaged (t: Ty) =
     | TEnt e -> e.Managed
     | TOpt t -> isManaged t
     | TTuple ts -> List.exists isManaged ts
+    // (a function value may own an environment)
+    | TFn _ -> true
     | _ -> false
 
 let isHeapTy (t: Ty) =
@@ -165,6 +167,9 @@ type Expr =
     | EPrim of string * Expr list * Ty
     | ECall of string * Expr list * Ty
     | ECallClo of Expr * Expr list * Ty
+    /// a function value: the function of the file (or `alias.name`) it calls, the values it
+    /// captures (they are that function's first parameters), and its type
+    | EClosure of string * Expr list * Ty
     | ECon of Ty * string * Expr list * Var option
     | EGet of Expr * Proj * Ty
     | ETest of Expr * string * Ty
@@ -220,6 +225,8 @@ type FnInfo =
         /// Some [i; j]: the result is a borrow of parameters i and j (the callee does not dup
         /// it and the caller does not drop it)
         mutable RetFrom: int list option
+        /// a lambda or a function declared inside another one: not visible to other files
+        IsLocal: bool
         IsEntryPoint: bool
         Range: SourceLocation option
     }
@@ -231,6 +238,7 @@ let rec typeOf (e: Expr) : Ty =
     | EPrim(_, _, t)
     | ECall(_, _, t)
     | ECallClo(_, _, t)
+    | EClosure(_, _, t)
     | ECon(t, _, _, _)
     | EGet(_, _, t)
     | EDeref(_, t)
@@ -271,6 +279,7 @@ let flatKids (e: Expr) : Expr list =
     | EPrim(_, xs, _)
     | ECall(_, xs, _)
     | EEmit(_, xs, _)
+    | EClosure(_, xs, _)
     | ECon(_, _, xs, _) -> xs
     | ECallClo(f, xs, _) -> f :: xs
     | EGet(x, _, _)
@@ -286,6 +295,7 @@ let withFlatKids (e: Expr) (xs: Expr list) : Expr =
     | EPrim(op, _, t), _ -> EPrim(op, xs, t)
     | ECall(f, _, t), _ -> ECall(f, xs, t)
     | EEmit(m, _, t), _ -> EEmit(m, xs, t)
+    | EClosure(f, _, t), _ -> EClosure(f, xs, t)
     | ECon(t, c, _, tok), _ -> ECon(t, c, xs, tok)
     | ECallClo(_, _, t), f :: rest -> ECallClo(f, rest, t)
     | EGet(_, p, t), [ x ] -> EGet(x, p, t)
@@ -327,6 +337,8 @@ let rec isPure (e: Expr) =
     | EUnit -> true
     | EPrim(("div" | "mod"), _, _) -> false // may trap
     | EPrim(_, xs, _) -> List.forall isPure xs
+    // (a function value that captures nothing is a constant; one that captures allocates)
+    | EClosure(_, xs, _) -> xs.IsEmpty
     // (a constructor that allocates a cell is not pure)
     | ECon(t, _, xs, None) -> (not (isHeapTy t) || xs.IsEmpty) && List.forall isPure xs
     | EGet(x, _, _)

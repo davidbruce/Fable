@@ -100,7 +100,38 @@ let tryCall (com: ICompiler) (ctx: Context) r t (info: CallInfo) (thisArg: Expr 
 
     match native with
     | Some _ -> native
-    | None -> Some(dotnetCall r t info thisArg args)
+    | None ->
+        // pipes and composition are applications and lambdas, not library functions
+        match info.DeclaringEntityFullName, info.CompiledName, args with
+        | "Microsoft.FSharp.Core.Operators", "op_PipeRight", [ x; f ]
+        | "Microsoft.FSharp.Core.Operators", "op_PipeLeft", [ f; x ] -> curriedApply r t f [ x ] |> Some
+        | "Microsoft.FSharp.Core.Operators", "op_PipeRight2", [ x; y; f ]
+        | "Microsoft.FSharp.Core.Operators", "op_PipeLeft2", [ f; x; y ] -> curriedApply r t f [ x; y ] |> Some
+        | "Microsoft.FSharp.Core.Operators", "op_PipeRight3", [ x; y; z; f ]
+        | "Microsoft.FSharp.Core.Operators", "op_PipeLeft3", [ f; x; y; z ] -> curriedApply r t f [ x; y; z ] |> Some
+        | "Microsoft.FSharp.Core.Operators", "op_ComposeRight", [ f1; f2 ]
+        | "Microsoft.FSharp.Core.Operators", "op_ComposeLeft", [ f2; f1 ] ->
+            // `fun x -> f2 (f1 x)`, with both functions evaluated first. The types come from
+            // the functions: the type of the call is not always the type of the composition.
+            match f1.Type, f2.Type with
+            | (LambdaType(argType, interType) | DelegateType([ argType ], interType)),
+              (LambdaType(_, retType) | DelegateType([ _ ], retType)) ->
+                let arg = makeUniqueIdent com ctx argType "arg"
+                let fun1 = makeUniqueIdent com ctx f1.Type "f1"
+                let fun2 = makeUniqueIdent com ctx f2.Type "f2"
+
+                let argExpr =
+                    match argType with
+                    | Unit -> Value(UnitConstant, None)
+                    | _ -> IdentExpr arg
+
+                let body =
+                    [ curriedApply None interType (IdentExpr fun1) [ argExpr ] ]
+                    |> curriedApply r retType (IdentExpr fun2)
+
+                Let(fun1, f1, Let(fun2, f2, Lambda(arg, body, None))) |> Some
+            | _ -> Some(dotnetCall r t info thisArg args)
+        | _ -> Some(dotnetCall r t info thisArg args)
 
 /// Static fields of .NET types (`Int32.MaxValue`, ...): none yet.
 let tryField (com: ICompiler) (returnTyp: Type) (ownerTyp: Type) (fieldName: string) : Expr option = None

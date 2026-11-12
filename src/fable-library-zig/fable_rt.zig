@@ -4,7 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const interface_version: i32 = 3;
+pub const interface_version: i32 = 4;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -110,6 +110,7 @@ fn isCellPtr(comptime T: type) bool {
 /// Does a value of this type hold references to cells? (Does not look through a cell.)
 pub fn isManaged(comptime T: type) bool {
     if (isCellPtr(T)) return true;
+    if (comptime isFunc(T)) return true;
     switch (@typeInfo(T)) {
         .optional => |o| return isManaged(o.child),
         .@"struct" => |s| {
@@ -150,6 +151,10 @@ pub inline fn dup(x: anytype) @TypeOf(x) {
 fn retainAll(x: anytype) void {
     const T = @TypeOf(x);
     if (comptime !isManaged(T)) return;
+    if (comptime isFunc(T)) {
+        if (x.env) |e| retain(e);
+        return;
+    }
     switch (@typeInfo(T)) {
         .pointer => retain(x),
         .optional => if (x) |v| retainAll(v),
@@ -166,6 +171,12 @@ fn retainAll(x: anytype) void {
 pub fn drop(x: anytype) void {
     const T = @TypeOf(x);
     if (comptime !isManaged(T)) return;
+    if (comptime isFunc(T)) {
+        if (x.env) |e| {
+            if (releaseIsLast(e)) e.destroy(e);
+        }
+        return;
+    }
     switch (@typeInfo(T)) {
         .optional => if (x) |v| drop(v),
         .@"struct" => |s| inline for (s.field_names) |name| drop(@field(x, name)),
@@ -218,6 +229,7 @@ fn dropHeap(comptime T: type, x: T) void {
 pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     const T = @TypeOf(a);
     if (comptime !isManaged(T)) return std.meta.eql(a, b);
+    if (comptime isFunc(T)) @compileError("function values cannot be compared");
     switch (@typeInfo(T)) {
         .pointer => |p| {
             if (a == b) return true;
@@ -249,6 +261,64 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
         },
         else => comptime unreachable,
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Function values
+//
+// A function value is a pointer to code and a pointer to the values the code captured:
+//
+//     fable_rt.Func(*const fn (?*fable_rt.Env, i32) i32)
+//
+// The code takes the environment first. It owns its other arguments and its result; what it
+// captured stays owned by the environment, which is reference counted and frees the captures
+// with itself. A function that captures nothing has no environment.
+// ---------------------------------------------------------------------------------------------
+
+/// The start of every environment.
+pub const Env = struct {
+    @"$rc": u32 = 1,
+    destroy: *const fn (*Env) void,
+};
+
+pub fn Func(comptime Code: type) type {
+    return struct {
+        pub const fable_func = {};
+        env: ?*Env,
+        code: Code,
+    };
+}
+
+fn isFunc(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "fable_func");
+}
+
+fn EnvOf(comptime Captures: type) type {
+    return struct {
+        header: Env,
+        captures: Captures,
+
+        fn destroy(header: *Env) void {
+            const self: *@This() = @fieldParentPtr("header", header);
+            drop(self.captures);
+            free(self);
+        }
+    };
+}
+
+/// A function value that owns `captures`.
+pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captures, code: @FieldType(F, "code")) F {
+    const E = EnvOf(Captures);
+    const e = allocator.create(E) catch @panic("fable: out of memory");
+    e.* = .{ .header = .{ .destroy = E.destroy }, .captures = captures };
+    if (track) stats.allocs += 1;
+    return .{ .env = &e.header, .code = code };
+}
+
+/// What the function value captured, from inside its code.
+pub inline fn captured(comptime Captures: type, env: ?*Env) *const Captures {
+    const e: *EnvOf(Captures) = @fieldParentPtr("header", env.?);
+    return &e.captures;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -469,6 +539,35 @@ test "a call between files costs what the callee needs" {
     try std.testing.expectEqual(@as(i32, 5), across(testSum, testSum_sig, .{.give}, .{t}));
     drop(xs);
     try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+}
+
+const TestFn = Func(*const fn (?*Env, i32) i32);
+const TestCaptures = struct { xs: TestList, n: i32 };
+
+fn testAddSum(env: ?*Env, x: i32) i32 {
+    const c = captured(TestCaptures, env);
+    return x + c.n + testSum(c.xs);
+}
+
+fn testDouble(_: ?*Env, x: i32) i32 {
+    return x * 2;
+}
+
+test "a function value owns what it captured" {
+    const before = stats;
+    const f = closure(TestFn, TestCaptures, .{ .xs = testRange(3), .n = 10 }, testAddSum);
+    try std.testing.expectEqual(@as(i32, 17), f.code(f.env, 1));
+    const g = dup(f);
+    drop(f);
+    try std.testing.expectEqual(@as(i32, 18), g.code(g.env, 2));
+    const plain = TestFn{ .env = null, .code = testDouble };
+    try std.testing.expectEqual(@as(i32, 8), plain.code(plain.env, 4));
+    drop(dup(plain));
+    // in a value that is dropped as a whole
+    const pair: struct { f: TestFn, o: ?TestFn } = .{ .f = g, .o = plain };
+    drop(pair);
+    try std.testing.expectEqual(@as(i64, 4), stats.allocs - before.allocs);
+    try std.testing.expectEqual(@as(i64, 4), stats.frees - before.frees);
 }
 
 test "conv follows .NET" {

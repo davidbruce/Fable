@@ -331,6 +331,7 @@ let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
             | ECallClo(f, xs, _) ->
                 go false f
                 List.iter (go true) xs
+            | EClosure(_, xs, _)
             | ECon(_, _, xs, _) -> List.iter (go true) xs
             | _ -> List.iter (go false) (flatKids e)
 
@@ -829,6 +830,7 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
                 match e with
                 | ECall(f, xs, _) -> modesOf p f xs |> List.map (fun m -> m = MOwned)
                 | ECallClo(_, xs, _) -> false :: (xs |> List.map (fun _ -> true))
+                | EClosure(_, xs, _)
                 | ECon(_, _, xs, _) -> xs |> List.map (fun _ -> true)
                 | _ -> kids |> List.map (fun _ -> false)
 
