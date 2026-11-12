@@ -4,7 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const interface_version: i32 = 2;
+pub const interface_version: i32 = 3;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -251,6 +251,45 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Calls between files
+//
+// A file is compiled without knowing what the functions of other files were inferred to
+// borrow. So the callee's file states it, as a constant next to the function:
+//
+//     pub const @"sumList$sig" = .{ .borrows = .{true}, .result_borrowed = false };
+//
+// and the caller's file says what it does with each argument: `.keep` (it uses the value
+// again), `.give` (this was its last use) or `.plain` (not a managed value). `across` puts
+// the two together when the program is compiled, so the call costs what it would cost if
+// both functions were in one file.
+// ---------------------------------------------------------------------------------------------
+
+pub const Use = enum { plain, keep, give };
+
+pub inline fn across(
+    comptime f: anytype,
+    comptime sig: anytype,
+    comptime uses: anytype,
+    args: anytype,
+) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+    var a: std.meta.ArgsTuple(@TypeOf(f)) = undefined;
+    inline for (uses, 0..) |use, i| {
+        const u: Use = use;
+        // the callee takes ownership, the caller keeps using the value: one more reference
+        a[i] = if (u == .keep and !sig.borrows[i]) dup(args[i]) else args[i];
+    }
+    const r = @call(.auto, f, a);
+    // (a borrowed result may be part of an argument: it is made owned before they are given up)
+    const result = if (sig.result_borrowed) dup(r) else r;
+    inline for (uses, 0..) |use, i| {
+        const u: Use = use;
+        // the callee only borrowed what the caller was done with: the caller gives it up
+        if (u == .give and sig.borrows[i]) drop(args[i]);
+    }
+    return result;
+}
+
 /// Cells that were allocated and not freed (0 when counters are not kept).
 pub fn live() i64 {
     return stats.allocs - stats.frees;
@@ -390,6 +429,46 @@ test "structural equality looks through cells" {
     drop(a);
     drop(b);
     drop(c);
+}
+
+fn testSum(xs: TestList) i32 {
+    var total: i32 = 0;
+    var cur = xs;
+    while (cur == .Cons) : (cur = cur.Cons.tail) total += cur.Cons.head;
+    return total;
+}
+const testSum_sig = .{ .borrows = .{true}, .result_borrowed = false };
+
+fn testTail(xs: TestList) TestList {
+    return if (xs == .Cons) xs.Cons.tail else .Nil;
+}
+const testTail_sig = .{ .borrows = .{true}, .result_borrowed = true };
+
+fn testPush(n: i32, xs: TestList) TestList {
+    return testCons(n, xs);
+}
+const testPush_sig = .{ .borrows = .{ false, false }, .result_borrowed = false };
+
+test "a call between files costs what the callee needs" {
+    const before = stats;
+    const xs = testRange(3);
+    // borrowed by the callee, kept by the caller: nothing is counted
+    try std.testing.expectEqual(@as(i32, 6), across(testSum, testSum_sig, .{.keep}, .{xs}));
+    try std.testing.expectEqual(@as(i64, 0), stats.dups - before.dups);
+    // a borrowed result is made owned
+    const t = across(testTail, testTail_sig, .{.keep}, .{xs});
+    try std.testing.expectEqual(@as(i64, 1), stats.dups - before.dups);
+    // owned by the callee, kept by the caller: one more reference
+    const ys = across(testPush, testPush_sig, .{ .plain, .keep }, .{ 0, xs });
+    try std.testing.expectEqual(@as(i64, 2), stats.dups - before.dups);
+    // owned by the callee, given by the caller: a move
+    const zs = across(testPush, testPush_sig, .{ .plain, .give }, .{ 9, ys });
+    try std.testing.expectEqual(@as(i64, 2), stats.dups - before.dups);
+    // borrowed by the callee, given by the caller: the caller gives it up after the call
+    try std.testing.expectEqual(@as(i32, 15), across(testSum, testSum_sig, .{.give}, .{zs}));
+    try std.testing.expectEqual(@as(i32, 5), across(testSum, testSum_sig, .{.give}, .{t}));
+    drop(xs);
+    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
 }
 
 test "conv follows .NET" {

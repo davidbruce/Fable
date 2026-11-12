@@ -93,14 +93,23 @@ whose entry point returns with cells still allocated says so and exits with code
 ### Calls between files
 
 Fable compiles files one at a time and in parallel, so a file cannot see what a function of
-another file was inferred to borrow. Every function that takes or returns a managed value
-therefore also has an owned entry, `@"name$owned"`, which owns its arguments and its result
-(it is an alias of the function when nothing is borrowed). Calls from other files go through
-it. This costs a dup and a drop per borrowed argument on such a call; per-function summaries
-(next step) remove it.
+another file was inferred to borrow; and what it borrows depends on its body, so a cached
+answer would go stale whenever the body changes without the signature changing. The question
+is therefore left to the Zig compiler, which sees every file:
 
-Everything else is reported as a compile error at the F# source location
-("the Zig target does not support … yet").
+```zig
+// Helpers.zig: next to each function that takes or returns a managed value
+pub const @"sumList$sig" = .{ .borrows = .{ true }, .result_borrowed = false };
+
+// Heap.zig: the caller says what it does with each argument
+fable_rt.across(m_Helpers.sumList, m_Helpers.@"sumList$sig", .{ .keep }, .{ xs })
+```
+
+`.keep` means the caller uses the value again, `.give` that this was its last use. `across`
+is resolved at compile time: a value the caller keeps and the callee borrows is passed as it
+is; one the caller gives and the callee borrows is dropped after the call; a borrowed result
+is made owned. The call costs what it would cost inside one file, except that a borrowed
+result is always dup'ed (inside a file it can stay a borrow).
 
 `./build.sh quicktest zig` compiles `src/quicktest-zig` and runs it with `zig run`.
 
@@ -110,10 +119,8 @@ Everything else is reported as a compile error at the F# source location
 2. ~~Heap values: recursive unions as reference-counted cells, the runtime library
    (`src/fable-library-zig`), borrow inference and dup/drop insertion (Perceus), reuse~~
    (done).
-3. Per-function summaries across files (borrow modes, borrowed returns, raising). F# has no
-   recursion across files, so a file only needs the finished summaries of the files before
-   it. Fable already shares inline functions between file compilations this way
-   (`InlineExprLazy` in `State.fs`).
+3. ~~What functions of other files borrow~~ (done, at Zig compile time: see "Calls between
+   files"). Whether a function of another file can raise will be stated the same way.
 4. Closures and function values, generics, exceptions, byrefs and spans.
 5. Mutable reference records and the cycle collector.
 6. Strings, collections and the rest of FSharp.Core through `Replacements.fs` and the library.

@@ -200,13 +200,12 @@ let callTarget (f: string) =
     | -1 -> topIdent f
     | i -> f.Substring(0, i + 1) + topIdent (f.Substring(i + 1))
 
-/// The entry of a function that other files call when managed values are passed or returned:
-/// it owns its arguments and its result, whatever the function itself was inferred to borrow.
-/// (`$` cannot be part of a name that comes from F#.)
-let ownedEntry (f: string) =
+/// The constant that states what a function borrows, for the calls from other files (which
+/// are compiled without seeing the function). `$` cannot be part of a name that comes from F#.
+let sigName (f: string) =
     match f.IndexOf '.' with
-    | -1 -> $"@\"%s{topIdent f}$owned\""
-    | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$owned\""
+    | -1 -> $"@\"%s{topIdent f}$sig\""
+    | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$sig\""
 
 let rec zigType (t: Ty) : string =
     match t with
@@ -305,15 +304,31 @@ let rec ex (em: Em) (e: Expr) : string =
         | "conv", [ x ] -> $"fable_rt.conv(%s{zigType t}, @as(%s{zigType argT}, %s{x}))"
         | _ -> fail None "internal: unknown primitive %s/%d" op a.Length
     | ECall(f, xs, t) ->
-        let args = xs |> List.map (ex em) |> String.concat ", "
+        if f.Contains "." && (isManaged t || xs |> List.exists (typeOf >> isManaged)) then
+            // A function of another file: this file does not know what it borrows, so the call
+            // says what the caller does with each argument and `across` settles the rest when
+            // the Zig is compiled.
+            let uses, args =
+                xs
+                |> List.map (fun x ->
+                    if not (isManaged (typeOf x)) then
+                        ".plain", ex em x
+                    else
+                        match x with
+                        | EDup(inner, _) -> ".keep", ex em inner
+                        | _ -> ".give", ex em x
+                )
+                |> List.unzip
 
-        let target =
-            if f.Contains "." && (isManaged t || xs |> List.exists (typeOf >> isManaged)) then
-                ownedEntry f
-            else
-                callTarget f
+            let tuple (items: string list) =
+                match items with
+                | [] -> ".{}"
+                | _ -> items |> String.concat ", " |> sprintf ".{ %s }"
 
-        $"%s{target}(%s{args})"
+            $"fable_rt.across(%s{callTarget f}, %s{sigName f}, %s{tuple uses}, %s{tuple args})"
+        else
+            let args = xs |> List.map (ex em) |> String.concat ", "
+            $"%s{callTarget f}(%s{args})"
     | EEmit(macro, xs, _) ->
         let args = xs |> List.map (ex em) |> Array.ofList
 
@@ -839,51 +854,39 @@ let emitFunction (out: StringBuilder) (rootNames: HashSet<string>) (fn: FnInfo) 
         .AppendLine("}")
     |> ignore
 
-    // What other files call when managed values are passed or returned: they cannot know what
-    // this function was inferred to borrow, so this entry owns its arguments and its result.
+    // What the function borrows, for the calls from other files.
     if hasManaged fn then
-        let entry = ownedEntry fn.Name
-        let name = topIdent fn.Name
+        let borrows =
+            match fn.Modes with
+            | [] -> ".{}"
+            | modes ->
+                modes
+                |> List.map (fun m ->
+                    if m = MBorrowed then
+                        "true"
+                    else
+                        "false"
+                )
+                |> String.concat ", "
+                |> sprintf ".{ %s }"
 
-        let borrowed =
-            List.zip ps fn.Modes
-            |> List.choose (fun ((s, _, _), m) ->
-                if m = MBorrowed then
-                    Some s
-                else
-                    None
-            )
-
-        if borrowed.IsEmpty && fn.RetFrom.IsNone then
-            out.AppendLine($"pub const %s{entry} = %s{name};") |> ignore
-        else
-            let args = ps |> List.map (fun (s, _, _) -> s) |> String.concat ", "
-            let call = $"%s{name}(%s{args})"
-
-            out.AppendLine($"pub fn %s{entry}(%s{sigParams}) %s{zigType fn.Ret} {{")
-            |> ignore
-
-            if isVoid fn.Ret then
-                out.AppendLine($"    %s{call};") |> ignore
-            elif fn.RetFrom.IsSome then
-                out.AppendLine($"    const r = %s{dupCode call};") |> ignore
+        let resultBorrowed =
+            if fn.RetFrom.IsSome then
+                "true"
             else
-                out.AppendLine($"    const r = %s{call};") |> ignore
+                "false"
 
-            for s in borrowed do
-                out.AppendLine("    " + dropCode s) |> ignore
-
-            if not (isVoid fn.Ret) then
-                out.AppendLine("    return r;") |> ignore
-
-            out.AppendLine("}") |> ignore
+        out.AppendLine(
+            $"pub const %s{sigName fn.Name} = .{{ .borrows = %s{borrows}, .result_borrowed = %s{resultBorrowed} }};"
+        )
+        |> ignore
 
     out.AppendLine() |> ignore
 
 /// The text of one file, without its imports (their paths are only known to the writer).
 let emitFile (state: FileState) : string =
     let out = StringBuilder()
-    let rootNames = HashSet<string>([ "r"; "result"; "hole"; "tail" ])
+    let rootNames = HashSet<string>([ "result"; "hole"; "tail" ])
 
     for (name, _, _) in state.Consts do
         rootNames.Add(topIdent name) |> ignore

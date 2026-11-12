@@ -19,6 +19,10 @@ let allocs () : int = nativeOnly
 [<Emit("@as(i32, @intCast(fable_rt.stats.reuses))")>]
 let reuses () : int = nativeOnly
 
+/// how often a reference was added to or taken off a cell that stayed shared
+[<Emit("@as(i32, @intCast(fable_rt.stats.dups + fable_rt.stats.decs))")>]
+let counted () : int = nativeOnly
+
 /// (the runtime only counts in builds with safety checks)
 [<Emit("fable_rt.track")>]
 let counting () : bool = nativeOnly
@@ -28,6 +32,7 @@ let native = true
 let liveCells () : int = 0
 let allocs () : int = 0
 let reuses () : int = 0
+let counted () : int = 0
 let counting () : bool = false
 let native = false
 #endif
@@ -120,7 +125,10 @@ let sumByLoop (xs: IntList) : int =
 let lists () : int =
     let before = liveCells ()
     let xs = rangeFrom 1 100
+    // sumList is in another file and borrows its argument: nothing is counted for the call
+    let c0 = counted ()
     let total = sumList xs
+    let acrossFiles = counted () - c0
     let n = length 0 xs
     // xs is still needed below, so mapDouble works on a shared list and must copy
     let a0 = allocs ()
@@ -140,6 +148,7 @@ let lists () : int =
     let evens = keepEven (rangeFrom 1 10)
 
     check (total = 5050 && n = 100)
+    + checkCount acrossFiles 0
     + check (s2 = 10100 && s1 = 5050)
     + checkCount copied 100
     + check (s3 = 2550)

@@ -296,8 +296,9 @@ let rec private splitPathsIn (state: FileState) (paths: Map<string, Var>) (e: Ex
 // (a reuse site).
 // =============================================================================================
 
-/// The modes of the parameters that `args` are passed to. A function of another file is called
-/// through its owned entry: it takes ownership of every managed argument.
+/// The modes of the parameters that `args` are passed to. What a function of another file
+/// borrows is not known here, so it is assumed to take ownership of every managed argument and
+/// to return an owned result; `fable_rt.across` adjusts the call when the Zig is compiled.
 let private modesOf (p: P) (fname: string) (args: Expr list) : Mode list =
     match p.Fns.TryGetValue fname with
     | true, f when f.Modes.Length = args.Length -> f.Modes
