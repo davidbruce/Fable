@@ -678,6 +678,7 @@ let transformToTargetAst (com: CompilerImpl) (fableAst: Fable.File) : IFableResu
         // Naming diagnostics are raised while constructing the target AST, after the earlier snapshot.
         let errors = com.Logs |> Array.map (mapFableError com)
         upcast BeamResult(ast, errors)
+    | Zig -> failwith "The Zig target is not available in the standalone compiler"
 
 let compileToTargetAst (results: IParseAndCheckResults) fileName fableLibrary typedArrays language : IFableResult =
     let res = results :?> ParseAndCheckResults

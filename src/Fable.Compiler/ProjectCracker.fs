@@ -737,6 +737,7 @@ let getFableLibraryPath (opts: CrackerOptions) (shouldCopy: bool) =
         | TypeScript, None -> "fable-library-ts", $"fable-library-ts.%s{Literals.VERSION}"
         | Php, None -> "fable-library-php", "fable-library-php"
         | Beam, None -> "fable-library-beam", "fable-library-beam"
+        | Zig, None -> "fable-library-zig", "fable-library-zig"
         | JavaScript, None -> "fable-library-js", $"fable-library-js.%s{Literals.VERSION}"
         // Python defaults to PyPI package (no bundled library copied)
         // fableLibPyPIPackage = "fable-library", fableLibPyPI = "fable_library" (import name)

@@ -585,6 +585,52 @@ module Beam =
                 do! ErlangPrinter.run writer erlModule
         }
 
+module Zig =
+    open Fable.Transforms.Zig
+
+    type ZigWriter(com: Compiler, cliArgs: CliArgs, pathResolver, targetPath: string) =
+        let sourcePath = com.CurrentFile
+        let fileExt = cliArgs.CompilerOptions.FileExtension
+        let stream = new IO.StreamWriter(targetPath)
+
+        interface Printer.Writer with
+            member _.Write(str) =
+                stream.WriteAsync(str) |> Async.AwaitTask
+
+            // `@import` takes the path of the other file relative to this one
+            member _.MakeImportPath(path) =
+                let projDir = IO.Path.GetDirectoryName(cliArgs.ProjectFile)
+
+                let path =
+                    Imports.getImportPath pathResolver sourcePath targetPath projDir cliArgs.OutDir path
+
+                if
+                    path.EndsWith(".fs", StringComparison.Ordinal)
+                    || path.EndsWith(".fsx", StringComparison.Ordinal)
+                then
+                    Path.ChangeExtension(path, fileExt)
+                else
+                    path
+
+            member _.AddSourceMapping(_, _, _, _, _, _) = ()
+
+            member _.AddLog(msg, severity, ?range) =
+                com.AddLog(msg, severity, ?range = range, fileName = com.CurrentFile)
+
+            member _.Dispose() = stream.Dispose()
+
+    let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPath: string) =
+        async {
+            let file =
+                FSharp2Fable.Compiler.transformFile com
+                |> FableTransforms.transformFile com
+                |> Compiler.transformFile com
+
+            if not (isSilent || ZigPrinter.isEmpty file) then
+                use writer = new ZigWriter(com, cliArgs, pathResolver, outPath)
+                do! ZigPrinter.run writer file
+        }
+
 let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPath: string) =
     match com.Options.Language with
     | JavaScript
@@ -594,3 +640,4 @@ let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPat
     | Dart -> Dart.compileFile com cliArgs pathResolver isSilent outPath
     | Rust -> Rust.compileFile com cliArgs pathResolver isSilent outPath
     | Beam -> Beam.compileFile com isSilent outPath
+    | Zig -> Zig.compileFile com cliArgs pathResolver isSilent outPath

@@ -133,6 +133,7 @@ module File =
             | Fable.Dart -> ".dart"
             | Fable.Rust -> ".rs"
             | Fable.Beam -> ".erl"
+            | Fable.Zig -> ".zig"
             | Fable.JavaScript -> ".js"
 
         match language, usesOutDir with

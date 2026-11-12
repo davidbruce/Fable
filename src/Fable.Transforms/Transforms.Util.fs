@@ -1276,6 +1276,7 @@ module AST =
         | TypeScript -> com.LibraryDir + "/" + moduleName + ".ts"
         | JavaScript -> com.LibraryDir + "/" + moduleName + ".js"
         | Php -> com.LibraryDir + "/" + moduleName + ".php"
+        | Zig -> com.LibraryDir + "/" + moduleName + ".zig"
         | Beam ->
             // Beam library modules: names starting with "fable_" pass through as-is.
             // Names from JS fallback (e.g., "Option") get fable_ prefix for backward compat.
