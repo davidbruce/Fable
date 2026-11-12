@@ -18,6 +18,8 @@ type EntKind =
     | KValueUnion
     /// recursive union or reference record: `union(enum)` of refcounted cell pointers
     | KHeapUnion
+    /// an F# `exception` declaration: its values have the type `exn`
+    | KExn
 
 [<ReferenceEquality>]
 type Ent =
@@ -55,6 +57,9 @@ let tVoid = TPrim "void"
 let tBool = TPrim "bool"
 let tI32 = TPrim "i32"
 
+/// F#'s `exn`, and the type of every exception: a reference-counted cell of the runtime.
+let tExn = TPrim "fable_rt.Exn"
+
 let isVoid (t: Ty) =
     match t with
     | TPrim "void" -> true
@@ -83,6 +88,7 @@ let rec isManaged (t: Ty) =
     | TTuple ts -> List.exists isManaged ts
     // (a function value may own an environment)
     | TFn _ -> true
+    | TPrim "fable_rt.Exn" -> true
     | _ -> false
 
 /// The same question for the declaration of a type, whatever its parameters stand for.
@@ -93,6 +99,7 @@ let rec isManagedDecl (t: Ty) =
     | TOpt t -> isManagedDecl t
     | TTuple ts -> List.exists isManagedDecl ts
     | TFn _ -> true
+    | TPrim "fable_rt.Exn" -> true
     | _ -> false
 
 let isHeapTy (t: Ty) =
@@ -261,6 +268,14 @@ type Expr =
     | EIndex of Expr * Expr * Ty
     /// `[<Emit>]`: Zig text with `$0`, `$1`, ... standing for the arguments
     | EEmit of string * Expr list * Ty
+    /// a new exception of the declared type, which owns the field values
+    | EExnNew of Ent * Expr list
+    /// is the exception of the declared type?
+    | EExnTest of Expr * Ent
+    /// a field of an exception that is of the declared type
+    | EExnGet of Expr * Ent * string * Ty
+    /// (after Perceus) a call that may raise, and what this function gives up if it does
+    | EOnRaise of Expr * Var list
     /// Perceus: turn a borrowed value into an owned one
     | EDup of Expr * Ty
     // ---- control ----
@@ -277,6 +292,11 @@ type Expr =
     | EUnpack of Unpack * Expr
     /// Perceus: a borrow outlives its owner and is consumed later, so it is retained now; k
     | EPromote of Var * Expr
+    /// raise: the exception moves into the runtime's slot and the function is left. (The
+    /// type is the one expected where the `raise` stands.)
+    | ERaise of Expr * Ty
+    /// try body / the variable that holds the caught exception / handler
+    | ETry of Expr * Var * Expr * Ty
 
 [<NoEquality; NoComparison>]
 type Unpack =
@@ -297,6 +317,14 @@ type Mode =
     | MOwned
     | MBorrowed
 
+/// Can a function raise?
+type Raises =
+    | RNever
+    | RAlways
+    /// only if one of these functions of other files (with these type arguments) can: that is
+    /// known when the Zig is compiled
+    | RDepends of (string * Ty list) list
+
 [<ReferenceEquality>]
 type FnInfo =
     {
@@ -310,6 +338,7 @@ type FnInfo =
         /// Some [i; j]: the result is a borrow of parameters i and j (the callee does not dup
         /// it and the caller does not drop it)
         mutable RetFrom: int list option
+        mutable Raises: Raises
         /// a lambda or a function declared inside another one: not visible to other files
         IsLocal: bool
         IsEntryPoint: bool
@@ -329,8 +358,14 @@ let rec typeOf (e: Expr) : Ty =
     | EDeref(_, t)
     | EIndex(_, _, t)
     | EEmit(_, _, t)
+    | EExnGet(_, _, _, t)
+    | ERaise(_, t)
+    | ETry(_, _, _, t)
     | EDup(_, t) -> t
+    | EOnRaise(x, _) -> typeOf x
+    | EExnNew _ -> tExn
     | EUnit -> tVoid
+    | EExnTest _
     | ETest _ -> tBool
     | EAddr(x, c) -> TPtr(typeOf x, c)
     | ELet(_, _, b)
@@ -355,6 +390,8 @@ let isFlat (e: Expr) =
     | EStore _
     | EDrop _
     | EUnpack _
+    | ERaise _
+    | ETry _
     | EPromote _ -> false
     | _ -> true
 
@@ -365,8 +402,13 @@ let flatKids (e: Expr) : Expr list =
     | ECall(_, _, xs, _)
     | EEmit(_, xs, _)
     | EClosure(_, _, xs, _)
+    | EExnNew(_, xs)
     | ECon(_, _, xs, _) -> xs
     | ECallClo(f, xs, _) -> f :: xs
+    | EExnTest(x, _)
+    | EExnGet(x, _, _, _)
+    | EOnRaise(x, _)
+    | ERaise(x, _)
     | EGet(x, _, _)
     | ETest(x, _, _)
     | EAddr(x, _)
@@ -382,6 +424,11 @@ let withFlatKids (e: Expr) (xs: Expr list) : Expr =
     | EEmit(m, _, t), _ -> EEmit(m, xs, t)
     | EClosure(f, tys, _, t), _ -> EClosure(f, tys, xs, t)
     | ECon(t, c, _, tok), _ -> ECon(t, c, xs, tok)
+    | EExnNew(ent, _), _ -> EExnNew(ent, xs)
+    | EExnTest(_, ent), [ x ] -> EExnTest(x, ent)
+    | EExnGet(_, ent, f, t), [ x ] -> EExnGet(x, ent, f, t)
+    | EOnRaise(_, ds), [ x ] -> EOnRaise(x, ds)
+    | ERaise(_, t), [ x ] -> ERaise(x, t)
     | ECallClo(_, _, t), f :: rest -> ECallClo(f, rest, t)
     | EGet(_, p, t), [ x ] -> EGet(x, p, t)
     | ETest(_, c, t), [ x ] -> ETest(x, c, t)
@@ -403,6 +450,8 @@ let rec fv (e: Expr) : Set<int> =
     | EIf(c, t, f, _) -> Set.unionMany [ fv c; fv t; fv f ]
     | EFor(i, a, b, _, body) -> Set.unionMany [ fv a; fv b; Set.remove i.Id (fv body) ]
     | EAssign(v, r) -> Set.add v.Id (fv r)
+    | ETry(b, v, h, _) -> Set.union (fv b) (Set.remove v.Id (fv h))
+    | EOnRaise(x, ds) -> ds |> List.fold (fun s d -> Set.add d.Id s) (fv x)
     | EDrop(v, k)
     | EPromote(v, k) -> Set.add v.Id (fv k)
     | EUnpack(u, k) ->
@@ -427,6 +476,8 @@ let rec isPure (e: Expr) =
     // (a constructor that allocates a cell is not pure)
     | ECon(t, _, xs, None) -> (not (isHeapTy t) || xs.IsEmpty) && List.forall isPure xs
     | EGet(x, _, _)
+    | EExnTest(x, _)
+    | EExnGet(x, _, _, _)
     | ETest(x, _, _) -> isPure x
     | _ -> false
 
@@ -439,6 +490,7 @@ let rec assignedIn (e: Expr) : Set<int> =
     | EWhile(r, b) -> Set.union (assignedIn r) (assignedIn b)
     | EIf(_, t, f, _) -> Set.union (assignedIn t) (assignedIn f)
     | EFor(_, _, _, _, body) -> assignedIn body
+    | ETry(b, _, h, _) -> Set.union (assignedIn b) (assignedIn h)
     | EDrop(_, k)
     | EUnpack(_, k)
     | EPromote(_, k) -> assignedIn k
@@ -456,6 +508,7 @@ let rec exists (pred: Expr -> bool) (e: Expr) : bool =
         | EIf(c, t, f, _) -> exists pred c || exists pred t || exists pred f
         | EFor(_, a, b, _, body) -> exists pred a || exists pred b || exists pred body
         | EAssign(_, r) -> exists pred r
+        | ETry(b, _, h, _) -> exists pred b || exists pred h
         | EDrop(_, k)
         | EUnpack(_, k)
         | EPromote(_, k) -> exists pred k

@@ -16,9 +16,12 @@ type private P =
 // Normalisation
 // =============================================================================================
 
-/// Remove `let x = <pure> in body` when x is unused.
+/// Remove `let x = <pure> in body` when x is unused, and what follows a `raise`.
 let rec private cleanup (e: Expr) : Expr =
     match e with
+    | ELet(_, ERaise(x, _), body) -> ERaise(x, typeOf body)
+    | ESeq(ERaise(x, _), b) -> ERaise(x, typeOf b)
+    | ETry(b, v, h, t) -> ETry(cleanup b, v, cleanup h, t)
     | ELet(v, rhs, body) ->
         let body' = cleanup body
 
@@ -238,6 +241,7 @@ let private nameProjections (state: FileState) (body: Expr) : Expr =
             | EFor(i, a, b, up, loopBody) -> EFor(i, sub a, sub b, up, arm names loopBody)
             | EAssign(v, r) -> EAssign(v, inner r)
             | EStore(lv, r) -> EStore(sub lv, sub r)
+            | ETry(b, v, h, t) -> ETry(arm names b, v, arm names h, t)
             | _ -> rw e
 
         scan e
@@ -288,7 +292,165 @@ let rec private splitPathsIn (state: FileState) (paths: Map<string, Var>) (e: Ex
     | EWhile(c, b) -> EWhile(c, sp b)
     | EFor(i, a, b, up, body) -> EFor(i, a, b, up, sp body)
     | EAssign(v, r) -> EAssign(v, sp r)
+    | ETry(b, v, h, t) -> ETry(sp b, v, sp h, t)
     | _ -> e
+
+// =============================================================================================
+// Exceptions: which functions can raise. A function that cannot keeps its plain result type
+// and pays nothing.
+// =============================================================================================
+
+let private joinRaises (a: Raises) (b: Raises) : Raises =
+    match a, b with
+    | RAlways, _
+    | _, RAlways -> RAlways
+    | RNever, x
+    | x, RNever -> x
+    | RDepends x, RDepends y ->
+        let key (name: string, tys: Ty list) =
+            name + "<" + (tys |> List.map tyKey |> String.concat ",") + ">"
+
+        let all = (x @ y) |> List.distinctBy key |> List.sortBy key
+        // (a long list is not worth a long type: the function is simply taken to raise)
+        if all.Length > 16 then
+            RAlways
+        else
+            RDepends all
+
+/// Can this call raise, as far as this file can tell? A function value always can. A function
+/// of another file can if Zig finds that it does.
+let private callRaises (p: P) (e: Expr) : Raises =
+    match e with
+    | ECallClo _ -> RAlways
+    | ECall(f, tyArgs, _, _) ->
+        match p.Fns.TryGetValue f with
+        | true, g ->
+            match g.Raises with
+            | RDepends ds when g.TypeParams.Length = tyArgs.Length && not tyArgs.IsEmpty ->
+                let m = Map.ofList (List.zip g.TypeParams tyArgs)
+                RDepends(ds |> List.map (fun (n, tys) -> n, tys |> List.map (substTy m)))
+            | r -> r
+        | _ -> RDepends [ f, tyArgs ]
+    | _ -> RNever
+
+let rec private raisesOf (p: P) (e: Expr) : Raises =
+    let many (es: Expr list) =
+        es |> List.map (raisesOf p) |> List.fold joinRaises RNever
+
+    match e with
+    | ERaise _ -> RAlways
+    // (what the body raises lands in the handler, which raises again what it does not handle)
+    | ETry(_, _, h, _) -> raisesOf p h
+    | ECall _
+    | ECallClo _ -> joinRaises (callRaises p e) (many (flatKids e))
+    | ELet(_, r, b)
+    | ESeq(r, b)
+    | EWhile(r, b)
+    | EStore(r, b) -> many [ r; b ]
+    | EIf(c, t, f, _) -> many [ c; t; f ]
+    | EFor(_, a, b, _, body) -> many [ a; b; body ]
+    | EAssign(_, r) -> raisesOf p r
+    | EDrop(_, k)
+    | EUnpack(_, k)
+    | EPromote(_, k) -> raisesOf p k
+    | _ -> many (flatKids e)
+
+let private inferRaises (p: P) : unit =
+    let mutable changed = true
+
+    while changed do
+        changed <- false
+
+        for fn in p.State.Fns do
+            let r = joinRaises fn.Raises (raisesOf p fn.Body)
+
+            if r <> fn.Raises then
+                fn.Raises <- r
+                changed <- true
+
+/// A call that may raise becomes a statement of its own, so that it is exact what the function
+/// still owns when it does. What is evaluated before it in the same expression, and may have
+/// an effect, is given a name first, to keep the order.
+let rec private hoistRaising (p: P) (e: Expr) : Expr =
+    let hr = hoistRaising p
+    let raising (x: Expr) = callRaises p x <> RNever
+    let hasRaising (x: Expr) = exists raising x
+
+    /// the bindings to put before `x`, and what is left of `x`
+    let rec lift (keepRoot: bool) (x: Expr) : (Var * Expr) list * Expr =
+        if not (hasRaising x) then
+            [], x
+        else
+            let kids = flatKids x
+
+            let last = kids |> List.tryFindIndexBack hasRaising |> Option.defaultValue -1
+
+            let binds = List<Var * Expr>()
+
+            let kids' =
+                kids
+                |> List.mapi (fun i k ->
+                    if i > last then
+                        k
+                    else
+                        let inner, k' = lift false k
+                        binds.AddRange inner
+
+                        if isPure k' then
+                            k'
+                        else
+                            let v = p.State.NewVar(tempName k', typeOf k', VLocal, false)
+                            binds.Add((v, k'))
+                            EVar v
+                )
+
+            let x' = withFlatKids x kids'
+
+            if raising x' && not keepRoot then
+                let v = p.State.NewVar(tempName x', typeOf x', VLocal, false)
+                binds.Add((v, x'))
+                List.ofSeq binds, EVar v
+            else
+                List.ofSeq binds, x'
+
+    let wrap (binds: (Var * Expr) list) (k: Expr) =
+        List.foldBack (fun (v, x) acc -> ELet(v, x, acc)) binds k
+
+    match e with
+    | ELet(v, rhs, body) when isFlat rhs ->
+        let binds, rhs' = lift true rhs
+        wrap binds (ELet(v, rhs', hr body))
+    | ELet(v, rhs, body) -> ELet(v, hr rhs, hr body)
+    | ESeq(a, b) when isFlat a ->
+        let binds, a' = lift true a
+        wrap binds (ESeq(a', hr b))
+    | ESeq(a, b) -> ESeq(hr a, hr b)
+    | EIf(c, t, f, ty) ->
+        let binds, c' = lift false c
+        wrap binds (EIf(c', hr t, hr f, ty))
+    | EWhile(c, b) ->
+        if hasRaising c then
+            fail None "the Zig target does not support a `while` condition that can raise yet"
+
+        EWhile(c, hr b)
+    | EFor(i, a, b, up, body) ->
+        let bindsA, a' = lift false a
+        let bindsB, b' = lift false b
+        wrap (bindsA @ bindsB) (EFor(i, a', b', up, hr body))
+    | EAssign(v, r) when isFlat r ->
+        let binds, r' = lift true r
+        wrap binds (EAssign(v, r'))
+    | EAssign(v, r) -> EAssign(v, hr r)
+    | EStore(lv, r) ->
+        let binds, r' = lift false r
+        wrap binds (EStore(lv, r'))
+    | ERaise(x, t) ->
+        let binds, x' = lift false x
+        wrap binds (ERaise(x', t))
+    | ETry(b, v, h, t) -> ETry(hr b, v, hr h, t)
+    | _ ->
+        let binds, e' = lift true e
+        wrap binds e'
 
 // =============================================================================================
 // Borrow inference: a managed parameter is borrowed unless the body consumes it (returns it,
@@ -332,6 +494,7 @@ let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
                 go false f
                 List.iter (go true) xs
             | EClosure(_, _, xs, _)
+            | EExnNew(_, xs)
             | ECon(_, _, xs, _) -> List.iter (go true) xs
             | _ -> List.iter (go false) (flatKids e)
 
@@ -355,6 +518,8 @@ let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
     | EFor(_, a, b, _, body) -> Set.unionMany [ flat false a; flat false b; owningUses p false body ]
     | EAssign(_, r) -> owningUses p true r
     | EStore(lv, r) -> Set.union (flat false lv) (owningUses p true r)
+    | ERaise(x, _) -> flat true x
+    | ETry(b, _, h, _) -> Set.union (owningUses p tail b) (owningUses p tail h)
     | _ -> flat tail e
 
 let private isReuseSite (body: Expr) (param: Var) =
@@ -501,6 +666,9 @@ type private PEnv =
         Tokens: (Var * (Ty * string)) list
         /// the function returns a borrow, so tail values are not made owned
         TailBorrowed: bool
+        /// inside a `try` body: what the handler (or the code after the `try`) still needs, and
+        /// an error edge must therefore leave alone
+        RaiseKeep: Set<int>
     }
 
 type private POp =
@@ -536,6 +704,10 @@ let rec private live (e: Expr) (after: Set<int>) : Set<int> =
         Set.unionMany [ head; fv a; fv b ]
     | EAssign(v, r) -> live r (Set.remove v.Id after)
     | EStore(lv, r) -> Set.union (fv lv) (live r after)
+    // (what the handler needs is needed throughout the body: any call in it may raise)
+    | ETry(b, v, h, _) ->
+        let hl = Set.remove v.Id (live h after)
+        Set.union hl (live b (Set.union after hl))
     | EDrop(v, k)
     | EPromote(v, k) -> Set.add v.Id (live k after)
     | EUnpack(u, k) -> Set.add u.Scrut.Id (live k after)
@@ -831,6 +1003,7 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
                 | ECall(f, _, xs, _) -> modesOf p f xs |> List.map (fun m -> m = MOwned)
                 | ECallClo(_, xs, _) -> false :: (xs |> List.map (fun _ -> true))
                 | EClosure(_, _, xs, _)
+                | EExnNew(_, xs)
                 | ECon(_, _, xs, _) -> xs |> List.map (fun _ -> true)
                 | _ -> kids |> List.map (fun _ -> false)
 
@@ -838,6 +1011,7 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
 
             match e' with
             | EGet _
+            | EExnGet _
             | EDeref _
             | EIndex _ when owning && isManaged (typeOf e') -> mkDup e' (typeOf e')
             | ECall(g, _, _, _) when owning && isBorrowedRet p g && isManaged (typeOf e') -> mkDup e' (typeOf e')
@@ -864,6 +1038,29 @@ let private refine (env: PEnv) (c: Expr) : PEnv * PEnv =
 
         envT, envF
     | _ -> env, env
+
+/// What an error edge gives up: everything this function still owns, except what the
+/// enclosing handler (or the code after the `try`) still needs. It is the "owned and not yet
+/// consumed" set that is tracked for the normal path anyway.
+let private raiseEdgeDrops (p: P) (env: PEnv) (stillOwned: Set<int>) : Var list =
+    stillOwned
+    |> Set.filter (fun x -> not (env.RaiseKeep.Contains x))
+    |> Set.toList
+    |> List.map (fun x -> p.State.Vars[x])
+    |> List.filter (fun xv ->
+        match env.Known.TryFind(vk xv.Id) with
+        | Some c -> not (caseIsNoopDrop xv.Ty c)
+        | None -> true
+    )
+
+/// A call that may raise carries what is given up if it does.
+let private wrapRaising (p: P) (env: PEnv) (e: Expr) (stillOwned: Set<int>) : Expr =
+    match e with
+    | ECall _
+    | ECallClo _ when callRaises p e <> RNever -> EOnRaise(e, raiseEdgeDrops p env stillOwned)
+    | EDup((ECall _ as call), t) when callRaises p call <> RNever ->
+        EDup(EOnRaise(call, raiseEdgeDrops p env stillOwned), t)
+    | _ -> e
 
 let rec private pc (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
     let env, ops = settle p env e L
@@ -954,6 +1151,57 @@ and private pcNode (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
     | EStore(lv, rhs) ->
         let lv', _, _ = rewriteFlat p env lv false (Set.union (fv rhs) L)
         EStore(lv', pcFlat p env rhs L true)
+    | ERaise(x, ty) ->
+        // the exception moves into the runtime's slot; everything else this function owns is
+        // given up before it leaves
+        // (inside a `try`, the handler and what follows it may still use the value raised)
+        let x', consumed, _ = rewriteFlat p env x true env.RaiseKeep
+        wrapDrops (raiseEdgeDrops p env (Set.difference env.Owned consumed)) (ERaise(x', ty))
+    | ETry(body, exV, handler, ty) ->
+        let hl = Set.remove exV.Id (live handler L)
+        let Lb = Set.union L hl
+        let keep = expand env Lb
+
+        let body' =
+            pc
+                p
+                { env with
+                    TailBorrowed = false
+                    Tokens = []
+                    RaiseKeep = keep
+                }
+                body
+                Lb
+
+        // what only the handler needed is still owned when the body ends without raising
+        let handlerOnly =
+            Set.difference (Set.intersect env.Owned keep) (expand env L)
+            |> Set.toList
+            |> List.map (fun x -> p.State.Vars[x])
+
+        let body' =
+            if handlerOnly.IsEmpty then
+                body'
+            elif isVoid ty then
+                ESeq(body', wrapDrops handlerOnly EUnit)
+            else
+                let tmp = p.State.NewVar("tried", ty, VLocal, false)
+                ELet(tmp, body', wrapDrops handlerOnly (EVar tmp))
+
+        let ownedH = Set.add exV.Id (Set.intersect env.Owned keep)
+
+        let handler' =
+            pc
+                p
+                { env with
+                    Owned = ownedH
+                    Tokens = []
+                    TailBorrowed = false
+                }
+                handler
+                L
+
+        ETry(body', exV, handler', ty)
     | _ -> pcFlat p env e L (not env.TailBorrowed)
 
 /// Nothing that is used in a loop is given up inside it: every turn needs it again. What the
@@ -974,6 +1222,7 @@ and private dropAfterLoop (p: P) (env: PEnv) (loop: Expr) (L: Set<int>) : Expr =
 
 and private pcFlat (p: P) (env: PEnv) (e: Expr) (L: Set<int>) (rootOwning: bool) : Expr =
     let e', consumed, env' = rewriteFlat p env e rootOwning L
+    let e' = wrapRaising p env e' (Set.difference env.Owned consumed)
     let lAfter = expand env' L
 
     let dropAfter =
@@ -1047,6 +1296,7 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
         let rhs', consumed, env2 = rewriteFlat p env1 rhs (isManaged v.Ty && not isAlias) Lb
 
         let remaining = Set.difference env1.Owned consumed
+        let rhs' = wrapRaising p env1 rhs' remaining
         let after = Set.remove v.Id (expand env2 Lb)
 
         let dropAfter =
@@ -1120,6 +1370,7 @@ let private emptyEnv =
         Excluded = Map.empty
         Tokens = []
         TailBorrowed = false
+        RaiseKeep = Set.empty
     }
 
 /// Run the ownership passes on every function of a file.
@@ -1140,12 +1391,17 @@ let run (state: FileState) : unit =
             raise (ZigError(msg, fn.Range))
 
     for fn in state.Fns do
+        fn.Body <- cleanup fn.Body
+
+    inferRaises p
+
+    for fn in state.Fns do
         located
             fn
             (fun () ->
                 fn.Body <-
                     fn.Body
-                    |> cleanup
+                    |> hoistRaising p
                     |> nameProjections state
                     |> splitPathsIn state Map.empty
                     |> cleanup

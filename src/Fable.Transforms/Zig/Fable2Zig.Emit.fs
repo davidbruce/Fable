@@ -127,6 +127,9 @@ type LoopInfo =
         Params: Var list
         /// tail recursion modulo cons: the result is built top-down through a destination
         Trmc: bool
+        /// a value without fields of the result type: when such a function is left by an
+        /// exception, the hole is filled with it so that what was built so far can be dropped
+        Plug: string option
     }
 
 /// The code of a function value: it takes the environment and then the arguments, which it
@@ -155,6 +158,8 @@ type Em =
         Fns: Dictionary<string, FnInfo>
         /// a call that ends the function can be a jump (see `tailTarget`)
         CanTail: bool
+        /// the labels of the `try` bodies around the code being emitted
+        TryLabels: Stack<string>
         /// the code of the function values made so far
         Adapters: Dictionary<string, Adapter>
         mutable Counter: int
@@ -257,9 +262,10 @@ let rec zigType (t: Ty) : string =
              "[]")
         + zigType t
     | TArr(t, n) -> $"[%d{n}]%s{zigType t}"
+    // (a function value may raise, whatever function is behind it)
     | TFn(args, ret) ->
         let ps = "?*fable_rt.Env" :: (args |> List.map zigType) |> String.concat ", "
-        $"fable_rt.Func(*const fn (%s{ps}) %s{zigType ret})"
+        $"fable_rt.Func(*const fn (%s{ps}) fable_rt.Raised!%s{zigType ret})"
     | TTok(t, c) -> $"?*fable_rt.Cell(%s{zigType t}, .%s{fieldIdent c})"
 
 /// A function with its type arguments: a generic function is a Zig function from types to a
@@ -278,6 +284,16 @@ let adapterRef (a: Adapter) =
     match a.Gens with
     | [] -> a.Name
     | gens -> gens |> List.map genName |> String.concat ", " |> sprintf "%s(%s)" a.Name
+
+/// The result type of a function: `Raised!T` if it can raise, `T` if it cannot, and if that
+/// depends on functions of other files, a type that Zig works out from theirs.
+let retType (fn: FnInfo) : string =
+    match fn.Raises with
+    | RNever -> zigType fn.Ret
+    | RAlways -> $"fable_rt.Raised!%s{zigType fn.Ret}"
+    | RDepends callees ->
+        let refs = callees |> List.map (fun (f, tys) -> fnRef f tys) |> String.concat ", "
+        $"fable_rt.MayRaise(%s{zigType fn.Ret}, .{{ %s{refs} }})"
 
 let dupCode (x: string) = $"fable_rt.dup(%s{x})"
 let dropCode (x: string) = $"fable_rt.drop(%s{x});"
@@ -412,6 +428,44 @@ let rec ex (em: Em) (e: Expr) : string =
                 caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
 
             $"fable_rt.closure(%s{zigType ty}, %s{ns}.Env, .{{ %s{inits} }}, %s{ns}.code)"
+    | EExnNew(ent, xs) ->
+        let fields = caseFields (TEnt(ent, [])) ""
+
+        let inits =
+            List.zip fields (xs |> List.map (ex em))
+            |> List.map (fun ((f, _), a) -> $".%s{fieldIdent f} = %s{a}")
+            |> String.concat ", "
+
+        if inits = "" then
+            $"%s{callTarget ent.Name}.new(.{{}})"
+        else
+            $"%s{callTarget ent.Name}.new(.{{ %s{inits} }})"
+    | EExnTest(x, ent) -> $"%s{callTarget ent.Name}.is(%s{ex em x})"
+    | EExnGet(x, ent, f, _) -> $"%s{callTarget ent.Name}.of(%s{ex em x}).%s{fieldIdent f}"
+    // A call that may raise: on its error edge the function gives up what it still owns and
+    // leaves, to the handler of the enclosing `try` or to its own caller.
+    | EOnRaise(call, ds) ->
+        let c = ex em call
+        let edge = edgeText em ds
+
+        let definite =
+            match call with
+            | ECallClo _ -> true
+            | ECall(f, _, _, _) ->
+                match em.Fns.TryGetValue f with
+                | true, g -> g.Raises = RAlways
+                | _ -> false
+            | _ -> false
+
+        if definite then
+            $"(%s{c} catch %s{edge})"
+        else
+            // whether this function raises is only known when the Zig is compiled
+            em.Counter <- em.Counter + 1
+            let lbl = $"call%d{em.Counter}"
+            let raw = freshName em "raw"
+
+            $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) (%s{raw} catch %s{edge}) else %s{raw}; }})"
     | EEmit(macro, xs, _) ->
         let args = xs |> List.map (ex em) |> Array.ofList
 
@@ -478,6 +532,24 @@ let rec ex (em: Em) (e: Expr) : string =
     | EIf(c, t, f, _) when isFlat c && isFlat t && isFlat f -> simpleIf em c t f
     | _ -> fail None "internal: this expression is not part of the Zig target yet"
 
+/// How the function is left when an exception is in flight.
+and leaveText (em: Em) : string =
+    if em.TryLabels.Count > 0 then
+        $"break :%s{em.TryLabels.Peek()};"
+    else
+        match em.Loop with
+        | Some {
+                   Trmc = true
+                   Plug = Some plug
+               } -> $"hole.* = %s{plug}; fable_rt.drop(result); return error.Raised;"
+        | _ -> "return error.Raised;"
+
+and edgeText (em: Em) (ds: Var list) : string =
+    let drops =
+        ds |> List.map (fun d -> dropCode (vname em d) + " ") |> String.concat ""
+
+    $"{{ %s{drops}%s{leaveText em} }}"
+
 and simpleIf (em: Em) (c: Expr) (t: Expr) (f: Expr) =
     match t, f with
     | _, ELit("false", _) -> $"(%s{ex em c} and %s{ex em t})"
@@ -511,7 +583,7 @@ let isSimpleIf (e: Expr) =
 /// The expressions a function can end with.
 let rec tailSites (e: Expr) : Expr list =
     match e with
-    | ELet(_, ECall _, ECon _) -> [ e ]
+    | ELet(_, (ECall _ | EOnRaise(ECall _, _)), ECon _) -> [ e ]
     | ELet(_, _, b)
     | ESeq(_, b)
     | EDrop(_, b)
@@ -536,7 +608,9 @@ let private countUses (id: int) (es: Expr list) =
 /// fills the hole.
 let trmcSite (self: string) (e: Expr) =
     match e with
-    | ELet(r, ECall(f, _, args, _), ECon(conTy, case, conArgs, tok)) when
+    // (a recursive call that may raise needs no error edge of its own once it is the next
+    // turn of the loop)
+    | ELet(r, (ECall(f, _, args, _) | EOnRaise(ECall(f, _, args, _), _)), ECon(conTy, case, conArgs, tok)) when
         f = self && isHeapTy conTy && not conArgs.IsEmpty
         ->
         let hits =
@@ -776,6 +850,55 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
     | EPromote(v, k) ->
         L $"_ = %s{dupCode (vname em v)}; // this borrow outlives its owner"
         stmt em ind k dest
+    | ERaise(x, _) ->
+        L $"fable_rt.throw(%s{ex em x});"
+        L(leaveText em)
+    | ETry(body, exV, handler, ty) ->
+        em.Counter <- em.Counter + 1
+        let okL = $"try%d{em.Counter}"
+        let errL = $"raised%d{em.Counter}"
+        // (the body and the handler go to a buffer first, to see which labels are used)
+        let inner = { em with Out = StringBuilder() }
+        em.TryLabels.Push errL
+
+        try
+            stmt inner (ind + "        ") body (DBreak okL)
+        finally
+            em.TryLabels.Pop() |> ignore
+
+        let bodyText = inner.Out.ToString()
+        let raises = bodyText.Contains $"break :%s{errL};"
+        inner.Out.Clear() |> ignore
+
+        if raises then
+            line inner ind $"    %s{errL}: {{"
+            inner.Out.Append(bodyText) |> ignore
+            line inner ind "    }"
+            // the handler owns the exception
+            line inner ind $"    const %s{vname inner exV}: fable_rt.Exn = fable_rt.take();"
+            stmt inner (ind + "    ") handler (DBreak okL)
+        else
+            inner.Out.Append(bodyText) |> ignore
+
+        em.Counter <- inner.Counter
+        let text = inner.Out.ToString()
+
+        if not (text.Contains $"break :%s{okL} ") then
+            // (every path raises again or returns: nothing comes after the `try`)
+            L "{"
+            em.Out.Append(text) |> ignore
+            L "}"
+        elif isVoid ty then
+            L $"%s{okL}: {{"
+            em.Out.Append(text) |> ignore
+            L "}"
+            finishUnit em ind dest
+        else
+            let tried = freshName em "tried"
+            L $"const %s{tried}: %s{zigType ty} = %s{okL}: {{"
+            em.Out.Append(text) |> ignore
+            L "};"
+            emitValue em ind (ELit(tried, ty)) dest
     | _ -> emitValue em ind e dest
 
 /// A call of another function of the file that ends this one can be a jump instead of a call
@@ -806,7 +929,8 @@ and tailTarget (em: Em) (e: Expr) : string option =
             let calleeRet = substTy inst g.Ret
 
             let same =
-                List.forall isScalar (calleeRet :: calleeParams)
+                g.Raises = RNever
+                && List.forall isScalar (calleeRet :: calleeParams)
                 && List.map zigType calleeParams = List.map zigType callerParams
                 && zigType calleeRet = zigType em.Self.Ret
 
@@ -833,7 +957,8 @@ and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
     match dest with
     | DReturn ->
         match em.Loop, e with
-        | Some loop, ECall(f, _, args, _) when f = loop.Self -> emitTailJump em ind args
+        | Some loop, (ECall(f, _, args, _) | EOnRaise(ECall(f, _, args, _), _)) when f = loop.Self ->
+            emitTailJump em ind args
         | Some loop, _ when loop.Trmc ->
             L $"hole.* = %s{ex em e};"
             L "return result;"
@@ -883,11 +1008,21 @@ let emitFunction
         sites
         |> List.exists (
             function
-            | ECall(f, _, _, _) -> f = fn.Name
+            | ECall(f, _, _, _)
+            | EOnRaise(ECall(f, _, _, _), _) -> f = fn.Name
             | _ -> false
         )
 
-    let trmc = sites |> List.exists (fun s -> (trmcSite fn.Name s).IsSome)
+    // (When the function can be left by an exception, what it has built so far must be
+    // droppable: that takes a value without fields to put in the hole.)
+    let plug =
+        allCases fn.Ret
+        |> List.tryFind (fun c -> isHeapTy fn.Ret && (caseFields fn.Ret c).IsEmpty)
+        |> Option.map (fun c -> $"@as(%s{zigType fn.Ret}, .%s{fieldIdent c})")
+
+    let trmc =
+        sites |> List.exists (fun s -> (trmcSite fn.Name s).IsSome)
+        && (fn.Raises = RNever || plug.IsSome)
 
     let reassigned =
         sites
@@ -895,7 +1030,7 @@ let emitFunction
             let args =
                 match s, trmcSite fn.Name s with
                 | _, Some(a, _, _, _, _, _) -> a
-                | ECall(f, _, a, _), _ when f = fn.Name -> a
+                | (ECall(f, _, a, _) | EOnRaise(ECall(f, _, a, _), _)), _ when f = fn.Name -> a
                 | _ -> []
 
             if args.IsEmpty then
@@ -917,6 +1052,7 @@ let emitFunction
                     Self = fn.Name
                     Params = fn.Params
                     Trmc = trmc
+                    Plug = plug
                 }
         else
             None
@@ -930,8 +1066,10 @@ let emitFunction
             Loop = loop
             Self = fn
             Fns = fns
+            TryLabels = Stack()
             CanTail =
                 not trmc
+                && fn.Raises = RNever
                 && not (
                     exists
                         (function
@@ -1013,7 +1151,7 @@ let emitFunction
     match fn.TypeParams with
     | [] ->
         out
-            .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{sigParams}) %s{zigType fn.Ret} {{")
+            .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{sigParams}) %s{retType fn} {{")
             .Append(unused)
             .Append(bodyText)
             .AppendLine("}")
@@ -1039,7 +1177,7 @@ let emitFunction
         out
             .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{comptimeParams}) type {{")
             .AppendLine("    return struct {")
-            .AppendLine($"        pub fn call(%s{sigParams}) %s{zigType fn.Ret} {{")
+            .AppendLine($"        pub fn call(%s{sigParams}) %s{retType fn} {{")
             .Append(indented unused)
             .Append(indented bodyText)
             .AppendLine("        }")
@@ -1113,19 +1251,30 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
 
     let line (text: string) = line (ind + text)
 
+    // (The function behind the value may raise or not; a function value always may. If the call
+    // raised, what the function only borrowed is given up here, like after a call that did not.)
     let finish (call: string) (resultBorrowed: bool) (dropAfter: string list) =
-        if isVoid ret then
-            line $"    %s{call};"
-        elif resultBorrowed then
-            line $"    const r = %s{dupCode call};"
+        let drops = dropAfter |> List.map (fun n -> dropCode n + " ") |> String.concat ""
+        line $"    const raw = %s{call};"
+
+        line
+            $"    const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch |err| {{ %s{drops}return err; }} else raw;"
+
+        let result =
+            if resultBorrowed then
+                dupCode "r"
+            else
+                "r"
+
+        if dropAfter.IsEmpty then
+            line $"    return %s{result};"
         else
-            line $"    const r = %s{call};"
+            line $"    const result = %s{result};"
 
-        for name in dropAfter do
-            line ("    " + dropCode name)
+            for name in dropAfter do
+                line ("    " + dropCode name)
 
-        if not (isVoid ret) then
-            line "    return r;"
+            line "    return result;"
 
     match fns.TryGetValue a.Target with
     | true, fn ->
@@ -1145,7 +1294,7 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
 
             line $"const Env = struct {{ %s{fields} }};"
 
-        line $"fn code(%s{sigParams}) %s{zigType ret} {{"
+        line $"fn code(%s{sigParams}) fable_rt.Raised!%s{zigType ret} {{"
 
         if a.NCaptures > 0 then
             line "    const c = fable_rt.captured(Env, env);"
@@ -1177,7 +1326,7 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
         finish $"%s{fnRef a.Target a.TypeArgs}(%s{args})" fn.RetFrom.IsSome dropAfter
     | _ ->
         // a function of another file: what it borrows is settled when the Zig is compiled
-        line $"fn code(%s{sigParams}) %s{zigType ret} {{"
+        line $"fn code(%s{sigParams}) fable_rt.Raised!%s{zigType ret} {{"
         line "    _ = env;"
 
         let tuple (items: string list) =
@@ -1250,6 +1399,13 @@ let emitFile (state: FileState) : string =
                 "    "
 
         match e.Kind with
+        | KExn ->
+            let payload = fields (snd e.Cases.Head) |> String.concat ", "
+
+            out.Append(
+                $"pub const %s{topIdent e.Name} = fable_rt.ExnOf(\"%s{e.Ref.DisplayName}\", struct {{ %s{payload} }})"
+            )
+            |> ignore
         | KRecord ->
             out.AppendLine(opening "struct") |> ignore
 
@@ -1279,7 +1435,10 @@ let emitFile (state: FileState) : string =
                     out.AppendLine($"%s{ind}    %s{fieldIdent c}: *struct {{ %s{payload} }},")
                     |> ignore
 
-        out.AppendLine(closing).AppendLine() |> ignore
+        if e.Kind = KExn then
+            out.AppendLine(";").AppendLine() |> ignore
+        else
+            out.AppendLine(closing).AppendLine() |> ignore
 
     for (name, ty, text) in state.Consts do
         out.AppendLine($"pub const %s{topIdent name}: %s{zigType ty} = %s{text};")
@@ -1308,12 +1467,21 @@ let emitFile (state: FileState) : string =
     for fn in state.Fns do
         if fn.IsEntryPoint then
             out.AppendLine("pub fn main() u8 {") |> ignore
+            let call = $"%s{topIdent fn.Name}()"
+
+            // (an exception that nothing handled ends the program, as on .NET)
+            let guarded =
+                match fn.Raises with
+                | RNever -> call
+                | RAlways -> $"%s{call} catch {{ fable_rt.uncaught(); return 134; }}"
+                | RDepends _ ->
+                    $"if (comptime fable_rt.isRaised(@TypeOf(%s{call}))) (%s{call} catch {{ fable_rt.uncaught(); return 134; }}) else %s{call}"
 
             if isVoid fn.Ret then
-                out.AppendLine($"    %s{topIdent fn.Name}();").AppendLine("    const code: i32 = 0;")
+                out.AppendLine($"    %s{guarded};").AppendLine("    const code: i32 = 0;")
                 |> ignore
             else
-                out.AppendLine($"    const code: i32 = %s{topIdent fn.Name}();") |> ignore
+                out.AppendLine($"    const code: i32 = %s{guarded};") |> ignore
 
             out
                 .AppendLine("    if (fable_rt.leaked()) return 70;")

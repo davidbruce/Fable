@@ -182,12 +182,56 @@ Functions cannot capture `let mutable` variables (F# does not allow it either).
 Not yet: a higher-order function is not specialised for the lambda it is given, so each call
 through a function value is an indirect call.
 
+## Exceptions
+
+`raise`, `try ... with`, `try ... finally` and `reraise ()`, for exceptions declared with F#'s
+`exception`.
+
+A function that can raise returns a Zig error union, `fable_rt.Raised!T`; every other function
+keeps its plain result type and pays nothing. `raise` moves the exception into a slot of the
+runtime and returns `error.Raised`. A call that may raise has an error edge:
+
+```zig
+const below: i32 = (buildAndCheck(n - 1, limit) catch { fable_rt.drop(mine); return error.Raised; });
+```
+
+What the edge drops is the set the ownership pass tracks anyway: what the function owns and
+has not consumed at that point. So there are no unwinding tables and no cleanup stack, and
+an exception frees exactly what a normal return would have. A `try` is a labelled block: the
+error edges inside its body break to the handler, which takes the exception out of the slot
+and owns it. Values that the handler, or the code after the `try`, still needs are not moved
+or dropped inside the body.
+
+An exception is a reference-counted cell that starts with a header naming its type
+(`fable_rt.ExnOf("ParseError", struct { pos: i32, code: i32 })`), so a file can declare
+exception types that no other file knows of; `exn` is a pointer to that header.
+
+Who can raise:
+
+- A function with a `raise` that no `try` of its own handles, or that calls such a function.
+- A function value, always: its code returns an error union whatever is behind it, so that
+  it has one shape. Hence a function that calls a function value can raise.
+- A function of another file: this file cannot know, so the call is written both ways and
+  Zig picks (`if (comptime fable_rt.isRaised(@TypeOf(raw))) ...`), and the result type of the
+  calling function is `fable_rt.MayRaise(T, .{ m_Other.f, ... })`, which Zig resolves to
+  `T` or `Raised!T`. Like borrowing, this needs nothing shared between file compilations.
+
+A loop that builds a list top-down (`map`) stays a loop when it can raise: on the error edge
+the hole is filled with the type's case without fields (`Nil`) and what was built is dropped.
+A type that has no such case makes the function recurse instead.
+
+Not yet: .NET's own exception classes and `failwith` (they carry a message, which needs
+strings), structural equality of exceptions, a `while` condition that can raise, and the
+exceptions .NET raises for a division by zero or a failed pattern match (those are still Zig
+panics). An exception that reaches the entry point is printed by name and the program exits
+with 134, as on .NET on Unix.
+
 ## Tail calls
 
 A function that calls itself last is a loop (also when the call is the last field of a new
 cell). A call of *another* function of the file that ends a function is a jump
 (`@call(fable_rt.tail_call, f, .{ ... })`) when both functions have the same parameter and
-result types and all of them are numbers, booleans or chars; `even`/`odd` and state machines
+result types, all of them are numbers, booleans or chars, and neither can raise; `even`/`odd` and state machines
 over numbers then run in constant stack, as on .NET. Other signatures stay calls: Zig passes
 and returns records and unions through pointers into the caller's frame, which a jump would
 leave dangling (and LLVM rejects the jump when the result is returned that way). So mutual
@@ -204,8 +248,8 @@ forced on the LLVM backend; elsewhere it is an ordinary call.
    (done).
 3. ~~What functions of other files borrow~~ (done, at Zig compile time: see "Calls between
    files"). Whether a function of another file can raise will be stated the same way.
-4. ~~Closures and function values~~ (done), ~~generics~~ (done), exceptions, byrefs and
-   spans.
+4. ~~Closures and function values~~ (done), ~~generics~~ (done), ~~exceptions~~ (done for
+   F# `exception` declarations), byrefs and spans.
 5. Mutable reference records and the cycle collector.
 6. Strings, collections and the rest of FSharp.Core through `Replacements.fs` and the library.
 7. The test suite (`tests/Zig`), starting from the tests the other targets share.

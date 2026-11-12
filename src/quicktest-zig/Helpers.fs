@@ -80,3 +80,17 @@ let mapBox (f: 'T -> 'U) (b: Box<'T>) : Box<'U> =
         Value = f b.Value
         Tag = b.Tag
     }
+
+/// (an exception that another file handles, and functions that raise it)
+exception TooBig of limit: int * value: int
+
+let addChecked (limit: int) (a: int) (b: int) : int =
+    if a + b > limit then
+        raise (TooBig(limit, a + b))
+    else
+        a + b
+
+let rec sumChecked (limit: int) (xs: IntList) : int =
+    match xs with
+    | Nil -> 0
+    | Cons(h, t) -> addChecked limit h (sumChecked limit t)

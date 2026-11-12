@@ -4,7 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const interface_version: i32 = 5;
+pub const interface_version: i32 = 6;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -181,6 +181,10 @@ pub fn drop(x: anytype) void {
         }
         return;
     }
+    if (T == Exn) {
+        if (releaseIsLast(x)) x.type.destroy(x);
+        return;
+    }
     switch (@typeInfo(T)) {
         .optional => if (x) |v| drop(v),
         .@"struct" => |s| inline for (s.field_names) |name| drop(@field(x, name)),
@@ -234,6 +238,7 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     const T = @TypeOf(a);
     if (comptime !isManaged(T)) return std.meta.eql(a, b);
     if (comptime isFunc(T)) @compileError("function values cannot be compared");
+    if (T == Exn) return a == b;
     switch (@typeInfo(T)) {
         .pointer => |p| {
             if (a == b) return true;
@@ -341,6 +346,101 @@ pub inline fn captured(comptime Captures: type, env: ?*Env) *const Captures {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Exceptions
+//
+// A function that can raise returns `Raised!T`. `raise` moves the exception into `current` and
+// returns `error.Raised`; every caller on the way gives up what it still owns and returns the
+// error too, until a `with` handler takes the exception out. The exception is always owned in
+// exactly one place.
+//
+// An exception is a reference-counted cell that starts with a header naming its type, so that
+// a file can declare exception types that no other file has to know about.
+// ---------------------------------------------------------------------------------------------
+
+pub const Raised = error{Raised};
+
+pub const ExnType = struct {
+    name: []const u8,
+    destroy: *const fn (Exn) void,
+};
+
+pub const ExnHeader = struct {
+    @"$rc": u32 = 1,
+    type: *const ExnType,
+};
+
+/// F#'s `exn`.
+pub const Exn = *ExnHeader;
+
+/// An F# `exception` declaration with the given fields.
+pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
+    return struct {
+        const Whole = struct { header: ExnHeader, payload: Payload };
+
+        pub const info: ExnType = .{ .name = name, .destroy = destroy };
+
+        pub fn new(payload: Payload) Exn {
+            const c = allocator.create(Whole) catch @panic("fable: out of memory");
+            c.* = .{ .header = .{ .type = &info }, .payload = payload };
+            if (track) stats.allocs += 1;
+            return &c.header;
+        }
+
+        /// Is `e` an exception of this type?
+        pub inline fn is(e: Exn) bool {
+            return e.type == &info;
+        }
+
+        /// The fields of an exception of this type.
+        pub inline fn of(e: Exn) *const Payload {
+            const c: *Whole = @fieldParentPtr("header", e);
+            return &c.payload;
+        }
+
+        fn destroy(e: Exn) void {
+            const c: *Whole = @fieldParentPtr("header", e);
+            drop(c.payload);
+            free(c);
+        }
+    };
+}
+
+/// The exception in flight.
+var current: ?Exn = null;
+
+pub fn throw(e: Exn) void {
+    std.debug.assert(current == null);
+    current = e;
+}
+
+pub fn take() Exn {
+    const e = current.?;
+    current = null;
+    return e;
+}
+
+/// Can a call with a result of this type have raised?
+pub fn isRaised(comptime T: type) bool {
+    return @typeInfo(T) == .error_union;
+}
+
+/// The result type of a function that raises only if one of the functions of other files it
+/// calls does. (A file is compiled without knowing whether they do; Zig knows.)
+pub fn MayRaise(comptime T: type, comptime callees: anytype) type {
+    inline for (callees) |callee| {
+        if (isRaised(@typeInfo(@TypeOf(callee)).@"fn".return_type.?)) return Raised!T;
+    }
+    return T;
+}
+
+/// The program's entry point let an exception escape: say which, and give it up.
+pub fn uncaught() void {
+    const e = take();
+    std.debug.print("Unhandled exception: {s}\n", .{e.type.name});
+    drop(e);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Calls between files
 //
 // A file is compiled without knowing what the functions of other files were inferred to
@@ -368,7 +468,16 @@ pub inline fn across(
         // the callee takes ownership, the caller keeps using the value: one more reference
         a[i] = if (u == .keep and !sig.borrows[i]) dup(args[i]) else args[i];
     }
-    const r = @call(.auto, f, a);
+    const raw = @call(.auto, f, a);
+    // (If the callee raised, it has given up what it owned; what it only borrowed and the caller
+    // was done with is given up here, and the caller goes on unwinding.)
+    const r = if (comptime isRaised(@TypeOf(raw))) raw catch |err| {
+        inline for (uses, 0..) |use, i| {
+            const u: Use = use;
+            if (u == .give and sig.borrows[i]) drop(args[i]);
+        }
+        return err;
+    } else raw;
     // (a borrowed result may be part of an argument: it is made owned before they are given up)
     const result = if (sig.result_borrowed) dup(r) else r;
     inline for (uses, 0..) |use, i| {
@@ -587,6 +696,48 @@ test "a function value owns what it captured" {
     drop(pair);
     try std.testing.expectEqual(@as(i64, 4), stats.allocs - before.allocs);
     try std.testing.expectEqual(@as(i64, 4), stats.frees - before.frees);
+}
+
+const TestParseError = ExnOf("ParseError", struct { pos: i32, items: TestList });
+const TestOverflow = ExnOf("Overflow", struct { limit: i32 });
+
+fn testCheck(x: i32, owned: TestList) Raised!i32 {
+    if (x < 0) {
+        throw(TestParseError.new(.{ .pos = x, .items = owned }));
+        return error.Raised;
+    }
+    drop(owned);
+    return x;
+}
+const testCheck_sig = .{ .borrows = .{ false, false }, .result_borrowed = false };
+
+fn testOuter(x: i32) MayRaise(i32, .{testCheck}) {
+    const xs = testRange(2);
+    const raw = across(testCheck, testCheck_sig, .{ .plain, .give }, .{ x, xs });
+    const r = if (comptime isRaised(@TypeOf(raw))) (raw catch return error.Raised) else raw;
+    return r + 1;
+}
+
+fn testPlain(x: i32) MayRaise(i32, .{testSum}) {
+    return x;
+}
+
+test "an exception owns its fields and is taken by one handler" {
+    const before = stats;
+    try std.testing.expectEqual(@as(i32, 6), try testOuter(5));
+    try std.testing.expectError(error.Raised, testOuter(-3));
+    const e = take();
+    try std.testing.expect(TestParseError.is(e));
+    try std.testing.expect(!TestOverflow.is(e));
+    try std.testing.expectEqual(@as(i32, -3), TestParseError.of(e).pos);
+    try std.testing.expectEqual(@as(i32, 3), testSum(TestParseError.of(e).items));
+    const again = dup(e);
+    drop(e);
+    drop(again);
+    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+    // a function that calls nothing that raises has a plain result
+    try std.testing.expect(@TypeOf(testPlain(1)) == i32);
+    try std.testing.expect(@TypeOf(testOuter(1)) == Raised!i32);
 }
 
 test "conv follows .NET" {

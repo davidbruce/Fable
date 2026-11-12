@@ -46,6 +46,8 @@ type Ctx =
         /// the names of the file's functions, to give the ones made here names of their own
         Reserved: HashSet<string>
         DecisionTargets: (Fable.Ident list * Fable.Expr) list
+        /// inside a `with` handler: the exception it caught (for `reraise ()`)
+        CaughtExn: Var option
     }
 
 /// Something that is called by name.
@@ -194,6 +196,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.GenericParam(name = name) -> TGen name
+    | Fable.DeclaredType(ent, _) when ent.FullName = "System.Exception" -> tExn
+    | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
     | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapType ctx r))
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
 
@@ -284,6 +288,50 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
 
         e
 
+/// The F# `exception` declaration behind an entity reference, if it is one. Its values have
+/// the type `exn`; the declaration says what fields they have.
+and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent option =
+    match ctx.State.Ents.TryGetValue entRef.FullName with
+    | true, e when e.Kind = KExn -> Some e
+    | true, _ -> None
+    | _ ->
+        match ctx.Com.TryGetEntity entRef with
+        | Some ent when ent.IsFSharpExceptionDeclaration ->
+            let name, isLocal =
+                match FSharp2Fable.Util.entityIdent ctx.Com entRef with
+                | Fable.IdentExpr id -> id.Name, true
+                | Fable.Import(imp, _, _) -> importAlias ctx imp.Path + "." + imp.Selector, false
+                | _ -> fail r "the Zig target cannot reference the exception %s" entRef.FullName
+
+            let e =
+                {
+                    Name = name
+                    Ref = entRef
+                    Kind = KExn
+                    TypeParams = []
+                    Cases = []
+                    Managed = false
+                    Copyable = true
+                    IsLocal = isLocal
+                }
+
+            ctx.State.Ents[entRef.FullName] <- e
+
+            try
+                e.Cases <-
+                    [
+                        "", ent.FSharpFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
+                    ]
+            with _ ->
+                ctx.State.Ents.Remove entRef.FullName |> ignore
+                reraise ()
+
+            if isLocal then
+                ctx.State.LocalEnts.Add e
+
+            Some e
+        | _ -> None
+
 and importAlias (ctx: Ctx) (path: string) =
     match ctx.State.Imports.TryGetValue path with
     | true, alias -> alias
@@ -354,6 +402,7 @@ let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr
                 | EEmit _ -> true
                 // (a constructor argument is an owning position)
                 | ECon(_, _, xs, _) -> not conArgs && not xs.IsEmpty
+                | EExnNew _ -> not conArgs
                 | _ -> false
             ))
 
@@ -565,6 +614,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             )
         | Fable.NumberConstant(v, _) -> ELit(numberLit r v)
         | Fable.CharConstant c -> ELit(string<int>(int c), TPrim "u16")
+        | Fable.NewRecord(values, entRef, _) when (tryExnEnt ctx r entRef).IsSome ->
+            let ent = (tryExnEnt ctx r entRef).Value
+            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> EExnNew(ent, xs))
         | Fable.NewRecord(values, entRef, genArgs) ->
             let ty = TEnt(entOf ctx r entRef, genArgs |> List.map (mapType ctx r))
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
@@ -751,6 +803,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         bindArgs ctx args (fun xs -> EEmit(info.Macro, xs, ty))
 
+    // a field of an exception, which is known to be of the declared type
+    | Fable.Get(x, Fable.FieldGet info, t, r) when
+        (match x.Type with
+         | Fable.DeclaredType(entRef, _) -> (tryExnEnt ctx r entRef).IsSome
+         | _ -> false)
+        ->
+        let ent =
+            match x.Type with
+            | Fable.DeclaredType(entRef, _) -> (tryExnEnt ctx r entRef).Value
+            | _ -> fail r "internal: not an exception"
+
+        let ty = mapType ctx r t
+        bindArgs ctx [ lw ctx x ] (fun xs -> EExnGet(xs.Head, ent, info.Name, ty))
+
     | Fable.Get(x, kind, t, r) ->
         let ty = mapType ctx r t
 
@@ -772,6 +838,41 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | Fable.OptionValue, TOpt _ -> EGet(v, PSome, ty)
                 | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
             )
+
+    // `:? SomeException`, and the patterns of a `with` handler
+    | Fable.Test(x, Fable.TypeTest(Fable.DeclaredType(entRef, _)), r) when (tryExnEnt ctx r entRef).IsSome ->
+        let ent = (tryExnEnt ctx r entRef).Value
+        bindArgs ctx [ lw ctx x ] (fun xs -> EExnTest(xs.Head, ent))
+
+    | Fable.Test(x, Fable.TypeTest(Fable.DeclaredType(entRef, _)), _) when entRef.FullName = "System.Exception" ->
+        ESeq(lwStmt ctx x, ELit("true", tBool))
+
+    // try/with: the handler owns the exception it caught. try/finally: the finalizer runs when
+    // the body has finished, and when it raised, before the exception goes on.
+    | Fable.TryCatch(body, catch, finalizer, r) ->
+        let ty = mapType ctx r e.Type
+
+        let guarded =
+            match catch with
+            | Some(id, handler) ->
+                let exV = ctx.State.NewVar(id.Name, tExn, VLocal, false)
+                let bodyIr = lw ctx body
+                ctx.Vars[id.Name] <- exV
+                ETry(bodyIr, exV, lw { ctx with CaughtExn = Some exV } handler, ty)
+            | None -> lw ctx body
+
+        match finalizer with
+        | None -> guarded
+        | Some fin ->
+            let exV = ctx.State.NewVar("exn", tExn, VLocal, false)
+            let onRaise = ESeq(lwStmt ctx fin, ERaise(EVar exV, ty))
+            let tried = ETry(guarded, exV, onRaise, ty)
+
+            if isVoid ty then
+                ESeq(tried, lwStmt ctx fin)
+            else
+                let result = ctx.State.NewVar("result", ty, VLocal, false)
+                ELet(result, tried, ESeq(lwStmt ctx fin, EVar result))
 
     | Fable.Test(x, kind, r) ->
         bindArgs
@@ -1091,6 +1192,7 @@ and liftGroup
                 LocalFns = Dictionary<string, LocalFn>(localFns)
                 TypeParams = ctx.TypeParams @ ownGens
                 DecisionTargets = []
+                CaughtExn = None
             }
 
         let captured =
@@ -1120,6 +1222,7 @@ and liftGroup
                 Ret = ret
                 Body = bodyIr
                 RetFrom = None
+                Raises = RNever
                 IsLocal = true
                 IsEntryPoint = false
                 Range = body.Range
@@ -1163,6 +1266,12 @@ and dotnetCall
         bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("eql", xs, tBool))
     | "Microsoft.FSharp.Core.Operators", "op_Inequality", [ a; b ] ->
         bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("not", [ EPrim("eql", xs, tBool) ], tBool))
+    | "Microsoft.FSharp.Core.Operators", "Raise", [ x ] ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx r t))
+    | "Microsoft.FSharp.Core.Operators", "Reraise", _ ->
+        match ctx.CaughtExn with
+        | Some exV -> ERaise(EVar exV, mapType ctx r t)
+        | None -> fail r "`reraise ()` is only possible inside a `with` handler"
     | "Microsoft.FSharp.Core.Operators", "Ignore", [ x ] -> lwStmt ctx x
     | "Microsoft.FSharp.Core.Operators", "Identity", [ x ] -> lw ctx x
     | "Microsoft.FSharp.Core.Operators", "Fst", [ x ] ->
@@ -1221,6 +1330,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             TypeParams = []
             Reserved = reserved
             DecisionTargets = []
+            CaughtExn = None
         }
 
     let report (r: SourceLocation option) (msg: string) =
@@ -1243,6 +1353,11 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
                         if not c.AttachedMembers.IsEmpty then
                             report None $"the Zig target does not support members of types yet (%s{c.Name})"
+                    with ZigError(msg, r) ->
+                        report r msg
+                | Some ent when ent.IsFSharpExceptionDeclaration ->
+                    try
+                        tryExnEnt (newCtx c.Name) None c.Entity |> ignore
                     with ZigError(msg, r) ->
                         report r msg
                 | _ -> report None $"the Zig target does not support this kind of type declaration yet (%s{c.Name})"
@@ -1309,6 +1424,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         Ret = ret
                         Body = body
                         RetFrom = None
+                        Raises = RNever
                         IsLocal = false
                         IsEntryPoint = entry
                         Range = d.Body.Range
