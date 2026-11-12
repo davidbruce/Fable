@@ -9,6 +9,8 @@ type ZigFile =
     {
         /// (alias, path of the imported file as Fable knows it)
         Imports: (string * string) list
+        /// the hand-written runtime, if the file uses it (its path as Fable knows it)
+        Runtime: string option
         Body: string
     }
 
@@ -28,5 +30,10 @@ let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
             |> Seq.map (fun kv -> kv.Value, kv.Key)
             |> Seq.sortBy fst
             |> List.ofSeq
+        Runtime =
+            if state.UsesRuntime then
+                Some(Fable.Transforms.AST.getLibPath com "fable_rt")
+            else
+                None
         Body = body
     }

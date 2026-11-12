@@ -80,6 +80,7 @@ let zigKeywords =
             "anyopaque"
             "std"
             "main"
+            "fable_rt"
         ]
 
 /// Zig reserves `i<N>` and `u<N>` for every N.
@@ -266,6 +267,8 @@ let rec ex (em: Em) (e: Expr) : string =
         | "shr", [ x; y ] -> $"(%s{x} >> %s{shiftCount y})"
         | "eql", [ x; y ] -> $"std.meta.eql(%s{x}, %s{y})"
         | "tag", [ x ] -> $"@as(i32, @intFromEnum(%s{x}))"
+        // (the source type is spelled out: a literal has no type of its own in Zig)
+        | "conv", [ x ] -> $"fable_rt.conv(%s{zigType t}, @as(%s{zigType argT}, %s{x}))"
         | _ -> fail None "internal: unknown primitive %s/%d" op a.Length
     | ECall(f, xs, _) ->
         let args = xs |> List.map (ex em) |> String.concat ", "

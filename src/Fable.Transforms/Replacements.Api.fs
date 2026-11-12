@@ -35,6 +35,7 @@ let tryField (com: ICompiler) returnTyp ownerTyp fieldName =
     | Python -> Py.Replacements.tryField com returnTyp ownerTyp fieldName
     | Dart -> Dart.Replacements.tryField com returnTyp ownerTyp fieldName
     | Beam -> Beam.Replacements.tryField com returnTyp ownerTyp fieldName
+    | Zig -> Zig.Replacements.tryField com returnTyp ownerTyp fieldName
     | _ -> JS.Replacements.tryField com returnTyp ownerTyp fieldName
 
 let tryBaseConstructor (com: ICompiler) ctx (ent: EntityRef) (argTypes: Lazy<Type list>) genArgs args =
@@ -43,6 +44,7 @@ let tryBaseConstructor (com: ICompiler) ctx (ent: EntityRef) (argTypes: Lazy<Typ
     | Dart -> Dart.Replacements.tryBaseConstructor com ctx ent argTypes genArgs args
     | Rust -> Rust.Replacements.tryBaseConstructor com ctx ent argTypes genArgs args
     | Beam -> Beam.Replacements.tryBaseConstructor com ctx ent argTypes genArgs args
+    | Zig -> Zig.Replacements.tryBaseConstructor com ctx ent argTypes genArgs args
     | _ -> JS.Replacements.tryBaseConstructor com ctx ent argTypes genArgs args
 
 let makeMethodInfo (com: ICompiler) r (name: string) (parameters: (string * Type) list) (returnType: Type) =
@@ -55,6 +57,7 @@ let tryType (com: ICompiler) (t: Type) =
     | Python -> Py.Replacements.tryType t
     | Dart -> Dart.Replacements.tryType t
     | Beam -> Beam.Replacements.tryType t
+    | Zig -> Zig.Replacements.tryType t
     | _ -> JS.Replacements.tryType t
 
 let tryCall (com: ICompiler) ctx r t info thisArg args =
@@ -72,6 +75,7 @@ let error (com: ICompiler) msg =
     | Rust -> Rust.Replacements.error com msg
     | Dart -> Dart.Replacements.error com msg
     | Beam -> Beam.Replacements.error com msg
+    | Zig -> Zig.Replacements.error com msg
     | _ -> JS.Replacements.error com msg
 
 let defaultof (com: ICompiler) ctx r typ =
@@ -80,6 +84,7 @@ let defaultof (com: ICompiler) ctx r typ =
     | Python -> Py.Replacements.defaultof com ctx r typ
     | Dart -> Dart.Replacements.getZero com ctx typ
     | Beam -> Beam.Replacements.defaultof com ctx r typ
+    | Zig -> Zig.Replacements.defaultof com ctx r typ
     | _ -> JS.Replacements.defaultof com ctx r typ
 
 let createMutablePublicValue (com: ICompiler) value =
@@ -99,6 +104,7 @@ let getRefCell (com: ICompiler) r typ (expr: Expr) =
     | Rust -> Rust.Replacements.getRefCell com r typ expr
     | Dart -> Dart.Replacements.getRefCell com r typ expr
     | Beam -> Beam.Replacements.getRefCell com r typ expr
+    | Zig -> Zig.Replacements.getRefCell com r typ expr
     | _ -> JS.Replacements.getRefCell com r typ expr
 
 let setRefCell (com: ICompiler) r (expr: Expr) (value: Expr) =
@@ -107,6 +113,7 @@ let setRefCell (com: ICompiler) r (expr: Expr) (value: Expr) =
     | Rust -> Rust.Replacements.setRefCell com r expr value
     | Dart -> Dart.Replacements.setRefCell com r expr value
     | Beam -> Beam.Replacements.setRefCell com r expr value
+    | Zig -> Zig.Replacements.setRefCell com r expr value
     | _ -> JS.Replacements.setRefCell com r expr value
 
 let makeRefCellFromValue (com: ICompiler) r (value: Expr) =
@@ -115,6 +122,7 @@ let makeRefCellFromValue (com: ICompiler) r (value: Expr) =
     | Rust -> Rust.Replacements.makeRefCellFromValue com r value
     | Dart -> Dart.Replacements.makeRefCellFromValue com r value
     | Beam -> Beam.Replacements.makeRefCellFromValue com r value
+    | Zig -> Zig.Replacements.makeRefCellFromValue com r value
     | _ -> JS.Replacements.makeRefCellFromValue com r value
 
 let makeRefFromMutableFunc (com: ICompiler) ctx r t (value: Expr) =
@@ -123,6 +131,7 @@ let makeRefFromMutableFunc (com: ICompiler) ctx r t (value: Expr) =
     | Rust -> Rust.Replacements.makeRefFromMutableFunc com ctx r t value
     | Dart -> Dart.Replacements.makeRefFromMutableFunc com ctx r t value
     | Beam -> Beam.Replacements.makeRefFromMutableFunc com ctx r t value
+    | Zig -> Zig.Replacements.makeRefFromMutableFunc com ctx r t value
     | _ -> JS.Replacements.makeRefFromMutableFunc com ctx r t value
 
 let makeRefFromMutableValue (com: ICompiler) ctx r t (value: Expr) =
@@ -131,6 +140,7 @@ let makeRefFromMutableValue (com: ICompiler) ctx r t (value: Expr) =
     | Rust -> Rust.Replacements.makeRefFromMutableValue com ctx r t value
     | Dart -> Dart.Replacements.makeRefFromMutableValue com ctx r t value
     | Beam -> Beam.Replacements.makeRefFromMutableValue com ctx r t value
+    | Zig -> Zig.Replacements.makeRefFromMutableValue com ctx r t value
     | _ -> JS.Replacements.makeRefFromMutableValue com ctx r t value
 
 let makeRefFromMutableField (com: ICompiler) ctx r t (value: Expr) =
@@ -139,4 +149,5 @@ let makeRefFromMutableField (com: ICompiler) ctx r t (value: Expr) =
     | Rust -> Rust.Replacements.makeRefFromMutableField com ctx r t value
     | Dart -> Dart.Replacements.makeRefFromMutableField com ctx r t value
     | Beam -> Beam.Replacements.makeRefFromMutableField com ctx r t value
+    | Zig -> Zig.Replacements.makeRefFromMutableField com ctx r t value
     | _ -> JS.Replacements.makeRefFromMutableField com ctx r t value

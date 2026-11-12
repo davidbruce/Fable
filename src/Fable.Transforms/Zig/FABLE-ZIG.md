@@ -26,8 +26,9 @@ There is no separate Zig AST: the IR is the last structured form, and the emitte
 
 Module-level functions (also recursive, also across files), literal module-level values,
 numbers, booleans and chars, `let`, `let mutable`, `if`, `while`, `for .. to`, arithmetic,
-comparison, bitwise and boolean operators, pattern matching, and an `[<EntryPoint>]` whose
-result becomes the process exit code.
+comparison, bitwise and boolean operators, conversions between numbers (`int`, `byte`,
+`float`, ... with .NET's results), pattern matching, and an `[<EntryPoint>]` whose result
+becomes the process exit code.
 
 Types that are plain values, also when another file declares them:
 
@@ -63,10 +64,16 @@ Everything else is reported as a compile error at the F# source location
 
 ## Notes for the shared code
 
-- `Zig/Replacements.fs` only replaces operators on numbers, booleans and chars (the
-  JavaScript replacements wrap integer division and 64-bit arithmetic in JavaScript-specific
-  code). Every other library call still falls through to the JavaScript replacements; the
-  lowering recognises the structural-equality call they make. The rest comes with step 6.
+- Nothing goes through another target's replacements. `Zig/Replacements.fs` handles every
+  entry point of `Replacements.Api`: operators on numbers, booleans and chars become plain
+  operation nodes, and every other call into .NET or FSharp.Core is kept as it is, as a call
+  to an import named after the declaring type (`dotnet:System.Math`, `Sqrt`). The lowering
+  resolves those by their .NET names (`dotnetCall` in `Fable2Zig.Lower.fs`) or rejects them
+  by name ("the Zig target does not support System.Math.Sqrt yet"). So far it knows
+  structural equality, `ignore`, `id`, `fst`, `snd` and the conversions between numbers.
+- Generated files import the hand-written runtime (`fable_rt.zig`, copied into
+  `fable_modules/fable-library-zig`) only when they use it. It has its own Zig tests
+  (`zig test src/fable-library-zig/fable_rt.zig`).
 - Two places in `FSharp2Fable.fs` drop information this target needs and will need a
   Zig-specific branch: the address of anything but a variable or field is discarded, and a
   store through a byref that is not a plain variable is rejected.

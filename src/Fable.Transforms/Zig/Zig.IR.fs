@@ -269,6 +269,8 @@ type FileState() =
     member val Consts = List<string * Ty * string>()
     /// imports of other files: path -> local alias
     member val Imports = Dictionary<string, string>()
+    /// the generated code calls the hand-written runtime (`fable_rt.zig`)
+    member val UsesRuntime = false with get, set
 
     member _.NewVar(baseName: string, ty: Ty, kind: VarKind, isMut: bool) : Var =
         varCounter <- varCounter + 1

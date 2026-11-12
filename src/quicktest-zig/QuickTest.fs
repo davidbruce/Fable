@@ -291,6 +291,27 @@ let typesWork () : int =
         && lengthOf ValueNone = -1
     )
 
+// ---- calls into FSharp.Core (kept under their .NET names, resolved by the target) ----
+let conversions () : int =
+    let big = 300
+    let neg = -5
+    let x = 3.99
+
+    check (byte big = 44uy && sbyte 200 = -56y)
+    + check (int64 neg = -5L && uint64 neg = 18446744073709551611UL)
+    + check (int x = 3 && int -x = -3 && int 1e30 = 2147483647)
+    + check (float big = 300.0 && float32 big = 300.0f)
+    + check (uint32 neg = 4294967291u && int (uint32 neg) = -5)
+    + check (int 'A' = 65 && char 66 = 'B')
+
+let coreFunctions () : int =
+    let pair = (7, true)
+    ignore (add 1 2)
+
+    check (fst pair = 7 && snd pair)
+    + check (not (snd pair) = false)
+    + check (id 5 = 5)
+
 [<EntryPoint>]
 let main _ =
     check (add 3 4 = 7)
@@ -304,3 +325,5 @@ let main _ =
     + check (wrapsAround ())
     + check (Helpers.clamp 0 10 42 = 10 && Helpers.isEven 4 && not (Helpers.isEven 7))
     + typesWork ()
+    + conversions ()
+    + coreFunctions ()

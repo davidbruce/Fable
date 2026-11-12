@@ -396,18 +396,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     | LogicalOr -> EIf(xs.Head, ELit("true", tBool), rhs, tBool)
                 )
 
-    // Structural equality of records, unions, tuples and options. (It arrives as the library
-    // call the JavaScript replacements make; plain values are compared field by field in Zig.)
-    | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
-        (imp.Selector = "equals" || imp.Selector = "equalArrays")
-        && info.Args.Length = 2
-        && (
-            match imp.Kind with
-            | Fable.LibraryImport _ -> true
-            | _ -> false
-        )
+    // A call that the replacements kept under its .NET name.
+    | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
+        imp.Path.StartsWith(Replacements.DotnetPrefix, System.StringComparison.Ordinal)
         ->
-        bindArgs ctx (info.Args |> List.map (lw ctx)) (fun xs -> EPrim("eql", xs, tBool))
+        dotnetCall ctx r (imp.Path.Substring Replacements.DotnetPrefix.Length) imp.Selector info t
 
     | Fable.Get(x, kind, t, r) ->
         let ty = mapType ctx r t
@@ -507,6 +500,54 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         |> lw ctx
 
     | _ -> fail e.Range "the Zig target does not support %s yet" (exprKind e)
+
+/// What the target does for a .NET or FSharp.Core member. This table is keyed by .NET names
+/// only, so it does not depend on how any other target implements the same member.
+and dotnetCall
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (entity: string)
+    (name: string)
+    (info: Fable.CallInfo)
+    (t: Fable.Type)
+    : Expr
+    =
+    let isNumber (ty: Ty) = intBits ty > 0 || isFloatTy ty
+
+    match entity, name, info.Args with
+    // structural equality of records, unions, tuples and options: plain values, compared
+    // field by field
+    | "Microsoft.FSharp.Core.Operators", "op_Equality", [ a; b ] ->
+        bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("eql", xs, tBool))
+    | "Microsoft.FSharp.Core.Operators", "op_Inequality", [ a; b ] ->
+        bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("not", [ EPrim("eql", xs, tBool) ], tBool))
+    | "Microsoft.FSharp.Core.Operators", "Ignore", [ x ] -> lwStmt ctx x
+    | "Microsoft.FSharp.Core.Operators", "Identity", [ x ] -> lw ctx x
+    | "Microsoft.FSharp.Core.Operators", "Fst", [ x ] ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 0, mapType ctx r t))
+    | "Microsoft.FSharp.Core.Operators", "Snd", [ x ] ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 1, mapType ctx r t))
+    // int, int64, byte, float, char, ...: conversions between numbers, with .NET's results
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when
+        name.StartsWith("To", System.StringComparison.Ordinal)
+        ->
+        let ty = mapType ctx r t
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                let from = typeOf xs.Head
+
+                if from = ty then
+                    xs.Head
+                elif isNumber from && isNumber ty then
+                    ctx.State.UsesRuntime <- true
+                    EPrim("conv", xs, ty)
+                else
+                    fail r "the Zig target does not support %s.%s yet" entity name
+            )
+    | _ -> fail r "the Zig target does not support %s.%s yet" entity name
 
 /// A statement: its value, if it has one, is not used.
 and asStmt (ctx: Ctx) (ir: Expr) : Expr =
