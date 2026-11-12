@@ -25,9 +25,11 @@ type Ent =
         Name: string
         Ref: Fable.EntityRef
         Kind: EntKind
+        /// the type parameters of a generic type; the field types below mention them as `TGen`
+        TypeParams: string list
         /// records: one case named ""
         mutable Cases: (string * (string * Ty) list) list
-        /// holds references to cells: its values are dup'ed and dropped
+        /// holds references to cells whatever its type arguments are
         mutable Managed: bool
         mutable Copyable: bool
         /// declared in the file being compiled (its declaration is emitted there)
@@ -36,15 +38,18 @@ type Ent =
 
 type Ty =
     | TPrim of string
-    | TEnt of Ent
+    /// a record or union, with its type arguments
+    | TEnt of Ent * Ty list
+    /// a type parameter of the function or type being compiled
+    | TGen of string
     | TOpt of Ty
     | TTuple of Ty list
     | TPtr of Ty * isConst: bool
     | TSlice of Ty * isConst: bool
     | TArr of Ty * int
     | TFn of Ty list * Ty
-    /// Perceus reuse token: `?*Ent_Case`
-    | TTok of Ent * string
+    /// Perceus reuse token: a dead cell of a case of a recursive union, or nothing
+    | TTok of Ty * string
 
 let tVoid = TPrim "void"
 let tBool = TPrim "bool"
@@ -67,24 +72,38 @@ let intBits (t: Ty) =
     | TPrim s when s.Length > 1 && (s[0] = 'i' || s[0] = 'u') && System.Char.IsDigit s[1] -> int (s.Substring 1)
     | _ -> 0
 
+/// Does a value of this type hold references to cells? What a type parameter stands for is
+/// not known while its function is compiled, so it counts as managed: the dup and the drop of
+/// such a value compile to nothing when the function is used with a type that is not.
 let rec isManaged (t: Ty) =
     match t with
-    | TEnt e -> e.Managed
+    | TEnt(e, args) -> e.Managed || List.exists isManaged args
+    | TGen _ -> true
     | TOpt t -> isManaged t
     | TTuple ts -> List.exists isManaged ts
     // (a function value may own an environment)
     | TFn _ -> true
     | _ -> false
 
+/// The same question for the declaration of a type, whatever its parameters stand for.
+let rec isManagedDecl (t: Ty) =
+    match t with
+    | TEnt(e, args) -> e.Managed || List.exists isManagedDecl args
+    | TGen _ -> false
+    | TOpt t -> isManagedDecl t
+    | TTuple ts -> List.exists isManagedDecl ts
+    | TFn _ -> true
+    | _ -> false
+
 let isHeapTy (t: Ty) =
     match t with
-    | TEnt e -> e.Kind = KHeapUnion
+    | TEnt(e, _) -> e.Kind = KHeapUnion
     | _ -> false
 
 /// Can a value be copied implicitly? Copying a handle shares the cell (count + 1).
 let rec isCopyable (t: Ty) =
     match t with
-    | TEnt e -> e.Copyable
+    | TEnt(e, args) -> e.Copyable && List.forall isCopyable args
     | TOpt t -> isCopyable t
     | TTuple ts -> List.forall isCopyable ts
     | _ -> true
@@ -93,21 +112,72 @@ let rec isCopyable (t: Ty) =
 let rec tyKey (t: Ty) : string =
     match t with
     | TPrim s -> s
-    | TEnt e -> e.Ref.FullName
+    | TEnt(e, []) -> e.Ref.FullName
+    | TEnt(e, args) -> e.Ref.FullName + "<" + (args |> List.map tyKey |> String.concat ",") + ">"
+    | TGen n -> "'" + n
     | TOpt t -> "?" + tyKey t
     | TTuple ts -> "(" + (ts |> List.map tyKey |> String.concat ",") + ")"
     | TPtr(t, c) -> $"*%b{c}%s{tyKey t}"
     | TSlice(t, c) -> $"[]%b{c}%s{tyKey t}"
     | TArr(t, n) -> $"[%d{n}]%s{tyKey t}"
     | TFn(args, ret) -> "fn(" + (args |> List.map tyKey |> String.concat ",") + ")" + tyKey ret
-    | TTok(e, c) -> $"tok:%s{e.Ref.FullName}.%s{c}"
+    | TTok(t, c) -> $"tok:%s{tyKey t}.%s{c}"
+
+/// Replace type parameters by what they stand for.
+let rec substTy (m: Map<string, Ty>) (t: Ty) : Ty =
+    if m.IsEmpty then
+        t
+    else
+        match t with
+        | TGen n ->
+            match m.TryFind n with
+            | Some x -> x
+            | None -> t
+        | TEnt(e, args) -> TEnt(e, args |> List.map (substTy m))
+        | TOpt t -> TOpt(substTy m t)
+        | TTuple ts -> TTuple(ts |> List.map (substTy m))
+        | TPtr(t, c) -> TPtr(substTy m t, c)
+        | TSlice(t, c) -> TSlice(substTy m t, c)
+        | TArr(t, n) -> TArr(substTy m t, n)
+        | TFn(args, ret) -> TFn(args |> List.map (substTy m), substTy m ret)
+        | TTok(t, c) -> TTok(substTy m t, c)
+        | TPrim _ -> t
+
+/// The type parameters a type mentions, in the order they appear.
+let freeGens (ts: Ty list) : string list =
+    let found = List<string>()
+
+    let rec go (t: Ty) =
+        match t with
+        | TGen n ->
+            if not (found.Contains n) then
+                found.Add n
+        | TEnt(_, args) -> List.iter go args
+        | TOpt t
+        | TPtr(t, _)
+        | TSlice(t, _)
+        | TArr(t, _)
+        | TTok(t, _) -> go t
+        | TTuple ts -> List.iter go ts
+        | TFn(args, ret) ->
+            List.iter go args
+            go ret
+        | TPrim _ -> ()
+
+    List.iter go ts
+    List.ofSeq found
 
 /// The fields of a case: (name, type). Records have one case, named "".
 let caseFields (t: Ty) (case: string) : (string * Ty) list =
     match t with
-    | TEnt e ->
+    | TEnt(e, args) ->
         match e.Cases |> List.tryFind (fun (c, _) -> c = case) with
-        | Some(_, fs) -> fs
+        | Some(_, fs) ->
+            if args.IsEmpty || args.Length <> e.TypeParams.Length then
+                fs
+            else
+                let m = Map.ofList (List.zip e.TypeParams args)
+                fs |> List.map (fun (f, ft) -> f, substTy m ft)
         | None -> fail None "internal: type %s has no case %s" e.Name case
     | TTuple ts -> ts |> List.mapi (fun i t -> string<int> i, t)
     | TOpt t ->
@@ -119,13 +189,24 @@ let caseFields (t: Ty) (case: string) : (string * Ty) list =
 
 let allCases (t: Ty) : string list =
     match t with
-    | TEnt e -> e.Cases |> List.map fst
+    | TEnt(e, _) -> e.Cases |> List.map fst
     | TOpt _ -> [ "None"; "Some" ]
     | _ -> [ "" ]
 
-/// The layout of a cell: a dead cell can be built in again by a constructor of the same shape.
-let cellShape (e: Ent) (case: string) : string =
-    caseFields (TEnt e) case |> List.map (snd >> tyKey) |> String.concat ","
+/// Can a constructor of `(t2, case2)` be built in a dead cell of `(t1, case1)`? Yes when the
+/// fields have the same types. When it is the same case of the same generic type with other
+/// type arguments, the two cells may or may not have the same layout: that is known when the
+/// Zig is compiled, and the runtime only builds in the dead cell if they do.
+let cellsMatch (t1: Ty, case1: string) (t2: Ty, case2: string) : bool =
+    let shape t case =
+        caseFields t case |> List.map (snd >> tyKey) |> String.concat ","
+
+    shape t1 case1 = shape t2 case2
+    || (
+        match t1, t2 with
+        | TEnt(e1, _), TEnt(e2, _) -> obj.ReferenceEquals(e1, e2) && case1 = case2
+        | _ -> false
+    )
 
 type VarKind =
     | VLocal
@@ -165,11 +246,13 @@ type Expr =
     | ELit of string * Ty
     | EUnit
     | EPrim of string * Expr list * Ty
-    | ECall of string * Expr list * Ty
+    /// a call of a function of the file (or `alias.name`), with its type arguments
+    | ECall of string * Ty list * Expr list * Ty
     | ECallClo of Expr * Expr list * Ty
-    /// a function value: the function of the file (or `alias.name`) it calls, the values it
-    /// captures (they are that function's first parameters), and its type
-    | EClosure of string * Expr list * Ty
+    /// a function value: the function of the file (or `alias.name`) it calls with its type
+    /// arguments, the values it captures (they are that function's first parameters), and its
+    /// type
+    | EClosure of string * Ty list * Expr list * Ty
     | ECon of Ty * string * Expr list * Var option
     | EGet of Expr * Proj * Ty
     | ETest of Expr * string * Ty
@@ -218,6 +301,8 @@ type Mode =
 type FnInfo =
     {
         Name: string
+        /// the type parameters of a generic function
+        TypeParams: string list
         Params: Var list
         mutable Modes: Mode list
         Ret: Ty
@@ -236,9 +321,9 @@ let rec typeOf (e: Expr) : Ty =
     | EVar v -> v.Ty
     | ELit(_, t)
     | EPrim(_, _, t)
-    | ECall(_, _, t)
+    | ECall(_, _, _, t)
     | ECallClo(_, _, t)
-    | EClosure(_, _, t)
+    | EClosure(_, _, _, t)
     | ECon(t, _, _, _)
     | EGet(_, _, t)
     | EDeref(_, t)
@@ -277,9 +362,9 @@ let isFlat (e: Expr) =
 let flatKids (e: Expr) : Expr list =
     match e with
     | EPrim(_, xs, _)
-    | ECall(_, xs, _)
+    | ECall(_, _, xs, _)
     | EEmit(_, xs, _)
-    | EClosure(_, xs, _)
+    | EClosure(_, _, xs, _)
     | ECon(_, _, xs, _) -> xs
     | ECallClo(f, xs, _) -> f :: xs
     | EGet(x, _, _)
@@ -293,9 +378,9 @@ let flatKids (e: Expr) : Expr list =
 let withFlatKids (e: Expr) (xs: Expr list) : Expr =
     match e, xs with
     | EPrim(op, _, t), _ -> EPrim(op, xs, t)
-    | ECall(f, _, t), _ -> ECall(f, xs, t)
+    | ECall(f, tys, _, t), _ -> ECall(f, tys, xs, t)
     | EEmit(m, _, t), _ -> EEmit(m, xs, t)
-    | EClosure(f, _, t), _ -> EClosure(f, xs, t)
+    | EClosure(f, tys, _, t), _ -> EClosure(f, tys, xs, t)
     | ECon(t, c, _, tok), _ -> ECon(t, c, xs, tok)
     | ECallClo(_, _, t), f :: rest -> ECallClo(f, rest, t)
     | EGet(_, p, t), [ x ] -> EGet(x, p, t)
@@ -338,7 +423,7 @@ let rec isPure (e: Expr) =
     | EPrim(("div" | "mod"), _, _) -> false // may trap
     | EPrim(_, xs, _) -> List.forall isPure xs
     // (a function value that captures nothing is a constant; one that captures allocates)
-    | EClosure(_, xs, _) -> xs.IsEmpty
+    | EClosure(_, _, xs, _) -> xs.IsEmpty
     // (a constructor that allocates a cell is not pure)
     | ECon(t, _, xs, None) -> (not (isHeapTy t) || xs.IsEmpty) && List.forall isPure xs
     | EGet(x, _, _)
@@ -380,10 +465,10 @@ let rec exists (pred: Expr -> bool) (e: Expr) : bool =
 /// A name for the temporary that holds the value of `e`.
 let tempName (e: Expr) =
     match e with
-    | ECall(f, _, _) -> f.Substring(f.LastIndexOf '.' + 1) + "_r"
+    | ECall(f, _, _, _) -> f.Substring(f.LastIndexOf '.' + 1) + "_r"
     | ECon(_, c, _, _) when c <> "" -> c.ToLowerInvariant()
     | ECon(TTuple _, _, _, _) -> "tup"
-    | ECon(TEnt e, _, _, _) -> e.Name.Substring(e.Name.LastIndexOf '.' + 1).ToLowerInvariant()
+    | ECon(TEnt(e, _), _, _, _) -> e.Name.Substring(e.Name.LastIndexOf '.' + 1).ToLowerInvariant()
     | _ -> "tmp"
 
 /// Per-file state of the lowering: fresh variables and the functions produced so far.

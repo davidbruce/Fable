@@ -129,6 +129,20 @@ type LoopInfo =
         Trmc: bool
     }
 
+/// The code of a function value: it takes the environment and then the arguments, which it
+/// owns, and calls the function `Target`.
+type Adapter =
+    {
+        Name: string
+        Target: string
+        TypeArgs: Ty list
+        NCaptures: int
+        FnTy: Ty
+        /// the type parameters of the surrounding function that the types above mention: the
+        /// adapter is generic in them
+        Gens: string list
+    }
+
 type Em =
     {
         Out: StringBuilder
@@ -136,9 +150,8 @@ type Em =
         Used: HashSet<string>
         Mutated: Set<int>
         Loop: LoopInfo option
-        /// the functions that are used as values: name -> (how many values they capture, the
-        /// type of the function value)
-        Adapters: Dictionary<string, int * Ty>
+        /// the code of the function values made so far
+        Adapters: Dictionary<string, Adapter>
         mutable Counter: int
     }
 
@@ -210,10 +223,20 @@ let sigName (f: string) =
     | -1 -> $"@\"%s{topIdent f}$sig\""
     | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$sig\""
 
+/// A type parameter. (`'` cannot be part of a name that comes from F#, so a type parameter
+/// never has the name of a value.)
+let genName (n: string) = $"@\"'%s{n}\""
+
 let rec zigType (t: Ty) : string =
     match t with
     | TPrim s -> s
-    | TEnt e -> callTarget e.Name
+    | TEnt(e, []) -> callTarget e.Name
+    | TEnt(e, args) ->
+        args
+        |> List.map zigType
+        |> String.concat ", "
+        |> sprintf "%s(%s)" (callTarget e.Name)
+    | TGen n -> genName n
     | TOpt t -> "?" + zigType t
     | TTuple ts -> ts |> List.map zigType |> String.concat ", " |> sprintf "@Tuple(&.{ %s })"
     | TPtr(t, c) ->
@@ -232,14 +255,24 @@ let rec zigType (t: Ty) : string =
     | TFn(args, ret) ->
         let ps = "?*fable_rt.Env" :: (args |> List.map zigType) |> String.concat ", "
         $"fable_rt.Func(*const fn (%s{ps}) %s{zigType ret})"
-    | TTok(e, c) -> $"?*fable_rt.Cell(%s{callTarget e.Name}, .%s{fieldIdent c})"
+    | TTok(t, c) -> $"?*fable_rt.Cell(%s{zigType t}, .%s{fieldIdent c})"
 
-/// The code of a function value: it takes the environment and then the arguments, which it
-/// owns, and calls the function. (`$` cannot be part of a name that comes from F#.)
-let adapterName (target: string) = $"@\"%s{target}$call\""
+/// A function with its type arguments: a generic function is a Zig function from types to a
+/// namespace that holds the function itself, as `call`.
+let fnRef (f: string) (typeArgs: Ty list) =
+    match typeArgs with
+    | [] -> callTarget f
+    | _ ->
+        typeArgs
+        |> List.map zigType
+        |> String.concat ", "
+        |> sprintf "%s(%s).call" (callTarget f)
 
-/// What a function value captures.
-let envName (target: string) = $"@\"%s{target}$env\""
+/// The namespace of an adapter, where it is used.
+let adapterRef (a: Adapter) =
+    match a.Gens with
+    | [] -> a.Name
+    | gens -> gens |> List.map genName |> String.concat ", " |> sprintf "%s(%s)" a.Name
 
 let dupCode (x: string) = $"fable_rt.dup(%s{x})"
 let dropCode (x: string) = $"fable_rt.drop(%s{x});"
@@ -249,7 +282,7 @@ let projAccess (t: Ty) (case: string) (field: string) (x: string) =
     match t with
     | TTuple _ -> $"%s{x}[%s{field}]"
     | TOpt _ -> x + ".?"
-    | TEnt e when e.Kind = KRecord -> $"%s{x}.%s{fieldIdent field}"
+    | TEnt(e, _) when e.Kind = KRecord -> $"%s{x}.%s{fieldIdent field}"
     | _ -> $"%s{x}.%s{fieldIdent case}.%s{fieldIdent field}"
 
 let rec ex (em: Em) (e: Expr) : string =
@@ -315,7 +348,7 @@ let rec ex (em: Em) (e: Expr) : string =
         // (the source type is spelled out: a literal has no type of its own in Zig)
         | "conv", [ x ] -> $"fable_rt.conv(%s{zigType t}, @as(%s{zigType argT}, %s{x}))"
         | _ -> fail None "internal: unknown primitive %s/%d" op a.Length
-    | ECall(f, xs, t) ->
+    | ECall(f, typeArgs, xs, t) ->
         if f.Contains "." && (isManaged t || xs |> List.exists (typeOf >> isManaged)) then
             // A function of another file: this file does not know what it borrows, so the call
             // says what the caller does with each argument and `across` settles the rest when
@@ -337,24 +370,43 @@ let rec ex (em: Em) (e: Expr) : string =
                 | [] -> ".{}"
                 | _ -> items |> String.concat ", " |> sprintf ".{ %s }"
 
-            $"fable_rt.across(%s{callTarget f}, %s{sigName f}, %s{tuple uses}, %s{tuple args})"
+            $"fable_rt.across(%s{fnRef f typeArgs}, %s{sigName f}, %s{tuple uses}, %s{tuple args})"
         else
             let args = xs |> List.map (ex em) |> String.concat ", "
-            $"%s{callTarget f}(%s{args})"
+            $"%s{fnRef f typeArgs}(%s{args})"
     | ECallClo(f, xs, _) ->
         let fn = ex em f
         let args = $"%s{fn}.env" :: (xs |> List.map (ex em)) |> String.concat ", "
         $"%s{fn}.code(%s{args})"
-    | EClosure(target, caps, ty) ->
-        em.Adapters[target] <- (caps.Length, ty)
+    | EClosure(target, typeArgs, caps, ty) ->
+        let key = target + "<" + (typeArgs |> List.map tyKey |> String.concat ",") + ">"
+
+        let adapter =
+            match em.Adapters.TryGetValue key with
+            | true, a -> a
+            | _ ->
+                let a =
+                    {
+                        Name = $"@\"%s{target}$fn%d{em.Adapters.Count}\""
+                        Target = target
+                        TypeArgs = typeArgs
+                        NCaptures = caps.Length
+                        FnTy = ty
+                        Gens = freeGens (ty :: typeArgs)
+                    }
+
+                em.Adapters[key] <- a
+                a
+
+        let ns = adapterRef adapter
 
         if caps.IsEmpty then
-            $"%s{zigType ty}{{ .env = null, .code = %s{adapterName target} }}"
+            $"%s{zigType ty}{{ .env = null, .code = %s{ns}.code }}"
         else
             let inits =
                 caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
 
-            $"fable_rt.closure(%s{zigType ty}, %s{envName target}, .{{ %s{inits} }}, %s{adapterName target})"
+            $"fable_rt.closure(%s{zigType ty}, %s{ns}.Env, .{{ %s{inits} }}, %s{ns}.code)"
     | EEmit(macro, xs, _) ->
         let args = xs |> List.map (ex em) |> Array.ofList
 
@@ -378,9 +430,9 @@ let rec ex (em: Em) (e: Expr) : string =
             |> String.concat ", "
 
         match t with
-        | TEnt e when e.Kind = KRecord -> $"%s{zigType t}{{ %s{inits (caseFields t case)} }}"
+        | TEnt(e, _) when e.Kind = KRecord -> $"%s{zigType t}{{ %s{inits (caseFields t case)} }}"
         | TEnt _ when args.IsEmpty -> $"@as(%s{zigType t}, .%s{fieldIdent case})"
-        | TEnt e when e.Kind = KHeapUnion ->
+        | TEnt(e, _) when e.Kind = KHeapUnion ->
             let init = $".{{ %s{inits (caseFields t case)} }}"
             let c = fieldIdent case
 
@@ -479,8 +531,8 @@ let private countUses (id: int) (es: Expr list) =
 /// fills the hole.
 let trmcSite (self: string) (e: Expr) =
     match e with
-    | ELet(r, ECall(f, args, _), ECon(TEnt ent, case, conArgs, tok)) when
-        f = self && ent.Kind = KHeapUnion && not conArgs.IsEmpty
+    | ELet(r, ECall(f, _, args, _), ECon(conTy, case, conArgs, tok)) when
+        f = self && isHeapTy conTy && not conArgs.IsEmpty
         ->
         let hits =
             conArgs
@@ -492,7 +544,7 @@ let trmcSite (self: string) (e: Expr) =
             )
 
         match hits with
-        | [ (i, _) ] when countUses r.Id conArgs = 1 -> Some(args, ent, case, conArgs, tok, i)
+        | [ (i, _) ] when countUses r.Id conArgs = 1 -> Some(args, conTy, case, conArgs, tok, i)
         | _ -> None
     | _ -> None
 
@@ -596,11 +648,12 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
 
     match e with
     | ELet _ when dest = DReturn && em.Loop.IsSome && (trmcSite em.Loop.Value.Self e).IsSome ->
-        let (args, ent, case, conArgs, tok, holeIdx) = (trmcSite em.Loop.Value.Self e).Value
+        let (args, conTy, case, conArgs, tok, holeIdx) =
+            (trmcSite em.Loop.Value.Self e).Value
 
-        let t = callTarget ent.Name
+        let t = zigType conTy
         let c = fieldIdent case
-        let fields = caseFields (TEnt ent) case
+        let fields = caseFields conTy case
 
         let inits =
             List.zip fields conArgs
@@ -723,7 +776,7 @@ and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
     match dest with
     | DReturn ->
         match em.Loop, e with
-        | Some loop, ECall(f, args, _) when f = loop.Self -> emitTailJump em ind args
+        | Some loop, ECall(f, _, args, _) when f = loop.Self -> emitTailJump em ind args
         | Some loop, _ when loop.Trmc ->
             L $"hole.* = %s{ex em e};"
             L "return result;"
@@ -761,7 +814,7 @@ let private hasManaged (fn: FnInfo) =
 let emitFunction
     (out: StringBuilder)
     (rootNames: HashSet<string>)
-    (adapters: Dictionary<string, int * Ty>)
+    (adapters: Dictionary<string, Adapter>)
     (fn: FnInfo)
     =
     // Is there a self call, or `let r = self(..) in Case(.., r, ..)`, where the function ends?
@@ -771,7 +824,7 @@ let emitFunction
         sites
         |> List.exists (
             function
-            | ECall(f, _, _) -> f = fn.Name
+            | ECall(f, _, _, _) -> f = fn.Name
             | _ -> false
         )
 
@@ -783,7 +836,7 @@ let emitFunction
             let args =
                 match s, trmcSite fn.Name s with
                 | _, Some(a, _, _, _, _, _) -> a
-                | ECall(f, a, _), _ when f = fn.Name -> a
+                | ECall(f, _, a, _), _ when f = fn.Name -> a
                 | _ -> []
 
             if args.IsEmpty then
@@ -885,12 +938,44 @@ let emitFunction
         else
             "pub "
 
-    out
-        .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{sigParams}) %s{zigType fn.Ret} {{")
-        .Append(ensureUsed (ps |> List.map (fun (s, _, _) -> s)) bodyText)
-        .Append(bodyText)
-        .AppendLine("}")
-    |> ignore
+    let unused = ensureUsed (ps |> List.map (fun (s, _, _) -> s)) bodyText
+
+    match fn.TypeParams with
+    | [] ->
+        out
+            .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{sigParams}) %s{zigType fn.Ret} {{")
+            .Append(unused)
+            .Append(bodyText)
+            .AppendLine("}")
+        |> ignore
+    | typeParams ->
+        // A generic function: a Zig function from its type arguments to a namespace that holds
+        // the function, so that `name(i32).call` is an ordinary function.
+        let comptimeParams =
+            typeParams
+            |> List.map (fun g -> $"comptime %s{genName g}: type")
+            |> String.concat ", "
+
+        let indented (text: string) =
+            text.Split('\n')
+            |> Array.map (fun l ->
+                if l = "" then
+                    l
+                else
+                    "        " + l
+            )
+            |> String.concat "\n"
+
+        out
+            .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{comptimeParams}) type {{")
+            .AppendLine("    return struct {")
+            .AppendLine($"        pub fn call(%s{sigParams}) %s{zigType fn.Ret} {{")
+            .Append(indented unused)
+            .Append(indented bodyText)
+            .AppendLine("        }")
+            .AppendLine("    };")
+            .AppendLine("}")
+        |> ignore
 
     // What the function borrows, for the calls from other files.
     if hasManaged fn && not fn.IsLocal then
@@ -921,12 +1006,12 @@ let emitFunction
 
     out.AppendLine() |> ignore
 
-/// The code of a function value that calls `target`. A function value owns its arguments and
-/// its result, and what it captured stays in its environment; the function it calls may have
-/// been inferred to borrow some of that, so this is where the two are brought together.
-let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (target: string) (nCaptures: int) (ty: Ty) =
+/// The code of a function value. A function value owns its arguments and its result, and what
+/// it captured stays in its environment; the function it calls may have been inferred to
+/// borrow some of that, so this is where the two are brought together.
+let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapter) =
     let argTys, ret =
-        match ty with
+        match a.FnTy with
         | TFn(args, ret) -> args, ret
         | _ -> fail None "internal: not a function type"
 
@@ -938,6 +1023,25 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (target: 
         |> String.concat ", "
 
     let line (text: string) = out.AppendLine(text) |> ignore
+
+    match a.Gens with
+    | [] -> line $"const %s{a.Name} = struct {{"
+    | gens ->
+        let comptimeParams =
+            gens
+            |> List.map (fun g -> $"comptime %s{genName g}: type")
+            |> String.concat ", "
+
+        line $"fn %s{a.Name}(%s{comptimeParams}) type {{"
+        line "    return struct {"
+
+    let ind =
+        if a.Gens.IsEmpty then
+            "    "
+        else
+            "        "
+
+    let line (text: string) = line (ind + text)
 
     let finish (call: string) (resultBorrowed: bool) (dropAfter: string list) =
         if isVoid ret then
@@ -953,22 +1057,28 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (target: 
         if not (isVoid ret) then
             line "    return r;"
 
-    match fns.TryGetValue target with
+    match fns.TryGetValue a.Target with
     | true, fn ->
-        let captured, rest = List.splitAt nCaptures (List.zip fn.Params fn.Modes)
+        let inst =
+            if fn.TypeParams.Length = a.TypeArgs.Length then
+                Map.ofList (List.zip fn.TypeParams a.TypeArgs)
+            else
+                Map.empty
 
-        if nCaptures > 0 then
+        let captured, rest = List.splitAt a.NCaptures (List.zip fn.Params fn.Modes)
+
+        if a.NCaptures > 0 then
             let fields =
                 captured
-                |> List.mapi (fun i (p, _) -> $"c%d{i}: %s{zigType p.Ty}")
+                |> List.mapi (fun i (p, _) -> $"c%d{i}: %s{zigType (substTy inst p.Ty)}")
                 |> String.concat ", "
 
-            line $"const %s{envName target} = struct {{ %s{fields} }};"
+            line $"const Env = struct {{ %s{fields} }};"
 
-        line $"fn %s{adapterName target}(%s{sigParams}) %s{zigType ret} {{"
+        line $"fn code(%s{sigParams}) %s{zigType ret} {{"
 
-        if nCaptures > 0 then
-            line $"    const c = fable_rt.captured(%s{envName target}, env);"
+        if a.NCaptures > 0 then
+            line "    const c = fable_rt.captured(Env, env);"
         else
             line "    _ = env;"
 
@@ -994,10 +1104,10 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (target: 
                     None
             )
 
-        finish $"%s{topIdent target}(%s{args})" fn.RetFrom.IsSome dropAfter
+        finish $"%s{fnRef a.Target a.TypeArgs}(%s{args})" fn.RetFrom.IsSome dropAfter
     | _ ->
         // a function of another file: what it borrows is settled when the Zig is compiled
-        line $"fn %s{adapterName target}(%s{sigParams}) %s{zigType ret} {{"
+        line $"fn code(%s{sigParams}) %s{zigType ret} {{"
         line "    _ = env;"
 
         let tuple (items: string list) =
@@ -1016,15 +1126,21 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (target: 
                 )
 
             finish
-                $"fable_rt.across(%s{callTarget target}, %s{sigName target}, %s{tuple uses}, %s{tuple (ps |> List.map fst)})"
+                $"fable_rt.across(%s{fnRef a.Target a.TypeArgs}, %s{sigName a.Target}, %s{tuple uses}, %s{tuple (ps |> List.map fst)})"
                 false
                 []
         else
             let args = ps |> List.map fst |> String.concat ", "
-            finish $"%s{callTarget target}(%s{args})" false []
+            finish $"%s{fnRef a.Target a.TypeArgs}(%s{args})" false []
 
     line "}"
-    line ""
+
+    if a.Gens.IsEmpty then
+        out.AppendLine("};") |> ignore
+    else
+        out.AppendLine("    };").AppendLine("}") |> ignore
+
+    out.AppendLine() |> ignore
 
 /// The text of one file, without its imports (their paths are only known to the writer).
 let emitFile (state: FileState) : string =
@@ -1047,33 +1163,53 @@ let emitFile (state: FileState) : string =
         let fields (fs: (string * Ty) list) =
             fs |> List.map (fun (f, t) -> $"%s{fieldIdent f}: %s{zigType t}")
 
+        // A generic type is a Zig function from its type arguments to the type.
+        let opening, closing, ind =
+            match e.TypeParams with
+            | [] -> (fun (kind: string) -> $"pub const %s{topIdent e.Name} = %s{kind} {{"), "};", ""
+            | typeParams ->
+                let comptimeParams =
+                    typeParams
+                    |> List.map (fun g -> $"comptime %s{genName g}: type")
+                    |> String.concat ", "
+
+                (fun (kind: string) ->
+                    $"pub fn %s{topIdent e.Name}(%s{comptimeParams}) type {{\n    return %s{kind} {{"
+                ),
+                "    };\n}",
+                "    "
+
         match e.Kind with
         | KRecord ->
-            out.AppendLine($"pub const %s{topIdent e.Name} = struct {{") |> ignore
+            out.AppendLine(opening "struct") |> ignore
 
-            for f in fields (caseFields (TEnt e) "") do
-                out.AppendLine($"    %s{f},") |> ignore
+            for f in fields (snd e.Cases.Head) do
+                out.AppendLine($"%s{ind}    %s{f},") |> ignore
         | KValueUnion ->
-            out.AppendLine($"pub const %s{topIdent e.Name} = union(enum) {{") |> ignore
+            out.AppendLine(opening "union(enum)") |> ignore
 
             for (c, fs) in e.Cases do
                 if fs.IsEmpty then
-                    out.AppendLine($"    %s{fieldIdent c},") |> ignore
+                    out.AppendLine($"%s{ind}    %s{fieldIdent c},") |> ignore
                 else
                     let payload = fields fs |> String.concat ", "
-                    out.AppendLine($"    %s{fieldIdent c}: struct {{ %s{payload} }},") |> ignore
+
+                    out.AppendLine($"%s{ind}    %s{fieldIdent c}: struct {{ %s{payload} }},")
+                    |> ignore
         | KHeapUnion ->
             // a case with fields points to a reference-counted cell; one without needs none
-            out.AppendLine($"pub const %s{topIdent e.Name} = union(enum) {{") |> ignore
+            out.AppendLine(opening "union(enum)") |> ignore
 
             for (c, fs) in e.Cases do
                 if fs.IsEmpty then
-                    out.AppendLine($"    %s{fieldIdent c},") |> ignore
+                    out.AppendLine($"%s{ind}    %s{fieldIdent c},") |> ignore
                 else
                     let payload = "@\"$rc\": u32 = 1" :: fields fs |> String.concat ", "
-                    out.AppendLine($"    %s{fieldIdent c}: *struct {{ %s{payload} }},") |> ignore
 
-        out.AppendLine("};").AppendLine() |> ignore
+                    out.AppendLine($"%s{ind}    %s{fieldIdent c}: *struct {{ %s{payload} }},")
+                    |> ignore
+
+        out.AppendLine(closing).AppendLine() |> ignore
 
     for (name, ty, text) in state.Consts do
         out.AppendLine($"pub const %s{topIdent name}: %s{zigType ty} = %s{text};")
@@ -1082,7 +1218,7 @@ let emitFile (state: FileState) : string =
     if state.Consts.Count > 0 then
         out.AppendLine() |> ignore
 
-    let adapters = Dictionary<string, int * Ty>()
+    let adapters = Dictionary<string, Adapter>()
     let fns = Dictionary<string, FnInfo>()
 
     for fn in state.Fns do
@@ -1094,9 +1230,8 @@ let emitFile (state: FileState) : string =
         with ZigError(msg, None) ->
             raise (ZigError(msg, fn.Range))
 
-    for kv in adapters do
-        let (nCaptures, ty) = kv.Value
-        emitAdapter out fns kv.Key nCaptures ty
+    for a in adapters.Values do
+        emitAdapter out fns a
 
     // The F# entry point returns the process exit code as an int; Zig's `main` returns a u8.
     // In builds that count cells, a program that ends with cells still allocated says so.

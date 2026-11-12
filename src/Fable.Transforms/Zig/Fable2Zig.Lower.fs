@@ -9,8 +9,8 @@ open Fable.Transforms
 open Fable.Transforms.Zig.IR
 
 type MemberKind =
-    /// how many arguments the function takes (as Fable counts them), and its result type
-    | MFunction of arity: int * ret: Fable.Type
+    /// a function: its type parameters, the types of its arguments, and its result type
+    | MFunction of typeParams: string list * argTypes: Fable.Type list * ret: Fable.Type
     | MConst of Ty
 
 /// A lambda, or a function declared inside another one. It is compiled as a function of the
@@ -22,7 +22,7 @@ type LocalFn =
         FnName: string
         /// the surrounding variables it uses, by their names there
         CaptureNames: string list
-        Arity: int
+        ArgTypes: Fable.Type list
         Ret: Fable.Type
     }
 
@@ -36,8 +36,9 @@ type Ctx =
         Members: Dictionary<string, MemberKind>
         /// the functions declared inside the function being lowered
         LocalFns: Dictionary<string, LocalFn>
-        /// the name of the module-level function being lowered
+        /// the name of the module-level function being lowered, and its type parameters
         FnBase: string
+        TypeParams: string list
         /// the names of the file's functions, to give the ones made here names of their own
         Reserved: HashSet<string>
         DecisionTargets: (Fable.Ident list * Fable.Expr) list
@@ -50,9 +51,15 @@ type Callable =
         Target: string
         /// the values it takes before its own arguments
         Captures: Expr list
-        Arity: int
+        /// its type parameters, the types of its arguments and of its result as declared
+        TypeParams: string list
+        ArgTypes: Fable.Type list
         Ret: Fable.Type
+        /// a function declared inside the one being lowered has that one's type parameters
+        IsLocal: bool
     }
+
+    member c.Arity = c.ArgTypes.Length
 
 let private exprKind (e: Fable.Expr) =
     match e with
@@ -116,11 +123,38 @@ let private settleManaged (state: FileState) =
         for e in state.Ents.Values do
             let m =
                 e.Kind = KHeapUnion
-                || e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> isManaged))
+                || e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> isManagedDecl))
 
             if m <> e.Managed then
                 e.Managed <- m
                 changed <- true
+
+let private listName = "Microsoft.FSharp.Collections.FSharpList`1"
+
+/// F#'s list: a generic recursive union that the runtime library declares.
+let private listEnt (state: FileState) : Ent =
+    match state.Ents.TryGetValue listName with
+    | true, e -> e
+    | _ ->
+        let e =
+            {
+                Name = "fable_rt.List"
+                Ref =
+                    {
+                        FullName = listName
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KHeapUnion
+                TypeParams = [ "T" ]
+                Cases = []
+                Managed = true
+                Copyable = true
+                IsLocal = false
+            }
+
+        e.Cases <- [ "Empty", []; "Cons", [ "Head", TGen "T"; "Tail", TEnt(e, [ TGen "T" ]) ] ]
+        state.Ents[listName] <- e
+        e
 
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
@@ -147,27 +181,15 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         | BigInt -> fail r "the Zig target does not support bigint yet"
         | Decimal -> fail r "the Zig target does not support decimal yet"
     | Fable.String -> fail r "the Zig target does not support strings yet"
-    | Fable.LambdaType(arg, ret) ->
-        TFn(
-            (match arg with
-             | Fable.Unit -> []
-             | _ -> [ mapType ctx r arg ]),
-            mapType ctx r ret
-        )
-    | Fable.DelegateType(args, ret) ->
-        TFn(
-            args
-            |> List.filter (fun a ->
-                match a with
-                | Fable.Unit -> false
-                | _ -> true
-            )
-            |> List.map (mapType ctx r),
-            mapType ctx r ret
-        )
+    // (a unit argument stays, as `void`: a function value has one shape whatever its type
+    // parameters stand for)
+    | Fable.LambdaType(arg, ret) -> TFn([ mapType ctx r arg ], mapType ctx r ret)
+    | Fable.DelegateType(args, ret) -> TFn(args |> List.map (mapType ctx r), mapType ctx r ret)
     | Fable.Tuple(ts, _) -> TTuple(ts |> List.map (mapType ctx r))
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
-    | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent genArgs)
+    | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
+    | Fable.GenericParam(name = name) -> TGen name
+    | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapType ctx r))
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
 
 /// The record or union behind an entity reference. Immutable, non-recursive records and
@@ -175,7 +197,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
 /// A union that contains itself is a handle: a `union(enum)` whose cases with fields point to
 /// reference-counted cells. (A record that reaches itself only through such unions is still a
 /// plain value.)
-and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) (genArgs: Fable.Type list) : Ent =
+and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent =
     match ctx.State.Ents.TryGetValue entRef.FullName with
     | true, e -> e
     | _ ->
@@ -186,9 +208,6 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) (genAr
 
         if not (ent.IsFSharpRecord || ent.IsFSharpUnion) then
             fail r "the Zig target does not support the type %s yet" entRef.FullName
-
-        if not genArgs.IsEmpty || not ent.GenericParameters.IsEmpty then
-            fail r "the Zig target does not support generic types yet (%s)" ent.DisplayName
 
         let recursive = reachesSelf ctx.Com true ent
 
@@ -223,6 +242,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) (genAr
                         KHeapUnion
                     else
                         KValueUnion
+                TypeParams = ent.GenericParameters |> List.map (fun g -> g.Name)
                 Cases = []
                 Managed = false
                 Copyable = true
@@ -447,18 +467,22 @@ let private tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
                 {
                     Target = fn.FnName
                     Captures = captureExprs ctx id.Range fn.CaptureNames
-                    Arity = fn.Arity
+                    TypeParams = ctx.TypeParams
+                    ArgTypes = fn.ArgTypes
                     Ret = fn.Ret
+                    IsLocal = true
                 }
         | _ ->
             match ctx.Members.TryGetValue id.Name with
-            | true, MFunction(arity, ret) ->
+            | true, MFunction(typeParams, argTypes, ret) ->
                 Some
                     {
                         Target = id.Name
                         Captures = []
-                        Arity = arity
+                        TypeParams = typeParams
+                        ArgTypes = argTypes
                         Ret = ret
+                        IsLocal = false
                     }
             | _ -> None
     | Fable.Import(imp, _, _) ->
@@ -466,19 +490,60 @@ let private tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
         | Fable.MemberImport memberRef ->
             match ctx.Com.TryGetMember memberRef with
             | Some m when not m.IsValue ->
+                let argTypes =
+                    match m.CurriedParameterGroups |> List.concat |> List.map (fun p -> p.Type) with
+                    | [] -> [ Fable.Unit ]
+                    | ts -> ts
+
                 Some
                     {
                         Target = importAlias ctx imp.Path + "." + imp.Selector
                         Captures = []
-                        Arity = max 1 (m.CurriedParameterGroups |> List.sumBy List.length)
+                        TypeParams = m.GenericParameters |> List.map (fun g -> g.Name)
+                        ArgTypes = argTypes
                         Ret = m.ReturnParameter.Type
+                        IsLocal = false
                     }
             | _ -> None
         | _ -> None
     | _ -> None
 
-let private nonUnit (args: Fable.Expr list) =
-    args |> List.filter (fun a -> not (isUnit a.Type))
+/// What the type parameters of `pattern` stand for, if `actual` is an instance of it.
+let rec private unify (found: Dictionary<string, Fable.Type>) (pattern: Fable.Type) (actual: Fable.Type) : unit =
+    let all (ps: Fable.Type list) (xs: Fable.Type list) =
+        if ps.Length = xs.Length then
+            List.iter2 (unify found) ps xs
+
+    /// a function type as the list of its arguments and its last result
+    let rec uncurried (t: Fable.Type) : Fable.Type list * Fable.Type =
+        match t with
+        | Fable.LambdaType(a, ret) ->
+            let rest, last = uncurried ret
+            a :: rest, last
+        | Fable.DelegateType(args, ret) ->
+            let rest, last = uncurried ret
+            args @ rest, last
+        | _ -> [], t
+
+    match pattern, actual with
+    | Fable.GenericParam(name = name), _ ->
+        if not (found.ContainsKey name) then
+            found[name] <- actual
+    | Fable.LambdaType(a1, r1), Fable.LambdaType(a2, r2) ->
+        unify found a1 a2
+        unify found r1 r2
+    | (Fable.LambdaType _ | Fable.DelegateType _), (Fable.LambdaType _ | Fable.DelegateType _) ->
+        // (one of them is written with its arguments in one step, the other is not)
+        let args1, ret1 = uncurried pattern
+        let args2, ret2 = uncurried actual
+
+        if args1.Length = args2.Length then
+            all args1 args2
+            unify found ret1 ret2
+    | Fable.Tuple(ts1, _), Fable.Tuple(ts2, _) -> all ts1 ts2
+    | Fable.Option(t1, _), Fable.Option(t2, _) -> unify found t1 t2
+    | Fable.DeclaredType(_, g1), Fable.DeclaredType(_, g2) -> all g1 g2
+    | _ -> all pattern.Generics actual.Generics
 
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
@@ -496,18 +561,26 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.NumberConstant(v, _) -> ELit(numberLit r v)
         | Fable.CharConstant c -> ELit(string<int>(int c), TPrim "u16")
         | Fable.NewRecord(values, entRef, genArgs) ->
-            let ent = entOf ctx r entRef genArgs
-            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TEnt ent, "", xs, None))
+            let ty = TEnt(entOf ctx r entRef, genArgs |> List.map (mapType ctx r))
+            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
         | Fable.NewUnion(values, tag, entRef, genArgs) ->
-            let ent = entOf ctx r entRef genArgs
+            let ent = entOf ctx r entRef
+            let ty = TEnt(ent, genArgs |> List.map (mapType ctx r))
             let case = fst (List.item tag ent.Cases)
-            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TEnt ent, case, xs, None))
+            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, case, xs, None))
         | Fable.NewTuple(values, _) ->
             bindArgsIn
                 true
                 ctx
                 (values |> List.map (lw ctx))
                 (fun xs -> ECon(TTuple(xs |> List.map typeOf), "", xs, None))
+        | Fable.NewList(headAndTail, t) ->
+            let ty = TEnt(listEnt ctx.State, [ mapType ctx r t ])
+
+            match headAndTail with
+            | Some(head, tail) ->
+                bindArgsIn true ctx [ lw ctx head; lw ctx tail ] (fun xs -> ECon(ty, "Cons", xs, None))
+            | None -> ECon(ty, "Empty", [], None)
         | Fable.NewOption(value, t, _) ->
             let ty = TOpt(mapType ctx r t)
 
@@ -515,6 +588,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | Some v -> bindArgsIn true ctx [ lw ctx v ] (fun xs -> ECon(ty, "Some", xs, None))
             | None -> ECon(ty, "None", [], None)
         | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
+
+    // (unit has one value: a variable of that type is never read)
+    | Fable.IdentExpr id when isUnit id.Type -> EUnit
 
     | Fable.IdentExpr id ->
         match ctx.Vars.TryGetValue id.Name with
@@ -558,7 +634,13 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.Lambda _
     | Fable.Delegate _ ->
         let fn = liftGroup ctx e.Range [ None, "lambda", e ] |> List.head
-        EClosure(fn.FnName, captureExprs ctx e.Range fn.CaptureNames, mapType ctx e.Range e.Type)
+
+        EClosure(
+            fn.FnName,
+            ctx.TypeParams |> List.map TGen,
+            captureExprs ctx e.Range fn.CaptureNames,
+            mapType ctx e.Range e.Type
+        )
 
     // a function with several arguments that is used one argument at a time
     | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
@@ -674,12 +756,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 let v = xs.Head
 
                 match kind, typeOf v with
-                | Fable.FieldGet info, TEnt ent when ent.Kind = KRecord -> EGet(v, PField info.Name, ty)
+                | Fable.FieldGet info, TEnt(ent, _) when ent.Kind = KRecord -> EGet(v, PField info.Name, ty)
                 | Fable.TupleIndex i, TTuple _ -> EGet(v, PItem i, ty)
-                | Fable.UnionField info, TEnt ent ->
+                | Fable.UnionField info, TEnt(ent, _) ->
                     let case, fields = List.item info.CaseIndex ent.Cases
                     EGet(v, PCase(case, fst (List.item info.FieldIndex fields)), ty)
                 | Fable.UnionTag, TEnt _ -> EPrim("tag", [ v ], tI32)
+                | Fable.ListHead, TEnt _ -> EGet(v, PCase("Cons", "Head"), ty)
+                | Fable.ListTail, TEnt _ -> EGet(v, PCase("Cons", "Tail"), ty)
                 | Fable.OptionValue, TOpt _ -> EGet(v, PSome, ty)
                 | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
             )
@@ -692,7 +776,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 let v = xs.Head
 
                 match kind, typeOf v with
-                | Fable.UnionCaseTest tag, (TEnt ent as t) -> ETest(v, fst (List.item tag ent.Cases), t)
+                | Fable.UnionCaseTest tag, (TEnt(ent, _) as t) -> ETest(v, fst (List.item tag ent.Cases), t)
+                | Fable.ListTest isCons, (TEnt _ as t) ->
+                    ETest(
+                        v,
+                        (if isCons then
+                             "Cons"
+                         else
+                             "Empty"),
+                        t
+                    )
                 | Fable.OptionTest isSome, (TOpt _ as t) ->
                     ETest(
                         v,
@@ -711,10 +804,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         if info.ThisArg.IsSome then
             fail r "the Zig target does not support method calls yet"
 
-        let args = nonUnit info.Args |> List.map (lw ctx)
+        let args = info.Args |> List.map (lw ctx)
 
         match tryCallable ctx callee, callee with
-        | Some c, _ -> bindArgs ctx args (fun xs -> ECall(c.Target, c.Captures @ xs, ty))
+        | Some c, _ ->
+            let typeArgs, _ =
+                typeArgsOf ctx r c (Some info.GenericArgs) (info.Args |> List.map (fun a -> a.Type)) (Some t)
+
+            bindArgs ctx args (fun xs -> ECall(c.Target, typeArgs, c.Captures @ xs, ty))
         | None, Fable.Import(imp, _, _) ->
             fail r "the Zig target does not support this library call yet (%s from %s)" imp.Selector imp.Path
         // a function value: all its arguments at once
@@ -724,18 +821,33 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         match tryCallable ctx applied with
         | Some c when args.Length >= c.Arity ->
             let now, rest = List.splitAt c.Arity args
-            let nowIr = nonUnit now |> List.map (lw ctx)
+            let nowIr = now |> List.map (lw ctx)
+
+            let typeArgs, subst =
+                typeArgsOf
+                    ctx
+                    r
+                    c
+                    None
+                    (now |> List.map (fun a -> a.Type))
+                    (if rest.IsEmpty then
+                         Some t
+                     else
+                         None)
 
             if rest.IsEmpty then
-                bindArgs ctx nowIr (fun xs -> ECall(c.Target, c.Captures @ xs, mapType ctx r t))
+                bindArgs ctx nowIr (fun xs -> ECall(c.Target, typeArgs, c.Captures @ xs, mapType ctx r t))
             else
                 // the function returns a function, which gets the other arguments
                 let first =
-                    bindArgs ctx nowIr (fun xs -> ECall(c.Target, c.Captures @ xs, mapType ctx r c.Ret))
+                    bindArgs
+                        ctx
+                        nowIr
+                        (fun xs -> ECall(c.Target, typeArgs, c.Captures @ xs, substTy subst (mapType ctx r c.Ret)))
 
-                applyValue ctx r first c.Ret rest t
-        | Some c -> applyValue ctx r (fnValue ctx r applied c applied.Type) applied.Type args t
-        | None -> applyValue ctx r (lw ctx applied) applied.Type args t
+                applyValue ctx r subst first c.Ret rest t
+        | Some c -> applyValue ctx r Map.empty (fnValue ctx r applied c applied.Type) applied.Type args t
+        | None -> applyValue ctx r Map.empty (lw ctx applied) applied.Type args t
 
     | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, r) ->
         match ctx.Vars.TryGetValue id.Name with
@@ -775,10 +887,56 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     | _ -> fail e.Range "the Zig target does not support %s yet" (exprKind e)
 
-/// Apply a function value to arguments, as many at a time as its type takes.
+/// The type arguments of a call of `c`, and what its type parameters stand for. They are what
+/// Fable says they are when it says; otherwise they follow from the types of the arguments
+/// and of the result.
+and typeArgsOf
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (c: Callable)
+    (given: Fable.Type list option)
+    (argTypes: Fable.Type list)
+    (resultType: Fable.Type option)
+    : Ty list * Map<string, Ty>
+    =
+    if c.IsLocal then
+        c.TypeParams |> List.map TGen, Map.empty
+    elif c.TypeParams.IsEmpty then
+        [], Map.empty
+    else
+        let tys =
+            match given with
+            | Some given when given.Length = c.TypeParams.Length -> given |> List.map (mapType ctx r)
+            | _ ->
+                let found = Dictionary<string, Fable.Type>()
+
+                for (declared, actual) in
+                    List.zip (List.truncate argTypes.Length c.ArgTypes) (List.truncate c.Arity argTypes) do
+                    unify found declared actual
+
+                resultType |> Option.iter (unify found c.Ret)
+
+                c.TypeParams
+                |> List.map (fun name ->
+                    match found.TryGetValue name with
+                    | true, t -> mapType ctx r t
+                    | _ ->
+                        fail
+                            r
+                            "the Zig target cannot tell what the type parameter '%s of `%s` stands for here"
+                            name
+                            c.Target
+                )
+
+        tys, Map.ofList (List.zip c.TypeParams tys)
+
+/// Apply a function value to arguments, as many at a time as its type takes. (`subst` says
+/// what the type parameters in `fTy` stand for, when it is the declared result type of a
+/// generic function.)
 and applyValue
     (ctx: Ctx)
     (r: SourceLocation option)
+    (subst: Map<string, Ty>)
     (f: Expr)
     (fTy: Fable.Type)
     (args: Fable.Expr list)
@@ -791,7 +949,7 @@ and applyValue
         let take, ret =
             match fTy with
             | Fable.LambdaType(_, ret) -> 1, ret
-            | Fable.DelegateType(ts, ret) -> max 1 ts.Length, ret
+            | Fable.DelegateType(ts, ret) -> ts.Length, ret
             | _ -> fail r "the Zig target cannot apply a value of this type"
 
         if args.Length < take then
@@ -801,28 +959,32 @@ and applyValue
 
         let resultTy =
             if rest.IsEmpty then
-                finalTy
+                mapType ctx r finalTy
             else
-                ret
+                substTy subst (mapType ctx r ret)
 
         let call =
-            bindArgs
-                ctx
-                (f :: (nonUnit now |> List.map (lw ctx)))
-                (fun xs -> ECallClo(xs.Head, xs.Tail, mapType ctx r resultTy))
+            bindArgs ctx (f :: (now |> List.map (lw ctx))) (fun xs -> ECallClo(xs.Head, xs.Tail, resultTy))
 
-        applyValue ctx r call ret rest finalTy
+        applyValue ctx r subst call ret rest finalTy
 
 /// A function that is called by name, used as a value of type `valueTy`.
 and fnValue (ctx: Ctx) (r: SourceLocation option) (orig: Fable.Expr) (c: Callable) (valueTy: Fable.Type) : Expr =
     let sameShape =
         match valueTy with
         | Fable.LambdaType _ -> c.Arity = 1
-        | Fable.DelegateType(ts, _) -> max 1 ts.Length = c.Arity
+        | Fable.DelegateType(ts, _) -> ts.Length = c.Arity
         | _ -> false
 
     if sameShape then
-        EClosure(c.Target, c.Captures, mapType ctx r valueTy)
+        let argTypes, resultType =
+            match valueTy with
+            | Fable.LambdaType(a, ret) -> [ a ], ret
+            | Fable.DelegateType(ts, ret) -> ts, ret
+            | _ -> [], valueTy
+
+        let typeArgs, _ = typeArgsOf ctx r c None argTypes (Some resultType)
+        EClosure(c.Target, typeArgs, c.Captures, mapType ctx r valueTy)
     else
         // The value takes its arguments in other steps than the function does (`let add a b`
         // used as `int -> int -> int`): lambdas that collect them, then the call.
@@ -841,7 +1003,6 @@ and fnValue (ctx: Ctx) (r: SourceLocation option) (orig: Fable.Expr) (c: Callabl
                     Fable.Lambda(x, build ret (acc @ [ Fable.IdentExpr x ]), None)
                 | Fable.DelegateType(ts, ret) ->
                     let xs = ts |> List.map fresh
-
                     Fable.Delegate(xs, build ret (acc @ (xs |> List.map Fable.IdentExpr)), None, [])
                 | _ -> fail r "the Zig target cannot use this function as a value of this type"
 
@@ -883,7 +1044,7 @@ and liftGroup
             {
                 FnName = uniqueName ctx $"%s{ctx.FnBase}_%s{hint}"
                 CaptureNames = captureNames
-                Arity = max 1 args.Length
+                ArgTypes = args |> List.map (fun a -> a.Type)
                 Ret = body.Type
             }
         )
@@ -918,7 +1079,6 @@ and liftGroup
 
         let ps =
             args
-            |> List.filter (fun a -> not (isUnit a.Type))
             |> List.map (fun a ->
                 let v = ctx.State.NewVar(a.Name, mapType ctx a.Range a.Type, VParam, false)
                 vars[a.Name] <- v
@@ -926,11 +1086,26 @@ and liftGroup
             )
 
         let ret = mapType ctx body.Range body.Type
+
+        // F# lets a function declared inside another one have type parameters of its own; it
+        // would have to be compiled once per use.
+        match
+            freeGens (ret :: (ps |> List.map (fun v -> v.Ty)))
+            |> List.filter (fun g -> not (List.contains g ctx.TypeParams))
+        with
+        | [] -> ()
+        | g :: _ ->
+            fail
+                r
+                "the Zig target does not support a generic function declared inside a function yet (type parameter '%s)"
+                g
+
         let bodyIr = lw inner body
 
         ctx.State.Fns.Add
             {
                 Name = fn.FnName
+                TypeParams = ctx.TypeParams
                 Params = captured @ ps
                 Modes = (captured @ ps) |> List.map (fun _ -> MPlain)
                 Ret = ret
@@ -956,7 +1131,23 @@ and dotnetCall
     =
     let isNumber (ty: Ty) = intBits ty > 0 || isFloatTy ty
 
-    match entity, name, info.Args with
+    // (the object of a property or method comes first)
+    let args =
+        match info.ThisArg with
+        | Some this -> this :: info.Args
+        | None -> info.Args
+
+    match entity, name, args with
+    // lists: what does not need a loop is a test or a field
+    | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
+      ("get_IsEmpty" | "IsEmpty"),
+      x :: _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ETest(xs.Head, "Empty", typeOf xs.Head))
+    | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
+      ("get_Head" | "Head"),
+      x :: _ -> bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PCase("Cons", "Head"), mapType ctx r t))
+    | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
+      ("get_Tail" | "Tail"),
+      x :: _ -> bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PCase("Cons", "Tail"), mapType ctx r t))
     // structural equality of records, unions, tuples and options: plain values, compared
     // field by field
     | "Microsoft.FSharp.Core.Operators", "op_Equality", [ a; b ] ->
@@ -1018,6 +1209,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             Members = members
             LocalFns = Dictionary()
             FnBase = fnBase
+            TypeParams = []
             Reserved = reserved
             DecisionTargets = []
         }
@@ -1038,7 +1230,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 match com.TryGetEntity c.Entity with
                 | Some ent when ent.IsFSharpRecord || ent.IsFSharpUnion ->
                     try
-                        entOf (newCtx c.Name) None c.Entity [] |> ignore
+                        entOf (newCtx c.Name) None c.Entity |> ignore
 
                         if not c.AttachedMembers.IsEmpty then
                             report None $"the Zig target does not support members of types yet (%s{c.Name})"
@@ -1061,13 +1253,19 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             if info.IsValue then
                 members[d.Name] <- MConst(mapType (newCtx d.Name) d.Body.Range d.Body.Type)
             else
-                members[d.Name] <- MFunction(max 1 d.Args.Length, d.Body.Type)
+                members[d.Name] <-
+                    MFunction(
+                        info.GenericParameters |> List.map (fun g -> g.Name),
+                        d.Args |> List.map (fun a -> a.Type),
+                        d.Body.Type
+                    )
         with ZigError(msg, r) ->
             report r msg
 
     for d in decls do
         let info = com.GetMember d.MemberRef
-        let ctx = newCtx d.Name
+        let typeParams = info.GenericParameters |> List.map (fun g -> g.Name)
+        let ctx = { newCtx d.Name with TypeParams = typeParams }
 
         try
             if info.IsValue then
@@ -1084,7 +1282,6 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         [] // (the argument array is not available yet)
                     else
                         d.Args
-                        |> List.filter (fun a -> not (isUnit a.Type))
                         |> List.map (fun a ->
                             let v = state.NewVar(a.Name, mapType ctx a.Range a.Type, VParam, false)
                             ctx.Vars[a.Name] <- v
@@ -1097,6 +1294,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 state.Fns.Add
                     {
                         Name = d.Name
+                        TypeParams = typeParams
                         Params = ps
                         Modes = ps |> List.map (fun _ -> MPlain)
                         Ret = ret

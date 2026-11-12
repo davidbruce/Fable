@@ -327,11 +327,11 @@ let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
             | EVar v ->
                 if owning then
                     acc.Add v.Id |> ignore
-            | ECall(f, xs, _) -> List.iter2 (fun m x -> go (m = MOwned) x) (modesOf p f xs) xs
+            | ECall(f, _, xs, _) -> List.iter2 (fun m x -> go (m = MOwned) x) (modesOf p f xs) xs
             | ECallClo(f, xs, _) ->
                 go false f
                 List.iter (go true) xs
-            | EClosure(_, xs, _)
+            | EClosure(_, _, xs, _)
             | ECon(_, _, xs, _) -> List.iter (go true) xs
             | _ -> List.iter (go false) (flatKids e)
 
@@ -359,7 +359,7 @@ let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
 
 let private isReuseSite (body: Expr) (param: Var) =
     match param.Ty with
-    | TEnt ent when ent.Kind = KHeapUnion ->
+    | TEnt(ent, _) when ent.Kind = KHeapUnion ->
         exists
             (function
             | ETest(EVar x, _, _) -> x.Id = param.Id
@@ -367,7 +367,7 @@ let private isReuseSite (body: Expr) (param: Var) =
             body
         && exists
             (function
-            | ECon(TEnt e2, _, xs, _) -> obj.ReferenceEquals(e2, ent) && not xs.IsEmpty
+            | ECon(TEnt(e2, _), _, xs, _) -> obj.ReferenceEquals(e2, ent) && not xs.IsEmpty
             | _ -> false)
             body
     | _ -> false
@@ -386,7 +386,7 @@ let rec private borrowSources (p: P) (fn: FnInfo) (aliases: Map<int, Set<int>>) 
         | None -> aliases.TryFind v.Id
     | EGet(x, _, _) -> borrowSources p fn aliases x
     | ECon(_, _, [], _) -> Some Set.empty // a constructor without fields owns nothing
-    | ECall(g, args, _) ->
+    | ECall(g, _, args, _) ->
         match p.Fns.TryGetValue g with
         | true, gi when gi.RetFrom.IsSome ->
             gi.RetFrom.Value
@@ -498,7 +498,7 @@ type private PEnv =
         Known: Map<string, string>
         Excluded: Map<string, Set<string>>
         /// reuse tokens that are available: (token, cell shape)
-        Tokens: (Var * string) list
+        Tokens: (Var * (Ty * string)) list
         /// the function returns a borrow, so tail values are not made owned
         TailBorrowed: bool
     }
@@ -571,12 +571,12 @@ let private expand (env: PEnv) (s: Set<int>) =
 let private ownersStar env b =
     Set.remove b (expand env (Set.singleton b))
 
-/// Is there a constructor of the given cell shape in `e` (outside loops)?
-let rec private hasConOfShape (shape: string) (e: Expr) =
+/// Is there a constructor in `e` (outside loops) that could be built in a dead cell of `shape`?
+let rec private hasConOfShape (shape: Ty * string) (e: Expr) =
     match e with
     | EWhile _
     | EFor _ -> false
-    | ECon(TEnt ent, c, xs, _) when ent.Kind = KHeapUnion && not xs.IsEmpty && cellShape ent c = shape -> true
+    | ECon(t, c, xs, _) when isHeapTy t && not xs.IsEmpty && cellsMatch shape (t, c) -> true
     | ELet(_, r, b) -> hasConOfShape shape r || hasConOfShape shape b
     | ESeq(a, b) -> hasConOfShape shape a || hasConOfShape shape b
     | EIf(_, t, f, _) -> hasConOfShape shape t || hasConOfShape shape f
@@ -597,7 +597,7 @@ let private tryUnpack (p: P) (env: PEnv) (x: int) (borrowers: Set<int>) (e: Expr
 
     let case =
         match xv.Ty with
-        | TEnt ent when ent.Kind = KRecord -> Some ""
+        | TEnt(ent, _) when ent.Kind = KRecord -> Some ""
         | TTuple _ -> Some ""
         | _ -> env.Known.TryFind(vk x)
     // The aliases of x's own fields move out; deeper aliases must hang off one of them (they
@@ -643,10 +643,10 @@ let private tryUnpack (p: P) (env: PEnv) (x: int) (borrowers: Set<int>) (e: Expr
             let heap = isHeapTy xv.Ty
 
             let token =
-                match xv.Ty with
-                | TEnt ent when heap && hasConOfShape (cellShape ent case) e ->
-                    Some(p.State.NewVar("ru_" + xv.Base, TTok(ent, case), VLocal, false))
-                | _ -> None
+                if heap && hasConOfShape (xv.Ty, case) e then
+                    Some(p.State.NewVar("ru_" + xv.Base, TTok(xv.Ty, case), VLocal, false))
+                else
+                    None
 
             let env' =
                 { env with
@@ -654,9 +654,9 @@ let private tryUnpack (p: P) (env: PEnv) (x: int) (borrowers: Set<int>) (e: Expr
                     Children = borrowers |> Set.fold (fun m b -> Map.remove b m) env.Children
                     Owners = borrowers |> Set.fold (fun m b -> Map.remove b m) env.Owners
                     Tokens =
-                        match token, xv.Ty with
-                        | Some t, TEnt ent -> (t, cellShape ent case) :: env.Tokens
-                        | _ -> env.Tokens
+                        match token with
+                        | Some t -> (t, (xv.Ty, case)) :: env.Tokens
+                        | None -> env.Tokens
                 }
 
             let op =
@@ -800,8 +800,8 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
 
     let takeToken (e: Expr) =
         match e with
-        | ECon(TEnt ent as t, c, xs, None) when ent.Kind = KHeapUnion && not xs.IsEmpty ->
-            match tokens |> List.tryFind (fun (_, shape) -> shape = cellShape ent c) with
+        | ECon(t, c, xs, None) when isHeapTy t && not xs.IsEmpty ->
+            match tokens |> List.tryFind (fun (_, shape) -> cellsMatch shape (t, c)) with
             | Some(tok, _) ->
                 tokens <- tokens |> List.filter (fun (t2, _) -> t2.Id <> tok.Id)
                 ECon(t, c, xs, Some tok)
@@ -828,9 +828,9 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
 
             let flags =
                 match e with
-                | ECall(f, xs, _) -> modesOf p f xs |> List.map (fun m -> m = MOwned)
+                | ECall(f, _, xs, _) -> modesOf p f xs |> List.map (fun m -> m = MOwned)
                 | ECallClo(_, xs, _) -> false :: (xs |> List.map (fun _ -> true))
-                | EClosure(_, xs, _)
+                | EClosure(_, _, xs, _)
                 | ECon(_, _, xs, _) -> xs |> List.map (fun _ -> true)
                 | _ -> kids |> List.map (fun _ -> false)
 
@@ -840,7 +840,7 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
             | EGet _
             | EDeref _
             | EIndex _ when owning && isManaged (typeOf e') -> mkDup e' (typeOf e')
-            | ECall(g, _, _) when owning && isBorrowedRet p g && isManaged (typeOf e') -> mkDup e' (typeOf e')
+            | ECall(g, _, _, _) when owning && isBorrowedRet p g && isManaged (typeOf e') -> mkDup e' (typeOf e')
             | ECon _ -> takeToken e'
             | _ -> e'
 
@@ -1029,7 +1029,7 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
                     | _ -> env1
 
                 env1, true
-            | ECall(g, args, _) when
+            | ECall(g, _, args, _) when
                 isManaged v.Ty
                 && not v.FMutable
                 && isBorrowedRet p g

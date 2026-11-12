@@ -44,12 +44,15 @@ Types that are plain values, also when another file declares them:
 | union that contains itself | `union(enum)` whose cases point to reference-counted cells |
 | tuple, struct tuple | `@Tuple(&.{ ... })` |
 | `option`, `voption` | `?T` |
+| `list` | `fable_rt.List(T)`, a recursive union of the runtime library |
+| generic record or union | a Zig function from its type arguments to the type |
+| `unit` | `void`; a unit argument is passed, it has no size |
 
 with construction, copy-and-update, field access, pattern matching and structural equality.
 A record, union, tuple or option that holds a recursive union is still a plain value; the
 references inside it are counted. Not yet: recursive records and records with mutable fields,
-generic types, members on types, ordering comparison, module-level values that are not
-literals.
+members on types, ordering comparison, module-level values that are not literals, and the
+functions of the `List` module (literals, `::`, patterns, `IsEmpty`, `Head` and `Tail` work).
 
 `[<Emit("...")>]` is supported for Zig text, with `$0`, `$1`, ... standing for the arguments.
 
@@ -117,6 +120,38 @@ has to assume the other function consumes it (assuming the opposite would cost i
 reuse, which is worth more). So the callers of such a forwarding function pay a dup and a
 drop where code in one file would pay nothing.
 
+## Generics
+
+A generic function is compiled once, for any type, and Zig makes the instances:
+
+```zig
+pub fn map(comptime @"'T": type, comptime @"'U": type) type {
+    return struct {
+        pub fn call(f: fable_rt.Func(*const fn (?*fable_rt.Env, @"'T") @"'U"), xs: Chain(@"'T")) Chain(@"'U") { ... }
+    };
+}
+
+map(i32, bool).call(f, xs)
+```
+
+(a function from types to a namespace, so that `map(i32, bool).call` is an ordinary function
+that can be passed on, also to `fable_rt.across`). This needs nothing shared between file
+compilations either: a generic function of another file is instantiated by Zig like any
+other.
+
+The ownership passes run on the generic code. A value whose type is a type parameter counts
+as managed; its dups and drops are calls of the runtime's generic `dup` and `drop`, which
+compile to nothing when the function is used with `int`. Borrowing is inferred once and
+holds for every instance. Reuse is decided as far as it can be: a dead cell and a new one
+that are the same case of one generic type are paired, and the runtime builds in the dead
+cell only if the two turn out to have the same layout in that instance (`map` over an
+unshared `Chain<int>` to `Chain<int>` allocates nothing; to `Chain<int64>` it allocates).
+
+The type arguments of a call are the ones Fable records; where it records none (a generic
+function used as a value), they are inferred from the types of the arguments and the result.
+
+Not yet: a generic function declared inside another function with type parameters of its own.
+
 ## Function values
 
 Every lambda, and every function declared inside another function, is compiled as a function
@@ -156,7 +191,8 @@ is given, so each call through a function value is an indirect call.
    (done).
 3. ~~What functions of other files borrow~~ (done, at Zig compile time: see "Calls between
    files"). Whether a function of another file can raise will be stated the same way.
-4. ~~Closures and function values~~ (done), generics, exceptions, byrefs and spans.
+4. ~~Closures and function values~~ (done), ~~generics~~ (done), exceptions, byrefs and
+   spans.
 5. Mutable reference records and the cycle collector.
 6. Strings, collections and the rest of FSharp.Core through `Replacements.fs` and the library.
 7. The test suite (`tests/Zig`), starting from the tests the other targets share.

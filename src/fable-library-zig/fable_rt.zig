@@ -4,7 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const interface_version: i32 = 4;
+pub const interface_version: i32 = 5;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -56,14 +56,18 @@ pub inline fn cell(comptime T: type, comptime tag: std.meta.Tag(T), init: Cell(T
 /// Reuse: build in the dead cell that `tok` holds, if it holds one; allocate otherwise.
 pub inline fn cellReuse(comptime T: type, comptime tag: std.meta.Tag(T), tok: anytype, init: Cell(T, tag)) *Cell(T, tag) {
     const C = Cell(T, tag);
-    if (tok.*) |p| {
-        tok.* = null;
-        comptime std.debug.assert(@sizeOf(@TypeOf(p.*)) == @sizeOf(C));
-        comptime std.debug.assert(@alignOf(@TypeOf(p.*)) == @alignOf(C));
-        const c: *C = @ptrCast(@alignCast(p));
-        c.* = init;
-        if (track) stats.reuses += 1;
-        return c;
+    const Dead = @typeInfo(@typeInfo(@TypeOf(tok)).pointer.child).optional.child;
+    // (In generic code the dead cell and the new one are the same case of one generic type,
+    // with type arguments that may differ. Only when they turn out to have one layout is the
+    // dead cell built in; otherwise the token is left alone and its owner frees the cell.)
+    if (comptime (@sizeOf(@typeInfo(Dead).pointer.child) == @sizeOf(C) and @alignOf(@typeInfo(Dead).pointer.child) == @alignOf(C))) {
+        if (tok.*) |p| {
+            tok.* = null;
+            const c: *C = @ptrCast(@alignCast(p));
+            c.* = init;
+            if (track) stats.reuses += 1;
+            return c;
+        }
     }
     return cell(T, tag, init);
 }
@@ -261,6 +265,14 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
         },
         else => comptime unreachable,
     }
+}
+
+/// F#'s list.
+pub fn List(comptime T: type) type {
+    return union(enum) {
+        Empty,
+        Cons: *struct { @"$rc": u32 = 1, Head: T, Tail: List(T) },
+    };
 }
 
 // ---------------------------------------------------------------------------------------------

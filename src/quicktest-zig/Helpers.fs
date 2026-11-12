@@ -61,3 +61,22 @@ let rec incAll (xs: IntList) : IntList =
     match xs with
     | Nil -> Nil
     | Cons(h, t) -> Cons(h + 1, incAll t)
+
+/// (a generic type and generic functions that another file uses)
+type Box<'T> =
+    {
+        Value: 'T
+        Tag: int
+    }
+
+let boxOf (tag: int) (value: 'T) : Box<'T> =
+    {
+        Value = value
+        Tag = tag
+    }
+
+let mapBox (f: 'T -> 'U) (b: Box<'T>) : Box<'U> =
+    {
+        Value = f b.Value
+        Tag = b.Tag
+    }

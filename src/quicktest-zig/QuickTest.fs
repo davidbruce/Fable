@@ -3,7 +3,8 @@ module QuickTest
 // What the Zig target compiles so far: numbers and booleans, let, if, loops, operators,
 // functions (also recursive and across files), pattern matching, records, unions, tuples
 // and options. Heap.fs and Stress.fs cover recursive unions (reference-counted cells),
-// Functions.fs covers lambdas, local functions and function values.
+// Functions.fs covers lambdas, local functions and function values, Generics.fs covers
+// generic types and functions and F#'s list.
 // The entry point returns the number of failed checks as the process exit code.
 
 let limit = 10
@@ -331,3 +332,4 @@ let main _ =
     + Heap.run ()
     + Stress.run ()
     + Functions.run ()
+    + Generics.run ()
