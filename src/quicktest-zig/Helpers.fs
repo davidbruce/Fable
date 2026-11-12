@@ -34,3 +34,30 @@ let area (s: Shape) : float =
     | Circle r -> 3.0 * r * r
     | Rect(w, h) -> w * h
     | Dot -> 0.0
+
+/// (a recursive union: its values live in reference-counted cells; the functions below are
+/// called from another file with such values)
+type IntList =
+    | Nil
+    | Cons of head: int * tail: IntList
+
+let rec rangeFrom (lo: int) (hi: int) : IntList =
+    if lo > hi then
+        Nil
+    else
+        Cons(lo, rangeFrom (lo + 1) hi)
+
+let rec sumList (xs: IntList) : int =
+    match xs with
+    | Nil -> 0
+    | Cons(h, t) -> h + sumList t
+
+let tailOf (xs: IntList) : IntList =
+    match xs with
+    | Nil -> Nil
+    | Cons(_, t) -> t
+
+let rec incAll (xs: IntList) : IntList =
+    match xs with
+    | Nil -> Nil
+    | Cons(h, t) -> Cons(h + 1, incAll t)

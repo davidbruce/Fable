@@ -3,6 +3,7 @@
   <ItemGroup>
     <Compile Include="Zig.IR.fs" />
     <Compile Include="Fable2Zig.Lower.fs" />
+    <Compile Include="Fable2Zig.Perceus.fs" />
     <Compile Include="Fable2Zig.Emit.fs" />
     <Compile Include="Fable2Zig.fs" />
     <Compile Include="ZigPrinter.fs" />

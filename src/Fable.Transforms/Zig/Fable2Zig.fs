@@ -19,6 +19,7 @@ let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
 
     let body =
         try
+            Perceus.run state
             Emit.emitFile state
         with ZigError(msg, r) ->
             com.AddLog(msg, Severity.Error, ?range = r, fileName = com.CurrentFile)
@@ -31,7 +32,7 @@ let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
             |> Seq.sortBy fst
             |> List.ofSeq
         Runtime =
-            if state.UsesRuntime then
+            if state.UsesRuntime || body.Contains "fable_rt." then
                 Some(Fable.Transforms.AST.getLibPath com "fable_rt")
             else
                 None

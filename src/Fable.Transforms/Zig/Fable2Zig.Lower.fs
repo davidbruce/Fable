@@ -43,7 +43,8 @@ let private exprKind (e: Fable.Expr) =
     | _ -> "this construct"
 
 /// Does a record or union contain itself, directly or through other records and unions?
-let private reachesSelf (com: Compiler) (start: Fable.Entity) : bool =
+/// With `throughUnions = false` the search stops at unions.
+let private reachesSelf (com: Compiler) (throughUnions: bool) (start: Fable.Entity) : bool =
     let seen = HashSet<string>()
 
     let rec typeRefs (t: Fable.Type) : Fable.EntityRef list =
@@ -66,12 +67,29 @@ let private reachesSelf (com: Compiler) (start: Fable.Entity) : bool =
             || (seen.Add r.FullName
                 && (
                     match com.TryGetEntity r with
-                    | Some e when e.IsFSharpRecord || e.IsFSharpUnion -> go e
+                    | Some e when e.IsFSharpRecord || (e.IsFSharpUnion && throughUnions) -> go e
                     | _ -> false
                 ))
         )
 
     go start
+
+/// Managed = holds references to cells: a recursive union, or anything that holds a managed
+/// value. Least fixpoint over every type the file has mentioned so far.
+let private settleManaged (state: FileState) =
+    let mutable changed = true
+
+    while changed do
+        changed <- false
+
+        for e in state.Ents.Values do
+            let m =
+                e.Kind = KHeapUnion
+                || e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> isManaged))
+
+            if m <> e.Managed then
+                e.Managed <- m
+                changed <- true
 
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
@@ -107,6 +125,9 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
 
 /// The record or union behind an entity reference. Immutable, non-recursive records and
 /// unions are plain Zig values: a `struct`, or a `union(enum)` with one payload per case.
+/// A union that contains itself is a handle: a `union(enum)` whose cases with fields point to
+/// reference-counted cells. (A record that reaches itself only through such unions is still a
+/// plain value.)
 and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) (genArgs: Fable.Type list) : Ent =
     match ctx.State.Ents.TryGetValue entRef.FullName with
     | true, e -> e
@@ -122,11 +143,10 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) (genAr
         if not genArgs.IsEmpty || not ent.GenericParameters.IsEmpty then
             fail r "the Zig target does not support generic types yet (%s)" ent.DisplayName
 
-        if reachesSelf ctx.Com ent then
-            fail
-                r
-                "the Zig target does not support recursive types yet (%s): they need the reference-counting runtime"
-                ent.DisplayName
+        let recursive = reachesSelf ctx.Com true ent
+
+        if ent.IsFSharpRecord && recursive && reachesSelf ctx.Com false ent then
+            fail r "the Zig target does not support recursive records yet (%s)" ent.DisplayName
 
         if
             ent.IsFSharpRecord
@@ -135,7 +155,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) (genAr
         then
             fail
                 r
-                "the Zig target does not support records with mutable fields yet (%s): they need the reference-counting runtime"
+                "the Zig target does not support records with mutable fields yet (%s): they need the cycle collector"
                 ent.DisplayName
 
         // a name in this file, or `alias.name` for a type another file declares
@@ -150,18 +170,20 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) (genAr
                 Name = name
                 Ref = entRef
                 Kind =
-                    if ent.IsFSharpUnion then
-                        KValueUnion
-                    else
+                    if not ent.IsFSharpUnion then
                         KRecord
+                    elif recursive then
+                        KHeapUnion
+                    else
+                        KValueUnion
                 Cases = []
                 Managed = false
-                DropAlloc = false
                 Copyable = true
                 IsLocal = isLocal
             }
 
         ctx.State.Ents[entRef.FullName] <- e
+        ctx.State.EntDepth <- ctx.State.EntDepth + 1
 
         try
             e.Cases <-
@@ -175,11 +197,18 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) (genAr
                         "", ent.FSharpFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
                     ]
         with _ ->
+            ctx.State.EntDepth <- ctx.State.EntDepth - 1
             ctx.State.Ents.Remove entRef.FullName |> ignore
             reraise ()
 
+        ctx.State.EntDepth <- ctx.State.EntDepth - 1
+
         if isLocal then
             ctx.State.LocalEnts.Add e
+
+        // (the types this one refers to are all known once the outermost one is finished)
+        if ctx.State.EntDepth = 0 then
+            settleManaged ctx.State
 
         e
 
@@ -239,10 +268,22 @@ let private numberLit (r: SourceLocation option) (v: Fable.NumberValue) : string
     | Fable.NumberValue.Float64 x -> floatLit "f64" x, TPrim "f64"
     | _ -> fail r "the Zig target does not support this kind of number yet"
 
-/// ANF for argument lists: an argument that is not a flat expression is let-bound, and so is
-/// any impure argument evaluated before it.
-let bindArgs (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr) : Expr =
-    let needsBind ir = not (isFlat ir)
+/// ANF for argument lists: an argument that is not a flat expression or that produces a managed
+/// value is let-bound, and so is any impure argument evaluated before it.
+let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr) : Expr =
+    let needsBind ir =
+        not (isFlat ir)
+        || (isManaged (typeOf ir)
+            && (
+                match ir with
+                | ECall _
+                | ECallClo _
+                | EEmit _ -> true
+                // (a constructor argument is an owning position)
+                | ECon(_, _, xs, _) -> not conArgs && not xs.IsEmpty
+                | _ -> false
+            ))
+
     let arr = List.toArray irs
 
     match arr |> Array.tryFindIndexBack needsBind with
@@ -263,10 +304,11 @@ let bindArgs (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr) : Expr =
                 if i <= last && (needsBind ir || not (isPure ir)) && not (isVoid (typeOf ir)) then
                     let ir = hoist ir
 
-                    if isFlat ir && isPure ir then
+                    // (what is left after hoisting may need no name: a variable, a literal)
+                    if isFlat ir && isPure ir && not (needsBind ir) then
                         ir
                     else
-                        let v = ctx.State.NewVar("tmp", typeOf ir, VLocal, false)
+                        let v = ctx.State.NewVar(tempName ir, typeOf ir, VLocal, false)
                         binds.Add((v, ir))
                         EVar v
                 else
@@ -274,6 +316,8 @@ let bindArgs (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr) : Expr =
             )
 
         List.foldBack (fun (v, ir) acc -> ELet(v, ir, acc)) (List.ofSeq binds) (k (List.ofArray outs))
+
+let bindArgs (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr) : Expr = bindArgsIn false ctx irs k
 
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
@@ -292,18 +336,22 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.CharConstant c -> ELit(string<int>(int c), TPrim "u16")
         | Fable.NewRecord(values, entRef, genArgs) ->
             let ent = entOf ctx r entRef genArgs
-            bindArgs ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TEnt ent, "", xs, None))
+            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TEnt ent, "", xs, None))
         | Fable.NewUnion(values, tag, entRef, genArgs) ->
             let ent = entOf ctx r entRef genArgs
             let case = fst (List.item tag ent.Cases)
-            bindArgs ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TEnt ent, case, xs, None))
+            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TEnt ent, case, xs, None))
         | Fable.NewTuple(values, _) ->
-            bindArgs ctx (values |> List.map (lw ctx)) (fun xs -> ECon(TTuple(xs |> List.map typeOf), "", xs, None))
+            bindArgsIn
+                true
+                ctx
+                (values |> List.map (lw ctx))
+                (fun xs -> ECon(TTuple(xs |> List.map typeOf), "", xs, None))
         | Fable.NewOption(value, t, _) ->
             let ty = TOpt(mapType ctx r t)
 
             match value with
-            | Some v -> bindArgs ctx [ lw ctx v ] (fun xs -> ECon(ty, "Some", xs, None))
+            | Some v -> bindArgsIn true ctx [ lw ctx v ] (fun xs -> ECon(ty, "Some", xs, None))
             | None -> ECon(ty, "None", [], None)
         | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
 
@@ -331,9 +379,15 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         if isVoid ty then
             ESeq(asStmt ctx rhs, lw ctx body)
         else
-            let v = ctx.State.NewVar(id.Name, ty, VLocal, id.IsMutable)
-            ctx.Vars[id.Name] <- v
-            ELet(v, rhs, lw ctx body)
+            match rhs with
+            // an immutable name for an immutable variable is that variable
+            | EVar x when not id.IsMutable && not x.FMutable && x.Kind <> VGlobal ->
+                ctx.Vars[id.Name] <- x
+                lw ctx body
+            | _ ->
+                let v = ctx.State.NewVar(id.Name, ty, VLocal, id.IsMutable)
+                ctx.Vars[id.Name] <- v
+                ELet(v, rhs, lw ctx body)
 
     | Fable.Sequential es ->
         match List.rev es with
@@ -401,6 +455,23 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         imp.Path.StartsWith(Replacements.DotnetPrefix, System.StringComparison.Ordinal)
         ->
         dotnetCall ctx r (imp.Path.Substring Replacements.DotnetPrefix.Length) imp.Selector info t
+
+    // `[<Emit("...")>]`: Zig text, with `$0`, `$1`, ... standing for the arguments
+    | Fable.Emit(info, t, r) ->
+        let ty = mapType ctx r t
+
+        if info.CallInfo.ThisArg.IsSome then
+            fail r "the Zig target does not support Emit on instance members yet"
+
+        if info.Macro.Contains "fable_rt." then
+            ctx.State.UsesRuntime <- true
+
+        let args =
+            info.CallInfo.Args
+            |> List.filter (fun a -> not (isUnit a.Type))
+            |> List.map (lw ctx)
+
+        bindArgs ctx args (fun xs -> EEmit(info.Macro, xs, ty))
 
     | Fable.Get(x, kind, t, r) ->
         let ty = mapType ctx r t
@@ -652,7 +723,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         Modes = ps |> List.map (fun _ -> MPlain)
                         Ret = ret
                         Body = body
-                        NeedsAlloc = false
+                        RetFrom = None
                         IsEntryPoint = entry
                         Range = d.Body.Range
                     }
