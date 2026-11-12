@@ -30,6 +30,7 @@ Available commands:
             dart                    Run for Dart
             rust                    Run for Rust
             beam                    Run for BEAM (Erlang)
+            zig                     Run for Zig
 
         Options:
             --force-fable-library   Force building fable-library
@@ -143,6 +144,7 @@ let main argv =
             | "--dart" :: _ -> BuildFableLibraryDart().Run()
             | "--rust" :: _ -> BuildFableLibraryRust().Run()
             | "--beam" :: _ -> BuildFableLibraryBeam().Run()
+            | "--zig" :: _ -> BuildFableLibraryZig().Run()
             | _ -> printHelp ()
         | "test" :: args ->
             match args with
@@ -167,6 +169,7 @@ let main argv =
             | "dart" :: _ -> Quicktest.Dart.handle args
             | "rust" :: _ -> Quicktest.Rust.handle args
             | "beam" :: _ -> Quicktest.Beam.handle args
+            | "zig" :: _ -> Quicktest.Zig.handle args
             | _ -> printHelp ()
         | "standalone" :: args -> Standalone.handle args
         | "compiler-js" :: args -> CompilerJs.handle args

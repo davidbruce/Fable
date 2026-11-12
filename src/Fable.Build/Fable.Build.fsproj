@@ -17,6 +17,7 @@
     <Compile Include="FableLibrary/JavaScript.fs" />
     <Compile Include="FableLibrary/Rust.fs" />
     <Compile Include="FableLibrary/Beam.fs" />
+    <Compile Include="FableLibrary/Zig.fs" />
     <Compile Include="WorkerJs.fs" />
     <Compile Include="Standalone.fs" />
     <Compile Include="CompilerJs.fs" />
@@ -37,6 +38,7 @@
     <Compile Include="Quicktest/Rust.fs" />
     <Compile Include="Quicktest/Dart.fs" />
     <Compile Include="Quicktest/Beam.fs" />
+    <Compile Include="Quicktest/Zig.fs" />
     <Compile Include="FcsRepo.fs" />
     <Compile Include="Publish.fs" />
     <Compile Include="GithubRelease.fs" />
