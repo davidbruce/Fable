@@ -39,6 +39,9 @@ type Ent =
         /// its cells can be part of a reference cycle whatever its type arguments are (they
         /// carry a header of the cycle collector)
         mutable Cyclic: bool
+        /// its cells can reach a function value or an exception: they can be part of a cycle
+        /// if function values can, which depends on the whole program
+        mutable ReachesOpaque: bool
         /// holds references to cells whatever its type arguments are
         mutable Managed: bool
         mutable Copyable: bool
@@ -132,6 +135,7 @@ let rec mayHoldCyclic (t: Ty) : bool =
     | TPrim "fable_rt.Exn" -> true
     | TEnt(e, args) ->
         e.Cyclic
+        || e.ReachesOpaque
         || List.exists mayHoldCyclic args
         || (e.Kind <> KHeapUnion
             && e.Kind <> KRefRecord
@@ -578,6 +582,9 @@ type FileState() =
     member val Imports = Dictionary<string, string>()
     /// the generated code calls the hand-written runtime (`fable_rt.zig`)
     member val UsesRuntime = false with get, set
+    /// what the file's code does that lets a function value be part of a cycle (see
+    /// `fable_rt.Cycles`): holds, generic, instantiated
+    member val Cycles = (false, false, false) with get, set
     /// every variable made so far, by id
     member val Vars = Dictionary<int, Var>()
     /// how many type declarations are being mapped (they refer to each other)

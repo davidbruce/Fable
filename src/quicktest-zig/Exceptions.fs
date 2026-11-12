@@ -7,18 +7,10 @@ module Exceptions
 
 open Helpers
 
-#if FABLE_COMPILER
-open Fable.Core
+open Fable.Core.Zig
 
-[<Emit("@as(i32, @intCast(fable_rt.live()))")>]
-let liveCells () : int = nativeOnly
-
-[<Emit("fable_rt.track")>]
-let counting () : bool = nativeOnly
-#else
-let liveCells () : int = 0
-let counting () : bool = false
-#endif
+let liveCells () : int = Counters.liveCells ()
+let counting () : bool = Counters.isCounting ()
 
 let expect (expected: int) (actual: int) : int =
     if actual = expected then

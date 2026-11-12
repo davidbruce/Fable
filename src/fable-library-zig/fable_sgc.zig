@@ -49,8 +49,8 @@
 //! piece can sit inside a structure that is still referenced. In both cases a
 //! member lost a reference and survived; that marks the structure dirty, and
 //! a dirty structure gets a *local check*: an incremental mark over its ring
-//! alone (the engine of rtgc.zig: colour in place, subtract internal edges,
-//! mark from what is left, sweep the rest).
+//! alone (colour the cells in place, subtract the edges between them, mark
+//! from what is left, sweep the rest).
 //!
 //! BOUNDED STEPS
 //! -------------
@@ -58,7 +58,7 @@
 //!     `cfg.free_budget` at a time, by tick() and step().
 //!   * A local check is a sequence of one-cell units, `cfg.pace` per tick().
 //!     While one runs, retain / release / store / move-out colour the cell
-//!     they touch (white -> grey), as in rtgc.zig.
+//!     they touch (white -> grey).
 //! Every hook is O(1), except a store that makes cells join (one unit per
 //! joining cell) and the drop of a member (its number of traced fields).
 //!
@@ -95,10 +95,12 @@
 //!   gc.configure(cfg), gc.noCollectEnter()/Leave(), gc.counters
 //!   sgc.isGarbage(&child.gc)     only inside Desc.release_outside
 //!
-//! Desc is the same as rtgc.zig's: rc_offset, trace, release_outside, free,
-//! finalize.
+//! Desc says, for one type of cell: where its count is (rc_offset), which
+//! cells it refers to (trace), and how to give up what it holds outside a dead
+//! set (release_outside), to free it (free), and to do both (finalize).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root");
 const assert = std.debug.assert;
 
@@ -126,16 +128,28 @@ const anchor: u8 align(desc_align) = 0;
 /// distance from `anchor` in these units: 25 bits reach 1 GB either way.
 pub const desc_align = 64;
 
-/// True only while a check's sweep runs a garbage cell's release_outside.
-var sweeping: bool = false;
+/// Each thread has a collector of its own, for the cells it made: a value
+/// never belongs to two threads (reference counts are not atomic). Where
+/// there is one thread, or no thread-local storage (a freestanding target, or
+/// a program whose root file says `pub const fable_one_thread = true;`), the
+/// state below is plain global.
+pub const per_thread: bool = !builtin.single_threaded and builtin.os.tag != .freestanding and
+    !(@hasDecl(root, "fable_one_thread") and root.fable_one_thread);
 
-/// The dead structure whose cells are releasing what they hold outside it
-/// (isGarbage counts the references they hold INSIDE it for the check below).
-var dying_now: ?*Structure = null;
-
-/// The one collector of the program (isGarbage has no other way to find the
-/// structure records).
-var the_gc: ?*Gc = null;
+const tl = if (per_thread) struct {
+    threadlocal var sweeping: bool = false;
+    threadlocal var dying_now: ?*Structure = null;
+    threadlocal var the_gc: ?*Gc = null;
+} else struct {
+    /// True only while a check's sweep runs a garbage cell's release_outside.
+    var sweeping: bool = false;
+    /// The dead structure whose cells are releasing what they hold outside it
+    /// (isGarbage counts the references they hold INSIDE it for the check below).
+    var dying_now: ?*Structure = null;
+    /// The thread's collector (isGarbage has no other way to find the
+    /// structure records).
+    var the_gc: ?*Gc = null;
+};
 
 /// Type descriptor (its distance from `anchor` in units of `desc_align`,
 /// +-1 GB), colour and flags.
@@ -244,13 +258,13 @@ pub const check_deaths: bool = if (@hasDecl(root, "sgc_check_deaths")) root.sgc_
 /// True for a cell that is going away together with the cell whose
 /// release_outside is running.
 pub fn isGarbage(h: *const Hdr) bool {
-    if (sweeping and h.meta.state == .white) return true;
+    if (tl.sweeping and h.meta.state == .white) return true;
     if (h.st == 0) return false;
-    var s = the_gc.?.rec(h.st);
+    var s = tl.the_gc.?.rec(h.st);
     while (s.parent) |p| s = p;
     if (!s.dead) return false;
     // (a cell the sweep had already taken out is on neither side of the sum)
-    if (check_deaths and dying_now == s and h.meta.flags & F_RELEASED == 0) s.v_edges += 1;
+    if (check_deaths and tl.dying_now == s and h.meta.flags & F_RELEASED == 0) s.v_edges += 1;
     return true;
 }
 
@@ -343,7 +357,7 @@ pub const Config = struct {
     /// count of the cell reached zero, not the count of its structure): how
     /// many cells ONE drop by the mutator frees at once. What is over waits
     /// in a queue, and credit a later drop does not use finalizes cells that
-    /// are waiting. 0: every such cell is queued. (As in rtgc.zig.)
+    /// are waiting. 0: every such cell is queued.
     /// A dead structure of at most this many cells is also freed on the
     /// spot instead of being queued.
     free_now: usize = 0,
@@ -355,7 +369,7 @@ pub const Config = struct {
 };
 
 pub const Counters = struct {
-    /// Local checks completed (the name matches rtgc.zig's).
+    /// Local checks completed.
     runs: u64 = 0,
     full_runs: u64 = 0,
     traced: u64 = 0,
@@ -470,7 +484,7 @@ pub const Gc = struct {
         gc.table0[0] = &gc.chunk0;
         gc.chunks = &gc.table0;
         gc.n_chunks = 1;
-        the_gc = gc;
+        tl.the_gc = gc;
     }
 
     /// Give the allocated structure records back. Nothing may be live.
@@ -573,7 +587,7 @@ pub const Gc = struct {
         // (Not when the reference came from a dead piece of the structure
         // that the check in progress is sweeping out: that check has just
         // looked at all of it.)
-        if (!r.dirty and !(sweeping and gc.check == r)) gc.makeDirty(r);
+        if (!r.dirty and !(tl.sweeping and gc.check == r)) gc.makeDirty(r);
         if (gc.barrier_on) gc.touch(h);
     }
 
@@ -1304,10 +1318,10 @@ pub const Gc = struct {
                 // holds inside.)
                 if (check_deaths) {
                     if (c != d.zeroed) d.v_sum += rcPtr(c).*;
-                    dying_now = d;
+                    tl.dying_now = d;
                 }
                 c.desc().release_outside(c, gc.ctx);
-                if (check_deaths) dying_now = null;
+                if (check_deaths) tl.dying_now = null;
             } else {
                 // Swept by the check that was running when the structure
                 // died: it has released everything but its references to the
@@ -1570,9 +1584,9 @@ pub const Gc = struct {
                     r.members -= 1;
                     gc.in_collector += 1;
                     gc.free_depth += 1;
-                    sweeping = true;
+                    tl.sweeping = true;
                     c.desc().release_outside(c, gc.ctx);
-                    sweeping = false;
+                    tl.sweeping = false;
                     gc.free_depth -= 1;
                     gc.in_collector -= 1;
                 } else {

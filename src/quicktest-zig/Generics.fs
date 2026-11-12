@@ -6,22 +6,11 @@ module Generics
 
 open Helpers
 
-#if FABLE_COMPILER
-open Fable.Core
+open Fable.Core.Zig
 
-[<Emit("@as(i32, @intCast(fable_rt.live()))")>]
-let liveCells () : int = nativeOnly
-
-[<Emit("@as(i32, @intCast(fable_rt.stats.allocs))")>]
-let allocs () : int = nativeOnly
-
-[<Emit("fable_rt.track")>]
-let counting () : bool = nativeOnly
-#else
-let liveCells () : int = 0
-let allocs () : int = 0
-let counting () : bool = false
-#endif
+let liveCells () : int = Counters.liveCells ()
+let allocs () : int = Counters.allocations ()
+let counting () : bool = Counters.isCounting ()
 
 let check (ok: bool) : int =
     if ok then

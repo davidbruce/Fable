@@ -302,13 +302,19 @@ let cyclicDecl (e: Ent) : string option =
     if e.Cyclic then
         Some "true"
     else
-        match e.TypeParams with
+        // (a type that can reach a function value or an exception is cyclic if those can be
+        // part of a cycle in this program, which the root file says)
+        let parts =
+            [
+                if e.ReachesOpaque then
+                    "fable_rt.functions_in_cycles"
+                for g in e.TypeParams do
+                    $"fable_rt.holdsCyclic(%s{genName g})"
+            ]
+
+        match parts with
         | [] -> None
-        | typeParams ->
-            typeParams
-            |> List.map (fun g -> $"fable_rt.holdsCyclic(%s{genName g})")
-            |> String.concat " or "
-            |> Some
+        | _ -> Some(String.concat " or " parts)
 
 /// The fields that every cell starts with: its count, and the collector's header if the type
 /// can be part of a cycle.
@@ -1469,6 +1475,33 @@ let emitFile (state: FileState) : string =
 
     for e in state.LocalEnts do
         rootNames.Add(topIdent e.Name) |> ignore
+
+    // What this file's code does that lets a function value be part of a cycle, joined with
+    // what the files it uses say (see `fable_rt.functions_in_cycles`).
+    let (holds, generic, instantiated) = state.Cycles
+
+    let used =
+        match
+            state.Imports.Values
+            |> Seq.sort
+            |> Seq.map (fun alias -> alias + ".@\"$cycles\"")
+            |> List.ofSeq
+        with
+        | [] -> ".{}"
+        | items -> items |> String.concat ", " |> sprintf ".{ %s }"
+
+    let b (x: bool) =
+        if x then
+            "true"
+        else
+            "false"
+
+    out
+        .AppendLine(
+            $"pub const @\"$cycles\" = fable_rt.joinCycles(.{{ .holds = %s{b holds}, .generic = %s{b generic}, .instantiated = %s{b instantiated} }}, %s{used});"
+        )
+        .AppendLine()
+    |> ignore
 
     for e in state.LocalEnts do
         let fields (fs: (string * Ty) list) =

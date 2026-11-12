@@ -3,9 +3,10 @@
 //! The cycle collector will live here too.
 const std = @import("std");
 const builtin = @import("builtin");
+const root = @import("root");
 pub const sgc = @import("fable_sgc.zig");
 
-pub const interface_version: i32 = 8;
+pub const interface_version: i32 = 9;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -39,7 +40,27 @@ pub const Stats = struct {
     dups: i64 = 0,
     decs: i64 = 0,
 };
-pub var stats: Stats = .{};
+
+/// What belongs to one thread: its counters, its cycle collector and the exception it is
+/// passing up. A value is owned by the thread that made it (counts are not atomic), so each
+/// thread has all of this for itself. (Plain globals where there is one thread or no
+/// thread-local storage: see `sgc.per_thread`.)
+const thread = if (sgc.per_thread) struct {
+    threadlocal var stats: Stats = .{};
+    threadlocal var collector: sgc.Gc = undefined;
+    threadlocal var collector_ready: bool = false;
+    threadlocal var current: ?Exn = null;
+} else struct {
+    var stats: Stats = .{};
+    var collector: sgc.Gc = undefined;
+    var collector_ready: bool = false;
+    var current: ?Exn = null;
+};
+
+/// This thread's counters (all zero in builds that do not count).
+pub inline fn counters() *Stats {
+    return &thread.stats;
+}
 
 /// The cell type of one case of a recursive union.
 pub fn Cell(comptime T: type, comptime tag: std.meta.Tag(T)) type {
@@ -53,7 +74,7 @@ pub inline fn cell(comptime T: type, comptime tag: std.meta.Tag(T), init: Cell(T
     const c = allocator.create(C) catch @panic("fable: out of memory");
     c.* = init;
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
-    if (track) stats.allocs += 1;
+    if (track) thread.stats.allocs += 1;
     return c;
 }
 
@@ -71,10 +92,10 @@ pub inline fn cellReuse(comptime T: type, comptime tag: std.meta.Tag(T), tok: an
             c.* = init;
             if (comptime hasGc(C)) {
                 // (a cell that is built in again is a new cell: it gets an age of its own)
-                collector.allocs += 1;
+                thread.collector.allocs += 1;
                 c.@"$gc" = gcHeader(C, c);
             }
-            if (track) stats.reuses += 1;
+            if (track) thread.stats.reuses += 1;
             return c;
         }
     }
@@ -87,15 +108,15 @@ pub inline fn isUnique(c: anytype) bool {
 
 pub inline fn retain(c: anytype) void {
     c.@"$rc" += 1;
-    if (track) stats.dups += 1;
-    if (gcOf(c)) |h| collector.onRetain(h);
+    if (track) thread.stats.dups += 1;
+    if (gcOf(c)) |h| thread.collector.onRetain(h);
 }
 
 /// Take one reference off a cell that is known to be shared.
 pub inline fn release(c: anytype) void {
     c.@"$rc" -= 1;
-    if (track) stats.decs += 1;
-    if (gcOf(c)) |h| collector.onRelease(h);
+    if (track) thread.stats.decs += 1;
+    if (gcOf(c)) |h| thread.collector.onRelease(h);
 }
 
 /// Take one reference off; true when it was the last one, and the caller gives up what the
@@ -104,18 +125,18 @@ pub inline fn release(c: anytype) void {
 pub inline fn releaseIsLast(c: anytype) bool {
     if (c.@"$rc" != 1) {
         c.@"$rc" -= 1;
-        if (track) stats.decs += 1;
-        if (gcOf(c)) |h| collector.onRelease(h);
+        if (track) thread.stats.decs += 1;
+        if (gcOf(c)) |h| thread.collector.onRelease(h);
         return false;
     }
-    if (gcOf(c)) |h| return !collector.onZero(h);
+    if (gcOf(c)) |h| return !thread.collector.onZero(h);
     return true;
 }
 
 /// A cell that is not shared is taken apart without its count going to zero: its fields are
 /// about to be moved out or given up.
 pub inline fn forget(c: anytype) void {
-    if (gcOf(c)) |h| collector.onFree(h);
+    if (gcOf(c)) |h| thread.collector.onFree(h);
 }
 
 /// A reference left a cell that is being taken apart and went to a variable as it is.
@@ -124,11 +145,11 @@ pub inline fn touch(x: anytype) void {
 }
 
 fn movedOut(_: void, h: *sgc.Hdr) void {
-    collector.onMoveOut(h);
+    thread.collector.onMoveOut(h);
 }
 
 pub inline fn free(c: anytype) void {
-    if (track) stats.frees += 1;
+    if (track) thread.stats.frees += 1;
     allocator.destroy(c);
 }
 
@@ -345,7 +366,7 @@ pub inline fn new(comptime P: type, init: @typeInfo(P).pointer.child) P {
     const c = allocator.create(C) catch @panic("fable: out of memory");
     c.* = init;
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
-    if (track) stats.allocs += 1;
+    if (track) thread.stats.allocs += 1;
     return c;
 }
 
@@ -372,11 +393,11 @@ pub inline fn storeIn(owner: anytype, comptime field: []const u8, value: @FieldT
 }
 
 fn unstored(owner: *sgc.Hdr, old: *sgc.Hdr) void {
-    collector.onUnstore(owner, old);
+    thread.collector.onUnstore(owner, old);
 }
 
 fn stored(owner: *sgc.Hdr, child: *sgc.Hdr) void {
-    collector.onStore(owner, child);
+    thread.collector.onStore(owner, child);
 }
 
 /// F#'s `ref` cell.
@@ -410,7 +431,7 @@ pub fn List(comptime T: type) type {
 // reaches zero the whole group is dead, cycles included, and is freed.
 //
 // What the collector has to be told is all in this file: a cell is made, retained, released,
-// taken apart, and a field of it is assigned. Generated code does not call the collector.
+// taken apart, and a field of it is assigned. Generated code does not call the thread.collector.
 // ---------------------------------------------------------------------------------------------
 
 /// A test mode: before every allocation of a cell with a collector header, every structure's
@@ -418,8 +439,40 @@ pub fn List(comptime T: type) type {
 /// `pub const fable_verify_cycles = true;` in its root file. Very slow.
 const verify_cycles: bool = if (@hasDecl(@import("root"), "fable_verify_cycles")) @import("root").fable_verify_cycles else false;
 
-var collector: sgc.Gc = undefined;
-var collector_ready: bool = false;
+
+/// What a file says about the records with assignable fields that its code makes:
+/// - `holds`: one of them has an assignable field that can hold a function value or an
+///   exception (directly or through other data);
+/// - `generic`: one of them is made in generic code, with an assignable field whose type
+///   depends on a type parameter;
+/// - `instantiated`: a generic function is used with a type argument that can hold a function
+///   value or an exception.
+pub const Cycles = struct { holds: bool = false, generic: bool = false, instantiated: bool = false };
+
+/// A file's own answer joined with those of the files it uses.
+pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
+    var r = own;
+    inline for (used) |u| {
+        r.holds = r.holds or u.holds;
+        r.generic = r.generic or u.generic;
+        r.instantiated = r.instantiated or u.instantiated;
+    }
+    return r;
+}
+
+/// Can a function value or an exception be part of a cycle in this program? What they hold
+/// is not in their type, so a cell that holds one would have to be taken for cycle-capable
+/// always. But a cycle needs an assignable field to close it, and one through a function
+/// value needs an assignable field that can hold a function value. The program's root file
+/// (the one with the entry point) says in `$cycles` whether the program makes a record with
+/// such a field anywhere, joined over all the files it uses. If it does not, function values
+/// and exceptions are never part of a cycle, and neither they nor the cells that hold them
+/// need the collector. (Yes when the root file does not say.)
+pub const functions_in_cycles: bool = blk: {
+    if (!@hasDecl(root, "$cycles")) break :blk true;
+    const c: Cycles = root.@"$cycles";
+    break :blk c.holds or (c.generic and c.instantiated);
+};
 
 /// The type of a cell's `$gc` field: the collector's header, or nothing.
 pub fn GcHdr(comptime cyclic: bool) type {
@@ -444,7 +497,7 @@ inline fn gcOf(c: anytype) ?*sgc.Hdr {
 /// (Only declarations are looked at, never fields of cells: this is evaluated while the types
 /// that ask are still being put together.)
 pub fn holdsCyclic(comptime T: type) bool {
-    if (T == Exn) return true;
+    if (T == Exn) return functions_in_cycles;
     switch (@typeInfo(T)) {
         .pointer => |p| {
             if (p.size != .one or @typeInfo(p.child) != .@"struct") return false;
@@ -452,7 +505,7 @@ pub fn holdsCyclic(comptime T: type) bool {
         },
         .optional => |o| return holdsCyclic(o.child),
         .@"struct" => |s| {
-            if (@hasDecl(T, "fable_func")) return true;
+            if (@hasDecl(T, "fable_func")) return functions_in_cycles;
             inline for (s.field_types) |F| {
                 if (holdsCyclic(F)) return true;
             }
@@ -612,38 +665,113 @@ fn Collected(comptime C: type, comptime gc_field: []const u8, comptime rc_offset
 }
 
 noinline fn collectorSetup() void {
-    collector.init(.{}, null, allocator);
-    collector_ready = true;
+    thread.collector.init(.{}, null, allocator);
+    thread.collector_ready = true;
 }
 
 /// Before a cell with a collector header is allocated (its field values are computed by
 /// then): the only place where the collector does work of its own accord.
 inline fn gcTick() void {
-    if (!collector_ready) collectorSetup();
-    if (verify_cycles) collector.verify();
-    if (collector.tickDue()) collector.tickSlow();
+    if (!thread.collector_ready) collectorSetup();
+    if (verify_cycles) thread.collector.verify();
+    if (thread.collector.tickDue()) thread.collector.tickSlow();
 }
 
 /// The header of a new cell of a recursive union or of a reference record.
 inline fn gcHeader(comptime C: type, c: *const C) sgc.Hdr {
     const K = Collected(C, "$gc", @as(isize, @offsetOf(C, "$rc")) - @as(isize, @offsetOf(C, "$gc")), null);
-    return collector.hdr(&K.desc, K.isLeaf(c));
+    return thread.collector.hdr(&K.desc, K.isLeaf(c));
 }
 
 /// Free every cycle that is dead now. Returns how many cells that freed.
-pub fn collect() i64 {
-    if (!collector_ready) return 0;
-    return @intCast(collector.collectAll());
+pub fn collect() i32 {
+    if (!thread.collector_ready) return 0;
+    return @intCast(thread.collector.collectAll());
+}
+
+/// At most `budget` cells of collector work. True while more is waiting. The collector only
+/// works of its own accord when a cell that can be part of a cycle is allocated; a program
+/// that has idle time, and may not allocate for a while, calls this there. With nothing to do
+/// it costs two compares.
+pub fn collectStep(budget: i32) bool {
+    if (!thread.collector_ready or budget <= 0) return false;
+    return thread.collector.step(@intCast(budget));
+}
+
+/// No collector work until `collectorResume`, for code that must not be delayed. (Counts are
+/// kept all the same, and a structure whose last outside reference goes is still freed.)
+pub fn collectorPause() void {
+    if (!thread.collector_ready) collectorSetup();
+    thread.collector.noCollectEnter();
+}
+
+pub fn collectorResume() void {
+    thread.collector.noCollectLeave();
+}
+
+pub const Knob = enum {
+    /// 0: checks of live structures are only started by `collect` and `collectStep`
+    automatic,
+    /// cells of a check per allocation (0 or less: a check runs to its end at once)
+    pace,
+    /// cells of a dead structure freed per allocation (0 or less: all at once, inside the
+    /// release that killed it)
+    free_budget,
+    /// with a free budget: cells that one drop frees at once before the rest is queued
+    free_now,
+    /// a structure that lost a reference is checked when it has grown by 1/`check_growth`
+    /// (at least `check_min` cells) since, or after max(`check_wait`, `check_factor` times
+    /// its cells) allocations
+    check_growth,
+    check_min,
+    check_wait,
+    check_factor,
+};
+
+/// Tune this thread's collector.
+pub fn collectorSet(comptime knob: Knob, value: i32) void {
+    if (!thread.collector_ready) collectorSetup();
+    var cfg = thread.collector.cfg;
+    const limit: usize = if (value <= 0) sgc.unlimited else @intCast(value);
+    const count: usize = if (value <= 0) 0 else @intCast(value);
+    switch (knob) {
+        .automatic => cfg.auto = value != 0,
+        .pace => cfg.pace = limit,
+        .free_budget => cfg.free_budget = limit,
+        .free_now => cfg.free_now = count,
+        .check_growth => cfg.check_growth = @max(count, 1),
+        .check_min => cfg.check_min = count,
+        .check_wait => cfg.check_wait = count,
+        .check_factor => cfg.check_factor = count,
+    }
+    thread.collector.configure(cfg);
+}
+
+/// For programs and tests that want to see what the runtime did (0 in builds that do not
+/// count): cells allocated, built in again, freed; references added to and taken off cells
+/// that stayed shared.
+pub fn counted(comptime what: enum { allocs, reuses, frees, shared }) i32 {
+    return @intCast(switch (what) {
+        .allocs => thread.stats.allocs,
+        .reuses => thread.stats.reuses,
+        .frees => thread.stats.frees,
+        .shared => thread.stats.dups + thread.stats.decs,
+    });
+}
+
+/// Cells of this thread that are allocated now (0 in builds that do not count).
+pub fn liveCells() i32 {
+    return @intCast(live());
 }
 
 /// Give back the collector's own bookkeeping. Nothing it looks after may be alive.
 pub fn collectorDeinit() void {
-    if (collector_ready) collector.deinit();
+    if (thread.collector_ready) thread.collector.deinit();
 }
 
 /// The collector's counters (see fable_sgc.zig), or null if no cell ever needed it.
 pub fn collectorCounters() ?sgc.Counters {
-    return if (collector_ready) collector.counters else null;
+    return if (thread.collector_ready) thread.collector.counters else null;
 }
 
 /// How a call that ends a function is made when the caller and the callee have the same
@@ -688,7 +816,7 @@ fn isFunc(comptime T: type) bool {
 fn EnvOf(comptime Captures: type) type {
     return struct {
         const Self = @This();
-        const cyclic = holdsCyclic(Captures);
+        const cyclic = functions_in_cycles and holdsCyclic(Captures);
         const K = Collected(
             Self,
             "hdr",
@@ -715,10 +843,10 @@ pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captu
     const e = allocator.create(E) catch @panic("fable: out of memory");
     e.* = .{ .header = .{ .destroy = E.destroy }, .captures = captures };
     if (comptime E.cyclic) {
-        e.hdr = collector.hdr(&E.K.desc, E.K.isLeaf(e));
+        e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
         e.header.gc = &e.hdr;
     }
-    if (track) stats.allocs += 1;
+    if (track) thread.stats.allocs += 1;
     return .{ .env = &e.header, .code = code };
 }
 
@@ -760,7 +888,7 @@ pub const Exn = *ExnHeader;
 /// An F# `exception` declaration with the given fields.
 pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
     return struct {
-        const cyclic = holdsCyclic(Payload);
+        const cyclic = functions_in_cycles and holdsCyclic(Payload);
         const Whole = struct { header: ExnHeader, hdr: GcHdr(cyclic) = undefined, payload: Payload };
         const K = Collected(
             Whole,
@@ -776,10 +904,10 @@ pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
             const c = allocator.create(Whole) catch @panic("fable: out of memory");
             c.* = .{ .header = .{ .type = &info }, .payload = payload };
             if (comptime cyclic) {
-                c.hdr = collector.hdr(&K.desc, K.isLeaf(c));
+                c.hdr = thread.collector.hdr(&K.desc, K.isLeaf(c));
                 c.header.gc = &c.hdr;
             }
-            if (track) stats.allocs += 1;
+            if (track) thread.stats.allocs += 1;
             return &c.header;
         }
 
@@ -802,17 +930,15 @@ pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
     };
 }
 
-/// The exception in flight.
-var current: ?Exn = null;
-
+/// The exception in flight is `thread.current`.
 pub fn throw(e: Exn) void {
-    std.debug.assert(current == null);
-    current = e;
+    std.debug.assert(thread.current == null);
+    thread.current = e;
 }
 
 pub fn take() Exn {
-    const e = current.?;
-    current = null;
+    const e = thread.current.?;
+    thread.current = null;
     return e;
 }
 
@@ -887,7 +1013,7 @@ pub inline fn across(
 
 /// Cells that were allocated and not freed (0 when counters are not kept).
 pub fn live() i64 {
-    return stats.allocs - stats.frees;
+    return thread.stats.allocs - thread.stats.frees;
 }
 
 /// Called when the program's entry point has returned: true, with a message, if cells are
@@ -896,7 +1022,7 @@ pub fn leaked() bool {
     // (cycles that died without anything noticing yet are not leaks)
     _ = collect();
     if (!track or live() == 0) return false;
-    std.debug.print("fable: {d} cell(s) were never freed (allocated {d}, freed {d})\n", .{ live(), stats.allocs, stats.frees });
+    std.debug.print("fable: {d} cell(s) were never freed (allocated {d}, freed {d})\n", .{ live(), thread.stats.allocs, thread.stats.frees });
     return true;
 }
 
@@ -971,46 +1097,46 @@ fn testTree(depth: i32) TestTree {
 }
 
 test "a dropped list frees every cell, without recursion" {
-    const before = stats;
+    const before = thread.stats;
     drop(testRange(1_000_000));
-    try std.testing.expectEqual(@as(i64, 1_000_000), stats.allocs - before.allocs);
-    try std.testing.expectEqual(@as(i64, 1_000_000), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 1_000_000), thread.stats.allocs - before.allocs);
+    try std.testing.expectEqual(@as(i64, 1_000_000), thread.stats.frees - before.frees);
 }
 
 test "a shared cell is freed by its last owner" {
-    const before = stats;
+    const before = thread.stats;
     const tail = testRange(3);
     const a = testCons(10, dup(tail));
     const b = testCons(20, tail);
     drop(a);
-    try std.testing.expectEqual(@as(i64, 1), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 1), thread.stats.frees - before.frees);
     try std.testing.expectEqual(@as(i32, 1), b.Cons.tail.Cons.head);
     drop(b);
-    try std.testing.expectEqual(@as(i64, 5), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 5), thread.stats.frees - before.frees);
 }
 
 test "trees, and values that hold cells" {
-    const before = stats;
+    const before = thread.stats;
     drop(testTree(10));
-    try std.testing.expectEqual(@as(i64, 1023), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 1023), thread.stats.frees - before.frees);
     const p = TestPair{ .first = testRange(2), .second = testRange(3), .n = 1 };
     const q = dup(p);
     drop(p);
-    try std.testing.expectEqual(@as(i64, 1023), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 1023), thread.stats.frees - before.frees);
     drop(q);
-    try std.testing.expectEqual(@as(i64, 1028), stats.frees - before.frees);
-    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 1028), thread.stats.frees - before.frees);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }
 
 test "a dead cell is built in again" {
-    const before = stats;
+    const before = thread.stats;
     const l = testRange(1);
     var tok: ?*Cell(TestList, .Cons) = null;
     if (isUnique(l.Cons)) tok = l.Cons;
     const m = TestList{ .Cons = cellReuse(TestList, .Cons, &tok, .{ .head = 7, .tail = .Nil }) };
     try std.testing.expectEqual(l.Cons, m.Cons);
-    try std.testing.expectEqual(@as(i64, 1), stats.reuses - before.reuses);
-    try std.testing.expectEqual(@as(i64, 1), stats.allocs - before.allocs);
+    try std.testing.expectEqual(@as(i64, 1), thread.stats.reuses - before.reuses);
+    try std.testing.expectEqual(@as(i64, 1), thread.stats.allocs - before.allocs);
     drop(m);
 }
 
@@ -1047,25 +1173,25 @@ fn testPush(n: i32, xs: TestList) TestList {
 const testPush_sig = .{ .borrows = .{ false, false }, .result_borrowed = false };
 
 test "a call between files costs what the callee needs" {
-    const before = stats;
+    const before = thread.stats;
     const xs = testRange(3);
     // borrowed by the callee, kept by the caller: nothing is counted
     try std.testing.expectEqual(@as(i32, 6), across(testSum, testSum_sig, .{.keep}, .{xs}));
-    try std.testing.expectEqual(@as(i64, 0), stats.dups - before.dups);
+    try std.testing.expectEqual(@as(i64, 0), thread.stats.dups - before.dups);
     // a borrowed result is made owned
     const t = across(testTail, testTail_sig, .{.keep}, .{xs});
-    try std.testing.expectEqual(@as(i64, 1), stats.dups - before.dups);
+    try std.testing.expectEqual(@as(i64, 1), thread.stats.dups - before.dups);
     // owned by the callee, kept by the caller: one more reference
     const ys = across(testPush, testPush_sig, .{ .plain, .keep }, .{ 0, xs });
-    try std.testing.expectEqual(@as(i64, 2), stats.dups - before.dups);
+    try std.testing.expectEqual(@as(i64, 2), thread.stats.dups - before.dups);
     // owned by the callee, given by the caller: a move
     const zs = across(testPush, testPush_sig, .{ .plain, .give }, .{ 9, ys });
-    try std.testing.expectEqual(@as(i64, 2), stats.dups - before.dups);
+    try std.testing.expectEqual(@as(i64, 2), thread.stats.dups - before.dups);
     // borrowed by the callee, given by the caller: the caller gives it up after the call
     try std.testing.expectEqual(@as(i32, 15), across(testSum, testSum_sig, .{.give}, .{zs}));
     try std.testing.expectEqual(@as(i32, 5), across(testSum, testSum_sig, .{.give}, .{t}));
     drop(xs);
-    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }
 
 const TestFn = Func(*const fn (?*Env, i32) i32);
@@ -1081,7 +1207,7 @@ fn testDouble(_: ?*Env, x: i32) i32 {
 }
 
 test "a function value owns what it captured" {
-    const before = stats;
+    const before = thread.stats;
     const f = closure(TestFn, TestCaptures, .{ .xs = testRange(3), .n = 10 }, testAddSum);
     try std.testing.expectEqual(@as(i32, 17), f.code(f.env, 1));
     const g = dup(f);
@@ -1093,8 +1219,8 @@ test "a function value owns what it captured" {
     // in a value that is dropped as a whole
     const pair: struct { f: TestFn, o: ?TestFn } = .{ .f = g, .o = plain };
     drop(pair);
-    try std.testing.expectEqual(@as(i64, 4), stats.allocs - before.allocs);
-    try std.testing.expectEqual(@as(i64, 4), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 4), thread.stats.allocs - before.allocs);
+    try std.testing.expectEqual(@as(i64, 4), thread.stats.frees - before.frees);
 }
 
 const TestParseError = ExnOf("ParseError", struct { pos: i32, items: TestList });
@@ -1122,7 +1248,7 @@ fn testPlain(x: i32) MayRaise(i32, .{testSum}) {
 }
 
 test "an exception owns its fields and is taken by one handler" {
-    const before = stats;
+    const before = thread.stats;
     try std.testing.expectEqual(@as(i32, 6), try testOuter(5));
     try std.testing.expectError(error.Raised, testOuter(-3));
     const e = take();
@@ -1133,7 +1259,7 @@ test "an exception owns its fields and is taken by one handler" {
     const again = dup(e);
     drop(e);
     drop(again);
-    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
     // a function that calls nothing that raises has a plain result
     try std.testing.expect(@TypeOf(testPlain(1)) == i32);
     try std.testing.expect(@TypeOf(testOuter(1)) == Raised!i32);
@@ -1142,7 +1268,7 @@ test "an exception owns its fields and is taken by one handler" {
 const TestNode = *struct { @"$rc": u32 = 1, id: i32, next: ?TestNode };
 
 test "reference records: identity, stores and long chains" {
-    const before = stats;
+    const before = thread.stats;
     var head: TestNode = new(TestNode, .{ .id = 0, .next = null });
     var i: i32 = 1;
     while (i < 200_000) : (i += 1) head = new(TestNode, .{ .id = i, .next = head });
@@ -1159,7 +1285,7 @@ test "reference records: identity, stores and long chains" {
     drop(second);
     drop(box);
     drop(alias);
-    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }
 
 const TestPerson = *struct {
@@ -1183,29 +1309,29 @@ fn testAddId(env: ?*Env, x: i32) Raised!i32 {
 }
 
 test "cycles are freed when their last outside reference goes" {
-    const before = stats;
+    const before = thread.stats;
     // two records that point at each other
     const a = testPerson(1);
     const b = testPerson(2);
     storeIn(a, "friend", dup(b));
     storeIn(b, "friend", dup(a));
     drop(a);
-    try std.testing.expectEqual(@as(i64, 0), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 0), thread.stats.frees - before.frees);
     drop(b);
-    try std.testing.expectEqual(@as(i64, 2), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 2), thread.stats.frees - before.frees);
     // a record that reaches itself through a list
     const c = testPerson(3);
     const cons = List(TestPerson){ .Cons = cell(List(TestPerson), .Cons, .{ .Head = dup(c), .Tail = .Empty }) };
     storeIn(c, "friends", cons);
     drop(c);
-    try std.testing.expectEqual(@as(i64, 4), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 4), thread.stats.frees - before.frees);
     // a record that holds a function which captured the record
     const d = testPerson(40);
     const f = closure(Func(*const fn (?*Env, i32) Raised!i32), TestSelf, .{ .self = dup(d) }, testAddId);
     storeIn(d, "callback", f);
     try std.testing.expectEqual(@as(i32, 42), try d.callback.?.code(d.callback.?.env, 2));
     drop(d);
-    try std.testing.expectEqual(@as(i64, 6), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 6), thread.stats.frees - before.frees);
     // a ring with a tail hanging off it, cut loose in the middle of a structure that lives on
     const keep = testPerson(5);
     const x = testPerson(6);
@@ -1216,15 +1342,64 @@ test "cycles are freed when their last outside reference goes" {
     drop(y);
     storeIn(keep, "friend", null);
     _ = collect();
-    try std.testing.expectEqual(@as(i64, 8), stats.frees - before.frees);
+    try std.testing.expectEqual(@as(i64, 8), thread.stats.frees - before.frees);
     drop(keep);
-    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
     // cells of the same types that never form a cycle are plain reference counting
     const lone = testPerson(8);
     storeIn(lone, "friends", List(TestPerson){ .Cons = cell(List(TestPerson), .Cons, .{ .Head = testPerson(9), .Tail = .Empty }) });
     drop(lone);
-    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
     try std.testing.expect(@sizeOf(@typeInfo(@FieldType(List(i32), "Cons")).pointer.child) == 24);
+}
+
+fn testThreadWork(result: *i64) void {
+    const before = thread.stats;
+    var round: i32 = 0;
+    while (round < 2000) : (round += 1) {
+        const a = testPerson(round);
+        const b = testPerson(round + 1);
+        storeIn(a, "friend", dup(b));
+        storeIn(b, "friend", dup(a));
+        drop(a);
+        drop(b);
+    }
+    throw(TestOverflow.new(.{ .limit = 1 }));
+    drop(take());
+    result.* = (thread.stats.allocs - before.allocs) - (thread.stats.frees - before.frees);
+}
+
+test "every thread has its own collector" {
+    if (!sgc.per_thread) return;
+    var left: [4]i64 = @splat(-1);
+    var threads: [4]std.Thread = undefined;
+    for (&threads, &left) |*t, *l| t.* = try std.Thread.spawn(.{}, testThreadWork, .{l});
+    for (threads) |t| t.join();
+    for (left) |l| try std.testing.expectEqual(@as(i64, 0), l);
+}
+
+test "the collector can be stepped and tuned" {
+    const before = thread.stats;
+    collectorSet(.free_budget, 2);
+    const a = testPerson(1);
+    const b = testPerson(2);
+    const c = testPerson(3);
+    storeIn(a, "friend", dup(b));
+    storeIn(b, "friend", dup(c));
+    storeIn(c, "friend", dup(a));
+    drop(a);
+    drop(b);
+    drop(c);
+    // dead, and queued: freed a few cells at a time
+    try std.testing.expect(thread.stats.frees - before.frees < 3);
+    var steps: i32 = 0;
+    while (collectStep(1)) steps += 1;
+    try std.testing.expect(steps > 0);
+    try std.testing.expectEqual(@as(i64, 3), thread.stats.frees - before.frees);
+    collectorSet(.free_budget, 0);
+    collectorPause();
+    collectorResume();
+    try std.testing.expectEqual(@as(i32, 0), collect());
 }
 
 test "conv follows .NET" {

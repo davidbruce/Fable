@@ -6,34 +6,16 @@ module Heap
 
 open Helpers
 
+open Fable.Core.Zig
+
+let liveCells () : int = Counters.liveCells ()
+let allocs () : int = Counters.allocations ()
+let reuses () : int = Counters.reuses ()
+let counted () : int = Counters.sharedCounts ()
+let counting () : bool = Counters.isCounting ()
 #if FABLE_COMPILER
-open Fable.Core
-
-/// cells that are allocated right now
-[<Emit("@as(i32, @intCast(fable_rt.live()))")>]
-let liveCells () : int = nativeOnly
-
-[<Emit("@as(i32, @intCast(fable_rt.stats.allocs))")>]
-let allocs () : int = nativeOnly
-
-[<Emit("@as(i32, @intCast(fable_rt.stats.reuses))")>]
-let reuses () : int = nativeOnly
-
-/// how often a reference was added to or taken off a cell that stayed shared
-[<Emit("@as(i32, @intCast(fable_rt.stats.dups + fable_rt.stats.decs))")>]
-let counted () : int = nativeOnly
-
-/// (the runtime only counts in builds with safety checks)
-[<Emit("fable_rt.track")>]
-let counting () : bool = nativeOnly
-
 let native = true
 #else
-let liveCells () : int = 0
-let allocs () : int = 0
-let reuses () : int = 0
-let counted () : int = 0
-let counting () : bool = false
 let native = false
 #endif
 

@@ -146,7 +146,8 @@ let private settleManaged (state: FileState) =
 /// component that contains an assignable field.
 ///
 /// A function value and an exception can hold anything, and their type does not say what. A
-/// type that can reach one of them is therefore taken to be able to be part of a cycle.
+/// type that can reach one of them (`ReachesOpaque`) can be part of a cycle if they can, and
+/// that depends on the whole program: see `settleCycles` below.
 ///
 /// The answer depends only on the declarations of the types, so every file that mentions a
 /// type gets the same one. (For a generic type it is the answer whatever the type arguments
@@ -237,11 +238,67 @@ let private settleCyclic (state: FileState) =
         && reach[b].Contains a
 
     for e in cells do
+        e.ReachesOpaque <- reachesAny.Contains e
+
         e.Cyclic <-
-            reachesAny.Contains e
-            || (reach[e].Contains e
-                && edges
-                   |> Seq.exists (fun (a, b, assignable) -> assignable && sameComponent e a && sameComponent e b))
+            reach[e].Contains e
+            && edges
+               |> Seq.exists (fun (a, b, assignable) -> assignable && sameComponent e a && sameComponent e b)
+
+/// Can a function value or an exception be part of a cycle? Only if some record with an
+/// assignable field that can hold one (directly or through other data) is ever made: a cycle
+/// needs an assignable field to close it. Whether the program makes such a record is known
+/// only for the whole program, so every file says what its own code does, and Zig joins the
+/// answers along the imports (`fable_rt.Cycles`):
+/// - holds: the file makes a record with an assignable field that can hold a function value
+///   or an exception;
+/// - generic: it makes one in generic code, with an assignable field whose type depends on a
+///   type parameter (what that stands for is not known here);
+/// - instantiated: it uses a generic function with a type argument that can hold a function
+///   value or an exception (which is what `generic` needs to matter).
+/// (When arrays come, a new array of such elements is a record with an assignable field too.)
+let private settleCycles (state: FileState) =
+    let rec reachesOpaque (t: Ty) : bool =
+        match t with
+        | TFn _
+        | TPrim "fable_rt.Exn" -> true
+        | TEnt(e, args) ->
+            List.exists reachesOpaque args
+            || (if e.Kind = KHeapUnion || e.Kind = KRefRecord then
+                    e.ReachesOpaque
+                else
+                    e.Cases
+                    |> List.exists (fun (c, _) -> caseFields t c |> List.exists (snd >> reachesOpaque)))
+        | TOpt t -> reachesOpaque t
+        | TTuple ts -> List.exists reachesOpaque ts
+        | _ -> false
+
+    let mutable holds = false
+    let mutable generic = false
+    let mutable instantiated = false
+
+    let look (e: Expr) =
+        match e with
+        | ECon(TEnt({ Kind = KRefRecord } as ent, _) as t, _, _, _) ->
+            for (f, fieldTy) in caseFields t "" do
+                if List.contains f ent.MutableFields then
+                    if reachesOpaque fieldTy then
+                        holds <- true
+
+                    if not (freeGens [ fieldTy ]).IsEmpty then
+                        generic <- true
+        | ECall(_, typeArgs, _, _)
+        | EClosure(_, typeArgs, _, _) ->
+            if List.exists reachesOpaque typeArgs then
+                instantiated <- true
+        | _ -> ()
+
+        false
+
+    for fn in state.Fns do
+        exists look fn.Body |> ignore
+
+    state.Cycles <- (holds, generic, instantiated)
 
 let private listName = "Microsoft.FSharp.Collections.FSharpList`1"
 
@@ -264,6 +321,7 @@ let private listEnt (state: FileState) : Ent =
                 MutableFields = []
                 Managed = true
                 Cyclic = false
+                ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
             }
@@ -293,6 +351,7 @@ let private refEnt (state: FileState) : Ent =
                 MutableFields = [ "contents" ]
                 Managed = true
                 Cyclic = false
+                ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
             }
@@ -396,6 +455,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                         []
                 Managed = false
                 Cyclic = false
+                ReachesOpaque = false
                 Copyable = true
                 IsLocal = isLocal
             }
@@ -455,6 +515,7 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
                     MutableFields = []
                     Managed = false
                     Cyclic = false
+                    ReachesOpaque = false
                     Copyable = true
                     IsLocal = isLocal
                 }
@@ -1627,4 +1688,5 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 msg
 
     settleCyclic state
+    settleCycles state
     state

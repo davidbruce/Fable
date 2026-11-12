@@ -5,16 +5,13 @@ module Stress
 // loops that overwrite what they hold. Every test also has to free everything it allocated.
 // `run` returns the number of failed checks.
 
+open Fable.Core.Zig
+
+let liveCells () : int = Counters.liveCells ()
 #if FABLE_COMPILER
-open Fable.Core
-
-[<Emit("@as(i32, @intCast(fable_rt.live()))")>]
-let liveCells () : int = nativeOnly
-
 /// (the recursion that builds a list is a loop here; .NET needs a list its stack can hold)
 let deep = 100000
 #else
-let liveCells () : int = 0
 let deep = 5000
 #endif
 
