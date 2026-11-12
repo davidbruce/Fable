@@ -275,6 +275,13 @@ pub fn List(comptime T: type) type {
     };
 }
 
+/// How a call that ends a function is made when the caller and the callee have the same
+/// parameter and result types: as a jump, where the compiler backend can guarantee one.
+pub const tail_call: std.builtin.CallModifier = if (builtin.zig_backend == .stage2_llvm and switch (builtin.cpu.arch) {
+    .wasm32, .wasm64 => false,
+    else => true,
+}) .always_tail else .auto;
+
 // ---------------------------------------------------------------------------------------------
 // Function values
 //

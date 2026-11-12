@@ -150,6 +150,11 @@ type Em =
         Used: HashSet<string>
         Mutated: Set<int>
         Loop: LoopInfo option
+        /// the function being emitted, and the functions of the file by name
+        Self: FnInfo
+        Fns: Dictionary<string, FnInfo>
+        /// a call that ends the function can be a jump (see `tailTarget`)
+        CanTail: bool
         /// the code of the function values made so far
         Adapters: Dictionary<string, Adapter>
         mutable Counter: int
@@ -709,8 +714,16 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
     | ESeq(a, b) ->
         stmt em ind a DDiscard
         stmt em ind b dest
-    // (where a loop function ends, each branch is a statement: one of them may be the jump)
-    | EIf _ when isSimpleIf e && dest <> DDiscard && not (dest = DReturn && em.Loop.IsSome) -> emitValue em ind e dest
+    // (where a function ends, each branch is a statement if one of them may be a jump)
+    | EIf(_, t, f, _) when
+        isSimpleIf e
+        && dest <> DDiscard
+        && not (
+            dest = DReturn
+            && (em.Loop.IsSome || (tailTarget em t).IsSome || (tailTarget em f).IsSome)
+        )
+        ->
+        emitValue em ind e dest
     | EIf(c, t, f, _) ->
         L $"if (%s{unparen (ex em c)}) {{"
         stmt em (ind + "    ") t dest
@@ -765,6 +778,50 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
         stmt em ind k dest
     | _ -> emitValue em ind e dest
 
+/// A call of another function of the file that ends this one can be a jump instead of a call
+/// when nothing is left to do after it (no result to store through a destination pointer, no
+/// dead cell waiting to be freed) and the two functions have the same parameter and result
+/// types, all of them numbers, booleans or chars: the callee then runs in the caller's frame.
+/// (Zig passes and returns records and unions through pointers into the caller's frame, which
+/// a jump would leave dangling, so such signatures stay calls.) Functions that call each other
+/// last (`even`/`odd`, state machines over numbers) then run in constant stack, as on .NET.
+and tailTarget (em: Em) (e: Expr) : string option =
+    let isScalar (t: Ty) =
+        match t with
+        | TPrim _ -> true
+        | _ -> false
+
+    match e with
+    | ECall(f, typeArgs, args, _) when em.CanTail && f <> em.Self.Name ->
+        match em.Fns.TryGetValue f with
+        | true, g ->
+            let inst =
+                if g.TypeParams.Length = typeArgs.Length then
+                    Map.ofList (List.zip g.TypeParams typeArgs)
+                else
+                    Map.empty
+
+            let calleeParams = g.Params |> List.map (fun p -> substTy inst p.Ty)
+            let callerParams = em.Self.Params |> List.map (fun p -> p.Ty)
+            let calleeRet = substTy inst g.Ret
+
+            let same =
+                List.forall isScalar (calleeRet :: calleeParams)
+                && List.map zigType calleeParams = List.map zigType callerParams
+                && zigType calleeRet = zigType em.Self.Ret
+
+            if same then
+                let tuple =
+                    match args with
+                    | [] -> ".{}"
+                    | _ -> args |> List.map (ex em) |> String.concat ", " |> sprintf ".{ %s }"
+
+                Some $"@call(fable_rt.tail_call, %s{fnRef f typeArgs}, %s{tuple})"
+            else
+                None
+        | _ -> None
+    | _ -> None
+
 and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
     let L = line em ind
 
@@ -780,6 +837,7 @@ and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
         | Some loop, _ when loop.Trmc ->
             L $"hole.* = %s{ex em e};"
             L "return result;"
+        | _ when (tailTarget em e).IsSome -> L $"return %s{(tailTarget em e).Value};"
         | _ ->
             if isVoid (typeOf e) then
                 effect ()
@@ -815,6 +873,7 @@ let emitFunction
     (out: StringBuilder)
     (rootNames: HashSet<string>)
     (adapters: Dictionary<string, Adapter>)
+    (fns: Dictionary<string, FnInfo>)
     (fn: FnInfo)
     =
     // Is there a self call, or `let r = self(..) in Case(.., r, ..)`, where the function ends?
@@ -869,6 +928,17 @@ let emitFunction
             Used = HashSet(rootNames)
             Mutated = assignedIn fn.Body
             Loop = loop
+            Self = fn
+            Fns = fns
+            CanTail =
+                not trmc
+                && not (
+                    exists
+                        (function
+                        | EUnpack(u, _) -> u.Token.IsSome
+                        | _ -> false)
+                        fn.Body
+                )
             Adapters = adapters
             Counter = 0
         }
@@ -1226,7 +1296,7 @@ let emitFile (state: FileState) : string =
 
     for fn in state.Fns do
         try
-            emitFunction out rootNames adapters fn
+            emitFunction out rootNames adapters fns fn
         with ZigError(msg, None) ->
             raise (ZigError(msg, fn.Range))
 

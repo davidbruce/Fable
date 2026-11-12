@@ -144,6 +144,33 @@ let runStep (s: Step) (x: int) : int =
 
 let sumOf (f: IntList -> int) (xs: IntList) : int = f xs
 
+/// (functions that call each other last run in constant stack; .NET in Debug does not, so
+/// it gets a smaller number)
+let rec isEvenDeep (n: int) : bool =
+    if n = 0 then
+        true
+    else
+        isOddDeep (n - 1)
+
+and isOddDeep (n: int) : bool =
+    if n = 0 then
+        false
+    else
+        isEvenDeep (n - 1)
+
+let collatzSteps (start: int) : int =
+    let rec whenEven (n: int) (steps: int) : int =
+        if n = 1 then
+            steps
+        elif n % 2 = 0 then
+            whenEven (n / 2) (steps + 1)
+        else
+            whenOdd n steps
+
+    and whenOdd (n: int) (steps: int) : int = whenEven (3 * n + 1) (steps + 1)
+
+    whenEven start 0
+
 /// (function values in reference-counted cells)
 type Pipeline =
     | Done
@@ -195,7 +222,14 @@ let moreFunctions () : int =
         else
             n + sumMapped triangle (n - 1)
 
-    check (
+    let deep =
+        if counting () then
+            3000001
+        else
+            2001
+
+    check (isOddDeep deep && not (isEvenDeep deep) && collatzSteps 27 = 111)
+    + check (
         runPipeline pipeline 5 = 111
         && runPipeline pipeline 0 = 101
         && runPipeline Done 9 = 9

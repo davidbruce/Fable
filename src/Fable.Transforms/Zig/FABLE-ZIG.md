@@ -150,7 +150,9 @@ unshared `Chain<int>` to `Chain<int>` allocates nothing; to `Chain<int64>` it al
 The type arguments of a call are the ones Fable records; where it records none (a generic
 function used as a value), they are inferred from the types of the arguments and the result.
 
-Not yet: a generic function declared inside another function with type parameters of its own.
+A function declared inside another one may be generic itself (`let pair x = (x, x)` used at
+two types): the lifted function has the surrounding function's type parameters and then its
+own.
 
 ## Function values
 
@@ -177,9 +179,20 @@ itself was inferred to borrow.
 two-argument function value); where it cannot, it is a function that returns a function.
 Functions cannot capture `let mutable` variables (F# does not allow it either).
 
-Not yet: tail calls between different functions are calls, not jumps, so deeply mutually
-recursive functions use stack; a higher-order function is not specialised for the lambda it
-is given, so each call through a function value is an indirect call.
+Not yet: a higher-order function is not specialised for the lambda it is given, so each call
+through a function value is an indirect call.
+
+## Tail calls
+
+A function that calls itself last is a loop (also when the call is the last field of a new
+cell). A call of *another* function of the file that ends a function is a jump
+(`@call(fable_rt.tail_call, f, .{ ... })`) when both functions have the same parameter and
+result types and all of them are numbers, booleans or chars; `even`/`odd` and state machines
+over numbers then run in constant stack, as on .NET. Other signatures stay calls: Zig passes
+and returns records and unions through pointers into the caller's frame, which a jump would
+leave dangling (and LLVM rejects the jump when the result is returned that way). So mutual
+recursion over lists or trees still uses stack in proportion to its depth. The jump is only
+forced on the LLVM backend; elsewhere it is an ordinary call.
 
 `./build.sh quicktest zig` compiles `src/quicktest-zig` and runs it with `zig run`.
 

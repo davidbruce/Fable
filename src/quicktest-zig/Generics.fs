@@ -143,6 +143,64 @@ let constantly (x: 'T) : int -> 'T = fun _ -> x
 
 let sum (xs: Chain<int>) : int = fold (fun acc x -> acc + x) 0 xs
 
+let compose (f: 'A -> 'B) (g: 'B -> 'C) : 'A -> 'C = fun x -> g (f x)
+
+let applyTwice (f: 'T -> 'T) (x: 'T) : 'T = f (f x)
+
+let pairWith (a: 'A) (b: 'B) : Pair<'A, 'B> =
+    {
+        First = a
+        Second = b
+    }
+
+/// (functions declared inside a function that are generic themselves, used at two types)
+let innerGenerics (n: int) (flag: bool) : int =
+    let twice x = Link(x, Link(x, End))
+    let second (p: Pair<'X, 'Y>) : 'Y = p.Second
+
+    let rec count (xs: Chain<'E>) (acc: int) : int =
+        match xs with
+        | End -> acc
+        | Link(_, t) -> count t (acc + 1)
+
+    let numbers = twice n
+    let flags = twice flag
+
+    count numbers 0
+    + count flags 10
+    + second (pairWith flag n)
+    + count (twice (twice 'c')) 100
+
+/// (a generic function with a generic function inside)
+let lastOr (fallback: 'T) (xs: Chain<'T>) : 'T =
+    let rec go (best: 'T) (rest: Chain<'T>) : 'T =
+        match rest with
+        | End -> best
+        | Link(h, t) -> go h t
+
+    let wrap (x: 'W) : 'W option = Some x
+    orElse fallback (wrap (go fallback xs))
+
+/// Generic functions used as values: what their type parameters stand for follows from the
+/// type they are used at.
+let asValues () : int =
+    let before = liveCells ()
+    let xs = range 1 4
+    let pairs = map (pairWith 'k') xs
+    let lengths = map length (Link(xs, Link(range 1 2, End)))
+    let incThenShow = compose (fun x -> x + 1) (fun x -> x > 3)
+    let nested = applyTwice (map (fun x -> x * 2)) xs
+
+    check (sum (map identity xs) = 10 && sum (map (applyTwice (fun x -> x + 1)) xs) = 18)
+    + check (sum (map firstOf (map swap pairs)) = 10 && length (map firstOf pairs) = 4)
+    + check (sum lengths = 6)
+    + check (incThenShow 3 && not (incThenShow 2) && (compose identity identity) 5 = 5)
+    + check (sum nested = 40 && applyTwice identity 'z' = 'z')
+    + check (fold (fun acc b -> acc + b.Tag) 0 (map (boxOf 3) xs) = 12)
+    + check (innerGenerics 5 true = 121)
+    + check (lastOr 0 xs = 4 && lastOr 'a' End = 'a')
+    + checkCount (liveCells () - before) 0
+
 let numbers () : int =
     let xs = range 1 4
     let doubled = map (fun x -> x * 2) xs
@@ -315,6 +373,7 @@ let run () : int =
     let before = liveCells ()
 
     numbers ()
+    + asValues ()
     + elements ()
     + acrossFiles ()
     + lists ()

@@ -22,6 +22,10 @@ type LocalFn =
         FnName: string
         /// the surrounding variables it uses, by their names there
         CaptureNames: string list
+        /// the type parameters of the function it is declared in (it has them too), and the
+        /// ones of its own (F# lets `let pair x = (x, x)` inside a function be generic)
+        OuterTypeParams: string list
+        TypeParams: string list
         ArgTypes: Fable.Type list
         Ret: Fable.Type
     }
@@ -51,12 +55,13 @@ type Callable =
         Target: string
         /// the values it takes before its own arguments
         Captures: Expr list
+        /// the type arguments it always gets: a function declared inside another one has
+        /// that one's type parameters
+        OuterTypeArgs: Ty list
         /// its type parameters, the types of its arguments and of its result as declared
         TypeParams: string list
         ArgTypes: Fable.Type list
         Ret: Fable.Type
-        /// a function declared inside the one being lowered has that one's type parameters
-        IsLocal: bool
     }
 
     member c.Arity = c.ArgTypes.Length
@@ -467,10 +472,10 @@ let private tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
                 {
                     Target = fn.FnName
                     Captures = captureExprs ctx id.Range fn.CaptureNames
-                    TypeParams = ctx.TypeParams
+                    OuterTypeArgs = fn.OuterTypeParams |> List.map TGen
+                    TypeParams = fn.TypeParams
                     ArgTypes = fn.ArgTypes
                     Ret = fn.Ret
-                    IsLocal = true
                 }
         | _ ->
             match ctx.Members.TryGetValue id.Name with
@@ -479,10 +484,10 @@ let private tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
                     {
                         Target = id.Name
                         Captures = []
+                        OuterTypeArgs = []
                         TypeParams = typeParams
                         ArgTypes = argTypes
                         Ret = ret
-                        IsLocal = false
                     }
             | _ -> None
     | Fable.Import(imp, _, _) ->
@@ -499,10 +504,10 @@ let private tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
                     {
                         Target = importAlias ctx imp.Path + "." + imp.Selector
                         Captures = []
+                        OuterTypeArgs = []
                         TypeParams = m.GenericParameters |> List.map (fun g -> g.Name)
                         ArgTypes = argTypes
                         Ret = m.ReturnParameter.Type
-                        IsLocal = false
                     }
             | _ -> None
         | _ -> None
@@ -899,10 +904,8 @@ and typeArgsOf
     (resultType: Fable.Type option)
     : Ty list * Map<string, Ty>
     =
-    if c.IsLocal then
-        c.TypeParams |> List.map TGen, Map.empty
-    elif c.TypeParams.IsEmpty then
-        [], Map.empty
+    if c.TypeParams.IsEmpty then
+        c.OuterTypeArgs, Map.empty
     else
         let tys =
             match given with
@@ -928,7 +931,7 @@ and typeArgsOf
                             c.Target
                 )
 
-        tys, Map.ofList (List.zip c.TypeParams tys)
+        c.OuterTypeArgs @ tys, Map.ofList (List.zip c.TypeParams tys)
 
 /// Apply a function value to arguments, as many at a time as its type takes. (`subst` says
 /// what the type parameters in `fTy` stand for, when it is the declared result type of a
@@ -1038,12 +1041,32 @@ and liftGroup
                 "the Zig target does not support a function that uses the mutable variable `%s` of its surroundings"
                 n
 
-    let fns =
+    // The types of the parameters and of the result, and the type parameters that are not
+    // the surrounding function's: they are the function's own.
+    let signatures =
         parts
-        |> List.map (fun (_, hint, args, body) ->
+        |> List.map (fun (ident, _, args, body) ->
+            let argTys = args |> List.map (fun a -> mapType ctx a.Range a.Type)
+            let ret = mapType ctx body.Range body.Type
+
+            let ownGens =
+                freeGens (ret :: argTys)
+                |> List.filter (fun g -> not (List.contains g ctx.TypeParams))
+
+            if ident.IsNone && not ownGens.IsEmpty then
+                fail r "internal: a lambda with a type parameter of its own ('%s)" ownGens.Head
+
+            argTys, ret, ownGens
+        )
+
+    let fns =
+        List.zip parts signatures
+        |> List.map (fun ((_, hint, args, body), (_, _, ownGens)) ->
             {
                 FnName = uniqueName ctx $"%s{ctx.FnBase}_%s{hint}"
                 CaptureNames = captureNames
+                OuterTypeParams = ctx.TypeParams
+                TypeParams = ownGens
                 ArgTypes = args |> List.map (fun a -> a.Type)
                 Ret = body.Type
             }
@@ -1059,13 +1082,14 @@ and liftGroup
             ctx.LocalFns[name] <- fn
         | None -> ()
 
-    for ((_, _, args, body), fn) in List.zip parts fns do
+    for (((_, _, args, body), fn), (argTys, ret, ownGens)) in List.zip (List.zip parts fns) signatures do
         let vars = Dictionary<string, Var>()
 
         let inner =
             { ctx with
                 Vars = vars
                 LocalFns = Dictionary<string, LocalFn>(localFns)
+                TypeParams = ctx.TypeParams @ ownGens
                 DecisionTargets = []
             }
 
@@ -1078,34 +1102,19 @@ and liftGroup
             )
 
         let ps =
-            args
-            |> List.map (fun a ->
-                let v = ctx.State.NewVar(a.Name, mapType ctx a.Range a.Type, VParam, false)
+            List.zip args argTys
+            |> List.map (fun (a, ty) ->
+                let v = ctx.State.NewVar(a.Name, ty, VParam, false)
                 vars[a.Name] <- v
                 v
             )
-
-        let ret = mapType ctx body.Range body.Type
-
-        // F# lets a function declared inside another one have type parameters of its own; it
-        // would have to be compiled once per use.
-        match
-            freeGens (ret :: (ps |> List.map (fun v -> v.Ty)))
-            |> List.filter (fun g -> not (List.contains g ctx.TypeParams))
-        with
-        | [] -> ()
-        | g :: _ ->
-            fail
-                r
-                "the Zig target does not support a generic function declared inside a function yet (type parameter '%s)"
-                g
 
         let bodyIr = lw inner body
 
         ctx.State.Fns.Add
             {
                 Name = fn.FnName
-                TypeParams = ctx.TypeParams
+                TypeParams = ctx.TypeParams @ ownGens
                 Params = captured @ ps
                 Modes = (captured @ ps) |> List.map (fun _ -> MPlain)
                 Ret = ret
