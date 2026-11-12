@@ -201,11 +201,46 @@ itself and a `ref` cell. Its equality is still structural, as in F#.
 - Nothing is remembered about what such a field holds, and such reads are not moved to the
   start of their branch: they happen where the program does them.
 
-**Cycles are not collected yet.** A structure that reaches itself through a field that can be
-assigned (or through a `ref` cell captured by a function stored in it) is never freed by
-reference counting alone. In builds that count cells, the program says so when its entry
-point returns. The cycle collector (per-structure counts) is the next step; until then such
-programs leak.
+## Cycles
+
+Reference counting alone never frees a structure that reaches itself. The cycle collector
+(`fable_sgc.zig`, the per-structure-count collector of the prototype) does.
+
+**Which types.** A cell that is never assigned after it was made can only point at cells that
+were there before it, so data without assignable fields cannot form a cycle however recursive
+its type is. A type can be part of a cycle only if, in the graph of which cell type can point
+at which, it is in a strongly connected component that contains an assignable field. Only the
+cells of those types carry the collector's header (36 bytes, next to the count); every other
+type is plain reference counting and the collector never sees it. Three refinements:
+
+- A function value and an exception can hold anything, and their type does not say what. A
+  type that can reach one of them is taken to be able to be part of a cycle, and an
+  environment or an exception gets a header when what it holds can be.
+- For a generic type the question is answered for its declaration; whether an instance is
+  cyclic because of its type arguments is decided when the Zig is compiled
+  (`fable_rt.holdsCyclic`): the cells of `Folder list` have a header, those of `int list` do
+  not.
+- The answer depends only on type declarations, so every file gives the same one.
+
+**How.** Every connected group of such cells that an assignment has joined keeps one count:
+the references to its cells that are not held in a field of one of them. When that count
+reaches zero the whole group is dead, cycles included, and is freed at once; nothing is
+scanned. A dead cycle inside a group that is still referenced is found by a check of that one
+group, in bounded steps, at later allocations of such cells. A cell of such a type that is
+never assigned to is in no group and costs one test per retain and release.
+
+**Where the collector is told.** All in the runtime: a cell is made, retained, released, taken
+apart, and a field of a reference record is assigned (`fable_rt.storeIn`). Generated code
+never calls the collector, and it has no per-type code either: what a cell refers to is found
+through `@typeInfo`.
+
+Checks: `pub const fable_verify_cycles = true;` in a program's root file compares every
+group's count with the cells before every allocation of such a cell (slow; for tests). In
+every build, a group whose count says it is dead is checked against its cells' counts before
+any of them is freed, so a wrong report is a panic with a message, not freed memory in use.
+
+Not yet: the collector's tuning (pace, budgets) is not reachable from F#, and it serves one
+thread.
 
 ## Exceptions
 
@@ -275,7 +310,7 @@ forced on the LLVM backend; elsewhere it is an ordinary call.
    files"). Whether a function of another file can raise will be stated the same way.
 4. ~~Closures and function values~~ (done), ~~generics~~ (done), ~~exceptions~~ (done for
    F# `exception` declarations), byrefs and spans.
-5. ~~Mutable reference records~~ (done) and the cycle collector.
+5. ~~Mutable reference records and the cycle collector~~ (done).
 6. Strings, collections and the rest of FSharp.Core through `Replacements.fs` and the library.
 7. The test suite (`tests/Zig`), starting from the tests the other targets share.
 

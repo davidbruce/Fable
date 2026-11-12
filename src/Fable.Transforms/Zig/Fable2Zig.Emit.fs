@@ -295,6 +295,28 @@ let retType (fn: FnInfo) : string =
         let refs = callees |> List.map (fun (f, tys) -> fnRef f tys) |> String.concat ", "
         $"fable_rt.MayRaise(%s{zigType fn.Ret}, .{{ %s{refs} }})"
 
+/// Whether the cells of a type can be part of a cycle, as Zig text: yes, no, or for a generic
+/// type whose own declaration says no, whether one of its type arguments holds such a cell.
+/// (Nothing when it is a plain no: the cells then have no field for the collector at all.)
+let cyclicDecl (e: Ent) : string option =
+    if e.Cyclic then
+        Some "true"
+    else
+        match e.TypeParams with
+        | [] -> None
+        | typeParams ->
+            typeParams
+            |> List.map (fun g -> $"fable_rt.holdsCyclic(%s{genName g})")
+            |> String.concat " or "
+            |> Some
+
+/// The fields that every cell starts with: its count, and the collector's header if the type
+/// can be part of a cycle.
+let cellHeader (e: Ent) : string list =
+    match cyclicDecl e with
+    | Some _ -> [ "@\"$rc\": u32 = 1"; "@\"$gc\": fable_rt.GcHdr(fable_cyclic) = undefined" ]
+    | None -> [ "@\"$rc\": u32 = 1" ]
+
 let dupCode (x: string) = $"fable_rt.dup(%s{x})"
 let dropCode (x: string) = $"fable_rt.drop(%s{x});"
 
@@ -693,10 +715,24 @@ let emitUnpack (em: Em) (ind: string) (u: Unpack) =
             L $"defer if (%s{tn}) |%s{dead}| fable_rt.free(%s{dead});"
         | None -> ()
 
+        let mayBeCyclic =
+            match u.Scrut.Ty with
+            | TEnt(ent, _) -> (cyclicDecl ent).IsSome
+            | _ -> false
+
         L $"if (fable_rt.isUnique(%s{cell})) {{"
+
+        // (the collector is told first: what the cell holds stops being held by its structure,
+        // whether it is given up or moved out)
+        if mayBeCyclic then
+            L $"    fable_rt.forget(%s{cell});"
 
         for (f, _) in u.Drops do
             L("    " + dropCode $"%s{cell}.%s{fieldIdent f}")
+
+        for (_, v) in u.Moves do
+            if isManaged v.Ty && mayHoldCyclic v.Ty then
+                L $"    fable_rt.touch(%s{vname em v});"
 
         match u.Token with
         | Some tk -> L $"    %s{vname em tk} = %s{cell};"
@@ -854,10 +890,19 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
                 block rhs (fun lbl -> $"const %s{stored}: %s{zigType (typeOf lv)} = %s{lbl}: {{")
                 stored
 
-        if isManaged (typeOf lv) then
-            L $"fable_rt.store(&%s{place}, %s{value});"
-        else
-            L $"%s{place} = %s{value};"
+        match lv with
+        // (a field of a reference record: the collector is told, a cycle may be closed here)
+        | EGet(owner, PField f, _) when
+            isManaged (typeOf lv)
+            && (
+                match typeOf owner with
+                | TEnt({ Kind = KRefRecord }, _) -> true
+                | _ -> false
+            )
+            ->
+            L $"fable_rt.storeIn(%s{ex em owner}, \"%s{f}\", %s{value});"
+        | _ when isManaged (typeOf lv) -> L $"fable_rt.store(&%s{place}, %s{value});"
+        | _ -> L $"%s{place} = %s{value};"
 
         finishUnit em ind dest
     | EDrop(v, k) ->
@@ -1448,7 +1493,13 @@ let emitFile (state: FileState) : string =
         match e.Kind with
         | KRefRecord ->
             // a pointer to a counted cell that holds the fields
-            let payload = "@\"$rc\": u32 = 1" :: fields (snd e.Cases.Head) |> String.concat ", "
+            let decl =
+                match cyclicDecl e with
+                | Some verdict -> $"pub const fable_cyclic = %s{verdict}; "
+                | None -> ""
+
+            let payload =
+                decl + (cellHeader e @ fields (snd e.Cases.Head) |> String.concat ", ")
 
             match e.TypeParams with
             | [] ->
@@ -1491,11 +1542,15 @@ let emitFile (state: FileState) : string =
             // a case with fields points to a reference-counted cell; one without needs none
             out.AppendLine(opening "union(enum)") |> ignore
 
+            match cyclicDecl e with
+            | Some verdict -> out.AppendLine($"%s{ind}    pub const fable_cyclic = %s{verdict};") |> ignore
+            | None -> ()
+
             for (c, fs) in e.Cases do
                 if fs.IsEmpty then
                     out.AppendLine($"%s{ind}    %s{fieldIdent c},") |> ignore
                 else
-                    let payload = "@\"$rc\": u32 = 1" :: fields fs |> String.concat ", "
+                    let payload = cellHeader e @ fields fs |> String.concat ", "
 
                     out.AppendLine($"%s{ind}    %s{fieldIdent c}: *struct {{ %s{payload} }},")
                     |> ignore

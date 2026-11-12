@@ -3,8 +3,9 @@
 //! The cycle collector will live here too.
 const std = @import("std");
 const builtin = @import("builtin");
+pub const sgc = @import("fable_sgc.zig");
 
-pub const interface_version: i32 = 7;
+pub const interface_version: i32 = 8;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -47,8 +48,11 @@ pub fn Cell(comptime T: type, comptime tag: std.meta.Tag(T)) type {
 
 /// A new cell with a count of one.
 pub inline fn cell(comptime T: type, comptime tag: std.meta.Tag(T), init: Cell(T, tag)) *Cell(T, tag) {
-    const c = allocator.create(Cell(T, tag)) catch @panic("fable: out of memory");
+    const C = Cell(T, tag);
+    if (comptime hasGc(C)) gcTick();
+    const c = allocator.create(C) catch @panic("fable: out of memory");
     c.* = init;
+    if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) stats.allocs += 1;
     return c;
 }
@@ -65,6 +69,11 @@ pub inline fn cellReuse(comptime T: type, comptime tag: std.meta.Tag(T), tok: an
             tok.* = null;
             const c: *C = @ptrCast(@alignCast(p));
             c.* = init;
+            if (comptime hasGc(C)) {
+                // (a cell that is built in again is a new cell: it gets an age of its own)
+                collector.allocs += 1;
+                c.@"$gc" = gcHeader(C, c);
+            }
             if (track) stats.reuses += 1;
             return c;
         }
@@ -79,20 +88,43 @@ pub inline fn isUnique(c: anytype) bool {
 pub inline fn retain(c: anytype) void {
     c.@"$rc" += 1;
     if (track) stats.dups += 1;
+    if (gcOf(c)) |h| collector.onRetain(h);
 }
 
 /// Take one reference off a cell that is known to be shared.
 pub inline fn release(c: anytype) void {
     c.@"$rc" -= 1;
     if (track) stats.decs += 1;
+    if (gcOf(c)) |h| collector.onRelease(h);
 }
 
-/// Take one reference off; true when it was the last one, and the caller frees the cell.
+/// Take one reference off; true when it was the last one, and the caller gives up what the
+/// cell holds and frees it. (False also when the cell's whole structure died with this
+/// reference: the collector frees all of it, this cell included.)
 pub inline fn releaseIsLast(c: anytype) bool {
-    if (c.@"$rc" == 1) return true;
-    c.@"$rc" -= 1;
-    if (track) stats.decs += 1;
-    return false;
+    if (c.@"$rc" != 1) {
+        c.@"$rc" -= 1;
+        if (track) stats.decs += 1;
+        if (gcOf(c)) |h| collector.onRelease(h);
+        return false;
+    }
+    if (gcOf(c)) |h| return !collector.onZero(h);
+    return true;
+}
+
+/// A cell that is not shared is taken apart without its count going to zero: its fields are
+/// about to be moved out or given up.
+pub inline fn forget(c: anytype) void {
+    if (gcOf(c)) |h| collector.onFree(h);
+}
+
+/// A reference left a cell that is being taken apart and went to a variable as it is.
+pub inline fn touch(x: anytype) void {
+    eachHdr(x, {}, movedOut);
+}
+
+fn movedOut(_: void, h: *sgc.Hdr) void {
+    collector.onMoveOut(h);
 }
 
 pub inline fn free(c: anytype) void {
@@ -100,8 +132,9 @@ pub inline fn free(c: anytype) void {
     allocator.destroy(c);
 }
 
+/// The count and the collector's header are not part of what a cell holds.
 fn isCount(comptime field_name: []const u8) bool {
-    return std.mem.eql(u8, field_name, "$rc");
+    return std.mem.eql(u8, field_name, "$rc") or std.mem.eql(u8, field_name, "$gc");
 }
 
 fn isCellPtr(comptime T: type) bool {
@@ -307,31 +340,310 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
 /// A new reference record (a record with mutable fields, or one that contains itself): a
 /// pointer to a counted cell that holds the fields.
 pub inline fn new(comptime P: type, init: @typeInfo(P).pointer.child) P {
-    const c = allocator.create(@typeInfo(P).pointer.child) catch @panic("fable: out of memory");
+    const C = @typeInfo(P).pointer.child;
+    if (comptime hasGc(C)) gcTick();
+    const c = allocator.create(C) catch @panic("fable: out of memory");
     c.* = init;
+    if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) stats.allocs += 1;
     return c;
 }
 
-/// Store into a field that owns its value: the old value is given up once the new one is in
-/// place.
+/// Store into a variable or a field of a plain value that owns what it holds: the old value
+/// is given up once the new one is in place.
 pub inline fn store(place: anytype, value: @TypeOf(place.*)) void {
     const old = place.*;
     place.* = value;
     drop(old);
 }
 
+/// Store into a field of a reference record. The collector is told what the record no longer
+/// points at and what it points at now: this is where a cycle can be closed.
+pub inline fn storeIn(owner: anytype, comptime field: []const u8, value: @FieldType(@TypeOf(owner.*), field)) void {
+    const old = @field(owner, field);
+    @field(owner, field) = value;
+    if (gcOf(owner)) |h| {
+        eachHdr(old, h, unstored);
+        eachHdr(value, h, stored);
+    } else {
+        touch(value);
+    }
+    drop(old);
+}
+
+fn unstored(owner: *sgc.Hdr, old: *sgc.Hdr) void {
+    collector.onUnstore(owner, old);
+}
+
+fn stored(owner: *sgc.Hdr, child: *sgc.Hdr) void {
+    collector.onStore(owner, child);
+}
+
 /// F#'s `ref` cell.
 pub fn Ref(comptime T: type) type {
-    return *struct { @"$rc": u32 = 1, contents: T };
+    return *struct {
+        pub const fable_cyclic = holdsCyclic(T);
+        @"$rc": u32 = 1,
+        @"$gc": GcHdr(fable_cyclic) = undefined,
+        contents: T,
+    };
 }
 
 /// F#'s list.
 pub fn List(comptime T: type) type {
     return union(enum) {
+        pub const fable_cyclic = holdsCyclic(T);
         Empty,
-        Cons: *struct { @"$rc": u32 = 1, Head: T, Tail: List(T) },
+        Cons: *struct { @"$rc": u32 = 1, @"$gc": GcHdr(fable_cyclic) = undefined, Head: T, Tail: List(T) },
     };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cycles
+//
+// Reference counting alone never frees a structure that reaches itself. A structure can only
+// do that through a field that is assigned after the cell was made, so most types cannot be
+// part of a cycle at all, and their cells are exactly as above. The cells of the types that
+// can (the compiler works out which) carry a header of the collector, `$gc`, next to their
+// count. The collector (fable_sgc.zig) keeps one count per connected group of such cells: the
+// references to its cells that are not held in a field of one of them. When that count
+// reaches zero the whole group is dead, cycles included, and is freed.
+//
+// What the collector has to be told is all in this file: a cell is made, retained, released,
+// taken apart, and a field of it is assigned. Generated code does not call the collector.
+// ---------------------------------------------------------------------------------------------
+
+/// A test mode: before every allocation of a cell with a collector header, every structure's
+/// count is checked against the cells and what they point at. A program turns it on with
+/// `pub const fable_verify_cycles = true;` in its root file. Very slow.
+const verify_cycles: bool = if (@hasDecl(@import("root"), "fable_verify_cycles")) @import("root").fable_verify_cycles else false;
+
+var collector: sgc.Gc = undefined;
+var collector_ready: bool = false;
+
+/// The type of a cell's `$gc` field: the collector's header, or nothing.
+pub fn GcHdr(comptime cyclic: bool) type {
+    return if (cyclic) sgc.Hdr else void;
+}
+
+fn hasGc(comptime C: type) bool {
+    return @hasField(C, "$gc") and @FieldType(C, "$gc") == sgc.Hdr;
+}
+
+/// The collector's header of a cell, if it has one. An environment and an exception say so
+/// themselves (their type does not show what they hold); for any other cell it is in its type.
+inline fn gcOf(c: anytype) ?*sgc.Hdr {
+    const C = @TypeOf(c.*);
+    if (C == Env or C == ExnHeader) return c.gc;
+    if (comptime hasGc(C)) return &c.@"$gc";
+    return null;
+}
+
+/// Does a value of this type hold, directly, a reference to a cell that can be part of a
+/// cycle? A function value and an exception count: what they hold is not in their type.
+/// (Only declarations are looked at, never fields of cells: this is evaluated while the types
+/// that ask are still being put together.)
+pub fn holdsCyclic(comptime T: type) bool {
+    if (T == Exn) return true;
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size != .one or @typeInfo(p.child) != .@"struct") return false;
+            return @hasDecl(p.child, "fable_cyclic") and p.child.fable_cyclic;
+        },
+        .optional => |o| return holdsCyclic(o.child),
+        .@"struct" => |s| {
+            if (@hasDecl(T, "fable_func")) return true;
+            inline for (s.field_types) |F| {
+                if (holdsCyclic(F)) return true;
+            }
+            return false;
+        },
+        .@"union" => |u| {
+            if (@hasDecl(T, "fable_cyclic")) return T.fable_cyclic;
+            inline for (u.field_types) |F| {
+                if (holdsCyclic(F)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// Call `f(ctx, header)` for every cell with a collector header that `x` refers to directly.
+fn eachHdr(x: anytype, ctx: anytype, comptime f: anytype) void {
+    const T = @TypeOf(x);
+    if (comptime !holdsCyclic(T)) return;
+    if (T == Exn) {
+        if (x.gc) |h| f(ctx, h);
+        return;
+    }
+    if (comptime isFunc(T)) {
+        if (x.env) |e| {
+            if (e.gc) |h| f(ctx, h);
+        }
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .pointer => f(ctx, &x.@"$gc"),
+        .optional => if (x) |v| eachHdr(v, ctx, f),
+        .@"struct" => |s| inline for (s.field_names) |name| eachHdr(@field(x, name), ctx, f),
+        .@"union" => switch (x) {
+            inline else => |p| {
+                if (comptime isCellPtr(@TypeOf(p))) {
+                    if (comptime hasGc(@TypeOf(p.*))) f(ctx, &p.@"$gc");
+                } else {
+                    eachHdr(p, ctx, f);
+                }
+            },
+        },
+        else => comptime unreachable,
+    }
+}
+
+/// Give up what a dead cell holds, except its references to cells that are going away with it.
+fn dropOutside(x: anytype) void {
+    const T = @TypeOf(x);
+    if (comptime !isManaged(T)) return;
+    if (comptime !holdsCyclic(T)) return drop(x);
+    if (T == Exn) {
+        if (x.gc) |h| {
+            if (sgc.isGarbage(h)) return;
+        }
+        return drop(x);
+    }
+    if (comptime isFunc(T)) {
+        if (x.env) |e| {
+            if (e.gc) |h| {
+                if (sgc.isGarbage(h)) return;
+            }
+        }
+        return drop(x);
+    }
+    switch (@typeInfo(T)) {
+        .pointer => if (!sgc.isGarbage(&x.@"$gc")) drop(x),
+        .optional => if (x) |v| dropOutside(v),
+        .@"struct" => |s| inline for (s.field_names) |name| dropOutside(@field(x, name)),
+        .@"union" => switch (x) {
+            inline else => |p| {
+                if (comptime isCellPtr(@TypeOf(p))) {
+                    if (comptime hasGc(@TypeOf(p.*))) {
+                        if (!sgc.isGarbage(&p.@"$gc")) drop(x);
+                    } else {
+                        drop(x);
+                    }
+                } else {
+                    dropOutside(p);
+                }
+            },
+        },
+        else => comptime unreachable,
+    }
+}
+
+fn visit(v: *sgc.Visitor, h: *sgc.Hdr) void {
+    v.visit(h);
+}
+
+fn countOne(n: *usize, _: *sgc.Hdr) void {
+    n.* += 1;
+}
+
+/// What the collector needs to know about one type of cell `C`: where its count is, which
+/// cells it refers to, and how to give up what it holds and free it. `gc_field` is the
+/// collector's header in `C`; `payload` is the field that holds everything else (all fields
+/// but the count and the header when it is null).
+fn Collected(comptime C: type, comptime gc_field: []const u8, comptime rc_offset: isize, comptime payload: ?[]const u8) type {
+    return struct {
+        inline fn cellOf(n: *sgc.Hdr) *C {
+            return @alignCast(@fieldParentPtr(gc_field, n));
+        }
+
+        fn trace(n: *sgc.Hdr, v: *sgc.Visitor) void {
+            const c = cellOf(n);
+            if (payload) |p| {
+                eachHdr(@field(c, p), v, visit);
+            } else inline for (@typeInfo(C).@"struct".field_names) |name| {
+                if (comptime !isCount(name)) eachHdr(@field(c, name), v, visit);
+            }
+        }
+
+        fn releaseOutside(n: *sgc.Hdr, _: ?*anyopaque) void {
+            const c = cellOf(n);
+            if (payload) |p| {
+                dropOutside(@field(c, p));
+            } else inline for (@typeInfo(C).@"struct".field_names) |name| {
+                if (comptime !isCount(name)) dropOutside(@field(c, name));
+            }
+        }
+
+        fn freeCell(n: *sgc.Hdr, _: ?*anyopaque) void {
+            free(cellOf(n));
+        }
+
+        fn finalize(n: *sgc.Hdr, _: ?*anyopaque) void {
+            const c = cellOf(n);
+            if (payload) |p| {
+                drop(@field(c, p));
+            } else inline for (@typeInfo(C).@"struct".field_names) |name| {
+                if (comptime !isCount(name)) drop(@field(c, name));
+            }
+            free(c);
+        }
+
+        /// Is the cell being made without a reference to a cell that can be part of a cycle?
+        fn isLeaf(c: *const C) bool {
+            var n: usize = 0;
+            if (payload) |p| {
+                eachHdr(@field(c, p), &n, countOne);
+            } else inline for (@typeInfo(C).@"struct".field_names) |name| {
+                if (comptime !isCount(name)) eachHdr(@field(c, name), &n, countOne);
+            }
+            return n == 0;
+        }
+
+        const desc: sgc.Desc = .{
+            .rc_offset = rc_offset,
+            .trace = trace,
+            .release_outside = releaseOutside,
+            .free = freeCell,
+            .finalize = finalize,
+        };
+    };
+}
+
+noinline fn collectorSetup() void {
+    collector.init(.{}, null, allocator);
+    collector_ready = true;
+}
+
+/// Before a cell with a collector header is allocated (its field values are computed by
+/// then): the only place where the collector does work of its own accord.
+inline fn gcTick() void {
+    if (!collector_ready) collectorSetup();
+    if (verify_cycles) collector.verify();
+    if (collector.tickDue()) collector.tickSlow();
+}
+
+/// The header of a new cell of a recursive union or of a reference record.
+inline fn gcHeader(comptime C: type, c: *const C) sgc.Hdr {
+    const K = Collected(C, "$gc", @as(isize, @offsetOf(C, "$rc")) - @as(isize, @offsetOf(C, "$gc")), null);
+    return collector.hdr(&K.desc, K.isLeaf(c));
+}
+
+/// Free every cycle that is dead now. Returns how many cells that freed.
+pub fn collect() i64 {
+    if (!collector_ready) return 0;
+    return @intCast(collector.collectAll());
+}
+
+/// Give back the collector's own bookkeeping. Nothing it looks after may be alive.
+pub fn collectorDeinit() void {
+    if (collector_ready) collector.deinit();
+}
+
+/// The collector's counters (see fable_sgc.zig), or null if no cell ever needed it.
+pub fn collectorCounters() ?sgc.Counters {
+    return if (collector_ready) collector.counters else null;
 }
 
 /// How a call that ends a function is made when the caller and the callee have the same
@@ -356,6 +668,8 @@ pub const tail_call: std.builtin.CallModifier = if (builtin.zig_backend == .stag
 /// The start of every environment.
 pub const Env = struct {
     @"$rc": u32 = 1,
+    /// the collector's header of this environment, if what it captured can be part of a cycle
+    gc: ?*sgc.Hdr = null,
     destroy: *const fn (*Env) void,
 };
 
@@ -373,11 +687,21 @@ fn isFunc(comptime T: type) bool {
 
 fn EnvOf(comptime Captures: type) type {
     return struct {
+        const Self = @This();
+        const cyclic = holdsCyclic(Captures);
+        const K = Collected(
+            Self,
+            "hdr",
+            @as(isize, @offsetOf(Self, "header")) + @as(isize, @offsetOf(Env, "$rc")) - @as(isize, @offsetOf(Self, "hdr")),
+            "captures",
+        );
+
         header: Env,
+        hdr: GcHdr(cyclic) = undefined,
         captures: Captures,
 
         fn destroy(header: *Env) void {
-            const self: *@This() = @fieldParentPtr("header", header);
+            const self: *Self = @fieldParentPtr("header", header);
             drop(self.captures);
             free(self);
         }
@@ -387,8 +711,13 @@ fn EnvOf(comptime Captures: type) type {
 /// A function value that owns `captures`.
 pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captures, code: @FieldType(F, "code")) F {
     const E = EnvOf(Captures);
+    if (comptime E.cyclic) gcTick();
     const e = allocator.create(E) catch @panic("fable: out of memory");
     e.* = .{ .header = .{ .destroy = E.destroy }, .captures = captures };
+    if (comptime E.cyclic) {
+        e.hdr = collector.hdr(&E.K.desc, E.K.isLeaf(e));
+        e.header.gc = &e.hdr;
+    }
     if (track) stats.allocs += 1;
     return .{ .env = &e.header, .code = code };
 }
@@ -420,6 +749,8 @@ pub const ExnType = struct {
 
 pub const ExnHeader = struct {
     @"$rc": u32 = 1,
+    /// the collector's header of this exception, if what it holds can be part of a cycle
+    gc: ?*sgc.Hdr = null,
     type: *const ExnType,
 };
 
@@ -429,13 +760,25 @@ pub const Exn = *ExnHeader;
 /// An F# `exception` declaration with the given fields.
 pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
     return struct {
-        const Whole = struct { header: ExnHeader, payload: Payload };
+        const cyclic = holdsCyclic(Payload);
+        const Whole = struct { header: ExnHeader, hdr: GcHdr(cyclic) = undefined, payload: Payload };
+        const K = Collected(
+            Whole,
+            "hdr",
+            @as(isize, @offsetOf(Whole, "header")) + @as(isize, @offsetOf(ExnHeader, "$rc")) - @as(isize, @offsetOf(Whole, "hdr")),
+            "payload",
+        );
 
         pub const info: ExnType = .{ .name = name, .destroy = destroy };
 
         pub fn new(payload: Payload) Exn {
+            if (comptime cyclic) gcTick();
             const c = allocator.create(Whole) catch @panic("fable: out of memory");
             c.* = .{ .header = .{ .type = &info }, .payload = payload };
+            if (comptime cyclic) {
+                c.hdr = collector.hdr(&K.desc, K.isLeaf(c));
+                c.header.gc = &c.hdr;
+            }
             if (track) stats.allocs += 1;
             return &c.header;
         }
@@ -550,6 +893,8 @@ pub fn live() i64 {
 /// Called when the program's entry point has returned: true, with a message, if cells are
 /// still allocated. Only checks in builds that keep counters.
 pub fn leaked() bool {
+    // (cycles that died without anything noticing yet are not leaks)
+    _ = collect();
     if (!track or live() == 0) return false;
     std.debug.print("fable: {d} cell(s) were never freed (allocated {d}, freed {d})\n", .{ live(), stats.allocs, stats.frees });
     return true;
@@ -815,6 +1160,71 @@ test "reference records: identity, stores and long chains" {
     drop(box);
     drop(alias);
     try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+}
+
+const TestPerson = *struct {
+    pub const fable_cyclic = true;
+    @"$rc": u32 = 1,
+    @"$gc": GcHdr(fable_cyclic) = undefined,
+    id: i32,
+    friend: ?TestPerson,
+    friends: List(TestPerson),
+    callback: ?Func(*const fn (?*Env, i32) Raised!i32),
+};
+
+fn testPerson(id: i32) TestPerson {
+    return new(TestPerson, .{ .id = id, .friend = null, .friends = .Empty, .callback = null });
+}
+
+const TestSelf = struct { self: TestPerson };
+
+fn testAddId(env: ?*Env, x: i32) Raised!i32 {
+    return x + captured(TestSelf, env).self.id;
+}
+
+test "cycles are freed when their last outside reference goes" {
+    const before = stats;
+    // two records that point at each other
+    const a = testPerson(1);
+    const b = testPerson(2);
+    storeIn(a, "friend", dup(b));
+    storeIn(b, "friend", dup(a));
+    drop(a);
+    try std.testing.expectEqual(@as(i64, 0), stats.frees - before.frees);
+    drop(b);
+    try std.testing.expectEqual(@as(i64, 2), stats.frees - before.frees);
+    // a record that reaches itself through a list
+    const c = testPerson(3);
+    const cons = List(TestPerson){ .Cons = cell(List(TestPerson), .Cons, .{ .Head = dup(c), .Tail = .Empty }) };
+    storeIn(c, "friends", cons);
+    drop(c);
+    try std.testing.expectEqual(@as(i64, 4), stats.frees - before.frees);
+    // a record that holds a function which captured the record
+    const d = testPerson(40);
+    const f = closure(Func(*const fn (?*Env, i32) Raised!i32), TestSelf, .{ .self = dup(d) }, testAddId);
+    storeIn(d, "callback", f);
+    try std.testing.expectEqual(@as(i32, 42), try d.callback.?.code(d.callback.?.env, 2));
+    drop(d);
+    try std.testing.expectEqual(@as(i64, 6), stats.frees - before.frees);
+    // a ring with a tail hanging off it, cut loose in the middle of a structure that lives on
+    const keep = testPerson(5);
+    const x = testPerson(6);
+    const y = testPerson(7);
+    storeIn(x, "friend", dup(y));
+    storeIn(y, "friend", dup(x));
+    storeIn(keep, "friend", x);
+    drop(y);
+    storeIn(keep, "friend", null);
+    _ = collect();
+    try std.testing.expectEqual(@as(i64, 8), stats.frees - before.frees);
+    drop(keep);
+    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+    // cells of the same types that never form a cycle are plain reference counting
+    const lone = testPerson(8);
+    storeIn(lone, "friends", List(TestPerson){ .Cons = cell(List(TestPerson), .Cons, .{ .Head = testPerson(9), .Tail = .Empty }) });
+    drop(lone);
+    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
+    try std.testing.expect(@sizeOf(@typeInfo(@FieldType(List(i32), "Cons")).pointer.child) == 24);
 }
 
 test "conv follows .NET" {

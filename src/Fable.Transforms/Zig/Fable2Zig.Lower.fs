@@ -137,6 +137,112 @@ let private settleManaged (state: FileState) =
                 e.Managed <- m
                 changed <- true
 
+/// Which types can be part of a reference cycle?
+///
+/// A cell that is never assigned after it was made can only point at cells that were there
+/// before it, so data without assignable fields cannot form a cycle however recursive its
+/// type is. A cycle needs an assignable field to close it. So: in the graph of which cell type
+/// can point at which, a type can be part of a cycle only if it is in a strongly connected
+/// component that contains an assignable field.
+///
+/// A function value and an exception can hold anything, and their type does not say what. A
+/// type that can reach one of them is therefore taken to be able to be part of a cycle.
+///
+/// The answer depends only on the declarations of the types, so every file that mentions a
+/// type gets the same one. (For a generic type it is the answer whatever the type arguments
+/// are; whether an instance is cyclic because of its arguments is decided when the Zig is
+/// compiled: `fable_rt.holdsCyclic`.)
+let private settleCyclic (state: FileState) =
+    let isCell (e: Ent) =
+        e.Kind = KHeapUnion || e.Kind = KRefRecord
+
+    let cells = state.Ents.Values |> Seq.filter isCell |> List.ofSeq
+
+    /// the cell types a value of this type refers to directly (looking through plain values),
+    /// and whether it holds a function value or an exception
+    let rec targets (seen: HashSet<Ent>) (t: Ty) : Ent list * bool =
+        let all (parts: (Ent list * bool) list) =
+            parts |> List.collect fst, parts |> List.exists snd
+
+        match t with
+        | TFn _
+        | TPrim "fable_rt.Exn" -> [], true
+        | TEnt(e, args) ->
+            let own =
+                if isCell e then
+                    [ e ], false
+                elif seen.Add e then
+                    e.Cases |> List.collect snd |> List.map (snd >> targets seen) |> all
+                else
+                    [], false
+
+            all (own :: (args |> List.map (targets seen)))
+        | TOpt t -> targets seen t
+        | TTuple ts -> all (ts |> List.map (targets seen))
+        | _ -> [], false
+
+    // (from, to, through an assignable field)
+    let edges = List<Ent * Ent * bool>()
+    let reachesAny = HashSet<Ent>()
+
+    for e in cells do
+        for (_, fields) in e.Cases do
+            for (f, t) in fields do
+                let tgts, any = targets (HashSet()) t
+
+                if any then
+                    reachesAny.Add e |> ignore
+
+                for tgt in tgts do
+                    edges.Add((e, tgt, List.contains f e.MutableFields))
+
+    let succ (e: Ent) =
+        edges
+        |> Seq.choose (fun (a, b, _) ->
+            if obj.ReferenceEquals(a, e) then
+                Some b
+            else
+                None
+        )
+        |> List.ofSeq
+
+    let reach = Dictionary<Ent, HashSet<Ent>>()
+
+    for e in cells do
+        let seen = HashSet<Ent>()
+
+        let rec go (x: Ent) =
+            for y in succ x do
+                if seen.Add y then
+                    go y
+
+        go e
+        reach[e] <- seen
+
+    // what points at a type that reaches a function value or an exception reaches one too
+    let mutable changed = true
+
+    while changed do
+        changed <- false
+
+        for e in cells do
+            if not (reachesAny.Contains e) && reach[e] |> Seq.exists reachesAny.Contains then
+                reachesAny.Add e |> ignore
+                changed <- true
+
+    let sameComponent (a: Ent) (b: Ent) =
+        reach.ContainsKey a
+        && reach.ContainsKey b
+        && reach[a].Contains b
+        && reach[b].Contains a
+
+    for e in cells do
+        e.Cyclic <-
+            reachesAny.Contains e
+            || (reach[e].Contains e
+                && edges
+                   |> Seq.exists (fun (a, b, assignable) -> assignable && sameComponent e a && sameComponent e b))
+
 let private listName = "Microsoft.FSharp.Collections.FSharpList`1"
 
 /// F#'s list: a generic recursive union that the runtime library declares.
@@ -157,6 +263,7 @@ let private listEnt (state: FileState) : Ent =
                 Cases = []
                 MutableFields = []
                 Managed = true
+                Cyclic = false
                 Copyable = true
                 IsLocal = false
             }
@@ -185,6 +292,7 @@ let private refEnt (state: FileState) : Ent =
                 Cases = [ "", [ "contents", TGen "T" ] ]
                 MutableFields = [ "contents" ]
                 Managed = true
+                Cyclic = false
                 Copyable = true
                 IsLocal = false
             }
@@ -287,6 +395,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                     else
                         []
                 Managed = false
+                Cyclic = false
                 Copyable = true
                 IsLocal = isLocal
             }
@@ -345,6 +454,7 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
                     Cases = []
                     MutableFields = []
                     Managed = false
+                    Cyclic = false
                     Copyable = true
                     IsLocal = isLocal
                 }
@@ -1516,4 +1626,5 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                  | None -> d.Body.Range)
                 msg
 
+    settleCyclic state
     state

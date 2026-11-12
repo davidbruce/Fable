@@ -36,6 +36,9 @@ type Ent =
         mutable Cases: (string * (string * Ty) list) list
         /// the fields of a record that can be assigned
         mutable MutableFields: string list
+        /// its cells can be part of a reference cycle whatever its type arguments are (they
+        /// carry a header of the cycle collector)
+        mutable Cyclic: bool
         /// holds references to cells whatever its type arguments are
         mutable Managed: bool
         mutable Copyable: bool
@@ -119,6 +122,23 @@ let rec isCopyable (t: Ty) =
     | TOpt t -> isCopyable t
     | TTuple ts -> List.forall isCopyable ts
     | _ -> true
+
+/// Can a value of this type hold a reference to a cell that can be part of a cycle? (What a
+/// type parameter, a function value or an exception holds is not known here.)
+let rec mayHoldCyclic (t: Ty) : bool =
+    match t with
+    | TFn _
+    | TGen _
+    | TPrim "fable_rt.Exn" -> true
+    | TEnt(e, args) ->
+        e.Cyclic
+        || List.exists mayHoldCyclic args
+        || (e.Kind <> KHeapUnion
+            && e.Kind <> KRefRecord
+            && e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> mayHoldCyclic)))
+    | TOpt t -> mayHoldCyclic t
+    | TTuple ts -> List.exists mayHoldCyclic ts
+    | _ -> false
 
 /// A name for a type that is the same wherever the type is written.
 let rec tyKey (t: Ty) : string =
