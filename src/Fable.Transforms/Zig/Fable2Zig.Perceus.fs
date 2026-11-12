@@ -17,10 +17,25 @@ type private P =
 // =============================================================================================
 
 /// Remove `let x = <pure> in body` when x is unused, and what follows a `raise`.
+/// If evaluating `e` always ends in a raise: `e`, with `ty` as the type that is expected where
+/// it stands. What comes after it can never run, and Zig refuses code that cannot.
+let rec private asRaise (ty: Ty) (e: Expr) : Expr option =
+    match e with
+    | ERaise(x, _) -> Some(ERaise(x, ty))
+    | ELet(v, r, b) -> asRaise ty b |> Option.map (fun b' -> ELet(v, r, b'))
+    | ESeq(a, b) -> asRaise ty b |> Option.map (fun b' -> ESeq(a, b'))
+    | EIf(c, t, f, _) ->
+        match asRaise ty t, asRaise ty f with
+        | Some t', Some f' -> Some(EIf(c, t', f', ty))
+        | _ -> None
+    | _ -> None
+
 let rec private cleanup (e: Expr) : Expr =
     match e with
     | ELet(_, ERaise(x, _), body) -> ERaise(x, typeOf body)
     | ESeq(ERaise(x, _), b) -> ERaise(x, typeOf b)
+    | ESeq(a, b) when (asRaise (typeOf b) a).IsSome -> cleanup (asRaise (typeOf b) a).Value
+    | ELet(_, rhs, body) when (asRaise (typeOf body) rhs).IsSome -> cleanup (asRaise (typeOf body) rhs).Value
     | ETry(b, v, h, t) -> ETry(cleanup b, v, cleanup h, t)
     | ELet(v, rhs, body) ->
         let body' = cleanup body
@@ -321,7 +336,8 @@ let private joinRaises (a: Raises) (b: Raises) : Raises =
 /// of another file can if Zig finds that it does.
 let private callRaises (p: P) (e: Expr) : Raises =
     match e with
-    | ECallClo _ -> RAlways
+    | ECallClo _
+    | ERt _ -> RAlways
     | ECall(f, tyArgs, _, _) ->
         match p.Fns.TryGetValue f with
         | true, g ->
@@ -342,6 +358,7 @@ let rec private raisesOf (p: P) (e: Expr) : Raises =
     // (what the body raises lands in the handler, which raises again what it does not handle)
     | ETry(_, _, h, _) -> raisesOf p h
     | ECall _
+    | ERt _
     | ECallClo _ -> joinRaises (callRaises p e) (many (flatKids e))
     | ELet(_, r, b)
     | ESeq(r, b)
@@ -428,11 +445,12 @@ let rec private hoistRaising (p: P) (e: Expr) : Expr =
     | EIf(c, t, f, ty) ->
         let binds, c' = lift false c
         wrap binds (EIf(c', hr t, hr f, ty))
-    | EWhile(c, b) ->
-        if hasRaising c then
-            fail None "the Zig target does not support a `while` condition that can raise yet"
-
-        EWhile(c, hr b)
+    | EWhile(c, b) when hasRaising c ->
+        // (a condition that can raise is tested inside the loop, where it can leave the function)
+        let go = p.State.NewVar("go", tBool, VLocal, true)
+        let stop = EAssign(go, ELit("false", tBool))
+        hr (ELet(go, ELit("true", tBool), EWhile(EVar go, EIf(c, b, stop, tVoid))))
+    | EWhile(c, b) -> EWhile(c, hr b)
     | EFor(i, a, b, up, body) ->
         let bindsA, a' = lift false a
         let bindsB, b' = lift false b
@@ -1107,6 +1125,7 @@ let private raiseEdgeDrops (p: P) (env: PEnv) (stillOwned: Set<int>) : Var list 
 let private wrapRaising (p: P) (env: PEnv) (e: Expr) (stillOwned: Set<int>) : Expr =
     match e with
     | ECall _
+    | ERt _
     | ECallClo _ when callRaises p e <> RNever -> EOnRaise(e, raiseEdgeDrops p env stillOwned)
     | EDup((ECall _ as call), t) when callRaises p call <> RNever ->
         EDup(EOnRaise(call, raiseEdgeDrops p env stillOwned), t)

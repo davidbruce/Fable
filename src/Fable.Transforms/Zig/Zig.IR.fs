@@ -302,6 +302,9 @@ type Expr =
     | EIndex of Expr * Expr * Ty
     /// `[<Emit>]`: Zig text with `$0`, `$1`, ... standing for the arguments
     | EEmit of string * Expr list * Ty
+    /// a call into the runtime library that can raise: Zig text like `EEmit`, whose result is
+    /// `fable_rt.Raised!T`
+    | ERt of string * Expr list * Ty
     /// a new exception of the declared type, which owns the field values
     | EExnNew of Ent * Expr list
     /// is the exception of the declared type?
@@ -394,6 +397,7 @@ let rec typeOf (e: Expr) : Ty =
     | EDeref(_, t)
     | EIndex(_, _, t)
     | EEmit(_, _, t)
+    | ERt(_, _, t)
     | EExnGet(_, _, _, t)
     | ERaise(_, t)
     | ETry(_, _, _, t)
@@ -448,6 +452,7 @@ let flatKids (e: Expr) : Expr list =
     | EPrim(_, xs, _)
     | ECall(_, _, xs, _)
     | EEmit(_, xs, _)
+    | ERt(_, xs, _)
     | EClosure(_, _, xs, _)
     | EExnNew(_, xs)
     | ECon(_, _, xs, _) -> xs
@@ -469,6 +474,7 @@ let withFlatKids (e: Expr) (xs: Expr list) : Expr =
     | EPrim(op, _, t), _ -> EPrim(op, xs, t)
     | ECall(f, tys, _, t), _ -> ECall(f, tys, xs, t)
     | EEmit(m, _, t), _ -> EEmit(m, xs, t)
+    | ERt(m, _, t), _ -> ERt(m, xs, t)
     | EClosure(f, tys, _, t), _ -> EClosure(f, tys, xs, t)
     | ECon(t, c, _, tok), _ -> ECon(t, c, xs, tok)
     | EExnNew(ent, _), _ -> EExnNew(ent, xs)

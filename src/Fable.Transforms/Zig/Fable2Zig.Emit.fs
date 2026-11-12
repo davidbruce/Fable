@@ -459,6 +459,14 @@ let rec ex (em: Em) (e: Expr) : string =
     | EExnNew(ent, xs) ->
         let fields = caseFields (TEnt(ent, [])) ""
 
+        if fields.Length <> xs.Length then
+            fail
+                None
+                "internal: the exception %s has %d field(s) and is made with %d value(s)"
+                ent.Name
+                fields.Length
+                xs.Length
+
         let inits =
             List.zip fields (xs |> List.map (ex em))
             |> List.map (fun ((f, _), a) -> $".%s{fieldIdent f} = %s{a}")
@@ -478,7 +486,8 @@ let rec ex (em: Em) (e: Expr) : string =
 
         let definite =
             match call with
-            | ECallClo _ -> true
+            | ECallClo _
+            | ERt _ -> true
             | ECall(f, _, _, _) ->
                 match em.Fns.TryGetValue f with
                 | true, g -> g.Raises = RAlways
@@ -494,7 +503,8 @@ let rec ex (em: Em) (e: Expr) : string =
             let raw = freshName em "raw"
 
             $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) (%s{raw} catch %s{edge}) else %s{raw}; }})"
-    | EEmit(macro, xs, _) ->
+    | EEmit(macro, xs, _)
+    | ERt(macro, xs, _) ->
         let args = xs |> List.map (ex em) |> Array.ofList
 
         Regex.Replace(

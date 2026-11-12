@@ -345,12 +345,16 @@ let private dotnetExceptions =
         "DivideByZeroException"
         "OverflowException"
         "FormatException"
+        "SystemException"
+        "ArithmeticException"
+        "NullReferenceException"
     ]
     |> List.map (fun name -> "System." + name, "fable_rt." + name)
     |> List.append
         [
             "System.Exception", "fable_rt.Failure"
             "System.Collections.Generic.KeyNotFoundException", "fable_rt.KeyNotFoundException"
+            "Microsoft.FSharp.Core.MatchFailureException", "fable_rt.MatchFailureException"
         ]
     |> Map.ofList
 
@@ -662,6 +666,7 @@ let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr
                 | ECall _
                 | ECallClo _
                 | EClosure _
+                | ERt _
                 | EEmit _ -> true
                 // (a constructor argument is an owning position)
                 | ECon(TEnt({ Kind = KRefRecord }, _), _, _, _) -> not conArgs
@@ -915,8 +920,8 @@ let private stringLiteral (text: string) : string =
 /// One part of an F# format string: literal text, or a specifier that takes a value.
 type private FormatPart =
     | Text of string
-    /// flags, width, precision, the letter
-    | Spec of string * int * int option * char
+    /// flags, width, precision, the letter, and the .NET format of a hole (`{x:N2}`)
+    | Spec of string * int * int option * char * string
 
 /// "%5d items%%" -> [ Spec("", 5, None, 'd'); Text " items%" ]. In an interpolated string every
 /// hole is `%P()`, after a specifier of its own if it has one (`%d%P()`).
@@ -981,23 +986,24 @@ let private parseFormat (r: SourceLocation option) (fmt: string) : FormatPart li
 
             if letter = 'P' then
                 // (the hole of an interpolated string: `%P()`, or `%P(format)` with a .NET format)
-                if i < fmt.Length && fmt[i] = '(' then
-                    let close = fmt.IndexOf(')', i)
-
-                    if close <> i + 1 then
-                        fail r "the Zig target does not support a .NET format in an interpolated string yet (`{x:...}`)"
-
-                    i <- close + 1
+                let net =
+                    if i < fmt.Length && fmt[i] = '(' then
+                        let close = fmt.IndexOf(')', i)
+                        let text = fmt.Substring(i + 1, close - i - 1)
+                        i <- close + 1
+                        text
+                    else
+                        ""
 
                 // a specifier right before the hole is the hole's (`%d{x}`)
                 if pending then
                     pending <- false
                 else
                     flush ()
-                    parts.Add(Spec(flags, width, precision, 'P'))
+                    parts.Add(Spec(flags, width, precision, 'P', net))
             else
                 flush ()
-                parts.Add(Spec(flags, width, precision, letter))
+                parts.Add(Spec(flags, width, precision, letter, ""))
                 pending <- true
 
     flush ()
@@ -1042,6 +1048,45 @@ let private (|PrintfCall|_|) (e: Fable.Expr) : (string * string * Fable.Expr lis
         | _ -> None
     | _ -> None
 
+/// (for the names of the values of a printf that is used as a function)
+let mutable private printfValues = 0
+
+/// A printf that has not been given all the values its format takes: the printf, and the
+/// values it has.
+let private (|PrintfPartial|_|) (e: Fable.Expr) : (Fable.Expr * Fable.Expr list) option =
+    let holes (fmt: string) =
+        parseFormat None fmt
+        |> List.filter (
+            function
+            | Spec _ -> true
+            | Text _ -> false
+        )
+        |> List.length
+
+    match e with
+    | PrintfCall(_, fmt, []) when holes fmt > 0 -> Some(e, [])
+    | Fable.CurriedApply(PrintfCall(_, fmt, []) as call, given, _, _) when given.Length < holes fmt -> Some(call, given)
+    | _ -> None
+
+/// The expression under the casts that F# puts where a list is given for a sequence.
+let rec private (|Uncast|) (e: Fable.Expr) : Fable.Expr =
+    match e with
+    | Fable.TypeCast(Uncast inner, _) -> inner
+    | _ -> e
+
+/// A string that is certainly not null: its length needs no test.
+let rec private neverNull (e: Fable.Expr) : bool =
+    match e with
+    | Fable.Value(Fable.StringConstant _, _) -> true
+    | Fable.TypeCast(x, _) -> neverNull x
+    | PrintfCall("PrintFormatToString", _, _)
+    | Fable.CurriedApply(PrintfCall("PrintFormatToString", _, _), _, _, _) -> true
+    | Fable.Call(Fable.Import(imp, _, _), _, Fable.String, _) ->
+        imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.StringModule"
+        || (imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
+            && (imp.Selector = "op_Addition" || imp.Selector = "ToString"))
+    | _ -> false
+
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
     | Fable.Value(kind, r) ->
@@ -1058,6 +1103,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.NumberConstant(v, _) -> ELit(numberLit r v)
         | Fable.CharConstant c -> ELit(string<int>(int c), TPrim "u16")
         | Fable.StringConstant text -> ELit(stringLiteral text, tStr)
+        // (what a match without a case raises, when F# writes it out: its file, line and column
+        // are not kept, its message is)
+        | Fable.NewRecord(_, entRef, _) when entRef.FullName = "Microsoft.FSharp.Core.MatchFailureException" ->
+            let message = ELit(stringLiteral "The match cases were incomplete", tStr)
+            EExnNew(dotnetExnEnt ctx entRef.FullName, [ message ])
         | Fable.NewRecord(values, entRef, _) when (tryExnEnt ctx r entRef).IsSome ->
             let ent = (tryExnEnt ctx r entRef).Value
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> EExnNew(ent, xs))
@@ -1143,6 +1193,23 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             mapType ctx e.Range e.Type
         )
 
+    // a match that no case covers
+    | Fable.Extended(Fable.Throw(Some(Fable.Value(Fable.StringConstant text, _)), t), r) when
+        text.StartsWith("Match failure", System.StringComparison.Ordinal)
+        ->
+        let message = ELit(stringLiteral "The match cases were incomplete", tStr)
+
+        let failure =
+            EExnNew(dotnetExnEnt ctx "Microsoft.FSharp.Core.MatchFailureException", [ message ])
+
+        // (Fable gives the raise no type: where it stands, nothing is expected of it)
+        ERaise(
+            failure,
+            match t with
+            | Fable.Any -> tVoid
+            | _ -> mapType ctx r t
+        )
+
     // a function with several arguments that is used one argument at a time
     | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
 
@@ -1210,8 +1277,36 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | BinaryExponent -> fail r "the Zig target does not support `**` yet"
 
             // (only numbers, booleans and chars get this far: anything else fails in mapType)
-            mapType ctx a.Range a.Type |> ignore
-            bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim(name, xs, ty))
+            let operandTy = mapType ctx a.Range a.Type
+
+            // A whole number divided by zero raises, as does the smallest one divided by -1. A
+            // divisor that is written out and is neither needs no test.
+            let safeDivisor =
+                match b with
+                | Fable.Value(Fable.NumberConstant(value, _), _) ->
+                    match value with
+                    | Fable.NumberValue.Int8 n -> n <> 0y && n <> -1y
+                    | Fable.NumberValue.Int16 n -> n <> 0s && n <> -1s
+                    | Fable.NumberValue.Int32 n -> n <> 0 && n <> -1
+                    | Fable.NumberValue.Int64 n -> n <> 0L && n <> -1L
+                    | Fable.NumberValue.UInt8 n -> n <> 0uy
+                    | Fable.NumberValue.UInt16 n -> n <> 0us
+                    | Fable.NumberValue.UInt32 n -> n <> 0u
+                    | Fable.NumberValue.UInt64 n -> n <> 0UL
+                    | _ -> false
+                | _ -> false
+
+            match name, operandTy with
+            | ("div" | "mod"), TPrim prim when intBits operandTy > 0 && not safeDivisor ->
+                let f =
+                    if name = "div" then
+                        "div"
+                    else
+                        "rem"
+
+                ctx.State.UsesRuntime <- true
+                bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> ERt($"fable_rt.%s{f}(%s{prim}, $0, $1)", xs, ty))
+            | _ -> bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim(name, xs, ty))
         | Fable.Logical(op, a, b) ->
             let rhs = lw ctx b
 
@@ -1225,7 +1320,74 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 )
 
     // printf, sprintf, failwithf and interpolated strings: the format is taken apart here
+    | Fable.CurriedApply(Fable.CurriedApply(PrintfCall(selector, fmt, []), first, _, _), rest, t, r) ->
+        formatted ctx r selector fmt (first @ rest) t
+    // A printf that is not given all its values where it stands (`List.iter (printfn "%d") xs`)
+    // is the function that takes the values that are missing.
+    | PrintfPartial(call, given) ->
+        let rec split (t: Fable.Type) (taken: int) : Fable.Type list * Fable.Type =
+            match t with
+            | Fable.LambdaType(arg, rest) ->
+                let args, ret = split rest (taken + 1)
+                arg :: args, ret
+            | ret -> [], ret
+
+        let argTypes, ret = split e.Type 0
+        let n = System.Threading.Interlocked.Increment(&printfValues)
+
+        let names =
+            argTypes
+            |> List.mapi (fun i t ->
+                {
+                    Name = $"fmt%d{n}_%d{i}"
+                    Type = t
+                    IsMutable = false
+                    IsThisArgument = false
+                    IsCompilerGenerated = true
+                    Range = None
+                    IsInlineIfLambda = false
+                }
+                : Fable.Ident
+            )
+
+        let all = given @ (names |> List.map Fable.IdentExpr)
+        let body = Fable.CurriedApply(call, all, ret, e.Range)
+        lw ctx (List.foldBack (fun name body -> Fable.Lambda(name, body, None)) names body)
     | Fable.CurriedApply(PrintfCall(selector, fmt, []), args, t, r) -> formatted ctx r selector fmt args t
+
+    // `printfn "%d"` that is not given all its values at once. F# names the function it stands
+    // for and applies the name where the values are (`let clo = printfn "%d" in fun x -> clo x`),
+    // so the name is put back: what has been given is evaluated here, the rest where it is used.
+    | Fable.Let(id, PrintfPartial(call, given), body) ->
+        let binds = List<Fable.Ident * Fable.Expr>()
+
+        let args =
+            given
+            |> List.mapi (fun i arg ->
+                match arg with
+                | Fable.Value _ -> arg
+                | Fable.IdentExpr x when not x.IsMutable -> arg
+                | _ ->
+                    let name =
+                        { id with
+                            Name = $"%s{id.Name}_given%d{i}"
+                            Type = arg.Type
+                            IsMutable = false
+                        }
+
+                    binds.Add((name, arg))
+                    Fable.IdentExpr name
+            )
+
+        let applied =
+            if args.IsEmpty then
+                call
+            else
+                Fable.CurriedApply(call, args, Fable.Any, None)
+
+        let body = FableTransforms.replaceValues (Map.ofList [ id.Name, applied ]) body
+        lw ctx (Seq.foldBack (fun (name, value) rest -> Fable.Let(name, value, rest)) binds body)
+
     | PrintfCall(selector, fmt, holes) -> formatted ctx e.Range selector fmt holes e.Type
 
     // A call that the replacements kept under its .NET name.
@@ -1430,7 +1592,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         if isFlat c then
             EWhile(c, lwStmt ctx body)
         else
-            fail r "the Zig target does not support a `while` condition with control flow in it yet"
+            // (a condition with control flow in it, like `a && b`, is tested inside the loop)
+            let go = ctx.State.NewVar("go", tBool, VLocal, true)
+            let stop = EAssign(go, ELit("false", tBool))
+            let step = bindArgs ctx [ c ] (fun xs -> EIf(xs.Head, lwStmt ctx body, stop, tVoid))
+            ELet(go, ELit("true", tBool), EWhile(EVar go, step))
 
     | Fable.ForLoop(id, start, limit, body, isUp, _) ->
         let iv = ctx.State.NewVar(id.Name, mapType ctx id.Range id.Type, VLocal, false)
@@ -1513,6 +1679,46 @@ and withParameter (ctx: Ctx) (message: Expr) (parameter: Fable.Expr) : Expr =
         [ message; lw ctx parameter ]
         (fun xs -> EEmit("fable_rt.format(.{ $0, \" (Parameter '\", $1, \"')\" })", xs, tStr))
 
+/// Can `%A` write a value of this type as F# does? Two pairs of F# types are one type in Zig
+/// (`uint16` and `char`, `option` and `voption`), a struct tuple is a tuple, and a function
+/// value has no name here: a type that mentions one of them is refused, so that what is
+/// written is never different from .NET's.
+and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
+    let seen = HashSet<string>()
+
+    let rec go (t: Fable.Type) =
+        match t with
+        | Fable.Number(UInt16, _) -> fail r "the Zig target cannot write a uint16 inside a value with %%A yet"
+        | Fable.Number _
+        | Fable.Boolean
+        | Fable.Char
+        | Fable.String
+        | Fable.Unit
+        | Fable.GenericParam _ -> ()
+        | Fable.Option(inner, false)
+        | Fable.List inner -> go inner
+        | Fable.Option(_, true) -> fail r "the Zig target cannot write a voption with %%A yet"
+        | Fable.Tuple(ts, false) -> List.iter go ts
+        | Fable.Tuple(_, true) -> fail r "the Zig target cannot write a struct tuple with %%A yet"
+        | Fable.LambdaType _
+        | Fable.DelegateType _ -> fail r "the Zig target cannot write a function value with %%A yet"
+        | Fable.DeclaredType(entRef, genArgs) ->
+            List.iter go genArgs
+
+            if not (dotnetExceptions.ContainsKey entRef.FullName) && seen.Add entRef.FullName then
+                match ctx.Com.TryGetEntity entRef with
+                | Some ent when ent.IsFSharpUnion ->
+                    for case in ent.UnionCases do
+                        for field in case.UnionCaseFields do
+                            go field.FieldType
+                | Some ent when ent.IsFSharpRecord || ent.IsFSharpExceptionDeclaration ->
+                    for field in ent.FSharpFields do
+                        go field.FieldType
+                | _ -> fail r "the Zig target cannot write a value of the type %s with %%A yet" entRef.FullName
+        | other -> fail r "the Zig target cannot write a value of this type with %%A yet (%A)" other
+
+    go t
+
 /// Argument `i` of a macro, with its type: a number that is written out in the program has
 /// no type of its own in Zig, and how it is formatted depends on the type it has in F#.
 and typedArg (ctx: Ctx) (r: SourceLocation option) (value: Fable.Expr) (i: int) : string =
@@ -1550,48 +1756,98 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                 match zigQuoted text with
                 | Some quoted -> quoted
                 | None -> fail r "the Zig target does not support this text in a format string"
-            | Spec(flags, width, precision, letter) ->
+            | Spec(flags, width, precision, letter, net) ->
                 let i = next
                 next <- next + 1
                 let value = args[i]
 
+                let isWhole =
+                    match value.Type with
+                    | Fable.Number((Float32 | Float64), _) -> false
+                    | Fable.Number _ -> true
+                    | _ -> false
+
+                // a .NET format: the standard ones for numbers (anything else ignores it)
+                let net =
+                    match value.Type with
+                    | Fable.Number _ when net <> "" ->
+                        let known =
+                            System.Text.RegularExpressions.Regex.IsMatch(net, "^[DdXxBbNnFfEeGgRrPpCc][0-9]{0,2}$")
+
+                        if not known then
+                            fail r "the Zig target does not support the .NET format `%s` yet" net
+
+                        if "DdXxBb".IndexOf(net[0]) >= 0 && not isWhole then
+                            fail r "the .NET format `%s` is for whole numbers" net
+
+                        net
+                    | Fable.String
+                    | Fable.Char
+                    | Fable.Boolean -> ""
+                    | _ when net = "" -> ""
+                    | other ->
+                        fail r "the Zig target does not support a .NET format for this type of value yet (%A)" other
+
                 // what the specifier means for the type of its value
                 let kind =
                     match letter, value.Type with
-                    | ('P' | 'O'), Fable.String -> 's'
+                    | 'P', Fable.String -> 's'
+                    | 'O', Fable.String -> 'O'
                     | ('P' | 'O'), Fable.Char -> 'c'
                     | ('P' | 'O'), (Fable.Boolean | Fable.Number _) -> 'P'
+                    // (a record or a union is written by its `ToString`, which is `%A`)
+                    | ('P' | 'O'), Fable.DeclaredType(entRef, _) when
+                        (match ctx.Com.TryGetEntity entRef with
+                         | Some ent -> ent.IsFSharpRecord || ent.IsFSharpUnion
+                         | None -> false)
+                        ->
+                        'A'
                     | 's', Fable.String -> 's'
                     | 'b', Fable.Boolean -> 'b'
                     | 'c', Fable.Char -> 'c'
-                    | ('d' | 'i'), Fable.Number _ -> 'd'
-                    | ('u' | 'x' | 'X' | 'o'), Fable.Number _ -> letter
+                    | ('d' | 'i'), Fable.Number _ when isWhole -> 'd'
+                    | ('u' | 'x' | 'X' | 'o'), Fable.Number _ when isWhole -> letter
                     | ('f' | 'F' | 'e' | 'E' | 'g' | 'G'), Fable.Number((Float32 | Float64), _) -> letter
-                    | 'A', _ -> fail r "the Zig target does not support %%A yet"
+                    | 'A', _ -> 'A'
                     | _, (Fable.String | Fable.Char | Fable.Boolean | Fable.Number _) ->
                         fail r "the Zig target does not support the format %%%c for this type of value yet" letter
                     | _, other -> fail r "the Zig target cannot turn a value of this type into text yet (%A)" other
 
-                let fields =
-                    [
-                        $".kind = '%c{kind}'"
-                        if width > 0 then
-                            $".width = %d{width}"
-                        match precision with
-                        | Some p -> $".precision = %d{p}"
-                        | None -> ()
-                        if flags.IndexOf('0') >= 0 then
-                            ".zero = true"
-                        if flags.IndexOf('-') >= 0 then
-                            ".left = true"
-                        if flags.IndexOf('+') >= 0 then
-                            ".plus = true"
-                        if flags.IndexOf(' ') >= 0 then
-                            ".space = true"
-                    ]
-                    |> String.concat ", "
+                if kind = 'A' then
+                    if width > 0 || precision.IsSome || flags.Trim('+') <> "" then
+                        fail r "the Zig target does not support a width or flags on %%A yet"
 
-                $"fable_rt.arg(.{{ %s{fields} }}, %s{typedArg ctx r value i})"
+                    match value.Type with
+                    // (a number of 16 bits without a sign and a char are the same type in Zig; at
+                    // the top the compiler can tell them apart, inside a value it cannot)
+                    | Fable.Number(UInt16, _) -> $"fable_rt.arg(.{{ .kind = 'd' }}, @as(u16, $%d{i})), \"us\""
+                    | t ->
+                        checkShowable ctx r t
+                        $"fable_rt.arg(.{{ .kind = 'A' }}, %s{typedArg ctx r value i})"
+                else
+
+                    let fields =
+                        [
+                            $".kind = '%c{kind}'"
+                            if width > 0 then
+                                $".width = %d{width}"
+                            match precision with
+                            | Some p -> $".precision = %d{p}"
+                            | None -> ()
+                            if flags.IndexOf('0') >= 0 then
+                                ".zero = true"
+                            if flags.IndexOf('-') >= 0 then
+                                ".left = true"
+                            if flags.IndexOf('+') >= 0 then
+                                ".plus = true"
+                            if flags.IndexOf(' ') >= 0 then
+                                ".space = true"
+                            if net <> "" then
+                                $".net = \"%s{net}\""
+                        ]
+                        |> String.concat ", "
+
+                    $"fable_rt.arg(.{{ %s{fields} }}, %s{typedArg ctx r value i})"
         )
 
     (match texts with
@@ -1852,6 +2108,23 @@ and dotnetCall
         | TEnt(_, [ elem ]) -> EGet(cell, PField "contents", elem)
         | _ -> fail r "internal: not a ref cell"
 
+    /// a call into the runtime library that can raise
+    let rt (macro: string) (xs: Fable.Expr list) (ty: Ty) : Expr =
+        ctx.State.UsesRuntime <- true
+        bindArgs ctx (xs |> List.map (lw ctx)) (fun irs -> ERt(macro, irs, ty))
+
+    /// a call into the runtime library that cannot
+    let pure' (macro: string) (xs: Fable.Expr list) (ty: Ty) : Expr =
+        ctx.State.UsesRuntime <- true
+        bindArgs ctx (xs |> List.map (lw ctx)) (fun irs -> EEmit(macro, irs, ty))
+
+    let tChar = TPrim "u16"
+
+    let isInt (x: Fable.Expr) =
+        match x.Type with
+        | Fable.Number(Int32, _) -> true
+        | _ -> false
+
     match entity, name, args with
     // ref cells: `ref x`, `!r` and `r.Value`, `r := x` and `r.Value <- x`, `incr`, `decr`
     | "Microsoft.FSharp.Core.Operators", "Ref", [ x ] ->
@@ -1899,13 +2172,96 @@ and dotnetCall
         mapType ctx r x.Type = mapType ctx r t
         ->
         lw ctx x
+    // ---- chars: each code unit to what .NET maps it to (there is no current culture) ----
+    | "System.Char", ("ToUpper" | "ToUpperInvariant"), [ c ] -> pure' "fable_rt.unicode.toUpper($0)" [ c ] tChar
+    | "System.Char", ("ToLower" | "ToLowerInvariant"), [ c ] -> pure' "fable_rt.unicode.toLower($0)" [ c ] tChar
+    | "System.Char", "IsWhiteSpace", [ c ] -> pure' "fable_rt.unicode.isWhiteSpace($0)" [ c ] tBool
     // ---- strings ----
-    | "System.String", "get_Length", s :: _
-    | "Microsoft.FSharp.Core.StringModule", "Length", [ s ] ->
-        bindArgs ctx [ lw ctx s ] (fun xs -> EEmit("fable_rt.strLen($0)", xs, tI32))
+    // (what a null string or an argument out of range raises on .NET, it raises here: those
+    // calls are `ERt`. The `String` module takes a null string for an empty one.)
+    | "Microsoft.FSharp.Core.Operators.Unchecked", "DefaultOf", [] when t = Fable.String ->
+        ELit("@as(fable_rt.String, null)", tStr)
+    | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String -> pure' "($0 == null)" [ x ] tBool
+    | "System.String", "get_Length", [ s ] when neverNull s -> pure' "fable_rt.strLength($0)" [ s ] tI32
+    | "System.String", "get_Length", [ s ] -> rt "fable_rt.strLen($0)" [ s ] tI32
+    | "Microsoft.FSharp.Core.StringModule", "Length", [ s ] -> pure' "fable_rt.strLength($0)" [ s ] tI32
     | "System.String", "get_Chars", [ s; i ]
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetString", [ s; i ] ->
-        bindArgs ctx [ lw ctx s; lw ctx i ] (fun xs -> EEmit("fable_rt.strAt($0, $1)", xs, TPrim "u16"))
+        rt "fable_rt.strAt($0, $1)" [ s; i ] tChar
+    | "System.String", "IsNullOrEmpty", [ s ] -> pure' "fable_rt.strIsNullOrEmpty($0)" [ s ] tBool
+    | "System.String", "IsNullOrWhiteSpace", [ s ] -> pure' "fable_rt.strIsNullOrWhiteSpace($0)" [ s ] tBool
+    | "System.String", "CompareOrdinal", [ a; b ] -> pure' "fable_rt.strCompare($0, $1)" [ a; b ] tI32
+    | "System.String", "Equals", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
+        if info.ThisArg.IsSome then
+            rt "fable_rt.strEquals($0, $1)" [ a; b ] tBool
+        else
+            pure' "fable_rt.strEql($0, $1)" [ a; b ] tBool
+    | "System.String", "ToString", [ s ] -> lw ctx s
+    | "System.String", ".ctor", [ c; n ] when c.Type = Fable.Char -> rt "fable_rt.strOfChar($0, $1)" [ c; n ] tStr
+    | "System.String", "Substring", [ s; start ] -> rt "fable_rt.strSubstring($0, $1, null)" [ s; start ] tStr
+    | "System.String", "Substring", [ s; start; n ] -> rt "fable_rt.strSubstring($0, $1, $2)" [ s; start; n ] tStr
+    | "System.String", "IndexOf", [ s; x ] when x.Type = Fable.Char ->
+        rt "fable_rt.strIndexOfChar($0, $1, 0)" [ s; x ] tI32
+    | "System.String", "IndexOf", [ s; x; start ] when x.Type = Fable.Char && isInt start ->
+        rt "fable_rt.strIndexOfChar($0, $1, $2)" [ s; x; start ] tI32
+    | "System.String", "IndexOf", [ s; x ] when x.Type = Fable.String ->
+        rt "fable_rt.strIndexOf($0, $1, 0)" [ s; x ] tI32
+    | "System.String", "IndexOf", [ s; x; start ] when x.Type = Fable.String && isInt start ->
+        rt "fable_rt.strIndexOf($0, $1, $2)" [ s; x; start ] tI32
+    | "System.String", "LastIndexOf", [ s; x ] when x.Type = Fable.Char ->
+        rt "fable_rt.strLastIndexOfChar($0, $1)" [ s; x ] tI32
+    | "System.String", "LastIndexOf", [ s; x ] when x.Type = Fable.String ->
+        rt "fable_rt.strLastIndexOf($0, $1)" [ s; x ] tI32
+    | "System.String", "Contains", [ s; x ] when x.Type = Fable.Char ->
+        rt "fable_rt.strContainsChar($0, $1)" [ s; x ] tBool
+    | "System.String", "Contains", [ s; x ] when x.Type = Fable.String ->
+        rt "fable_rt.strContains($0, $1)" [ s; x ] tBool
+    | "System.String", "StartsWith", [ s; x ] when x.Type = Fable.Char ->
+        rt "fable_rt.strStartsWithChar($0, $1)" [ s; x ] tBool
+    | "System.String", "StartsWith", [ s; x ] when x.Type = Fable.String ->
+        rt "fable_rt.strStartsWith($0, $1)" [ s; x ] tBool
+    | "System.String", "EndsWith", [ s; x ] when x.Type = Fable.Char ->
+        rt "fable_rt.strEndsWithChar($0, $1)" [ s; x ] tBool
+    | "System.String", "EndsWith", [ s; x ] when x.Type = Fable.String ->
+        rt "fable_rt.strEndsWith($0, $1)" [ s; x ] tBool
+    // (there is no current culture here: `ToUpper` is `ToUpperInvariant`)
+    | "System.String", ("ToUpper" | "ToUpperInvariant"), [ s ] -> rt "fable_rt.strCase($0, true)" [ s ] tStr
+    | "System.String", ("ToLower" | "ToLowerInvariant"), [ s ] -> rt "fable_rt.strCase($0, false)" [ s ] tStr
+    | "System.String", "Trim", [ s ] -> rt "fable_rt.strTrim($0, true, true, null)" [ s ] tStr
+    | "System.String", "TrimStart", [ s ] -> rt "fable_rt.strTrim($0, true, false, null)" [ s ] tStr
+    | "System.String", "TrimEnd", [ s ] -> rt "fable_rt.strTrim($0, false, true, null)" [ s ] tStr
+    | "System.String", "Trim", [ s; c ] when c.Type = Fable.Char ->
+        rt "fable_rt.strTrim($0, true, true, $1)" [ s; c ] tStr
+    | "System.String", "TrimStart", [ s; c ] when c.Type = Fable.Char ->
+        rt "fable_rt.strTrim($0, true, false, $1)" [ s; c ] tStr
+    | "System.String", "TrimEnd", [ s; c ] when c.Type = Fable.Char ->
+        rt "fable_rt.strTrim($0, false, true, $1)" [ s; c ] tStr
+    | "System.String", "Replace", [ s; a; b ] when a.Type = Fable.Char && b.Type = Fable.Char ->
+        rt "fable_rt.strReplaceChar($0, $1, $2)" [ s; a; b ] tStr
+    | "System.String", "Replace", [ s; a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
+        rt "fable_rt.strReplace($0, $1, $2)" [ s; a; b ] tStr
+    | "System.String", "Insert", [ s; at; x ] -> rt "fable_rt.strInsert($0, $1, $2)" [ s; at; x ] tStr
+    | "System.String", "Remove", [ s; start ] -> rt "fable_rt.strRemove($0, $1, null)" [ s; start ] tStr
+    | "System.String", "Remove", [ s; start; n ] -> rt "fable_rt.strRemove($0, $1, $2)" [ s; start; n ] tStr
+    | "System.String", "PadLeft", [ s; n ] -> rt "fable_rt.strPad($0, true, $1, ' ')" [ s; n ] tStr
+    | "System.String", "PadLeft", [ s; n; c ] -> rt "fable_rt.strPad($0, true, $1, $2)" [ s; n; c ] tStr
+    | "System.String", "PadRight", [ s; n ] -> rt "fable_rt.strPad($0, false, $1, ' ')" [ s; n ] tStr
+    | "System.String", "PadRight", [ s; n; c ] -> rt "fable_rt.strPad($0, false, $1, $2)" [ s; n; c ] tStr
+    | "Microsoft.FSharp.Core.StringModule", "Concat", [ sep; Uncast xs ] when xs.Type = Fable.List Fable.String ->
+        pure' "fable_rt.strJoin($0, $1)" [ sep; xs ] tStr
+    | "Microsoft.FSharp.Core.StringModule", "Replicate", [ n; s ] -> rt "fable_rt.strReplicate($0, $1)" [ n; s ] tStr
+    | "Microsoft.FSharp.Core.StringModule", "Initialize", [ n; f ] -> rt "fable_rt.strInit($0, $1)" [ n; f ] tStr
+    | "Microsoft.FSharp.Core.StringModule", "Map", [ f; s ] -> rt "fable_rt.strMap($0, $1)" [ f; s ] tStr
+    | "Microsoft.FSharp.Core.StringModule", "MapIndexed", [ f; s ] -> rt "fable_rt.strMapi($0, $1)" [ f; s ] tStr
+    | "Microsoft.FSharp.Core.StringModule", "Iterate", [ f; s ] -> rt "fable_rt.strIter($0, $1)" [ f; s ] tVoid
+    | "Microsoft.FSharp.Core.StringModule", "IterateIndexed", [ f; s ] -> rt "fable_rt.strIteri($0, $1)" [ f; s ] tVoid
+    | "Microsoft.FSharp.Core.StringModule", "ForAll", [ f; s ] -> rt "fable_rt.strForall($0, $1)" [ f; s ] tBool
+    | "Microsoft.FSharp.Core.StringModule", "Exists", [ f; s ] -> rt "fable_rt.strExists($0, $1)" [ f; s ] tBool
+    | "Microsoft.FSharp.Core.StringModule", "Filter", [ f; s ] -> rt "fable_rt.strFilter($0, $1)" [ f; s ] tStr
+    | "Microsoft.FSharp.Core.StringModule", "Collect", [ f; s ] -> rt "fable_rt.strCollect($0, $1)" [ f; s ] tStr
+    | "System.String", "Concat", parts when not parts.IsEmpty && parts |> List.forall (fun x -> x.Type = Fable.String) ->
+        let holes = parts |> List.mapi (fun i _ -> $"$%d{i}") |> String.concat ", "
+        pure' $"fable_rt.format(.{{ %s{holes} }})" parts tStr
     // `a + b + c`: one new string, whatever the number of parts
     | "Microsoft.FSharp.Core.Operators", "op_Addition", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
         let rec parts (x: Fable.Expr) : Fable.Expr list =
@@ -1940,12 +2296,20 @@ and dotnetCall
                 ctx
                 (values |> Seq.map (lw ctx) |> List.ofSeq)
                 (fun xs -> EEmit($"fable_rt.format(.{{ %s{texts} }})", xs, tStr))
-    | "System.String", "Concat", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
-        bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EEmit("fable_rt.strConcat($0, $1)", xs, tStr))
     // `string x`
     | "Microsoft.FSharp.Core.Operators", "ToString", [ x ] ->
         match x.Type with
-        | Fable.String -> lw ctx x
+        // (the text of a null string is the empty string)
+        | Fable.String when neverNull x -> lw ctx x
+        | Fable.String -> pure' "fable_rt.strConcat($0, null)" [ x ] tStr
+        // (a record or a union is written by its `ToString`, which is `%A`)
+        | Fable.DeclaredType(entRef, _) when
+            (match ctx.Com.TryGetEntity entRef with
+             | Some ent -> ent.IsFSharpRecord || ent.IsFSharpUnion
+             | None -> false)
+            ->
+            checkShowable ctx r x.Type
+            pure' "fable_rt.anyText($0)" [ x ] tStr
         | Fable.Char ->
             bindArgs
                 ctx

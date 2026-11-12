@@ -7,7 +7,8 @@ module QuickTest
 // generic types and functions and F#'s list, Exceptions.fs covers raise and try,
 // Records.fs covers records that can be assigned and ref cells, Cycles.fs covers
 // structures that reach themselves, Strings.fs covers strings, formatting, printing and
-// exceptions with messages.
+// exceptions with messages, Text.fs covers the string functions, null strings, `%A`, .NET
+// formats and what .NET raises on its own (division by zero, a match without a case).
 // The entry point returns the number of failed checks as the process exit code.
 
 let limit = 10
@@ -340,3 +341,4 @@ let main _ =
     + Records.run ()
     + Cycles.run ()
     + Strings.run ()
+    + Text.run ()

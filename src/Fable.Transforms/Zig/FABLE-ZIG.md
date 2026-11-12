@@ -47,7 +47,7 @@ Types that are plain values, also when another file declares them:
 | tuple, struct tuple | `@Tuple(&.{ ... })` |
 | `option`, `voption` | `?T` |
 | `list` | `fable_rt.List(T)`, a recursive union of the runtime library |
-| `string` | `fable_rt.String`, a pointer to counted UTF-16 text; a literal is static data |
+| `string` | `fable_rt.String`, a pointer to counted UTF-16 text or null; a literal is static data |
 | generic record or union | a Zig function from its type arguments to the type |
 | `unit` | `void`; a unit argument is passed, it has no size |
 
@@ -299,26 +299,52 @@ A type that has no such case makes the function recurse instead.
 `failwith`, `failwithf`, `invalidArg`, `invalidOp` and `nullArg` raise what they raise on
 .NET, with the same message (`invalidArg "n" "too big"` says "too big (Parameter 'n')"). The
 runtime library declares `System.Exception` and the classes a program most often raises or
-handles by name (`ArgumentException`, `ArgumentNullException`, `ArgumentOutOfRangeException`,
-`InvalidOperationException`, `NotSupportedException`, `NotImplementedException`,
-`IndexOutOfRangeException`, `DivideByZeroException`, `OverflowException`, `FormatException`,
-`KeyNotFoundException`): they can be made with a message (`raise (System.ArgumentException
-"...")`), matched (`Failure msg`, `:? System.ArgumentException as e`) and asked for their
-message (`e.Message`). Each is a type of its own: a handler for `ArgumentException` does not
-catch an `ArgumentNullException` as it would on .NET, because the runtime has no classes.
+handles by name, each under the class it derives from on .NET:
 
-Not yet: the message of an F# `exception` (`e.Message` gives its name, .NET gives the name
-with the fields), `e.StackTrace` and inner exceptions, classes that derive from one another,
-structural equality of exceptions, a `while` condition that can raise, and the exceptions
-.NET raises for a division by zero or a failed pattern match (those are still Zig panics). An
-exception that reaches the entry point is printed with its name and message, and the program
-exits with 134, as on .NET on Unix.
+```text
+System.Exception
+├─ System.SystemException
+│  ├─ ArgumentException ─ ArgumentNullException, ArgumentOutOfRangeException
+│  ├─ ArithmeticException ─ DivideByZeroException, OverflowException
+│  ├─ InvalidOperationException, NotSupportedException, NotImplementedException
+│  ├─ IndexOutOfRangeException, NullReferenceException, FormatException
+│  └─ KeyNotFoundException
+└─ Microsoft.FSharp.Core.MatchFailureException
+```
+
+They can be made with a message (`raise (System.ArgumentException "...")`), matched
+(`Failure msg`, `:? System.ArgumentException as e`) and asked for their message
+(`e.Message`). A handler for a class catches the classes under it: a type test walks the
+few links from the exception's class upwards. `Failure` is exactly `System.Exception`, as on
+.NET, and an F# `exception` is a class of its own that nothing derives from, so its test is
+one comparison. The message of an F# exception is the exception as `%A` writes it
+(`Broken (1, "a")`), which is what .NET gives.
+
+What .NET raises without a `raise` in the program is raised here too, with the same class and
+message, and can be handled:
+
+- A whole number divided by zero (`/` and `%`): `DivideByZeroException`. The smallest `int`
+  or `int64` divided by -1: `OverflowException`. A divisor that is written out and is neither
+  0 nor -1 needs no test and gets none.
+- A match that no case covers: `MatchFailureException`.
+- A character of a string outside of it: `IndexOutOfRangeException`. A member of a null
+  string: `NullReferenceException`. An argument of a string method out of range:
+  `ArgumentOutOfRangeException` or `ArgumentNullException`.
+
+These are calls into the runtime library that return an error union (`ERt` in the IR), so a
+function that divides by a variable can raise, and its callers have an error edge. A `while`
+condition may raise, and may have `&&` and `||` in it: it is then tested inside the loop.
+
+Not yet: `e.StackTrace` and inner exceptions, the file and line of a `MatchFailureException`,
+structural equality of exceptions, arithmetic that is `Checked`, and other .NET classes than
+those above. An exception that reaches the entry point is printed with its name and message,
+and the program exits with 134, as on .NET on Unix.
 
 ## Strings
 
-A `string` is what it is on .NET: immutable UTF-16. `s.Length` and `s.[i]` count and give
-code units, so an emoji has length 2 here as there, and nothing a program computes from a
-string differs. In memory it is a pointer to a header (count and length, 8 bytes) that the
+A `string` is what it is on .NET: immutable UTF-16, or null. `s.Length` and `s.[i]` count and
+give code units, so an emoji has length 2 here as there, and nothing a program computes from
+a string differs. In memory it is a pointer to a header (count and length, 8 bytes) that the
 units follow. A literal is static data of the program: its count is a fixed mark, so that
 making, copying and dropping one costs nothing and it is never freed.
 
@@ -332,32 +358,76 @@ A string is counted like a cell, by the same ownership pass: a parameter that is
 is borrowed, the last use moves. It can hold no reference, so the cycle collector never
 looks at one. `a + b + c` makes one string whatever the number of parts.
 
-Text from values is `fable_rt.format`: `sprintf`, `$"..."` and `string x` all become one call
-of it with the parts of the format, taken apart at compile time, so that no format string is
-read while the program runs and a value of a type that cannot be formatted is a compile
-error. `printf`, `printfn`, `eprintf` and `eprintfn` write such text as UTF-8 through
-`fable_rt.write_out` and `fable_rt.write_err`, which a program without an operating system
-sets to its own functions.
+Null is a value like on .NET: `isNull`, `match s with null -> ...`, `s = null`; `+`, the
+`String` module and formatting take it for an empty string; a member of it (`s.Length`,
+`s.[0]`, `s.Trim()`) raises `NullReferenceException`. The length of a string that cannot be
+null (a literal, the result of `+`, of `sprintf`, of the `String` module) is read without a
+test.
+
+Of `System.String`: `Length`, indexing, `Substring`, `IndexOf`, `LastIndexOf`, `Contains`,
+`StartsWith`, `EndsWith` (each for a string and for a char), `ToUpper`, `ToLower` and their
+`Invariant` forms, `Trim`, `TrimStart`, `TrimEnd` (white space or one char), `Replace`,
+`Insert`, `Remove`, `PadLeft`, `PadRight`, `Equals`, `String(c, n)`, `String.IsNullOrEmpty`,
+`IsNullOrWhiteSpace`, `Concat`, `CompareOrdinal`. Of the `String` module: `length`, `concat`
+(of a list), `replicate`, `init`, `map`, `mapi`, `iter`, `iteri`, `forall`, `exists`,
+`filter`, `collect`. Of `System.Char`: `ToUpper`, `ToLower`, `IsWhiteSpace`. What they
+return, and what they raise for which argument with which message, is .NET's.
+
+There is no current culture: everything is done as .NET does it in the invariant culture.
+Searching and comparing are by code unit (`IndexOf "x"` is what `IndexOf("x",
+StringComparison.Ordinal)` is on .NET). Upper and lower case map each code unit as
+`Char.ToUpperInvariant` does; the table (`fable_unicode.zig`) was written out from .NET, and
+a test compares all 65536 code units with a sum computed there.
+
+### Text from values
+
+`sprintf`, `$"..."` and `string x` all become one call of `fable_rt.format` with the parts of
+the format, taken apart at compile time, so that no format string is read while the program
+runs and a value of a type that cannot be formatted is a compile error. `printf`, `printfn`,
+`eprintf` and `eprintfn` write such text as UTF-8 through `fable_rt.write_out` and
+`fable_rt.write_err`, which a program without an operating system sets to its own functions.
+A printf that is not given all its values (`List.iter (printfn "%d") xs`, `let show = sprintf
+"<%d>"`) is the function that takes the rest.
 
 The text is .NET's, character for character; the runtime library's tests hold what .NET 10
 prints for each case:
 
-- `%d %i %u %x %X %o %b %c %s %f %F %e %E %g %G %O` with width, precision and the flags `0`,
-  `-`, `+` and space; `{x}` and `%d{x}` in an interpolated string.
+- `%d %i %u %x %X %o %b %c %s %f %F %e %E %g %G %O %A` with width, precision and the flags
+  `0`, `-`, `+` and space; `{x}` and `%d{x}` in an interpolated string.
 - `%f` and `%e` round the exact value of the number, a tie to the even digit (`%.2f` of 2.675
   is "2.67", of 0.125 "0.12"), from the number's exact decimal digits. `%e` writes three
   exponent digits, `%g` at least two.
 - `string x` and `{x}` are the shortest text that reads back as the same number: in digits
   from 10^-4 up to 10^17 (10^9 for a `float32`), as `1E+17` or `1E-05` outside of that.
   `string 1.0` is "1".
+- `{x:N2}`, `{n:D5}`, `{n:X}`, `{x:E2}`, `{x:G3}`: .NET's standard numeric formats (D, X, B,
+  N, F, E, G, R, P, C with an optional precision), and `{x,8}` and `{x,-8:F1}` for alignment.
 - `compare` on strings is by code unit and gives the number `String.CompareOrdinal` gives
   (`compare "a" "A"` is 32); on a float, not-a-number comes first.
 
-Not yet: `%A`, a .NET format in an interpolated string (`{x:N2}`, `{x,5}`), a format that is
-not given all its values at once (`printfn "%d"` as a function value), `null` strings, and
-the `String` module and the methods of `System.String` beyond `Length`, indexing and
-concatenation (slicing, `Substring`, `Split`, `Join`, `StringBuilder`, ...). Appending to a
-string in a loop copies it each time, as on .NET.
+`%A` writes a value as F# code: `{ Name = "Ann"` with every further field on its own line,
+`Some (1, "a")`, `[1; 2; 3]`, `Node (Leaf, 1, Leaf)`. It is FSharp.Core's printer rule for
+rule: the value becomes a layout of text and joints, the joints are broken from the
+outside in until every line fits in 80 columns, a list shows 100 items, and a record that
+contains itself is cut with `...` where it comes round again. `string x` and `{x}` of a
+record or a union are its `%A`, and so is the message of an F# exception. The printer reads
+the Zig types: field and case names are the F# ones, so nothing is generated per type.
+
+Not yet, each of them a compile error and not a different text:
+
+- `%A` of a type that mentions a `uint16`, a `voption`, a struct tuple or a function. (The
+  first three are the same Zig type as `char`, `option` and a tuple. In the message of an F#
+  exception, where nothing can be refused, they are written as those.)
+- A width or flags on `%A`; a custom .NET format (`{x:0.00}`); `String.Format`.
+- Methods that take a `StringComparison` or a culture; `CompareTo` and `String.Compare`
+  (they order by culture); `Split`, `Join`, `ToCharArray` and whatever else needs arrays;
+  `StringBuilder`; the other functions of `System.Char` (they need Unicode's categories).
+- `string` of an option, a list or a tuple (.NET writes those differently from `%A`).
+- A function that assigns a `let mutable` of the function around it (F# turns the variable
+  into a ref cell; use `ref` for now).
+
+Appending to a string in a loop copies it each time, as on .NET. A program that declares an
+F# exception links the `%A` printer, because any exception may be asked for its message.
 
 ## Tail calls
 
@@ -384,9 +454,9 @@ forced on the LLVM backend; elsewhere it is an ordinary call.
 4. ~~Closures and function values~~ (done), ~~generics~~ (done), ~~exceptions~~ (done for
    F# `exception` declarations), byrefs and spans.
 5. ~~Mutable reference records and the cycle collector~~ (done).
-6. ~~Strings, formatting and printing, exceptions with messages~~ (done); the `String`
-   module, arrays and the other collections, and the rest of FSharp.Core through
-   `Replacements.fs` and the library.
+6. ~~Strings, formatting and printing, `%A`, the `String` module, exceptions with messages
+   and classes~~ (done); arrays and the other collections, and the rest of FSharp.Core
+   through `Replacements.fs` and the library.
 7. The test suite (`tests/Zig`), starting from the tests the other targets share.
 
 ## Notes for the shared code

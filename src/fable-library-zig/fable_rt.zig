@@ -5,8 +5,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root");
 pub const sgc = @import("fable_sgc.zig");
+pub const unicode = @import("fable_unicode.zig");
 
-pub const interface_version: i32 = 10;
+pub const interface_version: i32 = 11;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -418,6 +419,7 @@ pub fn Ref(comptime T: type) type {
 pub fn List(comptime T: type) type {
     return union(enum) {
         pub const fable_cyclic = holdsCyclic(T);
+        pub const fable_list = {};
         Empty,
         Cons: *struct { @"$rc": u32 = 1, @"$gc": GcHdr(fable_cyclic) = undefined, Head: T, Tail: List(T) },
     };
@@ -807,8 +809,13 @@ pub const Str = extern struct {
     }
 };
 
-/// F#'s `string`.
-pub const String = *const Str;
+/// F#'s `string`: a pointer to the text, or null as on .NET.
+pub const String = ?*const Str;
+
+/// The code units of a string. A null string has none.
+pub inline fn unitsOf(s: String) []const u16 {
+    return if (s) |p| p.units() else &.{};
+}
 
 fn LiteralCell(comptime n: usize) type {
     return extern struct { header: Str, units: [n]u16 };
@@ -837,7 +844,7 @@ fn strWords(len: usize) usize {
 }
 
 /// A new string of `len` units, to be filled in by the caller. Its count is one.
-fn strNew(len: usize) struct { String, []u16 } {
+fn strNew(len: usize) struct { *Str, []u16 } {
     const words = allocator.alloc(u32, strWords(len)) catch @panic("fable: out of memory");
     const s: *Str = @ptrCast(words.ptr);
     s.* = .{ .rc = 1, .len = @intCast(len) };
@@ -846,15 +853,25 @@ fn strNew(len: usize) struct { String, []u16 } {
     return .{ s, first[0..len] };
 }
 
+/// A new string with these units.
+fn strFrom(u: []const u16) String {
+    if (u.len == 0) return str("");
+    const s, const out = strNew(u.len);
+    @memcpy(out, u);
+    return s;
+}
+
 inline fn strRetain(s: String) void {
-    if (s.rc == Str.literal) return;
-    @constCast(s).rc += 1;
+    const p = s orelse return;
+    if (p.rc == Str.literal) return;
+    @constCast(p).rc += 1;
     if (track) thread.stats.dups += 1;
 }
 
 inline fn strRelease(s: String) void {
-    if (s.rc == Str.literal) return;
-    const m = @constCast(s);
+    const p = s orelse return;
+    if (p.rc == Str.literal) return;
+    const m = @constCast(p);
     if (m.rc != 1) {
         m.rc -= 1;
         if (track) thread.stats.decs += 1;
@@ -865,15 +882,49 @@ inline fn strRelease(s: String) void {
     allocator.free(words[0..strWords(m.len)]);
 }
 
+/// Text that grows: what the functions below build a string of unknown length in.
+const TextBuilder = struct {
+    list: std.ArrayList(u16) = .empty,
+
+    fn add(b: *TextBuilder, u: []const u16) void {
+        b.list.appendSlice(allocator, u) catch @panic("fable: out of memory");
+    }
+
+    fn addOne(b: *TextBuilder, c: u16) void {
+        b.list.append(allocator, c) catch @panic("fable: out of memory");
+    }
+
+    fn addAscii(b: *TextBuilder, text: []const u8) void {
+        for (text) |c| b.addOne(c);
+    }
+
+    fn deinit(b: *TextBuilder) void {
+        b.list.deinit(allocator);
+    }
+
+    /// The text as a string; the builder is empty afterwards.
+    fn finish(b: *TextBuilder) String {
+        const s = strFrom(b.list.items);
+        b.deinit();
+        b.* = .{};
+        return s;
+    }
+};
+
 pub fn strEql(a: String, b: String) bool {
-    return a == b or std.mem.eql(u16, a.units(), b.units());
+    if (a == b) return true;
+    const x = a orelse return false;
+    const y = b orelse return false;
+    return std.mem.eql(u16, x.units(), y.units());
 }
 
 /// The order of two strings by their code units: negative, zero or positive, and the same
 /// number as .NET's `String.CompareOrdinal`, which is what F#'s `compare` gives for strings.
+/// A null string comes before every other.
 pub fn strCompare(a: String, b: String) i32 {
-    const x = a.units();
-    const y = b.units();
+    if (a == null or b == null) return @as(i32, @intFromBool(a != null)) - @as(i32, @intFromBool(b != null));
+    const x = unitsOf(a);
+    const y = unitsOf(b);
     const x0: i32 = if (x.len != 0) x[0] else 0;
     const y0: i32 = if (y.len != 0) y[0] else 0;
     if (x0 != y0) return x0 - y0;
@@ -896,23 +947,426 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
     return if (b == b) -1 else 0;
 }
 
-pub inline fn strLen(s: String) i32 {
-    return @intCast(s.len);
+// ---- what .NET raises for a string that is null or an argument that is out of range ----
+
+fn nullRef() Raised {
+    return raise(NullReferenceException, str("Object reference not set to an instance of an object."));
+}
+
+fn argNull(comptime param: []const u8) Raised {
+    return raise(ArgumentNullException, str("Value cannot be null. (Parameter '" ++ param ++ "')"));
+}
+
+fn argRange(comptime param: []const u8, comptime text: []const u8) Raised {
+    return raise(ArgumentOutOfRangeException, str(text ++ " (Parameter '" ++ param ++ "')"));
+}
+
+fn argNegative(comptime param: []const u8, value: i32) Raised {
+    return raise(ArgumentOutOfRangeException, format(.{
+        param ++ " ('",                                                                      value,
+        "') must be a non-negative value. (Parameter '" ++ param ++ "')\nActual value was ", value,
+        ".",
+    }));
+}
+
+fn argAbove(comptime param: []const u8, value: anytype, limit: i32) Raised {
+    return raise(ArgumentOutOfRangeException, format(.{
+        param ++ " ('",                                        value,
+        "') must be less than or equal to '",                  limit,
+        "'. (Parameter '" ++ param ++ "')\nActual value was ", value,
+        ".",
+    }));
+}
+
+const index_range = "Index was out of range. Must be non-negative and less than or equal to the size of the collection.";
+
+/// `s.Length`
+pub inline fn strLen(s: String) Raised!i32 {
+    const p = s orelse return nullRef();
+    return @intCast(p.len);
+}
+
+/// `String.length s`, and `s.Length` of a string that cannot be null.
+pub inline fn strLength(s: String) i32 {
+    return @intCast(unitsOf(s).len);
 }
 
 /// `s.[i]`
-pub inline fn strAt(s: String, i: i32) u16 {
-    return s.units()[@intCast(i)];
+pub inline fn strAt(s: String, i: i32) Raised!u16 {
+    const p = s orelse return nullRef();
+    if (i < 0 or i >= p.len) return raise(IndexOutOfRangeException, str("Index was outside the bounds of the array."));
+    return p.units()[@intCast(i)];
 }
 
-/// `a + b`: a new string, unless one of them is empty.
+/// `a + b`: a new string, unless one of them is empty. (Null counts as empty, and the result
+/// is never null.)
 pub fn strConcat(a: String, b: String) String {
-    if (a.len == 0) return dup(b);
-    if (b.len == 0) return dup(a);
-    const s, const u = strNew(a.len + b.len);
-    @memcpy(u[0..a.len], a.units());
-    @memcpy(u[a.len..], b.units());
+    const x = unitsOf(a);
+    const y = unitsOf(b);
+    if (x.len == 0) return if (y.len == 0) str("") else dup(b);
+    if (y.len == 0) return dup(a);
+    const s, const u = strNew(x.len + y.len);
+    @memcpy(u[0..x.len], x);
+    @memcpy(u[x.len..], y);
     return s;
+}
+
+/// `s.Equals(other)`
+pub fn strEquals(s: String, other: String) Raised!bool {
+    if (s == null) return nullRef();
+    return strEql(s, other);
+}
+
+pub inline fn strIsNullOrEmpty(s: String) bool {
+    return unitsOf(s).len == 0;
+}
+
+pub fn strIsNullOrWhiteSpace(s: String) bool {
+    for (unitsOf(s)) |c| {
+        if (!unicode.isWhiteSpace(c)) return false;
+    }
+    return true;
+}
+
+/// The part of `s` from `start` that is `n` long. Both are known to be inside the string.
+fn strSlice(s: String, start: usize, n: usize) String {
+    const u = unitsOf(s);
+    if (n == 0) return str("");
+    if (n == u.len) return dup(s);
+    return strFrom(u[start..][0..n]);
+}
+
+/// `s.Substring(start)` and `s.Substring(start, length)`
+pub fn strSubstring(s: String, start: i32, length: ?i32) Raised!String {
+    const p = s orelse return nullRef();
+    const total: i32 = @intCast(p.len);
+    if (start < 0) return argNegative("startIndex", start);
+    if (start > total) return argRange("startIndex", "startIndex cannot be larger than length of string.");
+    const n = length orelse total - start;
+    if (n < 0) return argNegative("length", n);
+    if (start > total - n) return argRange("length", "Index and length must refer to a location within the string.");
+    return strSlice(s, @intCast(start), @intCast(n));
+}
+
+/// `s.IndexOf(c)` and `s.IndexOf(c, start)`
+pub fn strIndexOfChar(s: String, c: u16, start: i32) Raised!i32 {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    if (start < 0 or start > u.len) return argRange("startIndex", index_range);
+    const at = std.mem.indexOfScalarPos(u16, u, @intCast(start), c) orelse return -1;
+    return @intCast(at);
+}
+
+/// `s.IndexOf(value)` and `s.IndexOf(value, start)`
+pub fn strIndexOf(s: String, value: String, start: i32) Raised!i32 {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    const u = p.units();
+    if (start < 0 or start > u.len) return argRange("startIndex", index_range);
+    if (v.len == 0) return start;
+    const at = std.mem.indexOfPos(u16, u, @intCast(start), v.units()) orelse return -1;
+    return @intCast(at);
+}
+
+pub fn strLastIndexOfChar(s: String, c: u16) Raised!i32 {
+    const p = s orelse return nullRef();
+    const at = std.mem.lastIndexOfScalar(u16, p.units(), c) orelse return -1;
+    return @intCast(at);
+}
+
+pub fn strLastIndexOf(s: String, value: String) Raised!i32 {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    if (v.len == 0) return @intCast(p.len);
+    const at = std.mem.lastIndexOf(u16, p.units(), v.units()) orelse return -1;
+    return @intCast(at);
+}
+
+pub fn strContains(s: String, value: String) Raised!bool {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    return std.mem.indexOf(u16, p.units(), v.units()) != null;
+}
+
+pub fn strContainsChar(s: String, c: u16) Raised!bool {
+    const p = s orelse return nullRef();
+    return std.mem.indexOfScalar(u16, p.units(), c) != null;
+}
+
+pub fn strStartsWith(s: String, value: String) Raised!bool {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    return std.mem.startsWith(u16, p.units(), v.units());
+}
+
+pub fn strEndsWith(s: String, value: String) Raised!bool {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    return std.mem.endsWith(u16, p.units(), v.units());
+}
+
+pub fn strStartsWithChar(s: String, c: u16) Raised!bool {
+    const p = s orelse return nullRef();
+    return p.len != 0 and p.units()[0] == c;
+}
+
+pub fn strEndsWithChar(s: String, c: u16) Raised!bool {
+    const p = s orelse return nullRef();
+    return p.len != 0 and p.units()[p.len - 1] == c;
+}
+
+/// `s.ToUpperInvariant()` (`upper`) and `s.ToLowerInvariant()`: each code unit to the one
+/// .NET maps it to. `ToUpper` and `ToLower` are the same here: there is no current culture.
+pub fn strCase(s: String, comptime upper: bool) Raised!String {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    const change = if (upper) unicode.toUpper else unicode.toLower;
+    for (u, 0..) |c, i| {
+        if (change(c) != c) {
+            const r, const out = strNew(u.len);
+            @memcpy(out[0..i], u[0..i]);
+            for (u[i..], out[i..]) |from, *to| to.* = change(from);
+            return r;
+        }
+    }
+    return dup(s);
+}
+
+/// `s.Trim()`, `s.TrimStart()`, `s.TrimEnd()`: white space, or the one character given.
+pub fn strTrim(s: String, comptime start: bool, comptime end: bool, only: ?u16) Raised!String {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    var from: usize = 0;
+    var to: usize = u.len;
+    if (start) {
+        while (from < to and (if (only) |c| u[from] == c else unicode.isWhiteSpace(u[from]))) from += 1;
+    }
+    if (end) {
+        while (to > from and (if (only) |c| u[to - 1] == c else unicode.isWhiteSpace(u[to - 1]))) to -= 1;
+    }
+    return strSlice(s, from, to - from);
+}
+
+/// `s.Replace(old, new)`
+pub fn strReplace(s: String, old: String, new_: String) Raised!String {
+    const p = s orelse return nullRef();
+    const o = old orelse return argNull("oldValue");
+    if (o.len == 0) return raise(ArgumentException, str("The value cannot be an empty string. (Parameter 'oldValue')"));
+    const u = p.units();
+    const with = unitsOf(new_);
+    var at = std.mem.indexOf(u16, u, o.units()) orelse return dup(s);
+    var b: TextBuilder = .{};
+    var done: usize = 0;
+    while (true) {
+        b.add(u[done..at]);
+        b.add(with);
+        done = at + o.len;
+        at = std.mem.indexOfPos(u16, u, done, o.units()) orelse break;
+    }
+    b.add(u[done..]);
+    return b.finish();
+}
+
+pub fn strReplaceChar(s: String, old: u16, new_: u16) Raised!String {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    const first = std.mem.indexOfScalar(u16, u, old) orelse return dup(s);
+    const r, const out = strNew(u.len);
+    @memcpy(out[0..first], u[0..first]);
+    for (u[first..], out[first..]) |from, *to| to.* = if (from == old) new_ else from;
+    return r;
+}
+
+/// `s.Insert(start, value)`
+pub fn strInsert(s: String, start: i32, value: String) Raised!String {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    const u = p.units();
+    // (.NET compares the index as an unsigned number, and says so in its message)
+    const index: u32 = @bitCast(start);
+    if (index > u.len) return argAbove("startIndex", index, @intCast(u.len));
+    if (v.len == 0) return dup(s);
+    if (u.len == 0) return dup(value);
+    const r, const out = strNew(u.len + v.len);
+    @memcpy(out[0..index], u[0..index]);
+    @memcpy(out[index..][0..v.len], v.units());
+    @memcpy(out[index + v.len ..], u[index..]);
+    return r;
+}
+
+/// `s.Remove(start)` and `s.Remove(start, count)`
+pub fn strRemove(s: String, start: i32, count: ?i32) Raised!String {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    const total: i32 = @intCast(u.len);
+    if (count) |n| {
+        if (start < 0) return argNegative("startIndex", start);
+        if (n < 0) return argNegative("count", n);
+        if (n > total - start) return argAbove("count", n, total - start);
+        if (n == 0) return dup(s);
+        const from: usize = @intCast(start);
+        const r, const out = strNew(u.len - @as(usize, @intCast(n)));
+        @memcpy(out[0..from], u[0..from]);
+        @memcpy(out[from..], u[from + @as(usize, @intCast(n)) ..]);
+        return if (out.len == 0) blk: {
+            strRelease(r);
+            break :blk str("");
+        } else r;
+    }
+    if (start < 0) return argRange("startIndex", "StartIndex cannot be less than zero.");
+    if (start > total) return argRange("startIndex", "startIndex cannot be larger than length of string.");
+    return strSlice(s, 0, @intCast(start));
+}
+
+/// `s.PadLeft(width, c)` (`left`) and `s.PadRight(width, c)`
+pub fn strPad(s: String, comptime left: bool, width: i32, c: u16) Raised!String {
+    const p = s orelse return nullRef();
+    if (width < 0) return argNegative("totalWidth", width);
+    const u = p.units();
+    const total: usize = @intCast(width);
+    if (total <= u.len) return dup(s);
+    const r, const out = strNew(total);
+    const pad = total - u.len;
+    if (left) {
+        @memset(out[0..pad], c);
+        @memcpy(out[pad..], u);
+    } else {
+        @memcpy(out[0..u.len], u);
+        @memset(out[u.len..], c);
+    }
+    return r;
+}
+
+/// `String(c, count)`
+pub fn strOfChar(c: u16, count: i32) Raised!String {
+    if (count < 0) return argNegative("count", count);
+    if (count == 0) return str("");
+    const r, const out = strNew(@intCast(count));
+    @memset(out, c);
+    return r;
+}
+
+// ---- F#'s `String` module: a null string is an empty one ----
+
+fn countNegative(count: i32) Raised {
+    return raise(ArgumentException, format(.{ "The input must be non-negative.\ncount = ", count, " (Parameter 'count')" }));
+}
+
+/// Apply a function value to two values: at once if it takes both, one after the other if it
+/// is a function that gives a function.
+inline fn apply2(comptime R: type, f: anytype, a: anytype, b: anytype) Raised!R {
+    const Code = @typeInfo(@FieldType(@TypeOf(f), "code")).pointer.child;
+    if (comptime @typeInfo(Code).@"fn".param_types.len == 3) return f.code(f.env, a, b);
+    const g = try f.code(f.env, a);
+    defer drop(g);
+    return g.code(g.env, b);
+}
+
+/// `String.replicate count s`
+pub fn strReplicate(count: i32, s: String) Raised!String {
+    if (count < 0) return countNegative(count);
+    const u = unitsOf(s);
+    const n: usize = @intCast(count);
+    if (n == 0 or u.len == 0) return str("");
+    if (n == 1) return dup(s);
+    const r, const out = strNew(u.len * n);
+    for (0..n) |i| @memcpy(out[i * u.len ..][0..u.len], u);
+    return r;
+}
+
+/// `String.concat sep strings`, for a list of strings
+pub fn strJoin(sep: String, strings: List(String)) String {
+    var b: TextBuilder = .{};
+    var rest = strings;
+    var first = true;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        if (!first) b.add(unitsOf(sep));
+        first = false;
+        b.add(unitsOf(rest.Cons.Head));
+    }
+    return b.finish();
+}
+
+/// `String.init count f`
+pub fn strInit(count: i32, f: anytype) Raised!String {
+    if (count < 0) return countNegative(count);
+    var b: TextBuilder = .{};
+    errdefer b.deinit();
+    var i: i32 = 0;
+    while (i < count) : (i += 1) {
+        const part: String = try f.code(f.env, i);
+        b.add(unitsOf(part));
+        drop(part);
+    }
+    return b.finish();
+}
+
+/// `String.map f s`
+pub fn strMap(f: anytype, s: String) Raised!String {
+    const u = unitsOf(s);
+    if (u.len == 0) return str("");
+    const r, const out = strNew(u.len);
+    errdefer strRelease(r);
+    for (u, out) |c, *to| to.* = try f.code(f.env, c);
+    return r;
+}
+
+/// `String.mapi f s`
+pub fn strMapi(f: anytype, s: String) Raised!String {
+    const u = unitsOf(s);
+    if (u.len == 0) return str("");
+    const r, const out = strNew(u.len);
+    errdefer strRelease(r);
+    for (u, out, 0..) |c, *to, i| to.* = try apply2(u16, f, @as(i32, @intCast(i)), c);
+    return r;
+}
+
+/// `String.iter f s`
+pub fn strIter(f: anytype, s: String) Raised!void {
+    for (unitsOf(s)) |c| try f.code(f.env, c);
+}
+
+/// `String.iteri f s`
+pub fn strIteri(f: anytype, s: String) Raised!void {
+    for (unitsOf(s), 0..) |c, i| try apply2(void, f, @as(i32, @intCast(i)), c);
+}
+
+/// `String.forall f s`
+pub fn strForall(f: anytype, s: String) Raised!bool {
+    for (unitsOf(s)) |c| {
+        if (!try f.code(f.env, c)) return false;
+    }
+    return true;
+}
+
+/// `String.exists f s`
+pub fn strExists(f: anytype, s: String) Raised!bool {
+    for (unitsOf(s)) |c| {
+        if (try f.code(f.env, c)) return true;
+    }
+    return false;
+}
+
+/// `String.filter f s`
+pub fn strFilter(f: anytype, s: String) Raised!String {
+    var b: TextBuilder = .{};
+    errdefer b.deinit();
+    for (unitsOf(s)) |c| {
+        if (try f.code(f.env, c)) b.addOne(c);
+    }
+    return b.finish();
+}
+
+/// `String.collect f s`
+pub fn strCollect(f: anytype, s: String) Raised!String {
+    var b: TextBuilder = .{};
+    errdefer b.deinit();
+    for (unitsOf(s)) |c| {
+        const part: String = try f.code(f.env, c);
+        b.add(unitsOf(part));
+        drop(part);
+    }
+    return b.finish();
 }
 
 /// How a value is turned into text: an F# format specifier (`%5d`, `%.2f`, `%s`, ...), or
@@ -925,6 +1379,8 @@ pub const Spec = struct {
     left: bool = false,
     plus: bool = false,
     space: bool = false,
+    /// a .NET format (`N2`), for a hole of an interpolated string that has one
+    net: []const u8 = "",
 };
 
 fn Arg(comptime T: type, comptime spec: Spec) type {
@@ -952,7 +1408,7 @@ const Piece = union(enum) {
     }
 };
 
-const scratch_len = 400;
+const scratch_len = 640;
 
 /// The decimal digits of a number: 0.d0 d1 d2 ... x 10^point.
 const Decimal = struct {
@@ -990,19 +1446,19 @@ const Decimal = struct {
             var n: usize = at + 3;
             var end: usize = d.digits.len;
             while (n > 0) {
-                var rem: u64 = 0;
+                var carry: u64 = 0;
                 var i = n;
                 while (i > 0) {
                     i -= 1;
-                    const cur = (rem << 32) | limbs[i];
+                    const cur = (carry << 32) | limbs[i];
                     limbs[i] = @intCast(cur / 1_000_000_000);
-                    rem = cur % 1_000_000_000;
+                    carry = cur % 1_000_000_000;
                 }
                 while (n > 0 and limbs[n - 1] == 0) n -= 1;
                 for (0..9) |_| {
                     end -= 1;
-                    d.digits[end] = @intCast(rem % 10);
-                    rem /= 10;
+                    d.digits[end] = @intCast(carry % 10);
+                    carry /= 10;
                 }
             }
             while (d.digits[end] == 0) end += 1;
@@ -1069,6 +1525,11 @@ const Decimal = struct {
 
     /// Keep `n` digits, rounding to the nearest and a tie to the even digit, as .NET does.
     fn round(d: *Decimal, n: i32) void {
+        d.roundTo(n, true);
+    }
+
+    /// Keep `n` digits, rounding to the nearest; a tie goes to the even digit, or up.
+    fn roundTo(d: *Decimal, n: i32, even: bool) void {
         if (n >= d.len) return;
         if (n < 0) {
             d.len = 0;
@@ -1078,7 +1539,7 @@ const Decimal = struct {
         const next = d.digits[keep];
         var up = next > 5;
         if (next == 5) {
-            up = keep > 0 and d.digits[keep - 1] % 2 == 1;
+            up = !even or (keep > 0 and d.digits[keep - 1] % 2 == 1);
             for (d.digits[keep + 1 .. d.len]) |c| {
                 if (c != 0) up = true;
             }
@@ -1210,13 +1671,18 @@ fn floatText(comptime spec: Spec, value: anytype, out: []u8) []const u8 {
 
 fn pieceOf(comptime spec: Spec, value: anytype, scratch: *[scratch_len]u8) Piece {
     const T = @TypeOf(value);
-    if (T == String) return .{ .units = value.units() };
+    if (T == String) {
+        // (only `%O` shows that a string is null)
+        if (value == null and spec.kind == 'O') return .{ .ascii = "<null>" };
+        return .{ .units = unitsOf(value) };
+    }
     switch (@typeInfo(T)) {
         .bool => return .{ .ascii = if (spec.kind == 'b')
             (if (value) "true" else "false")
         else
             (if (value) "True" else "False") },
         .int => |info| {
+            if (spec.net.len != 0) return .{ .ascii = netText(spec.net, value, scratch) };
             if (spec.kind == 'c') {
                 // (a char: one UTF-16 unit, kept in the scratch space as such)
                 const u: *[1]u16 = @ptrCast(@alignCast(scratch));
@@ -1235,7 +1701,7 @@ fn pieceOf(comptime spec: Spec, value: anytype, scratch: *[scratch_len]u8) Piece
             return .{ .ascii = text catch unreachable };
         },
         .comptime_int => return pieceOf(spec, @as(i64, value), scratch),
-        .float => return .{ .ascii = floatText(spec, value, scratch) },
+        .float => return .{ .ascii = if (spec.net.len != 0) netText(spec.net, value, scratch) else floatText(spec, value, scratch) },
         .comptime_float => return .{ .ascii = floatText(spec, @as(f64, value), scratch) },
         else => @compileError("fable: a value of type " ++ @typeName(T) ++ " cannot be formatted yet"),
     }
@@ -1258,6 +1724,9 @@ pub fn format(parts: anytype) String {
     var pieces: [names.len]Piece = undefined;
     var pad: [names.len]usize = @splat(0);
     var scratch: [names.len][scratch_len]u8 align(2) = undefined;
+    // (the text of a `%A` is a string of its own until it is copied into the result)
+    var written: [names.len]String = @splat(null);
+    defer for (written) |text| strRelease(text);
     var total: usize = 0;
     inline for (names, 0..) |name, i| {
         const part = @field(parts, name);
@@ -1265,7 +1734,12 @@ pub fn format(parts: anytype) String {
         if (comptime isLiteralText(T)) {
             pieces[i] = .{ .units = comptime std.unicode.utf8ToUtf16LeStringLiteral(part) };
         } else if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "fable_spec"))) {
-            pieces[i] = pieceOf(T.fable_spec, part.value, &scratch[i]);
+            if (comptime T.fable_spec.kind == 'A') {
+                written[i] = anyText(part.value);
+                pieces[i] = .{ .units = unitsOf(written[i]) };
+            } else {
+                pieces[i] = pieceOf(T.fable_spec, part.value, &scratch[i]);
+            }
             if (T.fable_spec.width > pieces[i].len()) pad[i] = T.fable_spec.width - pieces[i].len();
         } else {
             pieces[i] = pieceOf(.{}, part, &scratch[i]);
@@ -1347,7 +1821,7 @@ pub var write_err: *const fn (bytes: []const u8) void = defaultErr;
 
 fn writeText(write: *const fn ([]const u8) void, s: String, newline: bool) void {
     var buf: [512]u8 = undefined;
-    var rest = s.units();
+    var rest = unitsOf(s);
     while (rest.len != 0) {
         // (a pair of surrogates is not split between two chunks)
         var n = @min(rest.len, buf.len / 3);
@@ -1372,6 +1846,463 @@ pub fn printErr(parts: anytype, comptime newline: bool) void {
     const s = format(parts);
     writeText(write_err, s, newline);
     drop(s);
+}
+
+// ---------------------------------------------------------------------------------------------
+// .NET's standard numeric formats: what `{x:N2}` in an interpolated string asks for
+// ---------------------------------------------------------------------------------------------
+
+/// The digits before the point, in groups of three if `grouped`.
+fn wholeDigits(t: *Text, d: *const Decimal, comptime grouped: bool) void {
+    const count: i32 = @max(d.point, 1);
+    var i: i32 = 0;
+    while (i < count) : (i += 1) {
+        if (grouped and i != 0 and @mod(count - i, 3) == 0) t.put(',');
+        t.put(d.digit(i + d.point - count));
+    }
+}
+
+fn fraction(t: *Text, d: *const Decimal, places: i32) void {
+    if (places <= 0) return;
+    t.put('.');
+    var k: i32 = 0;
+    while (k < places) : (k += 1) t.put(d.digit(d.point + k));
+}
+
+/// A number as .NET's `ToString(format)` writes it in the invariant culture, for the
+/// standard formats: D, X, B, N, F, E, G, R, P and C with an optional precision.
+fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
+    const T = @TypeOf(value);
+    const whole = @typeInfo(T) == .int;
+    const letter = fmt[0];
+    const given: ?i32 = comptime if (fmt.len > 1) (std.fmt.parseInt(i32, fmt[1..], 10) catch @compileError("fable: the format " ++ fmt)) else null;
+    var t: Text = .{ .buf = out };
+
+    if (comptime (letter == 'X' or letter == 'x' or letter == 'B' or letter == 'b')) {
+        if (!whole) @compileError("fable: the format " ++ fmt ++ " is for whole numbers");
+        const bits: @Int(.unsigned, @typeInfo(T).int.bits) = @bitCast(value);
+        var raw: [140]u8 = undefined;
+        const text = switch (letter) {
+            'X' => std.fmt.bufPrint(&raw, "{X}", .{bits}),
+            'x' => std.fmt.bufPrint(&raw, "{x}", .{bits}),
+            else => std.fmt.bufPrint(&raw, "{b}", .{bits}),
+        } catch unreachable;
+        var pad: i32 = (given orelse 0) - @as(i32, @intCast(text.len));
+        while (pad > 0) : (pad -= 1) t.put('0');
+        for (text) |c| t.put(c);
+        return out[0..t.len];
+    }
+    if (!whole) {
+        if (std.math.isNan(value)) return "NaN";
+        if (std.math.isInf(value)) return if (value > 0) "Infinity" else "-Infinity";
+    }
+
+    const negative = if (whole) value < 0 else std.math.signbit(value);
+    const shortest = !whole and (letter == 'R' or letter == 'r' or ((letter == 'G' or letter == 'g') and (given orelse 0) == 0));
+    var d: Decimal = .{};
+    if (whole) {
+        if (value != 0) {
+            const text = std.fmt.bufPrint(&d.digits, "{d}", .{@abs(@as(i128, value))}) catch unreachable;
+            for (d.digits[0..text.len]) |*c| c.* -= '0';
+            d.len = text.len;
+            d.point = @intCast(text.len);
+        }
+    } else if (shortest) {
+        d = Decimal.shortest(@abs(value));
+    } else {
+        d = Decimal.exact(@abs(@as(f64, value)));
+    }
+    // (a whole number has no exact half to decide: .NET rounds its digits half up)
+    const even = !whole;
+
+    switch (letter) {
+        'D', 'd' => {
+            if (!whole) @compileError("fable: the format " ++ fmt ++ " is for whole numbers");
+            if (negative) t.put('-');
+            const have: i32 = @max(d.point, 1);
+            var pad: i32 = @as(i32, given orelse 0) - have;
+            while (pad > 0) : (pad -= 1) t.put('0');
+            wholeDigits(&t, &d, false);
+        },
+        'N', 'n', 'F', 'f', 'P', 'p', 'C', 'c' => {
+            const places: i32 = @min(given orelse 2, 80);
+            const percent = letter == 'P' or letter == 'p';
+            const currency = letter == 'C' or letter == 'c';
+            if (percent and d.len != 0) d.point += 2;
+            d.roundTo(d.point + places, even);
+            if (negative) t.put(if (currency) '(' else '-');
+            if (currency) t.put(0xA4);
+            wholeDigits(&t, &d, !(letter == 'F' or letter == 'f'));
+            fraction(&t, &d, places);
+            if (percent) {
+                t.put(' ');
+                t.put('%');
+            }
+            if (negative and currency) t.put(')');
+        },
+        'E', 'e' => {
+            const places: i32 = @min(given orelse 6, 80);
+            d.roundTo(places + 1, even);
+            if (negative) t.put('-');
+            t.put(d.digit(0));
+            if (places > 0) {
+                t.put('.');
+                var k: i32 = 1;
+                while (k <= places) : (k += 1) t.put(d.digit(k));
+            }
+            t.exponent(letter, d.point - 1, 3);
+        },
+        'G', 'g', 'R', 'r' => {
+            const e: u8 = if (letter == 'g' or letter == 'r') 'e' else 'E';
+            if (negative) t.put('-');
+            const limit: i32 = if (shortest)
+                (if (T == f32) 9 else 17)
+            else if (whole and (letter == 'R' or letter == 'r' or (given orelse 0) == 0))
+                std.math.maxInt(i32)
+            else
+                given.?;
+            if (!shortest) d.roundTo(limit, even);
+            if (d.len == 0) t.put('0') else t.general(&d, limit, e);
+        },
+        else => @compileError("fable: the format " ++ fmt ++ " is not supported"),
+    }
+    return out[0..t.len];
+}
+
+// ---------------------------------------------------------------------------------------------
+// %A: a value as F# would write it
+//
+// This is the printer of FSharp.Core, rule for rule, so that the text is the same: the value
+// becomes a layout (text, and joints that may or must break), the layout is fitted into lines
+// of 80 characters by breaking the outermost joints first, and the result is written with the
+// indentation the breaks ask for. A list shows its first 100 items; a record that contains
+// itself is cut where it comes round again.
+// ---------------------------------------------------------------------------------------------
+
+const Joint = union(enum) { unbreakable, breakable: i32, broken: i32 };
+
+const Layout = struct {
+    /// no space is wanted before this text (`tight_left`) or after it (`tight_right`)
+    tight_left: bool,
+    tight_right: bool,
+    what: union(enum) {
+        leaf: []const u16,
+        node: struct { l: *Layout, r: *Layout, joint: Joint },
+    },
+};
+
+/// Where a value stands decides whether it needs brackets.
+pub const Prec = enum(u8) { bracket_if_tuple_or_not_atomic = 2, bracket_if_tuple = 3, never_bracket = 4 };
+
+const print_width = 80;
+const print_length = 100;
+const print_depth = 100;
+
+pub const Shower = struct {
+    arena: std.mem.Allocator,
+    /// the reference records that are being written, to find one that contains itself
+    path: [print_depth]*const anyopaque = undefined,
+    on_path: usize = 0,
+    /// the breaks that could still be made to gain room: the columns each would save (negative
+    /// once it was made), the innermost last
+    savings: std.ArrayList(i32) = .empty,
+    outer: usize = 0,
+
+    fn leaf(b: *Shower, tight_left: bool, text: []const u16, tight_right: bool) *Layout {
+        const l = b.arena.create(Layout) catch @panic("fable: out of memory");
+        l.* = .{ .tight_left = tight_left, .tight_right = tight_right, .what = .{ .leaf = text } };
+        return l;
+    }
+
+    fn ascii(b: *Shower, tight_left: bool, text: []const u8, tight_right: bool) *Layout {
+        const u = b.arena.alloc(u16, text.len) catch @panic("fable: out of memory");
+        for (text, u) |c, *to| to.* = c;
+        return b.leaf(tight_left, u, tight_right);
+    }
+
+    fn word(b: *Shower, text: []const u8) *Layout {
+        return b.ascii(false, text, false);
+    }
+
+    fn join(b: *Shower, l: *Layout, r: *Layout, joint: Joint) *Layout {
+        const n = b.arena.create(Layout) catch @panic("fable: out of memory");
+        n.* = .{ .tight_left = l.tight_left, .tight_right = r.tight_right, .what = .{ .node = .{ .l = l, .r = r, .joint = joint } } };
+        return n;
+    }
+
+    fn tight(b: *Shower, l: *Layout, r: *Layout) *Layout {
+        return b.join(l, r, .unbreakable);
+    }
+
+    fn bracket(b: *Shower, l: *Layout) *Layout {
+        return b.tight(b.tight(b.ascii(false, "(", true), l), b.ascii(true, ")", false));
+    }
+
+    /// The items with `sep` after each but the last, and a possible break after each `sep`.
+    fn separated(b: *Shower, items: []const *Layout, sep: []const u8) *Layout {
+        var all = items[0];
+        for (items[1..]) |item| all = b.join(b.tight(all, b.ascii(true, sep, false)), item, .{ .breakable = 0 });
+        return all;
+    }
+
+    /// `Case`, `Case x` or `Case (x, y)`: a union case, `Some`, or an F# exception.
+    fn case(b: *Shower, name: []const u8, payload: anytype, prec: Prec, depth: i32) *Layout {
+        const P = @TypeOf(payload);
+        if (P == void) return b.word(name);
+        const fields = if (@typeInfo(P) == .pointer) payload else &payload;
+        const names = @typeInfo(@TypeOf(fields.*)).@"struct".field_names;
+        comptime var n = 0;
+        inline for (names) |field| {
+            if (comptime !isCount(field)) n += 1;
+        }
+        if (n == 0) return b.word(name);
+        var items: [n]*Layout = undefined;
+        comptime var i = 0;
+        inline for (names) |field| {
+            if (comptime !isCount(field)) {
+                items[i] = b.show(@field(fields, field), if (n == 1) .bracket_if_tuple_or_not_atomic else .bracket_if_tuple, depth - 1);
+                i += 1;
+            }
+        }
+        const args = if (n == 1) items[0] else b.bracket(b.separated(&items, ","));
+        const whole = b.join(b.word(name), args, .{ .breakable = 2 });
+        return if (@backingInt(prec) <= @backingInt(Prec.bracket_if_tuple_or_not_atomic)) b.bracket(whole) else whole;
+    }
+
+    /// `{ A = 1` and every further field on a line of its own.
+    fn record(b: *Shower, fields: anytype, depth: i32) *Layout {
+        var all: ?*Layout = null;
+        inline for (@typeInfo(@TypeOf(fields.*)).@"struct".field_names) |field| {
+            if (comptime !isCount(field)) {
+                const value = b.show(@field(fields, field), .bracket_if_tuple, depth - 1);
+                const item = b.join(b.tight(b.word(field), b.word("=")), value, .{ .breakable = 1 });
+                all = if (all) |above| b.join(above, item, .{ .broken = 0 }) else item;
+            }
+        }
+        return b.tight(b.tight(b.word("{"), all.?), b.word("}"));
+    }
+
+    fn number(b: *Shower, x: anytype) *Layout {
+        const T = @TypeOf(x);
+        var buf: [scratch_len + 4]u8 = undefined;
+        switch (@typeInfo(T)) {
+            .int => |info| {
+                const suffix = switch (T) {
+                    i8 => "y",
+                    u8 => "uy",
+                    i16 => "s",
+                    i32 => "",
+                    u32 => "u",
+                    i64 => "L",
+                    u64 => "UL",
+                    isize => "n",
+                    usize => "un",
+                    else => if (info.signedness == .signed) "" else "u",
+                };
+                return b.word(std.fmt.bufPrint(&buf, "{d}{s}", .{ x, suffix }) catch unreachable);
+            },
+            .float => {
+                const suffix = if (T == f32) "f" else "";
+                if (std.math.isNan(x)) return b.word("nan" ++ suffix);
+                if (std.math.isInf(x)) return if (x > 0) b.word("infinity" ++ suffix) else b.word("-infinity" ++ suffix);
+                if (T == f32 and x > -2147483648.0 and x < 2147483648.0 and @trunc(x) == x) {
+                    return b.word(std.fmt.bufPrint(&buf, "{d}.0f", .{@as(i32, @intFromFloat(x))}) catch unreachable);
+                }
+                const text = floatText(.{ .kind = 'g', .precision = 10 }, x, buf[0..scratch_len]);
+                var plain = T == f64;
+                for (text) |c| {
+                    if (!(std.ascii.isDigit(c) or c == '-')) plain = false;
+                }
+                const tail = if (plain) ".0" else suffix;
+                var all: [scratch_len + 4]u8 = undefined;
+                return b.word(std.fmt.bufPrint(&all, "{s}{s}", .{ text, tail }) catch unreachable);
+            },
+            else => comptime unreachable,
+        }
+    }
+
+    fn char(b: *Shower, c: u16) *Layout {
+        var text: [8]u16 = undefined;
+        var n: usize = 0;
+        text[n] = '\'';
+        n += 1;
+        if (c == '\'' or c == '\\') {
+            text[n] = '\\';
+            text[n + 1] = c;
+            n += 2;
+        } else if (c == 8) {
+            text[n] = '\\';
+            text[n + 1] = 'b';
+            n += 2;
+        } else if (c < 0x20 or (c >= 0x7F and c <= 0x9F)) {
+            text[n] = '\\';
+            text[n + 1] = '0' + c / 100;
+            text[n + 2] = '0' + (c / 10) % 10;
+            text[n + 3] = '0' + c % 10;
+            n += 4;
+        } else {
+            text[n] = c;
+            n += 1;
+        }
+        text[n] = '\'';
+        n += 1;
+        return b.leaf(false, b.arena.dupe(u16, text[0..n]) catch @panic("fable: out of memory"), false);
+    }
+
+    fn quoted(b: *Shower, u: []const u16) *Layout {
+        const text = b.arena.alloc(u16, u.len + 2) catch @panic("fable: out of memory");
+        text[0] = '"';
+        @memcpy(text[1..][0..u.len], u);
+        text[u.len + 1] = '"';
+        return b.leaf(false, text, false);
+    }
+
+    /// The layout of a value. A `u16` is taken to be a char.
+    pub fn show(b: *Shower, x: anytype, prec: Prec, depth: i32) *Layout {
+        const T = @TypeOf(x);
+        if (depth <= 0) return b.word("...");
+        if (T == String) return if (x) |p| b.quoted(p.units()) else b.word("null");
+        if (T == Exn) return x.type.show(b, x, prec, depth);
+        if (comptime isFunc(T)) return b.word("<fun>");
+        switch (@typeInfo(T)) {
+            .void => return b.word("()"),
+            .bool => return b.word(if (x) "true" else "false"),
+            .int => return if (T == u16) b.char(x) else b.number(x),
+            .float => return b.number(x),
+            .optional => return if (x) |v| b.case("Some", .{v}, prec, depth) else b.word("None"),
+            .pointer => {
+                // a reference record
+                const addr: *const anyopaque = @ptrCast(x);
+                for (b.path[0..b.on_path]) |seen| {
+                    if (seen == addr) return b.word("...");
+                }
+                if (b.on_path == b.path.len) return b.word("...");
+                b.path[b.on_path] = addr;
+                b.on_path += 1;
+                defer b.on_path -= 1;
+                return b.record(x, depth);
+            },
+            .@"struct" => |s| {
+                if (!s.is_tuple) return b.record(&x, depth);
+                var items: [s.field_names.len]*Layout = undefined;
+                inline for (s.field_names, 0..) |field, i| items[i] = b.show(@field(x, field), .bracket_if_tuple, depth - 1);
+                return b.bracket(b.separated(&items, ","));
+            },
+            .@"union" => {
+                if (comptime @hasDecl(T, "fable_list")) {
+                    if (x == .Empty) return b.word("[]");
+                    var items: std.ArrayList(*Layout) = .empty;
+                    var rest = x;
+                    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+                        if (items.items.len == print_length) {
+                            items.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+                            break;
+                        }
+                        items.append(b.arena, b.show(rest.Cons.Head, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
+                    }
+                    return b.tight(b.tight(b.ascii(false, "[", true), b.separated(items.items, ";")), b.ascii(true, "]", false));
+                }
+                switch (x) {
+                    inline else => |payload, tag| return b.case(@tagName(tag), payload, prec, depth),
+                }
+            },
+            else => @compileError("fable: a value of type " ++ @typeName(T) ++ " cannot be written with %A"),
+        }
+    }
+
+    /// Make the next break that is still open, the outermost first; the columns it saves.
+    fn forceBreak(b: *Shower) ?i32 {
+        if (b.outer == b.savings.items.len) return null;
+        const saving = b.savings.items[b.outer];
+        b.savings.items[b.outer] = -saving;
+        b.outer += 1;
+        return saving;
+    }
+
+    /// Fit `layout`, which starts at column `start`, into the width by turning joints that may
+    /// break into breaks. Returns the column after it, and the width of its last line.
+    fn fit(b: *Shower, start: i32, layout: *Layout) struct { i32, i32 } {
+        switch (layout.what) {
+            .leaf => |text| {
+                const width: i32 = @intCast(text.len);
+                var pos = start;
+                while (pos + width > print_width) {
+                    pos -= b.forceBreak() orelse break;
+                }
+                return .{ pos + width, width };
+            },
+            .node => |*n| {
+                const mid: i32 = if (n.l.tight_right or n.r.tight_left) 0 else 1;
+                var pos, const left = b.fit(start, n.l);
+                switch (n.joint) {
+                    .unbreakable => {
+                        pos, const right = b.fit(pos + mid, n.r);
+                        return .{ pos, left + mid + right };
+                    },
+                    .broken => |indent| {
+                        pos, const right = b.fit(pos - left + indent, n.r);
+                        return .{ pos, indent + right };
+                    },
+                    .breakable => |indent| {
+                        const saving = left + mid - indent;
+                        if (saving <= 0) {
+                            pos, const right = b.fit(pos + mid, n.r);
+                            return .{ pos, left + mid + right };
+                        }
+                        b.savings.append(b.arena, saving) catch @panic("fable: out of memory");
+                        pos, const right = b.fit(pos + mid, n.r);
+                        const made = b.savings.pop().? < 0;
+                        if (b.outer > b.savings.items.len) b.outer = b.savings.items.len;
+                        if (!made) return .{ pos, left + mid + right };
+                        n.joint = .{ .broken = indent };
+                        return .{ pos, indent + right };
+                    },
+                }
+            },
+        }
+    }
+
+    fn write(out: *TextBuilder, column: *i32, layout: *const Layout, tab: i32) void {
+        switch (layout.what) {
+            .leaf => |text| {
+                out.add(text);
+                column.* += @intCast(text.len);
+            },
+            .node => |n| {
+                write(out, column, n.l, tab);
+                switch (n.joint) {
+                    .broken => |indent| {
+                        out.addOne('\n');
+                        var i: i32 = 0;
+                        while (i < tab + indent) : (i += 1) out.addOne(' ');
+                        column.* = tab + indent;
+                        write(out, column, n.r, tab + indent);
+                    },
+                    else => {
+                        if (!(n.l.tight_right or n.r.tight_left)) {
+                            out.addOne(' ');
+                            column.* += 1;
+                        }
+                        write(out, column, n.r, column.*);
+                    },
+                }
+            },
+        }
+    }
+};
+
+/// `%A`: the value as F# would write it.
+pub fn anyText(x: anytype) String {
+    if (@TypeOf(x) == String and x == null) return str("<null>");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var b: Shower = .{ .arena = arena.allocator() };
+    const layout = b.show(x, .bracket_if_tuple, print_depth);
+    _ = b.fit(0, layout);
+    var out: TextBuilder = .{};
+    var column: i32 = 0;
+    Shower.write(&out, &column, layout, 0);
+    return out.finish();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1468,6 +2399,10 @@ pub const ExnType = struct {
     destroy: *const fn (Exn) void,
     /// the message, for an exception that was made with one
     message: ?*const fn (Exn) String = null,
+    /// the .NET class this one derives from, if a program can name it
+    parent: ?*const ExnType = null,
+    /// the exception as `%A` writes it
+    show: *const fn (*Shower, Exn, Prec, i32) *Layout,
 };
 
 pub const ExnHeader = struct {
@@ -1482,6 +2417,15 @@ pub const Exn = *ExnHeader;
 
 /// An F# `exception` declaration with the given fields.
 pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
+    return ExnUnder(name, Payload, null, true);
+}
+
+/// A .NET exception class with a message, derived from `Parent` (or from `System.Exception`).
+fn Class(comptime name: []const u8, comptime Parent: ?type) type {
+    return ExnUnder(name, Described, if (Parent) |P| &P.info else null, false);
+}
+
+fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime parent: ?*const ExnType, comptime sealed: bool) type {
     return struct {
         const cyclic = functions_in_cycles and holdsCyclic(Payload);
         const Whole = struct { header: ExnHeader, hdr: GcHdr(cyclic) = undefined, payload: Payload };
@@ -1496,7 +2440,19 @@ pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
             .name = name,
             .destroy = destroy,
             .message = if (Payload == Described) message else null,
+            .parent = parent,
+            .show = show,
         };
+
+        fn show(b: *Shower, e: Exn, prec: Prec, depth: i32) *Layout {
+            if (Payload != Described) return b.case(name, of(e), prec, depth);
+            // a .NET exception: its class and its message
+            const text = unitsOf(of(e).Message);
+            const all = b.arena.alloc(u16, name.len + 2 + text.len) catch @panic("fable: out of memory");
+            for (name ++ ": ", all[0 .. name.len + 2]) |c, *to| to.* = c;
+            @memcpy(all[name.len + 2 ..], text);
+            return b.leaf(false, all, false);
+        }
 
         fn message(e: Exn) String {
             return dup(of(e).Message);
@@ -1514,9 +2470,14 @@ pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
             return &c.header;
         }
 
-        /// Is `e` an exception of this type?
+        /// Is `e` an exception of this type, or of a class that derives from it?
         pub inline fn is(e: Exn) bool {
-            return e.type == &info;
+            if (sealed) return e.type == &info;
+            var t: ?*const ExnType = e.type;
+            while (t) |class| : (t = class.parent) {
+                if (class == &info) return true;
+            }
+            return false;
         }
 
         /// The fields of an exception of this type.
@@ -1562,43 +2523,78 @@ pub fn MayRaise(comptime T: type, comptime callees: anytype) type {
 /// What a .NET exception class holds: its message.
 pub const Described = struct { Message: String };
 
-/// What `failwith` raises: .NET's `System.Exception` with a message.
-pub const Failure = ExnOf("System.Exception", Described);
+/// What `failwith` raises: .NET's `System.Exception` with a message. (Every exception is a
+/// `System.Exception`, so a test for that class is not a test at all; this is the test for
+/// exactly this class, which is what the `Failure` pattern is.)
+pub const Failure = ExnUnder("System.Exception", Described, null, true);
 
-/// The .NET exception classes that a program can raise and handle by name. (Each is a type of
-/// its own here: a handler for one does not catch the classes that derive from it on .NET.)
-pub const ArgumentException = ExnOf("System.ArgumentException", Described);
-pub const ArgumentNullException = ExnOf("System.ArgumentNullException", Described);
-pub const ArgumentOutOfRangeException = ExnOf("System.ArgumentOutOfRangeException", Described);
-pub const InvalidOperationException = ExnOf("System.InvalidOperationException", Described);
-pub const NotSupportedException = ExnOf("System.NotSupportedException", Described);
-pub const NotImplementedException = ExnOf("System.NotImplementedException", Described);
-pub const IndexOutOfRangeException = ExnOf("System.IndexOutOfRangeException", Described);
-pub const DivideByZeroException = ExnOf("System.DivideByZeroException", Described);
-pub const OverflowException = ExnOf("System.OverflowException", Described);
-pub const FormatException = ExnOf("System.FormatException", Described);
-pub const KeyNotFoundException = ExnOf("System.Collections.Generic.KeyNotFoundException", Described);
+/// The .NET exception classes that a program can raise and handle by name, each under the
+/// class it derives from on .NET.
+pub const SystemException = Class("System.SystemException", null);
+pub const ArgumentException = Class("System.ArgumentException", SystemException);
+pub const ArgumentNullException = Class("System.ArgumentNullException", ArgumentException);
+pub const ArgumentOutOfRangeException = Class("System.ArgumentOutOfRangeException", ArgumentException);
+pub const ArithmeticException = Class("System.ArithmeticException", SystemException);
+pub const DivideByZeroException = Class("System.DivideByZeroException", ArithmeticException);
+pub const OverflowException = Class("System.OverflowException", ArithmeticException);
+pub const InvalidOperationException = Class("System.InvalidOperationException", SystemException);
+pub const NotSupportedException = Class("System.NotSupportedException", SystemException);
+pub const NotImplementedException = Class("System.NotImplementedException", SystemException);
+pub const IndexOutOfRangeException = Class("System.IndexOutOfRangeException", SystemException);
+pub const NullReferenceException = Class("System.NullReferenceException", SystemException);
+pub const FormatException = Class("System.FormatException", SystemException);
+pub const KeyNotFoundException = Class("System.Collections.Generic.KeyNotFoundException", SystemException);
+pub const MatchFailureException = Class("Microsoft.FSharp.Core.MatchFailureException", null);
 
-/// `e.Message`: the message an exception was made with; for an F# exception, its name.
+/// Raise an exception of a .NET class with a message.
+pub fn raise(comptime C: type, message: String) Raised {
+    throw(C.new(.{ .Message = message }));
+    return error.Raised;
+}
+
+/// `a / b` for whole numbers: as .NET, a division by zero raises, and so does the smallest
+/// number of 32 or 64 bits divided by -1 (its result does not fit).
+pub fn div(comptime T: type, a: T, b: T) Raised!T {
+    if (b == 0) return raise(DivideByZeroException, str("Attempted to divide by zero."));
+    const info = @typeInfo(T).int;
+    if (info.signedness == .signed and b == -1) {
+        if (info.bits >= 32 and a == std.math.minInt(T)) {
+            return raise(OverflowException, str("Arithmetic operation resulted in an overflow."));
+        }
+        return 0 -% a;
+    }
+    return @divTrunc(a, b);
+}
+
+/// `a % b` for whole numbers, with the sign of `a`.
+pub fn rem(comptime T: type, a: T, b: T) Raised!T {
+    if (b == 0) return raise(DivideByZeroException, str("Attempted to divide by zero."));
+    const info = @typeInfo(T).int;
+    if (info.signedness == .signed and b == -1) {
+        if (info.bits >= 32 and a == std.math.minInt(T)) {
+            return raise(OverflowException, str("Arithmetic operation resulted in an overflow."));
+        }
+        return 0;
+    }
+    return @rem(a, b);
+}
+
+/// `e.Message`: the message an exception was made with; for an F# exception, the exception
+/// as `%A` writes it.
 pub fn exnMessage(e: Exn) String {
     if (e.type.message) |message| return message(e);
-    const s, const u = strNew(e.type.name.len);
-    for (e.type.name, u) |c, *o| o.* = c;
-    return s;
+    return anyText(e);
 }
 
 /// The program's entry point let an exception escape: say which, and give it up.
 pub fn uncaught() void {
     const e = take();
+    const text = exnMessage(e);
     write_err("Unhandled exception. ");
     write_err(e.type.name);
-    if (e.type.message) |message| {
-        const text = message(e);
-        write_err(": ");
-        writeText(write_err, text, false);
-        drop(text);
-    }
-    write_err("\n");
+    write_err(": ");
+    writeText(write_err, text, true);
+    drop(text);
     drop(e);
 }
 
@@ -2043,7 +3039,7 @@ test "the collector can be stepped and tuned" {
 
 fn expectText(expected: []const u8, s: String) !void {
     var buf: [512]u8 = undefined;
-    const n = std.unicode.wtf16LeToWtf8(&buf, s.units());
+    const n = std.unicode.wtf16LeToWtf8(&buf, unitsOf(s));
     try std.testing.expectEqualStrings(expected, buf[0..n]);
     drop(s);
 }
@@ -2051,10 +3047,10 @@ fn expectText(expected: []const u8, s: String) !void {
 test "strings: literals, concatenation, comparison" {
     const before = thread.stats;
     const hello = str("héllo");
-    try std.testing.expectEqual(@as(i32, 5), strLen(hello));
-    try std.testing.expectEqual(@as(u16, 0xE9), strAt(hello, 1));
+    try std.testing.expectEqual(@as(i32, 5), try strLen(hello));
+    try std.testing.expectEqual(@as(u16, 0xE9), try strAt(hello, 1));
     const both = strConcat(hello, str(" wörld"));
-    try std.testing.expectEqual(@as(i32, 11), strLen(both));
+    try std.testing.expectEqual(@as(i32, 11), try strLen(both));
     const again = dup(both);
     try std.testing.expect(eql(both, again));
     try std.testing.expect(eql(str("ab"), str("ab")) and !eql(str("ab"), str("ac")));
@@ -2066,7 +3062,7 @@ test "strings: literals, concatenation, comparison" {
     try std.testing.expectEqual(@as(i64, 1), thread.stats.allocs - before.allocs);
     try std.testing.expectEqual(@as(i64, 1), thread.stats.frees - before.frees);
     // an emoji is two units
-    try std.testing.expectEqual(@as(i32, 2), strLen(str("\u{1F600}")));
+    try std.testing.expectEqual(@as(i32, 2), try strLen(str("\u{1F600}")));
 }
 
 test "format follows F# and .NET" {
@@ -2215,6 +3211,337 @@ test "a failure carries its message" {
     try expectText("no", exnMessage(other));
     drop(other);
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+fn expectRaised(comptime C: type, expected: []const u8, result: anytype) !void {
+    if (result) |value| {
+        drop(value);
+        return error.TestExpectedError;
+    } else |_| {}
+    const e = take();
+    defer drop(e);
+    try std.testing.expect(C.is(e));
+    try expectText(expected, exnMessage(e));
+}
+
+test "string methods do what .NET does" {
+    const before = thread.stats;
+    const abc = str("abc");
+    const none: String = null;
+    try expectText("bc", try strSubstring(abc, 1, null));
+    try expectText("b", try strSubstring(abc, 1, 1));
+    try expectText("", try strSubstring(abc, 3, null));
+    try expectRaised(ArgumentOutOfRangeException, "startIndex cannot be larger than length of string. (Parameter 'startIndex')", strSubstring(abc, 5, null));
+    try expectRaised(ArgumentOutOfRangeException, "Index and length must refer to a location within the string. (Parameter 'length')", strSubstring(abc, 1, 5));
+    try expectRaised(ArgumentOutOfRangeException, "startIndex ('-1') must be a non-negative value. (Parameter 'startIndex')\nActual value was -1.", strSubstring(abc, -1, null));
+    try expectRaised(ArgumentOutOfRangeException, "length ('-1') must be a non-negative value. (Parameter 'length')\nActual value was -1.", strSubstring(abc, 2, -1));
+    try expectRaised(NullReferenceException, "Object reference not set to an instance of an object.", strSubstring(none, 1, null));
+    try expectRaised(NullReferenceException, "Object reference not set to an instance of an object.", strLen(none));
+    try expectRaised(IndexOutOfRangeException, "Index was outside the bounds of the array.", strAt(abc, 5));
+    try expectRaised(IndexOutOfRangeException, "Index was outside the bounds of the array.", strAt(abc, -1));
+    try std.testing.expectEqual(@as(i32, 0), strLength(none));
+    try std.testing.expectEqual(@as(i32, 2), try strIndexOfChar(abc, 'c', 0));
+    try std.testing.expectEqual(@as(i32, -1), try strIndexOf(abc, str("c"), 3));
+    try std.testing.expectEqual(@as(i32, 0), try strIndexOf(abc, str(""), 0));
+    try std.testing.expectEqual(@as(i32, 3), try strLastIndexOf(abc, str("")));
+    try std.testing.expectEqual(@as(i32, 0), try strLastIndexOfChar(abc, 'a'));
+    try expectRaised(ArgumentOutOfRangeException, index_range ++ " (Parameter 'startIndex')", strIndexOf(abc, str("c"), 4));
+    try expectRaised(ArgumentNullException, "Value cannot be null. (Parameter 'value')", strIndexOf(abc, none, 0));
+    try expectRaised(ArgumentNullException, "Value cannot be null. (Parameter 'value')", strContains(abc, none));
+    try std.testing.expect(try strContains(abc, str("bc")) and try strStartsWith(abc, str("")) and try strEndsWith(abc, str("bc")));
+    try std.testing.expect(try strContainsChar(abc, 'b') and try strStartsWithChar(abc, 'a') and !try strEndsWithChar(abc, 'a'));
+    try expectText("Ǆ STRAßE ΐ İI", try strCase(str("ǅ straße ΐ İi"), true));
+    try expectText("ǆ strasse İi σ", try strCase(str("ǅ STRASSE İI Σ"), false));
+    try expectText("x y", try strTrim(str(" \t\n\u{a0}\u{2003}x y\u{3000}\u{85} "), true, true, null));
+    try expectText("a ", try strTrim(str(" a "), true, false, null));
+    try expectText(" a", try strTrim(str(" a "), false, true, null));
+    try expectText("a", try strTrim(str("xxaxx"), true, true, 'x'));
+    try expectText("azcazc", try strReplaceChar(str("abcabc"), 'b', 'z'));
+    try expectText("aa", try strReplace(str("abcabc"), str("bc"), str("")));
+    try expectText("ac", try strReplace(abc, str("b"), none));
+    try expectRaised(ArgumentException, "The value cannot be an empty string. (Parameter 'oldValue')", strReplace(abc, str(""), str("x")));
+    try expectRaised(ArgumentNullException, "Value cannot be null. (Parameter 'oldValue')", strReplace(abc, none, str("x")));
+    try expectText("aXYbc", try strInsert(abc, 1, str("XY")));
+    try expectRaised(ArgumentOutOfRangeException, "startIndex ('5') must be less than or equal to '3'. (Parameter 'startIndex')\nActual value was 5.", strInsert(abc, 5, str("x")));
+    try expectRaised(ArgumentOutOfRangeException, "startIndex ('4294967295') must be less than or equal to '3'. (Parameter 'startIndex')\nActual value was 4294967295.", strInsert(abc, -1, str("x")));
+    try expectText("a", try strRemove(abc, 1, null));
+    try expectText("ac", try strRemove(abc, 1, 1));
+    try expectRaised(ArgumentOutOfRangeException, "startIndex cannot be larger than length of string. (Parameter 'startIndex')", strRemove(abc, 5, null));
+    try expectRaised(ArgumentOutOfRangeException, "StartIndex cannot be less than zero. (Parameter 'startIndex')", strRemove(abc, -1, null));
+    try expectRaised(ArgumentOutOfRangeException, "count ('5') must be less than or equal to '2'. (Parameter 'count')\nActual value was 5.", strRemove(abc, 1, 5));
+    try expectText("  abc", try strPad(abc, true, 5, ' '));
+    try expectText("abc..", try strPad(abc, false, 5, '.'));
+    try expectRaised(ArgumentOutOfRangeException, "totalWidth ('-1') must be a non-negative value. (Parameter 'totalWidth')\nActual value was -1.", strPad(abc, true, -1, ' '));
+    try expectText("xxx", try strOfChar('x', 3));
+    try expectText("ababab", try strReplicate(3, str("ab")));
+    try expectRaised(ArgumentException, "The input must be non-negative.\ncount = -1 (Parameter 'count')", strReplicate(-1, str("a")));
+    try expectText("", strConcat(none, none));
+    try std.testing.expect(strConcat(none, none) != null and strIsNullOrEmpty(none) and strIsNullOrWhiteSpace(str(" \t")));
+    try std.testing.expect(!eql(none, str("")) and eql(none, none));
+    try std.testing.expectEqual(@as(i32, -1), compare(none, str("")));
+    try std.testing.expectEqual(@as(i32, 1), compare(str(""), none));
+    try expectText("|     |<null>|", format(.{ arg(.{ .kind = 's' }, none), "|", arg(.{ .kind = 's', .width = 5 }, none), "|", arg(.{ .kind = 'O' }, none), "|", none }));
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "case mapping is .NET's for every code unit" {
+    var upper: u32 = 0;
+    var lower: u32 = 0;
+    for (0..0x10000) |c| {
+        upper = upper *% 31 +% unicode.toUpper(@intCast(c));
+        lower = lower *% 31 +% unicode.toLower(@intCast(c));
+    }
+    // (the same sums over Char.ToUpperInvariant and Char.ToLowerInvariant on .NET 10)
+    try std.testing.expectEqual(@as(u32, 4105874476), upper);
+    try std.testing.expectEqual(@as(u32, 3480348820), lower);
+}
+
+fn expectNet(expected: []const u8, comptime fmt: []const u8, value: anytype) !void {
+    var buf: [scratch_len]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, netText(fmt, value, &buf));
+}
+
+test ".NET's standard numeric formats" {
+    const x: f64 = 1234.5678;
+    try expectNet("1,234.57", "N2", x);
+    try expectNet("1,235", "N0", x);
+    try expectNet("1,234.57", "N", x);
+    try expectNet("1234.6", "F1", x);
+    try expectNet("1235", "F0", x);
+    try expectNet("1.23E+003", "E2", x);
+    try expectNet("1.234568e+003", "e", x);
+    try expectNet("1234.5678", "G", x);
+    try expectNet("1.23E+03", "G3", x);
+    try expectNet("1.2e+03", "g2", x);
+    try expectNet("1234.5678", "R", x);
+    try expectNet("123,456.8 %", "P1", x);
+    try expectNet("123,456.78 %", "P", x);
+    try expectNet("\xA41,234.57", "C", x);
+    try expectNet("(\xA41,234.57)", "C", -x);
+    try expectNet("-123,456.78 %", "P", -x);
+    try expectNet("1E+03", "G1", x);
+    try expectNet("1234.5678", "G10", x);
+    try expectNet("42", "D", @as(i32, 42));
+    try expectNet("00042", "D5", @as(i32, 42));
+    try expectNet("2A", "X", @as(i32, 42));
+    try expectNet("002a", "x4", @as(i32, 42));
+    try expectNet("42.00", "N2", @as(i32, 42));
+    try expectNet("4.20E+001", "E2", @as(i32, 42));
+    try expectNet("4,200 %", "P0", @as(i32, 42));
+    try expectNet("\xA442.00", "C", @as(i32, 42));
+    try expectNet("00101010", "B8", @as(i32, 42));
+    try expectNet("-0001234567", "D10", @as(i32, -1234567));
+    try expectNet("FFED2979", "X", @as(i32, -1234567));
+    try expectNet("-1,234,567.0", "N1", @as(i32, -1234567));
+    try expectNet("(\xA41,234,567.00)", "C", @as(i32, -1234567));
+    try expectNet("-123,456,700 %", "P0", @as(i32, -1234567));
+    try expectNet("-1.235E+006", "E3", @as(i32, -1234567));
+    try expectNet("-1.235E+06", "G4", @as(i32, -1234567));
+    try expectNet("1,234,567,890,123", "N0", @as(i64, 1234567890123));
+    try expectNet("FF", "X", @as(i8, -1));
+    try expectNet("ffffffffffffffff", "x", @as(i64, -1));
+    try expectNet("00065535", "D8", @as(u16, 65535));
+    try expectNet("0", "N0", @as(i32, 0));
+    try expectNet("0.00E+000", "E2", @as(i32, 0));
+    try expectNet("1.23E+04", "G3", @as(i32, 12345));
+    try expectNet("12345", "G", @as(i32, 12345));
+    try expectNet("1.2E+04", "G2", @as(i64, 12345));
+    try expectNet("0.00", "N2", @as(f64, 0.0));
+    try expectNet("-0", "N0", @as(f64, -0.5));
+    try expectNet("-0.0", "F1", @as(f64, -0.0));
+    try expectNet("0.12", "F2", @as(f64, 0.125));
+    try expectNet("2.67", "F2", @as(f64, 2.675));
+    try expectNet("2", "F0", @as(f64, 2.5));
+    try expectNet("2", "N0", @as(f64, 1.5));
+    try expectNet("100,000,000,000,000,000,000", "N0", @as(f64, 1e20));
+    try expectNet("1E+008", "E0", @as(f64, 123456789.0));
+    try expectNet("0.00012", "G2", @as(f64, 0.000123));
+    try expectNet("1000000000000000", "G", @as(f64, 1e15));
+    try expectNet("1E-05", "G", @as(f64, 1e-5));
+    try expectNet("1.2345678901234568E+17", "G", @as(f64, 123456789012345678.0));
+    try expectNet("1E+02", "G2", @as(f64, 100.0));
+    try expectNet("0.10000000000000001", "G17", @as(f64, 0.1));
+    try expectNet("NaN", "N2", std.math.nan(f64));
+    try expectNet("-Infinity", "E2", -std.math.inf(f64));
+    try expectNet("0.100", "F3", @as(f32, 0.1));
+    try expectNet("0.1", "G", @as(f32, 0.1));
+    try expectNet("0.1000000015", "N10", @as(f32, 0.1));
+    try expectText("   42|42   |     1,234.6", format(.{
+        arg(.{ .width = 5 }, @as(i32, 42)), "|", arg(.{ .width = 5, .left = true }, @as(i32, 42)), "|", arg(.{ .width = 12, .net = "N1" }, x),
+    }));
+}
+
+fn run(comptime c: u8, comptime n: usize) *const [n]u8 {
+    return &@as([n]u8, @splat(c));
+}
+
+const ShowPerson = struct { Name: String, Age: i32 };
+const ShowShape = union(enum) {
+    A,
+    B: struct { Item: i32 },
+    C: struct { Item1: String, Item2: i32 },
+    D: struct { Item: ShowPerson },
+    F: struct { Item: struct { i32, i32 } },
+};
+const ShowTree = union(enum) {
+    Leaf,
+    Node: *struct { @"$rc": u32 = 1, Item1: ShowTree, Item2: i32, Item3: ShowTree },
+};
+const ShowRing = *struct { @"$rc": u32 = 1, Count: i32, Next: ?ShowRing };
+const ShowErr = ExnOf("MyErr", struct { Data0: i32, Data1: String });
+
+fn testList(comptime T: type, items: []const T) List(T) {
+    var all: List(T) = .Empty;
+    var i = items.len;
+    while (i > 0) {
+        i -= 1;
+        const tail = all;
+        all = .{ .Cons = cell(List(T), .Cons, .{ .Head = dup(items[i]), .Tail = tail }) };
+    }
+    return all;
+}
+
+fn expectAny(expected: []const u8, x: anytype) !void {
+    try expectText(expected, anyText(x));
+}
+
+test "%A writes what F# writes" {
+    const before = thread.stats;
+    try expectAny("1", @as(i32, 1));
+    try expectAny("1uy", @as(u8, 1));
+    try expectAny("-1y", @as(i8, -1));
+    try expectAny("1L", @as(i64, 1));
+    try expectAny("1UL", @as(u64, 1));
+    try expectAny("1.0", @as(f64, 1.0));
+    try expectAny("-0.0", @as(f64, -0.0));
+    try expectAny("1e+20", @as(f64, 1e20));
+    try expectAny("1e-05", @as(f64, 1e-5));
+    try expectAny("123456789.1", @as(f64, 123456789.123456789));
+    try expectAny("1.23456789e+12", @as(f64, 1234567890123.0));
+    try expectAny("1.0f", @as(f32, 1.0));
+    try expectAny("1.5f", @as(f32, 1.5));
+    try expectAny("1e+10f", @as(f32, 1e10));
+    try expectAny("nan", std.math.nan(f64));
+    try expectAny("nanf", std.math.nan(f32));
+    try expectAny("-infinity", -std.math.inf(f64));
+    try expectAny("'a'", @as(u16, 'a'));
+    try expectAny("'\\010'", @as(u16, '\n'));
+    try expectAny("'\\''", @as(u16, '\''));
+    try expectAny("'\"'", @as(u16, '"'));
+    try expectAny("'\\\\'", @as(u16, '\\'));
+    try expectAny("'\\000'", @as(u16, 0));
+    try expectAny("\"q\"uote\"", str("q\"uote"));
+    try expectAny("<null>", @as(String, null));
+    try expectAny("()", {});
+    try expectAny("(1, \"a\")", @as(struct { i32, String }, .{ 1, str("a") }));
+    try expectAny("Some 1", @as(?i32, 1));
+    try expectAny("None", @as(?i32, null));
+    try expectAny("Some (Some 1)", @as(??i32, @as(?i32, 1)));
+    try expectAny("Some None", @as(??i32, @as(?i32, null)));
+    try expectAny("Some (1, 2)", @as(?struct { i32, i32 }, .{ 1, 2 }));
+    try expectAny("Some -1", @as(?i32, -1));
+    try expectAny("A", @as(ShowShape, .A));
+    try expectAny("B 1", @as(ShowShape, .{ .B = .{ .Item = 1 } }));
+    try expectAny("C (\"x\", 2)", @as(ShowShape, .{ .C = .{ .Item1 = str("x"), .Item2 = 2 } }));
+    try expectAny("F (1, 2)", @as(ShowShape, .{ .F = .{ .Item = .{ 1, 2 } } }));
+    try expectAny("Some A", @as(?ShowShape, .A));
+    try expectAny("Some (B 1)", @as(?ShowShape, .{ .B = .{ .Item = 1 } }));
+    const ann: ShowPerson = .{ .Name = str("Ann"), .Age = 3 };
+    try expectAny("{ Name = \"Ann\"\n  Age = 3 }", ann);
+    try expectAny("D { Name = \"Ann\"\n    Age = 3 }", @as(ShowShape, .{ .D = .{ .Item = ann } }));
+    try expectAny("{ Name = null\n  Age = 3 }", @as(ShowPerson, .{ .Name = null, .Age = 3 }));
+    try expectAny(
+        "{ Inner = { Name = \"Ann\"\n            Age = 3 }\n  Opt = Some 1 }",
+        @as(struct { Inner: ShowPerson, Opt: ?i32 }, .{ .Inner = ann, .Opt = 1 }),
+    );
+
+    const three = testList(i32, &.{ 1, 2, 3 });
+    try expectAny("[1; 2; 3]", three);
+    try expectAny("Some [1; 2; 3]", @as(?List(i32), three));
+    drop(three);
+    try expectAny("[]", @as(List(i32), .Empty));
+    var numbers: [120]i32 = undefined;
+    for (&numbers, 1..) |*n, i| n.* = @intCast(i);
+    const forty = testList(i32, numbers[0..40]);
+    try expectAny(
+        "[1; 2; 3; 4; 5; 6; 7; 8; 9; 10; 11; 12; 13; 14; 15; 16; 17; 18; 19; 20; 21; 22;\n" ++
+            " 23; 24; 25; 26; 27; 28; 29; 30; 31; 32; 33; 34; 35; 36; 37; 38; 39; 40]",
+        forty,
+    );
+    drop(forty);
+    const many = testList(i32, &numbers);
+    try expectAny(
+        "[1; 2; 3; 4; 5; 6; 7; 8; 9; 10; 11; 12; 13; 14; 15; 16; 17; 18; 19; 20; 21; 22;\n" ++
+            " 23; 24; 25; 26; 27; 28; 29; 30; 31; 32; 33; 34; 35; 36; 37; 38; 39; 40; 41; 42;\n" ++
+            " 43; 44; 45; 46; 47; 48; 49; 50; 51; 52; 53; 54; 55; 56; 57; 58; 59; 60; 61; 62;\n" ++
+            " 63; 64; 65; 66; 67; 68; 69; 70; 71; 72; 73; 74; 75; 76; 77; 78; 79; 80; 81; 82;\n" ++
+            " 83; 84; 85; 86; 87; 88; 89; 90; 91; 92; 93; 94; 95; 96; 97; 98; 99; 100; ...]",
+        many,
+    );
+    drop(many);
+    const people = testList(ShowPerson, &.{ ann, .{ .Name = str("Bob"), .Age = 4 } });
+    try expectAny("[{ Name = \"Ann\"\n   Age = 3 }; { Name = \"Bob\"\n                Age = 4 }]", people);
+    drop(people);
+
+    const z80 = str(run('z', 80));
+    try expectAny("C (\"" ++ run('z', 80) ++ "\",\n   1)", @as(ShowShape, .{ .C = .{ .Item1 = z80, .Item2 = 1 } }));
+    try expectAny("Some\n  \"" ++ run('z', 80) ++ "\"", @as(?String, z80));
+    try expectAny(
+        "(\"" ++ run('z', 70) ++ "\",\n \"" ++ run('w', 70) ++ "\")",
+        @as(struct { String, String }, .{ str(run('z', 70)), str(run('w', 70)) }),
+    );
+
+    const leafT: ShowTree = .Leaf;
+    const node = struct {
+        fn of(l: ShowTree, v: i32, r: ShowTree) ShowTree {
+            return .{ .Node = cell(ShowTree, .Node, .{ .Item1 = l, .Item2 = v, .Item3 = r }) };
+        }
+    }.of;
+    const small = node(node(leafT, 1, leafT), 2, node(leafT, 3, leafT));
+    try expectAny("Node (Node (Leaf, 1, Leaf), 2, Node (Leaf, 3, Leaf))", small);
+    drop(small);
+    const big = node(
+        node(node(node(leafT, 1111111111, leafT), 222222222, leafT), 333333333, node(leafT, 444444444, leafT)),
+        555555555,
+        node(leafT, 666666666, node(leafT, 777777777, leafT)),
+    );
+    try expectAny(
+        "Node\n  (Node\n     (Node (Node (Leaf, 1111111111, Leaf), 222222222, Leaf), 333333333,\n" ++
+            "      Node (Leaf, 444444444, Leaf)), 555555555,\n   Node (Leaf, 666666666, Node (Leaf, 777777777, Leaf)))",
+        big,
+    );
+    drop(big);
+
+    // a record that contains itself
+    const first = new(ShowRing, .{ .Count = 1, .Next = null });
+    const second = new(ShowRing, .{ .Count = 2, .Next = first });
+    first.Next = second;
+    try expectAny("{ Count = 1\n  Next = Some { Count = 2\n                Next = Some ... } }", first);
+    first.Next = null;
+    drop(second);
+
+    // an F# exception: `%A`, and its message
+    const e = ShowErr.new(.{ .Data0 = 1, .Data1 = str("a") });
+    try expectAny("MyErr (1, \"a\")", e);
+    try expectText("MyErr (1, \"a\")", exnMessage(e));
+    try expectText("x=MyErr (1, \"a\")!", format(.{ "x=", arg(.{ .kind = 'A' }, e), "!" }));
+    drop(e);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "exception classes derive as on .NET, division raises" {
+    const e = ArgumentNullException.new(.{ .Message = str("no") });
+    try std.testing.expect(ArgumentNullException.is(e) and ArgumentException.is(e) and SystemException.is(e));
+    try std.testing.expect(!ArgumentOutOfRangeException.is(e) and !Failure.is(e) and !ArithmeticException.is(e));
+    drop(e);
+    try std.testing.expectEqual(@as(i32, -3), try div(i32, 7, -2));
+    try std.testing.expectEqual(@as(i32, 1), try rem(i32, 7, -2));
+    try std.testing.expectEqual(@as(i8, -128), try div(i8, -128, -1));
+    try std.testing.expectEqual(@as(i8, 0), try rem(i8, -128, -1));
+    try expectRaised(DivideByZeroException, "Attempted to divide by zero.", div(i32, 5, 0));
+    try expectRaised(DivideByZeroException, "Attempted to divide by zero.", rem(u8, 5, 0));
+    try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", div(i32, std.math.minInt(i32), -1));
+    try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", rem(i64, std.math.minInt(i64), -1));
 }
 
 test "conv follows .NET" {
