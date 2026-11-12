@@ -6,7 +6,8 @@ module QuickTest
 // Functions.fs covers lambdas, local functions and function values, Generics.fs covers
 // generic types and functions and F#'s list, Exceptions.fs covers raise and try,
 // Records.fs covers records that can be assigned and ref cells, Cycles.fs covers
-// structures that reach themselves.
+// structures that reach themselves, Strings.fs covers strings, formatting, printing and
+// exceptions with messages.
 // The entry point returns the number of failed checks as the process exit code.
 
 let limit = 10
@@ -338,3 +339,4 @@ let main _ =
     + Exceptions.run ()
     + Records.run ()
     + Cycles.run ()
+    + Strings.run ()

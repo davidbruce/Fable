@@ -71,6 +71,9 @@ let tI32 = TPrim "i32"
 /// F#'s `exn`, and the type of every exception: a reference-counted cell of the runtime.
 let tExn = TPrim "fable_rt.Exn"
 
+/// F#'s `string`: immutable UTF-16, counted unless it is a literal.
+let tStr = TPrim "fable_rt.String"
+
 let isVoid (t: Ty) =
     match t with
     | TPrim "void" -> true
@@ -99,7 +102,8 @@ let rec isManaged (t: Ty) =
     | TTuple ts -> List.exists isManaged ts
     // (a function value may own an environment)
     | TFn _ -> true
-    | TPrim "fable_rt.Exn" -> true
+    | TPrim "fable_rt.Exn"
+    | TPrim "fable_rt.String" -> true
     | _ -> false
 
 /// The same question for the declaration of a type, whatever its parameters stand for.
@@ -110,7 +114,8 @@ let rec isManagedDecl (t: Ty) =
     | TOpt t -> isManagedDecl t
     | TTuple ts -> List.exists isManagedDecl ts
     | TFn _ -> true
-    | TPrim "fable_rt.Exn" -> true
+    | TPrim "fable_rt.Exn"
+    | TPrim "fable_rt.String" -> true
     | _ -> false
 
 let isHeapTy (t: Ty) =

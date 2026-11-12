@@ -332,6 +332,59 @@ let private listEnt (state: FileState) : Ent =
 
 let private refName = "Microsoft.FSharp.Core.FSharpRef`1"
 
+/// The .NET exception classes that the runtime library declares: each holds a message.
+let private dotnetExceptions =
+    [
+        "ArgumentException"
+        "ArgumentNullException"
+        "ArgumentOutOfRangeException"
+        "InvalidOperationException"
+        "NotSupportedException"
+        "NotImplementedException"
+        "IndexOutOfRangeException"
+        "DivideByZeroException"
+        "OverflowException"
+        "FormatException"
+    ]
+    |> List.map (fun name -> "System." + name, "fable_rt." + name)
+    |> List.append
+        [
+            "System.Exception", "fable_rt.Failure"
+            "System.Collections.Generic.KeyNotFoundException", "fable_rt.KeyNotFoundException"
+        ]
+    |> Map.ofList
+
+/// A .NET exception class that the runtime library declares (`System.Exception` is what
+/// `failwith` raises). Its one field is the message.
+let private dotnetExnEntIn (state: FileState) (fullName: string) : Ent =
+    let key = "$exn:" + fullName
+
+    match state.Ents.TryGetValue key with
+    | true, e -> e
+    | _ ->
+        let e =
+            {
+                Name = dotnetExceptions[fullName]
+                Ref =
+                    {
+                        FullName = fullName
+                        Path = Fable.CoreAssemblyName "System.Runtime"
+                    }
+                Kind = KExn
+                TypeParams = []
+                Cases = [ "", [ "Message", tStr ] ]
+                MutableFields = []
+                Managed = false
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        state.Ents[key] <- e
+        state.UsesRuntime <- true
+        e
+
 /// F#'s `ref` cell: a generic reference record that the runtime library declares.
 let private refEnt (state: FileState) : Ent =
     match state.Ents.TryGetValue refName with
@@ -383,7 +436,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         | Float64 -> TPrim "f64"
         | BigInt -> fail r "the Zig target does not support bigint yet"
         | Decimal -> fail r "the Zig target does not support decimal yet"
-    | Fable.String -> fail r "the Zig target does not support strings yet"
+    | Fable.String -> tStr
     // (a unit argument stays, as `void`: a function value has one shape whatever its type
     // parameters stand for)
     | Fable.LambdaType(arg, ret) -> TFn([ mapType ctx r arg ], mapType ctx r ret)
@@ -392,7 +445,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.GenericParam(name = name) -> TGen name
-    | Fable.DeclaredType(ent, _) when ent.FullName = "System.Exception" -> tExn
+    | Fable.DeclaredType(ent, _) when dotnetExceptions.ContainsKey ent.FullName -> tExn
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
     | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapType ctx r))
@@ -496,6 +549,11 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
     match ctx.State.Ents.TryGetValue entRef.FullName with
     | true, e when e.Kind = KExn -> Some e
     | true, _ -> None
+    | _ when
+        entRef.FullName <> "System.Exception"
+        && dotnetExceptions.ContainsKey entRef.FullName
+        ->
+        Some(dotnetExnEntIn ctx.State entRef.FullName)
     | _ ->
         match ctx.Com.TryGetEntity entRef with
         | Some ent when ent.IsFSharpExceptionDeclaration ->
@@ -807,6 +865,183 @@ let rec private unify (found: Dictionary<string, Fable.Type>) (pattern: Fable.Ty
     | Fable.DeclaredType(_, g1), Fable.DeclaredType(_, g2) -> all g1 g2
     | _ -> all pattern.Generics actual.Generics
 
+/// The text of a Zig string literal (UTF-8) for F# text (UTF-16), or None when the text is
+/// not well-formed (a surrogate on its own). `$` is written as an escape: the text may become
+/// part of an `Emit` macro, where `$0` stands for an argument.
+let private zigQuoted (text: string) : string option =
+    let sb = System.Text.StringBuilder("\"")
+    let mutable ok = true
+    let mutable i = 0
+
+    while ok && i < text.Length do
+        let c = text[i]
+
+        if
+            System.Char.IsHighSurrogate c
+            && i + 1 < text.Length
+            && System.Char.IsLowSurrogate text[i + 1]
+        then
+            sb.Append($"\\u{{%X{System.Char.ConvertToUtf32(c, text[i + 1])}}}") |> ignore
+            i <- i + 1
+        elif System.Char.IsSurrogate c then
+            ok <- false
+        else
+            match c with
+            | '"' -> sb.Append("\\\"") |> ignore
+            | '\\' -> sb.Append("\\\\") |> ignore
+            | '\n' -> sb.Append("\\n") |> ignore
+            | '\r' -> sb.Append("\\r") |> ignore
+            | '\t' -> sb.Append("\\t") |> ignore
+            | '$' -> sb.Append("\\x24") |> ignore
+            | c when c < ' ' || c = '\127' -> sb.Append($"\\x%02x{int c}") |> ignore
+            | c when c < '\128' -> sb.Append(c) |> ignore
+            | c -> sb.Append($"\\u{{%X{int c}}}") |> ignore
+
+        i <- i + 1
+
+    if ok then
+        Some(sb.Append('"').ToString())
+    else
+        None
+
+/// A string literal: static data of the generated program.
+let private stringLiteral (text: string) : string =
+    match zigQuoted text with
+    | Some quoted -> $"fable_rt.str(%s{quoted})"
+    | None ->
+        let units = text |> Seq.map (fun c -> string<int>(int c)) |> String.concat ", "
+        $"fable_rt.strOf(&[_]u16{{ %s{units} }})"
+
+/// One part of an F# format string: literal text, or a specifier that takes a value.
+type private FormatPart =
+    | Text of string
+    /// flags, width, precision, the letter
+    | Spec of string * int * int option * char
+
+/// "%5d items%%" -> [ Spec("", 5, None, 'd'); Text " items%" ]. In an interpolated string every
+/// hole is `%P()`, after a specifier of its own if it has one (`%d%P()`).
+let private parseFormat (r: SourceLocation option) (fmt: string) : FormatPart list =
+    let parts = List<FormatPart>()
+    let text = System.Text.StringBuilder()
+
+    let flush () =
+        if text.Length > 0 then
+            parts.Add(Text(text.ToString()))
+            text.Clear() |> ignore
+
+    let mutable i = 0
+    // the last part is a specifier that has not got its hole yet
+    let mutable pending = false
+
+    while i < fmt.Length do
+        if fmt[i] <> '%' then
+            text.Append(fmt[i]) |> ignore
+            pending <- false
+            i <- i + 1
+        elif i + 1 < fmt.Length && fmt[i + 1] = '%' then
+            text.Append('%') |> ignore
+            pending <- false
+            i <- i + 2
+        else
+            i <- i + 1
+            let start = i
+
+            while i < fmt.Length && "0-+ ".IndexOf(fmt[i]) >= 0 do
+                i <- i + 1
+
+            let flags = fmt.Substring(start, i - start)
+            let widthStart = i
+
+            while i < fmt.Length && System.Char.IsDigit fmt[i] do
+                i <- i + 1
+
+            let width =
+                if i > widthStart then
+                    int (fmt.Substring(widthStart, i - widthStart))
+                else
+                    0
+
+            let precision =
+                if i < fmt.Length && fmt[i] = '.' then
+                    i <- i + 1
+                    let precisionStart = i
+
+                    while i < fmt.Length && System.Char.IsDigit fmt[i] do
+                        i <- i + 1
+
+                    Some(int (fmt.Substring(precisionStart, i - precisionStart)))
+                else
+                    None
+
+            if i >= fmt.Length then
+                fail r "the format string ends in the middle of a specifier"
+
+            let letter = fmt[i]
+            i <- i + 1
+
+            if letter = 'P' then
+                // (the hole of an interpolated string: `%P()`, or `%P(format)` with a .NET format)
+                if i < fmt.Length && fmt[i] = '(' then
+                    let close = fmt.IndexOf(')', i)
+
+                    if close <> i + 1 then
+                        fail r "the Zig target does not support a .NET format in an interpolated string yet (`{x:...}`)"
+
+                    i <- close + 1
+
+                // a specifier right before the hole is the hole's (`%d{x}`)
+                if pending then
+                    pending <- false
+                else
+                    flush ()
+                    parts.Add(Spec(flags, width, precision, 'P'))
+            else
+                flush ()
+                parts.Add(Spec(flags, width, precision, letter))
+                pending <- true
+
+    flush ()
+    List.ofSeq parts
+
+/// `printfn "..."` and its relatives, and an interpolated string: which of them, the format
+/// string, and the values of the holes of an interpolated string.
+let private (|PrintfCall|_|) (e: Fable.Expr) : (string * string * Fable.Expr list) option =
+    let rec uncast (x: Fable.Expr) =
+        match x with
+        | Fable.TypeCast(inner, _) -> uncast inner
+        | _ -> x
+
+    let isDotnet (imp: Fable.ImportInfo) (entityPrefix: string) =
+        imp.Path.StartsWith(Replacements.DotnetPrefix + entityPrefix, System.StringComparison.Ordinal)
+
+    match e with
+    | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
+        isDotnet imp "Microsoft.FSharp.Core.ExtraTopLevelOperators"
+        && imp.Selector.StartsWith("PrintFormat", System.StringComparison.Ordinal)
+        ->
+        match info.Args |> List.map uncast with
+        | [ Fable.Call(Fable.Import(ctor, _, _), ctorInfo, _, _) ] when
+            ctor.Selector = ".ctor" && isDotnet ctor "Microsoft.FSharp.Core.PrintfFormat"
+            ->
+            match ctorInfo.Args with
+            | Fable.Value(Fable.StringConstant fmt, _) :: rest ->
+                let holes =
+                    match rest with
+                    | Fable.Value(Fable.NewArray(Fable.ArrayValues values, _, _), _) :: _ ->
+                        values
+                        |> List.map (fun v ->
+                            match uncast v with
+                            | Fable.Call(Fable.Import(box, _, _), boxInfo, _, _) when box.Selector = "Box" ->
+                                boxInfo.Args.Head
+                            | other -> other
+                        )
+                    | _ -> []
+
+                Some(imp.Selector, fmt, holes)
+            | _ -> None
+        | _ -> None
+    | _ -> None
+
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
     | Fable.Value(kind, r) ->
@@ -822,6 +1057,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             )
         | Fable.NumberConstant(v, _) -> ELit(numberLit r v)
         | Fable.CharConstant c -> ELit(string<int>(int c), TPrim "u16")
+        | Fable.StringConstant text -> ELit(stringLiteral text, tStr)
         | Fable.NewRecord(values, entRef, _) when (tryExnEnt ctx r entRef).IsSome ->
             let ent = (tryExnEnt ctx r entRef).Value
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> EExnNew(ent, xs))
@@ -987,6 +1223,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     | LogicalAnd -> EIf(xs.Head, rhs, ELit("false", tBool), tBool)
                     | LogicalOr -> EIf(xs.Head, ELit("true", tBool), rhs, tBool)
                 )
+
+    // printf, sprintf, failwithf and interpolated strings: the format is taken apart here
+    | Fable.CurriedApply(PrintfCall(selector, fmt, []), args, t, r) -> formatted ctx r selector fmt args t
+    | PrintfCall(selector, fmt, holes) -> formatted ctx e.Range selector fmt holes e.Type
 
     // A call that the replacements kept under its .NET name.
     | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
@@ -1258,6 +1498,139 @@ and typeArgsOf
 
         c.OuterTypeArgs @ tys, Map.ofList (List.zip c.TypeParams tys)
 
+and dotnetExnEnt (ctx: Ctx) (fullName: string) : Ent = dotnetExnEntIn ctx.State fullName
+
+and failureEnt (ctx: Ctx) : Ent = dotnetExnEnt ctx "System.Exception"
+
+/// Raise a .NET exception of the given class with the given message.
+and raiseDotnet (ctx: Ctx) (r: SourceLocation option) (fullName: string) (message: Expr) (t: Fable.Type) : Expr =
+    bindArgsIn true ctx [ message ] (fun xs -> ERaise(EExnNew(dotnetExnEnt ctx fullName, xs), mapType ctx r t))
+
+/// "message (Parameter 'name')", as .NET puts the name of a parameter into a message
+and withParameter (ctx: Ctx) (message: Expr) (parameter: Fable.Expr) : Expr =
+    bindArgs
+        ctx
+        [ message; lw ctx parameter ]
+        (fun xs -> EEmit("fable_rt.format(.{ $0, \" (Parameter '\", $1, \"')\" })", xs, tStr))
+
+/// Argument `i` of a macro, with its type: a number that is written out in the program has
+/// no type of its own in Zig, and how it is formatted depends on the type it has in F#.
+and typedArg (ctx: Ctx) (r: SourceLocation option) (value: Fable.Expr) (i: int) : string =
+    match mapType ctx r value.Type with
+    | TPrim name when not (name.StartsWith("fable_rt.", System.StringComparison.Ordinal)) -> $"@as(%s{name}, $%d{i})"
+    | _ -> $"$%d{i}"
+
+/// The text of `fable_rt.format`'s parts for a format string and its arguments, and the
+/// arguments in the order the macro names them.
+and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable.Expr list) : string * Fable.Expr list =
+    let parts = parseFormat r fmt
+
+    let specs =
+        parts
+        |> List.filter (
+            function
+            | Spec _ -> true
+            | Text _ -> false
+        )
+
+    if specs.Length <> args.Length then
+        fail
+            r
+            "the Zig target needs a format with all its %d value(s) given at once here (it has %d)"
+            specs.Length
+            args.Length
+
+    let mutable next = 0
+
+    let texts =
+        parts
+        |> List.map (fun part ->
+            match part with
+            | Text text ->
+                match zigQuoted text with
+                | Some quoted -> quoted
+                | None -> fail r "the Zig target does not support this text in a format string"
+            | Spec(flags, width, precision, letter) ->
+                let i = next
+                next <- next + 1
+                let value = args[i]
+
+                // what the specifier means for the type of its value
+                let kind =
+                    match letter, value.Type with
+                    | ('P' | 'O'), Fable.String -> 's'
+                    | ('P' | 'O'), Fable.Char -> 'c'
+                    | ('P' | 'O'), (Fable.Boolean | Fable.Number _) -> 'P'
+                    | 's', Fable.String -> 's'
+                    | 'b', Fable.Boolean -> 'b'
+                    | 'c', Fable.Char -> 'c'
+                    | ('d' | 'i'), Fable.Number _ -> 'd'
+                    | ('u' | 'x' | 'X' | 'o'), Fable.Number _ -> letter
+                    | ('f' | 'F' | 'e' | 'E' | 'g' | 'G'), Fable.Number((Float32 | Float64), _) -> letter
+                    | 'A', _ -> fail r "the Zig target does not support %%A yet"
+                    | _, (Fable.String | Fable.Char | Fable.Boolean | Fable.Number _) ->
+                        fail r "the Zig target does not support the format %%%c for this type of value yet" letter
+                    | _, other -> fail r "the Zig target cannot turn a value of this type into text yet (%A)" other
+
+                let fields =
+                    [
+                        $".kind = '%c{kind}'"
+                        if width > 0 then
+                            $".width = %d{width}"
+                        match precision with
+                        | Some p -> $".precision = %d{p}"
+                        | None -> ()
+                        if flags.IndexOf('0') >= 0 then
+                            ".zero = true"
+                        if flags.IndexOf('-') >= 0 then
+                            ".left = true"
+                        if flags.IndexOf('+') >= 0 then
+                            ".plus = true"
+                        if flags.IndexOf(' ') >= 0 then
+                            ".space = true"
+                    ]
+                    |> String.concat ", "
+
+                $"fable_rt.arg(.{{ %s{fields} }}, %s{typedArg ctx r value i})"
+        )
+
+    (match texts with
+     | [] -> ".{}"
+     | _ -> texts |> String.concat ", " |> sprintf ".{ %s }"),
+    args
+
+/// printf and its relatives: text is built from the format's parts and printed, returned or
+/// raised.
+and formatted
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (selector: string)
+    (fmt: string)
+    (args: Fable.Expr list)
+    (t: Fable.Type)
+    : Expr
+    =
+    let parts, values = formatParts ctx r fmt args
+    ctx.State.UsesRuntime <- true
+    let irs = values |> List.map (lw ctx)
+
+    let emit (macro: string) (ty: Ty) =
+        bindArgs ctx irs (fun xs -> EEmit(macro, xs, ty))
+
+    match selector with
+    | "PrintFormatToString" -> emit $"fable_rt.format(%s{parts})" tStr
+    | "PrintFormat" -> emit $"fable_rt.print(%s{parts}, false)" tVoid
+    | "PrintFormatLine" -> emit $"fable_rt.print(%s{parts}, true)" tVoid
+    | "PrintFormatToError" -> emit $"fable_rt.printErr(%s{parts}, false)" tVoid
+    | "PrintFormatLineToError" -> emit $"fable_rt.printErr(%s{parts}, true)" tVoid
+    | "PrintFormatToStringThenFail" ->
+        // failwithf
+        bindArgs
+            ctx
+            [ emit $"fable_rt.format(%s{parts})" tStr ]
+            (fun xs -> ERaise(EExnNew(failureEnt ctx, xs), mapType ctx r t))
+    | _ -> fail r "the Zig target does not support this kind of printf yet (%s)" selector
+
 /// Apply a function value to arguments, as many at a time as its type takes. (`subst` says
 /// what the type parameters in `fTy` stand for, when it is the declared result type of a
 /// generic function.)
@@ -1516,6 +1889,147 @@ and dotnetCall
         bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("eql", xs, tBool))
     | "Microsoft.FSharp.Core.Operators", "op_Inequality", [ a; b ] ->
         bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("not", [ EPrim("eql", xs, tBool) ], tBool))
+    // ---- numbers that are not numbers ----
+    | "Microsoft.FSharp.Core.Operators", "NaN", [] -> ELit("std.math.nan(f64)", TPrim "f64")
+    | "Microsoft.FSharp.Core.Operators", "NaNSingle", [] -> ELit("std.math.nan(f32)", TPrim "f32")
+    | "Microsoft.FSharp.Core.Operators", "Infinity", [] -> ELit("std.math.inf(f64)", TPrim "f64")
+    | "Microsoft.FSharp.Core.Operators", "InfinitySingle", [] -> ELit("std.math.inf(f32)", TPrim "f32")
+    // (a cast that changes nothing here: an exception of a known class is an `exn`)
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ x ] when
+        mapType ctx r x.Type = mapType ctx r t
+        ->
+        lw ctx x
+    // ---- strings ----
+    | "System.String", "get_Length", s :: _
+    | "Microsoft.FSharp.Core.StringModule", "Length", [ s ] ->
+        bindArgs ctx [ lw ctx s ] (fun xs -> EEmit("fable_rt.strLen($0)", xs, tI32))
+    | "System.String", "get_Chars", [ s; i ]
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetString", [ s; i ] ->
+        bindArgs ctx [ lw ctx s; lw ctx i ] (fun xs -> EEmit("fable_rt.strAt($0, $1)", xs, TPrim "u16"))
+    // `a + b + c`: one new string, whatever the number of parts
+    | "Microsoft.FSharp.Core.Operators", "op_Addition", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
+        let rec parts (x: Fable.Expr) : Fable.Expr list =
+            match x with
+            | Fable.Call(Fable.Import(imp, _, _), inner, Fable.String, _) when
+                imp.Selector = "op_Addition"
+                && imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
+                && inner.Args.Length = 2
+                && inner.Args |> List.forall (fun arg -> arg.Type = Fable.String)
+                ->
+                inner.Args |> List.collect parts
+            | _ -> [ x ]
+
+        match parts a @ parts b with
+        | [ a; b ] -> bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EEmit("fable_rt.strConcat($0, $1)", xs, tStr))
+        | many ->
+            // (literal text among the parts is written into the result directly)
+            let values = List<Fable.Expr>()
+
+            let texts =
+                many
+                |> List.map (fun part ->
+                    match part with
+                    | Fable.Value(Fable.StringConstant text, _) when (zigQuoted text).IsSome -> (zigQuoted text).Value
+                    | _ ->
+                        values.Add part
+                        $"$%d{values.Count - 1}"
+                )
+                |> String.concat ", "
+
+            bindArgs
+                ctx
+                (values |> Seq.map (lw ctx) |> List.ofSeq)
+                (fun xs -> EEmit($"fable_rt.format(.{{ %s{texts} }})", xs, tStr))
+    | "System.String", "Concat", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
+        bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EEmit("fable_rt.strConcat($0, $1)", xs, tStr))
+    // `string x`
+    | "Microsoft.FSharp.Core.Operators", "ToString", [ x ] ->
+        match x.Type with
+        | Fable.String -> lw ctx x
+        | Fable.Char ->
+            bindArgs
+                ctx
+                [ lw ctx x ]
+                (fun xs -> EEmit("fable_rt.format(.{ fable_rt.arg(.{ .kind = 'c' }, @as(u16, $0)) })", xs, tStr))
+        | Fable.Boolean
+        | Fable.Number _ ->
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.format(.{{ %s{typedArg ctx r x 0} }})", xs, tStr))
+        | other -> fail r "the Zig target cannot turn a value of this type into text yet (%A)" other
+    // ---- comparison of what is not a number: by `compare` ----
+    | "Microsoft.FSharp.Core.Operators",
+      ("op_LessThan" | "op_GreaterThan" | "op_LessThanOrEqual" | "op_GreaterThanOrEqual" | "Compare"),
+      [ a; b ] when
+        (match a.Type with
+         | Fable.String
+         | Fable.Number _
+         | Fable.Char
+         | Fable.Boolean -> true
+         | _ -> false)
+        ->
+        let op =
+            match name with
+            | "op_LessThan" -> Some "lt"
+            | "op_GreaterThan" -> Some "gt"
+            | "op_LessThanOrEqual" -> Some "le"
+            | "op_GreaterThanOrEqual" -> Some "ge"
+            | _ -> None
+
+        bindArgs
+            ctx
+            [ lw ctx a; lw ctx b ]
+            (fun xs ->
+                let order = EEmit("fable_rt.compare($0, $1)", xs, tI32)
+
+                match op with
+                | Some op -> EPrim(op, [ order; ELit("0", tI32) ], tBool)
+                | None -> order
+            )
+    // ---- failures ----
+    | "Microsoft.FSharp.Core.Operators", "FailWith", [ msg ] -> raiseDotnet ctx r "System.Exception" (lw ctx msg) t
+    | "Microsoft.FSharp.Core.Operators", "InvalidOp", [ msg ] ->
+        raiseDotnet ctx r "System.InvalidOperationException" (lw ctx msg) t
+    | "Microsoft.FSharp.Core.Operators", "InvalidArg", [ arg; msg ] ->
+        raiseDotnet ctx r "System.ArgumentException" (withParameter ctx (lw ctx msg) arg) t
+    | "Microsoft.FSharp.Core.Operators", "NullArg", [ arg ] ->
+        let message = ELit(stringLiteral "Value cannot be null.", tStr)
+        raiseDotnet ctx r "System.ArgumentNullException" (withParameter ctx message arg) t
+    // `System.Exception("...")` and the other classes: a new exception with that message
+    | cls, ".ctor", args when
+        dotnetExceptions.ContainsKey cls
+        && args |> List.forall (fun a -> a.Type = Fable.String)
+        ->
+        let message =
+            match cls, args with
+            | "System.Exception", [] -> ELit(stringLiteral "Exception of type 'System.Exception' was thrown.", tStr)
+            | "System.ArgumentNullException", [ parameter ] ->
+                withParameter ctx (ELit(stringLiteral "Value cannot be null.", tStr)) parameter
+            | "System.ArgumentOutOfRangeException", [ parameter ] ->
+                let text = "Specified argument was out of the range of valid values."
+                withParameter ctx (ELit(stringLiteral text, tStr)) parameter
+            | ("System.ArgumentNullException" | "System.ArgumentOutOfRangeException"), [ parameter; message ] ->
+                withParameter ctx (lw ctx message) parameter
+            | "System.ArgumentException", [ message; parameter ] -> withParameter ctx (lw ctx message) parameter
+            | _, [ message ] -> lw ctx message
+            | _ -> fail r "the Zig target does not support this way of making a %s yet" cls
+
+        bindArgsIn true ctx [ message ] (fun xs -> EExnNew(dotnetExnEnt ctx cls, xs))
+    // `Failure msg` in a pattern: the message, if the exception is a failure
+    | "Microsoft.FSharp.Core.Operators", "FailurePattern", [ x ] ->
+        let failure = failureEnt ctx
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                EIf(
+                    EExnTest(xs.Head, failure),
+                    ECon(TOpt tStr, "Some", [ EExnGet(xs.Head, failure, "Message", tStr) ], None),
+                    ECon(TOpt tStr, "None", [], None),
+                    TOpt tStr
+                )
+            )
+    | "System.Exception", "get_Message", x :: _ ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnMessage($0)", xs, tStr))
     | "Microsoft.FSharp.Core.Operators", "Raise", [ x ] ->
         bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx r t))
     | "Microsoft.FSharp.Core.Operators", "Reraise", _ ->

@@ -6,7 +6,7 @@ const builtin = @import("builtin");
 const root = @import("root");
 pub const sgc = @import("fable_sgc.zig");
 
-pub const interface_version: i32 = 9;
+pub const interface_version: i32 = 10;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -167,6 +167,7 @@ fn isCellPtr(comptime T: type) bool {
 
 /// Does a value of this type hold references to cells? (Does not look through a cell.)
 pub fn isManaged(comptime T: type) bool {
+    if (T == String) return true;
     if (isCellPtr(T)) return true;
     if (comptime isFunc(T)) return true;
     switch (@typeInfo(T)) {
@@ -213,6 +214,7 @@ fn retainAll(x: anytype) void {
         if (x.env) |e| retain(e);
         return;
     }
+    if (T == String) return strRetain(x);
     switch (@typeInfo(T)) {
         .pointer => retain(x),
         .optional => if (x) |v| retainAll(v),
@@ -239,6 +241,7 @@ pub fn drop(x: anytype) void {
         if (releaseIsLast(x)) x.type.destroy(x);
         return;
     }
+    if (T == String) return strRelease(x);
     switch (@typeInfo(T)) {
         .pointer => dropRecord(T, x),
         .optional => if (x) |v| drop(v),
@@ -325,6 +328,7 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     if (comptime !isManaged(T)) return std.meta.eql(a, b);
     if (comptime isFunc(T)) @compileError("function values cannot be compared");
     if (T == Exn) return a == b;
+    if (T == String) return strEql(a, b);
     switch (@typeInfo(T)) {
         .pointer => |p| {
             if (a == b) return true;
@@ -438,7 +442,6 @@ pub fn List(comptime T: type) type {
 /// count is checked against the cells and what they point at. A program turns it on with
 /// `pub const fable_verify_cycles = true;` in its root file. Very slow.
 const verify_cycles: bool = if (@hasDecl(@import("root"), "fable_verify_cycles")) @import("root").fable_verify_cycles else false;
-
 
 /// What a file says about the records with assignable fields that its code makes:
 /// - `holds`: one of them has an assignable field that can hold a function value or an
@@ -782,6 +785,596 @@ pub const tail_call: std.builtin.CallModifier = if (builtin.zig_backend == .stag
 }) .always_tail else .auto;
 
 // ---------------------------------------------------------------------------------------------
+// Strings
+//
+// A string is what it is on .NET: an immutable sequence of UTF-16 code units, so that its
+// length, its characters and their order are the same here and there. It is a pointer to a
+// header that the units follow. A literal is static data: it is never counted and never
+// freed, and making one costs nothing.
+// ---------------------------------------------------------------------------------------------
+
+pub const Str = extern struct {
+    /// the number of references, or `literal` for a string that is static data
+    rc: u32,
+    len: u32,
+
+    pub const literal: u32 = std.math.maxInt(u32);
+
+    /// The UTF-16 code units.
+    pub inline fn units(s: *const Str) []const u16 {
+        const first: [*]const u16 = @ptrCast(@as([*]const Str, @ptrCast(s)) + 1);
+        return first[0..s.len];
+    }
+};
+
+/// F#'s `string`.
+pub const String = *const Str;
+
+fn LiteralCell(comptime n: usize) type {
+    return extern struct { header: Str, units: [n]u16 };
+}
+
+/// A string literal, from UTF-8 text.
+pub inline fn str(comptime utf8: []const u8) String {
+    const static = comptime blk: {
+        // (the conversion is a loop at compile time, and a function with many literals runs it
+        // many times: the compiler's guard against endless loops is not for this)
+        @setEvalBranchQuota(std.math.maxInt(u32));
+        const u = std.unicode.utf8ToUtf16LeStringLiteral(utf8);
+        break :blk LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len }, .units = u.* };
+    };
+    return &static.header;
+}
+
+/// A string literal that is not well-formed text (F# allows a surrogate on its own).
+pub inline fn strOf(comptime u: []const u16) String {
+    const static = comptime LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len }, .units = u[0..u.len].* };
+    return &static.header;
+}
+
+fn strWords(len: usize) usize {
+    return @sizeOf(Str) / 4 + (len + 1) / 2;
+}
+
+/// A new string of `len` units, to be filled in by the caller. Its count is one.
+fn strNew(len: usize) struct { String, []u16 } {
+    const words = allocator.alloc(u32, strWords(len)) catch @panic("fable: out of memory");
+    const s: *Str = @ptrCast(words.ptr);
+    s.* = .{ .rc = 1, .len = @intCast(len) };
+    if (track) thread.stats.allocs += 1;
+    const first: [*]u16 = @ptrCast(@as([*]Str, @ptrCast(s)) + 1);
+    return .{ s, first[0..len] };
+}
+
+inline fn strRetain(s: String) void {
+    if (s.rc == Str.literal) return;
+    @constCast(s).rc += 1;
+    if (track) thread.stats.dups += 1;
+}
+
+inline fn strRelease(s: String) void {
+    if (s.rc == Str.literal) return;
+    const m = @constCast(s);
+    if (m.rc != 1) {
+        m.rc -= 1;
+        if (track) thread.stats.decs += 1;
+        return;
+    }
+    if (track) thread.stats.frees += 1;
+    const words: [*]u32 = @ptrCast(@alignCast(m));
+    allocator.free(words[0..strWords(m.len)]);
+}
+
+pub fn strEql(a: String, b: String) bool {
+    return a == b or std.mem.eql(u16, a.units(), b.units());
+}
+
+/// The order of two strings by their code units: negative, zero or positive, and the same
+/// number as .NET's `String.CompareOrdinal`, which is what F#'s `compare` gives for strings.
+pub fn strCompare(a: String, b: String) i32 {
+    const x = a.units();
+    const y = b.units();
+    const x0: i32 = if (x.len != 0) x[0] else 0;
+    const y0: i32 = if (y.len != 0) y[0] else 0;
+    if (x0 != y0) return x0 - y0;
+    for (x[0..@min(x.len, y.len)], y[0..@min(x.len, y.len)]) |c, d| {
+        if (c != d) return @as(i32, c) - @as(i32, d);
+    }
+    return @as(i32, @intCast(x.len)) - @as(i32, @intCast(y.len));
+}
+
+/// F#'s `compare` for numbers, chars, booleans and strings: negative, zero or positive.
+pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
+    const T = @TypeOf(a);
+    if (T == String) return strCompare(a, b);
+    if (T == bool) return @as(i32, @intFromBool(a)) - @as(i32, @intFromBool(b));
+    if (a < b) return -1;
+    if (a > b) return 1;
+    if (a == b) return 0;
+    // (not a number: it comes before every number, and equals itself)
+    if (a == a) return 1;
+    return if (b == b) -1 else 0;
+}
+
+pub inline fn strLen(s: String) i32 {
+    return @intCast(s.len);
+}
+
+/// `s.[i]`
+pub inline fn strAt(s: String, i: i32) u16 {
+    return s.units()[@intCast(i)];
+}
+
+/// `a + b`: a new string, unless one of them is empty.
+pub fn strConcat(a: String, b: String) String {
+    if (a.len == 0) return dup(b);
+    if (b.len == 0) return dup(a);
+    const s, const u = strNew(a.len + b.len);
+    @memcpy(u[0..a.len], a.units());
+    @memcpy(u[a.len..], b.units());
+    return s;
+}
+
+/// How a value is turned into text: an F# format specifier (`%5d`, `%.2f`, `%s`, ...), or
+/// what `string x` and `$"{x}"` do (kind 'P').
+pub const Spec = struct {
+    kind: u8 = 'P',
+    width: u16 = 0,
+    precision: ?u8 = null,
+    zero: bool = false,
+    left: bool = false,
+    plus: bool = false,
+    space: bool = false,
+};
+
+fn Arg(comptime T: type, comptime spec: Spec) type {
+    return struct {
+        pub const fable_spec = spec;
+        value: T,
+    };
+}
+
+/// A value with its format specifier, as a part of `format`.
+pub inline fn arg(comptime spec: Spec, value: anytype) Arg(@TypeOf(value), spec) {
+    return .{ .value = value };
+}
+
+/// The text of one part: ASCII in `scratch`, or the units of a string.
+const Piece = union(enum) {
+    ascii: []const u8,
+    units: []const u16,
+
+    fn len(p: Piece) usize {
+        return switch (p) {
+            .ascii => |a| a.len,
+            .units => |u| u.len,
+        };
+    }
+};
+
+const scratch_len = 400;
+
+/// The decimal digits of a number: 0.d0 d1 d2 ... x 10^point.
+const Decimal = struct {
+    /// (a double has at most 309 digits before the point, or 1074 after it)
+    digits: [1100]u8 = undefined,
+    len: usize = 0,
+    point: i32 = 1,
+
+    /// The exact digits of a finite number that is not negative.
+    fn exact(x: f64) Decimal {
+        var d: Decimal = .{};
+        if (x == 0) return d;
+        const bits: u64 = @bitCast(x);
+        const biased: i32 = @intCast((bits >> 52) & 0x7FF);
+        var m: u64 = bits & ((1 << 52) - 1);
+        var e: i32 = undefined;
+        if (biased == 0) {
+            e = -1074;
+        } else {
+            m |= 1 << 52;
+            e = biased - 1075;
+        }
+        const zeros: u6 = @intCast(@ctz(m));
+        m >>= zeros;
+        e += zeros;
+
+        var limbs: [36]u32 = @splat(0);
+        if (e >= 0) {
+            // a whole number, m * 2^e: its digits, nine at a time from the last
+            const at: usize = @intCast(@divTrunc(e, 32));
+            const wide: u128 = @as(u128, m) << @intCast(@mod(e, 32));
+            limbs[at] = @truncate(wide);
+            limbs[at + 1] = @truncate(wide >> 32);
+            limbs[at + 2] = @truncate(wide >> 64);
+            var n: usize = at + 3;
+            var end: usize = d.digits.len;
+            while (n > 0) {
+                var rem: u64 = 0;
+                var i = n;
+                while (i > 0) {
+                    i -= 1;
+                    const cur = (rem << 32) | limbs[i];
+                    limbs[i] = @intCast(cur / 1_000_000_000);
+                    rem = cur % 1_000_000_000;
+                }
+                while (n > 0 and limbs[n - 1] == 0) n -= 1;
+                for (0..9) |_| {
+                    end -= 1;
+                    d.digits[end] = @intCast(rem % 10);
+                    rem /= 10;
+                }
+            }
+            while (d.digits[end] == 0) end += 1;
+            d.len = d.digits.len - end;
+            std.mem.copyForwards(u8, d.digits[0..d.len], d.digits[end..]);
+            d.point = @intCast(d.len);
+            return d;
+        }
+
+        // m / 2^shift: the whole part, then one digit of the rest at a time
+        const shift: usize = @intCast(-e);
+        const whole: u64 = if (shift >= 64) 0 else m >> @intCast(shift);
+        const rest: u64 = if (shift >= 64) m else m & ((@as(u64, 1) << @intCast(shift)) - 1);
+        if (whole != 0) {
+            const text = std.fmt.bufPrint(&d.digits, "{d}", .{whole}) catch unreachable;
+            for (d.digits[0..text.len]) |*c| c.* -= '0';
+            d.len = text.len;
+        }
+        d.point = @intCast(d.len);
+        limbs[0] = @truncate(rest);
+        limbs[1] = @truncate(rest >> 32);
+        const top = shift / 32;
+        const bit: u5 = @intCast(shift % 32);
+        for (0..shift) |_| {
+            var carry: u64 = 0;
+            for (limbs[0 .. top + 2]) |*l| {
+                const cur = @as(u64, l.*) * 10 + carry;
+                l.* = @truncate(cur);
+                carry = cur >> 32;
+            }
+            var next: u32 = limbs[top] >> bit;
+            if (bit != 0) {
+                next |= limbs[top + 1] << @intCast(32 - @as(u6, bit));
+                limbs[top] &= (@as(u32, 1) << bit) - 1;
+            } else {
+                limbs[top] = 0;
+            }
+            limbs[top + 1] = 0;
+            if (d.len == 0 and next == 0) {
+                d.point -= 1;
+            } else {
+                d.digits[d.len] = @intCast(next);
+                d.len += 1;
+            }
+        }
+        return d;
+    }
+
+    /// The shortest digits that read back as the same number, of its own type.
+    fn shortest(x: anytype) Decimal {
+        var d: Decimal = .{};
+        if (x == 0) return d;
+        var buf: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{e}", .{x}) catch unreachable;
+        const e = std.mem.indexOfScalar(u8, text, 'e').?;
+        for (text[0..e]) |c| {
+            if (c == '.') continue;
+            d.digits[d.len] = c - '0';
+            d.len += 1;
+        }
+        d.point = (std.fmt.parseInt(i32, text[e + 1 ..], 10) catch unreachable) + 1;
+        return d;
+    }
+
+    /// Keep `n` digits, rounding to the nearest and a tie to the even digit, as .NET does.
+    fn round(d: *Decimal, n: i32) void {
+        if (n >= d.len) return;
+        if (n < 0) {
+            d.len = 0;
+            return;
+        }
+        const keep: usize = @intCast(n);
+        const next = d.digits[keep];
+        var up = next > 5;
+        if (next == 5) {
+            up = keep > 0 and d.digits[keep - 1] % 2 == 1;
+            for (d.digits[keep + 1 .. d.len]) |c| {
+                if (c != 0) up = true;
+            }
+        }
+        d.len = keep;
+        if (!up) return;
+        var i = keep;
+        while (i > 0) {
+            i -= 1;
+            if (d.digits[i] != 9) {
+                d.digits[i] += 1;
+                return;
+            }
+            d.digits[i] = 0;
+        }
+        // (all nines, or no digit at all: one, a place higher)
+        d.digits[0] = 1;
+        d.len = @max(keep, 1);
+        d.point += 1;
+    }
+
+    inline fn digit(d: *const Decimal, i: i32) u8 {
+        return if (i >= 0 and i < d.len) '0' + d.digits[@intCast(i)] else '0';
+    }
+};
+
+const Text = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    inline fn put(t: *Text, c: u8) void {
+        t.buf[t.len] = c;
+        t.len += 1;
+    }
+
+    /// e+005: the exponent with its sign and at least `width` digits
+    fn exponent(t: *Text, letter: u8, exp: i32, width: usize) void {
+        t.put(letter);
+        t.put(if (exp < 0) '-' else '+');
+        var digits: [8]u8 = undefined;
+        const text = std.fmt.bufPrint(&digits, "{d}", .{@abs(exp)}) catch unreachable;
+        for (@min(text.len, width)..width) |_| t.put('0');
+        for (text) |c| t.put(c);
+    }
+
+    /// The digits without the zeros at their end: plainly while the exponent is above -5 and
+    /// below `limit`, as d.ddde+xx otherwise.
+    fn general(t: *Text, d: *const Decimal, limit: i32, letter: u8) void {
+        var n: i32 = @intCast(d.len);
+        while (n > 0 and d.digits[@intCast(n - 1)] == 0) n -= 1;
+        const exp = d.point - 1;
+        if (exp > -5 and exp < limit) {
+            if (d.point <= 0) {
+                t.put('0');
+            } else {
+                var i: i32 = 0;
+                while (i < d.point) : (i += 1) t.put(d.digit(i));
+            }
+            if (n > d.point) {
+                t.put('.');
+                var i: i32 = @min(d.point, 0);
+                while (i < 0) : (i += 1) t.put('0');
+                i = @max(d.point, 0);
+                while (i < n) : (i += 1) t.put(d.digit(i));
+            }
+        } else {
+            t.put(d.digit(0));
+            if (n > 1) {
+                t.put('.');
+                var i: i32 = 1;
+                while (i < n) : (i += 1) t.put(d.digit(i));
+            }
+            t.exponent(letter, exp, 2);
+        }
+    }
+};
+
+/// A float as F# and .NET write it. `%f` and `%e` round the exact value of the number; `%g`
+/// keeps six digits; everything else (`string x`, `$"{x}"`, `%O`) is the shortest text that
+/// reads back as the same number.
+fn floatText(comptime spec: Spec, value: anytype, out: []u8) []const u8 {
+    const x: f64 = value;
+    if (std.math.isNan(x)) return "NaN";
+    if (std.math.isInf(x)) return if (x > 0) "Infinity" else "-Infinity";
+    var t: Text = .{ .buf = out };
+    if (std.math.signbit(x)) t.put('-') else if (spec.plus) t.put('+') else if (spec.space) t.put(' ');
+    const precision: i32 = @min(spec.precision orelse 6, 80);
+    switch (spec.kind) {
+        'f', 'F' => {
+            var d = Decimal.exact(@abs(x));
+            d.round(d.point + precision);
+            var i: i32 = @min(d.point, 1) - 1;
+            while (i < d.point) : (i += 1) t.put(d.digit(i));
+            if (precision > 0) {
+                t.put('.');
+                var k: i32 = 0;
+                while (k < precision) : (k += 1) t.put(d.digit(d.point + k));
+            }
+        },
+        'e', 'E' => {
+            var d = Decimal.exact(@abs(x));
+            d.round(precision + 1);
+            t.put(d.digit(0));
+            if (precision > 0) {
+                t.put('.');
+                var k: i32 = 1;
+                while (k <= precision) : (k += 1) t.put(d.digit(k));
+            }
+            t.exponent(spec.kind, d.point - 1, 3);
+        },
+        'g', 'G' => {
+            const letter: u8 = if (spec.kind == 'g') 'e' else 'E';
+            if (precision == 0) {
+                const d = Decimal.shortest(@abs(value));
+                t.general(&d, if (@TypeOf(value) == f32) 9 else 17, letter);
+            } else {
+                var d = Decimal.exact(@abs(x));
+                d.round(precision);
+                t.general(&d, precision, letter);
+            }
+        },
+        else => {
+            const d = Decimal.shortest(@abs(value));
+            t.general(&d, if (@TypeOf(value) == f32) 9 else 17, 'E');
+        },
+    }
+    return out[0..t.len];
+}
+
+fn pieceOf(comptime spec: Spec, value: anytype, scratch: *[scratch_len]u8) Piece {
+    const T = @TypeOf(value);
+    if (T == String) return .{ .units = value.units() };
+    switch (@typeInfo(T)) {
+        .bool => return .{ .ascii = if (spec.kind == 'b')
+            (if (value) "true" else "false")
+        else
+            (if (value) "True" else "False") },
+        .int => |info| {
+            if (spec.kind == 'c') {
+                // (a char: one UTF-16 unit, kept in the scratch space as such)
+                const u: *[1]u16 = @ptrCast(@alignCast(scratch));
+                u[0] = @intCast(value);
+                return .{ .units = u };
+            }
+            const Bits = @Int(.unsigned, info.bits);
+            const sign: []const u8 = if (value >= 0 and spec.plus) "+" else if (value >= 0 and spec.space) " " else "";
+            const text = switch (spec.kind) {
+                'x' => std.fmt.bufPrint(scratch, "{x}", .{@as(Bits, @bitCast(value))}),
+                'X' => std.fmt.bufPrint(scratch, "{X}", .{@as(Bits, @bitCast(value))}),
+                'o' => std.fmt.bufPrint(scratch, "{o}", .{@as(Bits, @bitCast(value))}),
+                'u' => std.fmt.bufPrint(scratch, "{d}", .{@as(Bits, @bitCast(value))}),
+                else => std.fmt.bufPrint(scratch, "{s}{d}", .{ sign, value }),
+            };
+            return .{ .ascii = text catch unreachable };
+        },
+        .comptime_int => return pieceOf(spec, @as(i64, value), scratch),
+        .float => return .{ .ascii = floatText(spec, value, scratch) },
+        .comptime_float => return .{ .ascii = floatText(spec, @as(f64, value), scratch) },
+        else => @compileError("fable: a value of type " ++ @typeName(T) ++ " cannot be formatted yet"),
+    }
+}
+
+fn isLiteralText(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .pointer) return false;
+    if (info.pointer.size == .slice) return info.pointer.child == u8;
+    if (info.pointer.size != .one) return false;
+    const child = @typeInfo(info.pointer.child);
+    return child == .array and child.array.child == u8;
+}
+
+/// Text from parts: literal text (a Zig string literal), strings, and values, bare or with a
+/// format specifier (`fable_rt.arg`). This is `sprintf`, string interpolation and `string x`.
+pub fn format(parts: anytype) String {
+    @setEvalBranchQuota(std.math.maxInt(u32));
+    const names = @typeInfo(@TypeOf(parts)).@"struct".field_names;
+    var pieces: [names.len]Piece = undefined;
+    var pad: [names.len]usize = @splat(0);
+    var scratch: [names.len][scratch_len]u8 align(2) = undefined;
+    var total: usize = 0;
+    inline for (names, 0..) |name, i| {
+        const part = @field(parts, name);
+        const T = @TypeOf(part);
+        if (comptime isLiteralText(T)) {
+            pieces[i] = .{ .units = comptime std.unicode.utf8ToUtf16LeStringLiteral(part) };
+        } else if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "fable_spec"))) {
+            pieces[i] = pieceOf(T.fable_spec, part.value, &scratch[i]);
+            if (T.fable_spec.width > pieces[i].len()) pad[i] = T.fable_spec.width - pieces[i].len();
+        } else {
+            pieces[i] = pieceOf(.{}, part, &scratch[i]);
+        }
+        total += pieces[i].len() + pad[i];
+    }
+    const s, const out = strNew(total);
+    var at: usize = 0;
+    inline for (names, 0..) |name, i| {
+        const T = @TypeOf(@field(parts, name));
+        const spec: Spec = if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "fable_spec"))) T.fable_spec else .{};
+        at = writePiece(out, at, pieces[i], pad[i], spec);
+    }
+    return s;
+}
+
+/// Write one part at `at`, padded to its width; returns where the next part starts.
+fn writePiece(out: []u16, start: usize, piece: Piece, pad: usize, spec: Spec) usize {
+    var at = start;
+    if (pad != 0 and !spec.left) {
+        if (spec.zero and piece == .ascii) {
+            // (zeros go between the sign and the digits)
+            const a = piece.ascii;
+            const signed = a.len > 0 and (a[0] == '-' or a[0] == '+' or a[0] == ' ');
+            if (signed) {
+                out[at] = a[0];
+                at += 1;
+            }
+            @memset(out[at..][0..pad], '0');
+            at += pad;
+            for (a[@intFromBool(signed)..]) |c| {
+                out[at] = c;
+                at += 1;
+            }
+            return at;
+        }
+        @memset(out[at..][0..pad], ' ');
+        at += pad;
+    }
+    switch (piece) {
+        .ascii => |a| for (a) |c| {
+            out[at] = c;
+            at += 1;
+        },
+        .units => |u| {
+            @memcpy(out[at..][0..u.len], u);
+            at += u.len;
+        },
+    }
+    if (pad != 0 and spec.left) {
+        @memset(out[at..][0..pad], ' ');
+        at += pad;
+    }
+    return at;
+}
+
+fn posixWrite(fd: i32, bytes: []const u8) void {
+    if (builtin.os.tag == .freestanding) return;
+    var done: usize = 0;
+    while (done < bytes.len) {
+        const n = std.posix.system.write(fd, bytes.ptr + done, bytes.len - done);
+        if (n <= 0) return;
+        done += @intCast(n);
+    }
+}
+
+fn defaultOut(bytes: []const u8) void {
+    posixWrite(1, bytes);
+}
+
+fn defaultErr(bytes: []const u8) void {
+    posixWrite(2, bytes);
+}
+
+/// Where `printf` and `eprintf` send their text, as UTF-8. A program may replace them (a
+/// freestanding one has to: there they do nothing).
+pub var write_out: *const fn (bytes: []const u8) void = defaultOut;
+pub var write_err: *const fn (bytes: []const u8) void = defaultErr;
+
+fn writeText(write: *const fn ([]const u8) void, s: String, newline: bool) void {
+    var buf: [512]u8 = undefined;
+    var rest = s.units();
+    while (rest.len != 0) {
+        // (a pair of surrogates is not split between two chunks)
+        var n = @min(rest.len, buf.len / 3);
+        if (n < rest.len and rest[n - 1] >= 0xD800 and rest[n - 1] < 0xDC00) n -= 1;
+        if (n == 0) n = 1;
+        const len = std.unicode.wtf16LeToWtf8(&buf, rest[0..n]);
+        write(buf[0..len]);
+        rest = rest[n..];
+    }
+    if (newline) write("\n");
+}
+
+/// `printf` / `printfn`: the text of `parts` (see `format`) to standard output.
+pub fn print(parts: anytype, comptime newline: bool) void {
+    const s = format(parts);
+    writeText(write_out, s, newline);
+    drop(s);
+}
+
+/// `eprintf` / `eprintfn`
+pub fn printErr(parts: anytype, comptime newline: bool) void {
+    const s = format(parts);
+    writeText(write_err, s, newline);
+    drop(s);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Function values
 //
 // A function value is a pointer to code and a pointer to the values the code captured:
@@ -873,6 +1466,8 @@ pub const Raised = error{Raised};
 pub const ExnType = struct {
     name: []const u8,
     destroy: *const fn (Exn) void,
+    /// the message, for an exception that was made with one
+    message: ?*const fn (Exn) String = null,
 };
 
 pub const ExnHeader = struct {
@@ -897,7 +1492,15 @@ pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
             "payload",
         );
 
-        pub const info: ExnType = .{ .name = name, .destroy = destroy };
+        pub const info: ExnType = .{
+            .name = name,
+            .destroy = destroy,
+            .message = if (Payload == Described) message else null,
+        };
+
+        fn message(e: Exn) String {
+            return dup(of(e).Message);
+        }
 
         pub fn new(payload: Payload) Exn {
             if (comptime cyclic) gcTick();
@@ -956,10 +1559,46 @@ pub fn MayRaise(comptime T: type, comptime callees: anytype) type {
     return T;
 }
 
+/// What a .NET exception class holds: its message.
+pub const Described = struct { Message: String };
+
+/// What `failwith` raises: .NET's `System.Exception` with a message.
+pub const Failure = ExnOf("System.Exception", Described);
+
+/// The .NET exception classes that a program can raise and handle by name. (Each is a type of
+/// its own here: a handler for one does not catch the classes that derive from it on .NET.)
+pub const ArgumentException = ExnOf("System.ArgumentException", Described);
+pub const ArgumentNullException = ExnOf("System.ArgumentNullException", Described);
+pub const ArgumentOutOfRangeException = ExnOf("System.ArgumentOutOfRangeException", Described);
+pub const InvalidOperationException = ExnOf("System.InvalidOperationException", Described);
+pub const NotSupportedException = ExnOf("System.NotSupportedException", Described);
+pub const NotImplementedException = ExnOf("System.NotImplementedException", Described);
+pub const IndexOutOfRangeException = ExnOf("System.IndexOutOfRangeException", Described);
+pub const DivideByZeroException = ExnOf("System.DivideByZeroException", Described);
+pub const OverflowException = ExnOf("System.OverflowException", Described);
+pub const FormatException = ExnOf("System.FormatException", Described);
+pub const KeyNotFoundException = ExnOf("System.Collections.Generic.KeyNotFoundException", Described);
+
+/// `e.Message`: the message an exception was made with; for an F# exception, its name.
+pub fn exnMessage(e: Exn) String {
+    if (e.type.message) |message| return message(e);
+    const s, const u = strNew(e.type.name.len);
+    for (e.type.name, u) |c, *o| o.* = c;
+    return s;
+}
+
 /// The program's entry point let an exception escape: say which, and give it up.
 pub fn uncaught() void {
     const e = take();
-    std.debug.print("Unhandled exception: {s}\n", .{e.type.name});
+    write_err("Unhandled exception. ");
+    write_err(e.type.name);
+    if (e.type.message) |message| {
+        const text = message(e);
+        write_err(": ");
+        writeText(write_err, text, false);
+        drop(text);
+    }
+    write_err("\n");
     drop(e);
 }
 
@@ -1400,6 +2039,182 @@ test "the collector can be stepped and tuned" {
     collectorPause();
     collectorResume();
     try std.testing.expectEqual(@as(i32, 0), collect());
+}
+
+fn expectText(expected: []const u8, s: String) !void {
+    var buf: [512]u8 = undefined;
+    const n = std.unicode.wtf16LeToWtf8(&buf, s.units());
+    try std.testing.expectEqualStrings(expected, buf[0..n]);
+    drop(s);
+}
+
+test "strings: literals, concatenation, comparison" {
+    const before = thread.stats;
+    const hello = str("héllo");
+    try std.testing.expectEqual(@as(i32, 5), strLen(hello));
+    try std.testing.expectEqual(@as(u16, 0xE9), strAt(hello, 1));
+    const both = strConcat(hello, str(" wörld"));
+    try std.testing.expectEqual(@as(i32, 11), strLen(both));
+    const again = dup(both);
+    try std.testing.expect(eql(both, again));
+    try std.testing.expect(eql(str("ab"), str("ab")) and !eql(str("ab"), str("ac")));
+    try std.testing.expect(strConcat(str(""), hello) == hello);
+    drop(both);
+    drop(again);
+    drop(hello);
+    // (a literal is never counted: only `both` was allocated)
+    try std.testing.expectEqual(@as(i64, 1), thread.stats.allocs - before.allocs);
+    try std.testing.expectEqual(@as(i64, 1), thread.stats.frees - before.frees);
+    // an emoji is two units
+    try std.testing.expectEqual(@as(i32, 2), strLen(str("\u{1F600}")));
+}
+
+test "format follows F# and .NET" {
+    const name = str("list");
+    try expectText("list has 3 items", format(.{ name, " has ", @as(i32, 3), " items" }));
+    try expectText("n=   42|42   |00042|-0042|+7| 7|  +42|+42  ", format(.{
+        "n=", arg(.{ .kind = 'd', .width = 5 }, @as(i32, 42)),
+        "|",  arg(.{ .kind = 'd', .width = 5, .left = true }, @as(i32, 42)),
+        "|",  arg(.{ .kind = 'd', .width = 5, .zero = true }, @as(i32, 42)),
+        "|",  arg(.{ .kind = 'd', .width = 5, .zero = true }, @as(i32, -42)),
+        "|",  arg(.{ .kind = 'd', .plus = true }, @as(i32, 7)),
+        "|",  arg(.{ .kind = 'd', .space = true }, @as(i32, 7)),
+        "|",  arg(.{ .kind = 'd', .width = 5, .plus = true }, @as(i32, 42)),
+        "|",  arg(.{ .kind = 'd', .width = 5, .plus = true, .left = true }, @as(i32, 42)),
+    }));
+    try expectText("ff FF 377 ffffffff 4294967295 -9223372036854775808", format(.{
+        arg(.{ .kind = 'x' }, @as(i32, 255)), " ", arg(.{ .kind = 'X' }, @as(i32, 255)),                  " ",
+        arg(.{ .kind = 'o' }, @as(i32, 255)), " ", arg(.{ .kind = 'x' }, @as(i32, -1)),                   " ",
+        arg(.{ .kind = 'u' }, @as(i32, -1)),  " ", arg(.{ .kind = 'd' }, @as(i64, std.math.minInt(i64))),
+    }));
+    try expectText("true True A é", format(.{
+        arg(.{ .kind = 'b' }, true), " ", true, " ", arg(.{ .kind = 'c' }, @as(u16, 'A')), " ", arg(.{ .kind = 'c' }, @as(u16, 0xE9)),
+    }));
+    try expectText("[  ab]", format(.{ "[", arg(.{ .kind = 's', .width = 4 }, str("ab")), "]" }));
+}
+
+fn expectFloat(expected: []const u8, comptime spec: Spec, value: anytype) !void {
+    var buf: [scratch_len]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, floatText(spec, value, &buf));
+}
+
+test "floats are written as .NET writes them" {
+    const f: Spec = .{ .kind = 'f' };
+    const e: Spec = .{ .kind = 'e' };
+    const g: Spec = .{ .kind = 'g' };
+    // (every expected text here is what .NET 10 prints)
+    // %f: the exact value, a tie to the even digit
+    try expectFloat("3.141590", f, @as(f64, 3.14159));
+    try expectFloat("2.67", .{ .kind = 'f', .precision = 2 }, @as(f64, 2.675));
+    try expectFloat("0.12", .{ .kind = 'f', .precision = 2 }, @as(f64, 0.125));
+    try expectFloat("0.38", .{ .kind = 'f', .precision = 2 }, @as(f64, 0.375));
+    try expectFloat("0.62", .{ .kind = 'f', .precision = 2 }, @as(f64, 0.625));
+    try expectFloat("1.00", .{ .kind = 'f', .precision = 2 }, @as(f64, 1.005));
+    try expectFloat("0", .{ .kind = 'f', .precision = 0 }, @as(f64, 0.5));
+    try expectFloat("2", .{ .kind = 'f', .precision = 0 }, @as(f64, 1.5));
+    try expectFloat("2", .{ .kind = 'f', .precision = 0 }, @as(f64, 2.5));
+    try expectFloat("1.000", .{ .kind = 'f', .precision = 3 }, @as(f64, 1.0005));
+    try expectFloat("10000000000000000000000.000000", f, @as(f64, 1e22));
+    try expectFloat("-0.000000", f, @as(f64, -0.0));
+    try expectFloat("0.000000", f, @as(f64, 1e-7));
+    try expectFloat("0.000", .{ .kind = 'f', .precision = 3 }, std.math.floatTrueMin(f64));
+    try expectFloat("0.100000", f, @as(f32, 0.1));
+    try expectFloat("0.1000000015", .{ .kind = 'f', .precision = 10 }, @as(f32, 0.1));
+    try expectFloat("+1.500000", .{ .kind = 'f', .plus = true }, @as(f64, 1.5));
+    try expectFloat(" 1.500000", .{ .kind = 'f', .space = true }, @as(f64, 1.5));
+    try expectFloat("999.999000", f, @as(f64, 999.999));
+    try expectFloat("1000.00", .{ .kind = 'f', .precision = 2 }, @as(f64, 999.999));
+    // %e
+    try expectFloat("1.500000e+020", e, @as(f64, 1.5e20));
+    try expectFloat("1.500000E-020", .{ .kind = 'E' }, @as(f64, 1.5e-20));
+    try expectFloat("1.23e+004", .{ .kind = 'e', .precision = 2 }, @as(f64, 12345.678));
+    try expectFloat("0.000000e+000", e, @as(f64, 0.0));
+    try expectFloat("2e+000", .{ .kind = 'e', .precision = 0 }, @as(f64, 2.5));
+    try expectFloat("1.2e+000", .{ .kind = 'e', .precision = 1 }, @as(f64, 1.25));
+    try expectFloat("1.4e+000", .{ .kind = 'e', .precision = 1 }, @as(f64, 1.35));
+    try expectFloat("1.000000e+023", e, @as(f64, 1e23));
+    try expectFloat("1.000000e+011", e, @as(f64, 9.9999999e10));
+    try expectFloat("-1.234e-004", .{ .kind = 'e', .precision = 3 }, @as(f64, -0.00012345));
+    try expectFloat("4.940656e-324", e, std.math.floatTrueMin(f64));
+    try expectFloat("1.000000e-001", e, @as(f32, 0.1));
+    // %g
+    try expectFloat("3", g, @as(f64, 3.0));
+    try expectFloat("1e+20", g, @as(f64, 1e20));
+    try expectFloat("0.0001", g, @as(f64, 0.0001));
+    try expectFloat("1e-05", g, @as(f64, 0.00001));
+    try expectFloat("3.14159", g, @as(f64, 3.14159265));
+    try expectFloat("123456", g, @as(f64, 123456.0));
+    try expectFloat("1.23457e+06", g, @as(f64, 1234567.0));
+    try expectFloat("100000", g, @as(f64, 100000.0));
+    try expectFloat("1e+06", g, @as(f64, 1000000.0));
+    try expectFloat("1E-20", .{ .kind = 'G' }, @as(f64, 1e-20));
+    try expectFloat("3.14", .{ .kind = 'g', .precision = 3 }, @as(f64, 3.14159));
+    try expectFloat("1.23e+03", .{ .kind = 'g', .precision = 3 }, @as(f64, 1234.0));
+    try expectFloat("10", g, @as(f64, 9.9999995));
+    try expectFloat("-0", g, @as(f64, -0.0));
+    try expectFloat("0.1", g, @as(f32, 0.1));
+    try expectFloat("1.79769e+308", g, std.math.floatMax(f64));
+    try expectFloat("2.5", .{ .kind = 'g', .precision = 0 }, @as(f64, 2.5));
+    try expectFloat("1.2345678901234568e+17", .{ .kind = 'g', .precision = 0 }, @as(f64, 123456789012345678.0));
+    try expectFloat("2", .{ .kind = 'g', .precision = 1 }, @as(f64, 2.5));
+    try expectFloat("0.3", .{ .kind = 'g', .precision = 1 }, @as(f64, 0.35));
+    try expectFloat("0.10000000000000000555", .{ .kind = 'g', .precision = 20 }, @as(f64, 0.1));
+    // `string x`
+    const p: Spec = .{};
+    try expectFloat("1", p, @as(f64, 1.0));
+    try expectFloat("1.5", p, @as(f64, 1.5));
+    try expectFloat("-0", p, @as(f64, -0.0));
+    try expectFloat("0.0001", p, @as(f64, 0.0001));
+    try expectFloat("1E-05", p, @as(f64, 0.00001));
+    try expectFloat("1.5E-05", p, @as(f64, 1.5e-5));
+    try expectFloat("100000000000000", p, @as(f64, 1e14));
+    try expectFloat("10000000000000000", p, @as(f64, 1e16));
+    try expectFloat("15000000000000000", p, @as(f64, 1.5e16));
+    try expectFloat("1E+17", p, @as(f64, 1e17));
+    try expectFloat("1.2345678901234568E+17", p, @as(f64, 123456789012345678.0));
+    try expectFloat("1E+20", p, @as(f64, 1e20));
+    try expectFloat("1.7976931348623157E+308", p, std.math.floatMax(f64));
+    try expectFloat("5E-324", p, std.math.floatTrueMin(f64));
+    try expectFloat("NaN", p, std.math.nan(f64));
+    try expectFloat("-Infinity", p, -std.math.inf(f64));
+    try expectFloat("0.1", p, @as(f32, 0.1));
+    try expectFloat("16777216", p, @as(f32, 16777216.0));
+    try expectFloat("100000000", p, @as(f32, 1e8));
+    try expectFloat("1E+09", p, @as(f32, 1e9));
+    try expectFloat("123456790", p, @as(f32, 123456789.0));
+    try expectFloat("3E-05", p, @as(f32, 3.0e-5));
+    try expectFloat("3.4028235E+38", p, std.math.floatMax(f32));
+}
+
+test "compare gives what .NET gives" {
+    try std.testing.expectEqual(@as(i32, -1), compare(str("abc"), str("abd")));
+    try std.testing.expectEqual(@as(i32, 1), compare(str("b"), str("abc")));
+    try std.testing.expectEqual(@as(i32, 32), compare(str("a"), str("A")));
+    try std.testing.expectEqual(@as(i32, 131), compare(str("é"), str("f")));
+    try std.testing.expectEqual(@as(i32, -97), compare(str(""), str("a")));
+    try std.testing.expectEqual(@as(i32, -2), compare(str("ab"), str("abcd")));
+    try std.testing.expectEqual(@as(i32, 0), compare(str("ab"), str("ab")));
+    try std.testing.expectEqual(@as(i32, -1), compare(@as(i32, 1), @as(i32, 2)));
+    try std.testing.expectEqual(@as(i32, 1), compare(true, false));
+    try std.testing.expectEqual(@as(i32, -1), compare(@as(u16, 'a'), @as(u16, 'c')));
+    const nan = std.math.nan(f64);
+    try std.testing.expectEqual(@as(i32, -1), compare(nan, @as(f64, 1.0)));
+    try std.testing.expectEqual(@as(i32, 1), compare(@as(f64, 1.0), nan));
+    try std.testing.expectEqual(@as(i32, 0), compare(nan, nan));
+}
+
+test "a failure carries its message" {
+    const before = thread.stats;
+    throw(Failure.new(.{ .Message = format(.{ "bad ", @as(i32, 7) }) }));
+    const e = take();
+    try std.testing.expect(Failure.is(e) and !ArgumentException.is(e));
+    try expectText("bad 7", exnMessage(e));
+    drop(e);
+    const other = ArgumentException.new(.{ .Message = str("no") });
+    try std.testing.expect(!Failure.is(other) and ArgumentException.is(other));
+    try expectText("no", exnMessage(other));
+    drop(other);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }
 
 test "conv follows .NET" {

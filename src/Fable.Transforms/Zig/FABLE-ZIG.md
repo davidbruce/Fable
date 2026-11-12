@@ -30,7 +30,7 @@ There is no separate Zig AST: the IR is the last structured form, and the emitte
 Module-level functions (also recursive, also across files), functions declared inside
 functions, lambdas and function values (see "Function values"), pipes and composition,
 literal module-level values,
-numbers, booleans and chars, `let`, `let mutable`, `if`, `while`, `for .. to`, arithmetic,
+numbers, booleans, chars and strings (see "Strings"), `let`, `let mutable`, `if`, `while`, `for .. to`, arithmetic,
 comparison, bitwise and boolean operators, conversions between numbers (`int`, `byte`,
 `float`, ... with .NET's results), pattern matching, and an `[<EntryPoint>]` whose result
 becomes the process exit code.
@@ -47,13 +47,14 @@ Types that are plain values, also when another file declares them:
 | tuple, struct tuple | `@Tuple(&.{ ... })` |
 | `option`, `voption` | `?T` |
 | `list` | `fable_rt.List(T)`, a recursive union of the runtime library |
+| `string` | `fable_rt.String`, a pointer to counted UTF-16 text; a literal is static data |
 | generic record or union | a Zig function from its type arguments to the type |
 | `unit` | `void`; a unit argument is passed, it has no size |
 
 with construction, copy-and-update, field access, pattern matching and structural equality.
 A record, union, tuple or option that holds a recursive union is still a plain value; the
-references inside it are counted. Not yet: members on types, ordering comparison, module-level
-values that are not literals, and the functions of the `List` module (literals, `::`,
+references inside it are counted. Not yet: members on types, ordering comparison of anything
+but numbers, chars, booleans and strings, module-level values that are not literals, and the functions of the `List` module (literals, `::`,
 patterns, `IsEmpty`, `Head` and `Tail` work).
 
 `[<Emit("...")>]` is supported for Zig text, with `$0`, `$1`, ... standing for the arguments.
@@ -295,11 +296,68 @@ A loop that builds a list top-down (`map`) stays a loop when it can raise: on th
 the hole is filled with the type's case without fields (`Nil`) and what was built is dropped.
 A type that has no such case makes the function recurse instead.
 
-Not yet: .NET's own exception classes and `failwith` (they carry a message, which needs
-strings), structural equality of exceptions, a `while` condition that can raise, and the
-exceptions .NET raises for a division by zero or a failed pattern match (those are still Zig
-panics). An exception that reaches the entry point is printed by name and the program exits
-with 134, as on .NET on Unix.
+`failwith`, `failwithf`, `invalidArg`, `invalidOp` and `nullArg` raise what they raise on
+.NET, with the same message (`invalidArg "n" "too big"` says "too big (Parameter 'n')"). The
+runtime library declares `System.Exception` and the classes a program most often raises or
+handles by name (`ArgumentException`, `ArgumentNullException`, `ArgumentOutOfRangeException`,
+`InvalidOperationException`, `NotSupportedException`, `NotImplementedException`,
+`IndexOutOfRangeException`, `DivideByZeroException`, `OverflowException`, `FormatException`,
+`KeyNotFoundException`): they can be made with a message (`raise (System.ArgumentException
+"...")`), matched (`Failure msg`, `:? System.ArgumentException as e`) and asked for their
+message (`e.Message`). Each is a type of its own: a handler for `ArgumentException` does not
+catch an `ArgumentNullException` as it would on .NET, because the runtime has no classes.
+
+Not yet: the message of an F# `exception` (`e.Message` gives its name, .NET gives the name
+with the fields), `e.StackTrace` and inner exceptions, classes that derive from one another,
+structural equality of exceptions, a `while` condition that can raise, and the exceptions
+.NET raises for a division by zero or a failed pattern match (those are still Zig panics). An
+exception that reaches the entry point is printed with its name and message, and the program
+exits with 134, as on .NET on Unix.
+
+## Strings
+
+A `string` is what it is on .NET: immutable UTF-16. `s.Length` and `s.[i]` count and give
+code units, so an emoji has length 2 here as there, and nothing a program computes from a
+string differs. In memory it is a pointer to a header (count and length, 8 bytes) that the
+units follow. A literal is static data of the program: its count is a fixed mark, so that
+making, copying and dropping one costs nothing and it is never freed.
+
+```zig
+pub fn greet(name: fable_rt.String) fable_rt.String {
+    return fable_rt.format(.{ "hello, ", name, "!" });
+}
+```
+
+A string is counted like a cell, by the same ownership pass: a parameter that is only read
+is borrowed, the last use moves. It can hold no reference, so the cycle collector never
+looks at one. `a + b + c` makes one string whatever the number of parts.
+
+Text from values is `fable_rt.format`: `sprintf`, `$"..."` and `string x` all become one call
+of it with the parts of the format, taken apart at compile time, so that no format string is
+read while the program runs and a value of a type that cannot be formatted is a compile
+error. `printf`, `printfn`, `eprintf` and `eprintfn` write such text as UTF-8 through
+`fable_rt.write_out` and `fable_rt.write_err`, which a program without an operating system
+sets to its own functions.
+
+The text is .NET's, character for character; the runtime library's tests hold what .NET 10
+prints for each case:
+
+- `%d %i %u %x %X %o %b %c %s %f %F %e %E %g %G %O` with width, precision and the flags `0`,
+  `-`, `+` and space; `{x}` and `%d{x}` in an interpolated string.
+- `%f` and `%e` round the exact value of the number, a tie to the even digit (`%.2f` of 2.675
+  is "2.67", of 0.125 "0.12"), from the number's exact decimal digits. `%e` writes three
+  exponent digits, `%g` at least two.
+- `string x` and `{x}` are the shortest text that reads back as the same number: in digits
+  from 10^-4 up to 10^17 (10^9 for a `float32`), as `1E+17` or `1E-05` outside of that.
+  `string 1.0` is "1".
+- `compare` on strings is by code unit and gives the number `String.CompareOrdinal` gives
+  (`compare "a" "A"` is 32); on a float, not-a-number comes first.
+
+Not yet: `%A`, a .NET format in an interpolated string (`{x:N2}`, `{x,5}`), a format that is
+not given all its values at once (`printfn "%d"` as a function value), `null` strings, and
+the `String` module and the methods of `System.String` beyond `Length`, indexing and
+concatenation (slicing, `Substring`, `Split`, `Join`, `StringBuilder`, ...). Appending to a
+string in a loop copies it each time, as on .NET.
 
 ## Tail calls
 
@@ -326,7 +384,9 @@ forced on the LLVM backend; elsewhere it is an ordinary call.
 4. ~~Closures and function values~~ (done), ~~generics~~ (done), ~~exceptions~~ (done for
    F# `exception` declarations), byrefs and spans.
 5. ~~Mutable reference records and the cycle collector~~ (done).
-6. Strings, collections and the rest of FSharp.Core through `Replacements.fs` and the library.
+6. ~~Strings, formatting and printing, exceptions with messages~~ (done); the `String`
+   module, arrays and the other collections, and the rest of FSharp.Core through
+   `Replacements.fs` and the library.
 7. The test suite (`tests/Zig`), starting from the tests the other targets share.
 
 ## Notes for the shared code
@@ -337,7 +397,8 @@ forced on the LLVM backend; elsewhere it is an ordinary call.
   to an import named after the declaring type (`dotnet:System.Math`, `Sqrt`). The lowering
   resolves those by their .NET names (`dotnetCall` in `Fable2Zig.Lower.fs`) or rejects them
   by name ("the Zig target does not support System.Math.Sqrt yet"). So far it knows
-  structural equality, `ignore`, `id`, `fst`, `snd` and the conversions between numbers.
+  structural equality, `compare`, `ignore`, `id`, `fst`, `snd`, the conversions between
+  numbers, strings and `printf`, the ref cell operators and the functions that raise.
 - Generated files import the hand-written runtime (`fable_rt.zig`, copied into
   `fable_modules/fable-library-zig`) only when they use it. It has its own Zig tests
   (`zig test src/fable-library-zig/fable_rt.zig`). Its type introspection uses the
