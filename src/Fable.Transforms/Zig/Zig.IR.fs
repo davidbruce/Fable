@@ -18,6 +18,9 @@ type EntKind =
     | KValueUnion
     /// recursive union or reference record: `union(enum)` of refcounted cell pointers
     | KHeapUnion
+    /// a record with mutable fields, or one that contains itself: a pointer to a
+    /// reference-counted cell, so that it has an identity, as on .NET
+    | KRefRecord
     /// an F# `exception` declaration: its values have the type `exn`
     | KExn
 
@@ -31,6 +34,8 @@ type Ent =
         TypeParams: string list
         /// records: one case named ""
         mutable Cases: (string * (string * Ty) list) list
+        /// the fields of a record that can be assigned
+        mutable MutableFields: string list
         /// holds references to cells whatever its type arguments are
         mutable Managed: bool
         mutable Copyable: bool
@@ -339,6 +344,8 @@ type FnInfo =
         /// it and the caller does not drop it)
         mutable RetFrom: int list option
         mutable Raises: Raises
+        /// can it (or what it calls) assign a field of a reference record?
+        mutable Stores: bool
         /// a lambda or a function declared inside another one: not visible to other files
         IsLocal: bool
         IsEntryPoint: bool
@@ -378,6 +385,17 @@ let rec typeOf (e: Expr) : Ty =
     | EFor _
     | EAssign _
     | EStore _ -> tVoid
+
+/// Is this a read of (or through) a field that can be assigned? What such a read yields may
+/// be replaced in the record at any later time.
+let rec touchesMutable (e: Expr) : bool =
+    match e with
+    | EGet(x, proj, _) ->
+        (match proj, typeOf x with
+         | PField f, TEnt(ent, _) -> List.contains f ent.MutableFields
+         | _ -> false)
+        || touchesMutable x
+    | _ -> false
 
 let isFlat (e: Expr) =
     match e with
@@ -474,8 +492,10 @@ let rec isPure (e: Expr) =
     // (a function value that captures nothing is a constant; one that captures allocates)
     | EClosure(_, _, xs, _) -> xs.IsEmpty
     // (a constructor that allocates a cell is not pure)
+    | ECon(TEnt({ Kind = KRefRecord }, _), _, _, _) -> false
     | ECon(t, _, xs, None) -> (not (isHeapTy t) || xs.IsEmpty) && List.forall isPure xs
-    | EGet(x, _, _)
+    // (what a field that can be assigned holds depends on when it is read)
+    | EGet(x, _, _) -> not (touchesMutable e) && isPure x
     | EExnTest(x, _)
     | EExnGet(x, _, _, _)
     | ETest(x, _, _) -> isPure x

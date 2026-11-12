@@ -130,6 +130,7 @@ let private settleManaged (state: FileState) =
         for e in state.Ents.Values do
             let m =
                 e.Kind = KHeapUnion
+                || e.Kind = KRefRecord
                 || e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> isManagedDecl))
 
             if m <> e.Managed then
@@ -154,6 +155,7 @@ let private listEnt (state: FileState) : Ent =
                 Kind = KHeapUnion
                 TypeParams = [ "T" ]
                 Cases = []
+                MutableFields = []
                 Managed = true
                 Copyable = true
                 IsLocal = false
@@ -161,6 +163,33 @@ let private listEnt (state: FileState) : Ent =
 
         e.Cases <- [ "Empty", []; "Cons", [ "Head", TGen "T"; "Tail", TEnt(e, [ TGen "T" ]) ] ]
         state.Ents[listName] <- e
+        e
+
+let private refName = "Microsoft.FSharp.Core.FSharpRef`1"
+
+/// F#'s `ref` cell: a generic reference record that the runtime library declares.
+let private refEnt (state: FileState) : Ent =
+    match state.Ents.TryGetValue refName with
+    | true, e -> e
+    | _ ->
+        let e =
+            {
+                Name = "fable_rt.Ref"
+                Ref =
+                    {
+                        FullName = refName
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KRefRecord
+                TypeParams = [ "T" ]
+                Cases = [ "", [ "contents", TGen "T" ] ]
+                MutableFields = [ "contents" ]
+                Managed = true
+                Copyable = true
+                IsLocal = false
+            }
+
+        state.Ents[refName] <- e
         e
 
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
@@ -197,6 +226,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.GenericParam(name = name) -> TGen name
     | Fable.DeclaredType(ent, _) when ent.FullName = "System.Exception" -> tExn
+    | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
     | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapType ctx r))
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
@@ -220,18 +250,12 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
 
         let recursive = reachesSelf ctx.Com true ent
 
-        if ent.IsFSharpRecord && recursive && reachesSelf ctx.Com false ent then
-            fail r "the Zig target does not support recursive records yet (%s)" ent.DisplayName
-
-        if
+        // A record that can be assigned to (and is not a struct), or that contains itself, is a
+        // reference: a pointer to a counted cell.
+        let isReference =
             ent.IsFSharpRecord
-            && not ent.IsValueType
-            && ent.FSharpFields |> List.exists (fun f -> f.IsMutable)
-        then
-            fail
-                r
-                "the Zig target does not support records with mutable fields yet (%s): they need the cycle collector"
-                ent.DisplayName
+            && ((recursive && reachesSelf ctx.Com false ent)
+                || (not ent.IsValueType && ent.FSharpFields |> List.exists (fun f -> f.IsMutable)))
 
         // a name in this file, or `alias.name` for a type another file declares
         let name, isLocal =
@@ -245,7 +269,9 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 Name = name
                 Ref = entRef
                 Kind =
-                    if not ent.IsFSharpUnion then
+                    if isReference then
+                        KRefRecord
+                    elif not ent.IsFSharpUnion then
                         KRecord
                     elif recursive then
                         KHeapUnion
@@ -253,6 +279,13 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                         KValueUnion
                 TypeParams = ent.GenericParameters |> List.map (fun g -> g.Name)
                 Cases = []
+                MutableFields =
+                    if ent.IsFSharpRecord then
+                        ent.FSharpFields
+                        |> List.filter (fun f -> f.IsMutable)
+                        |> List.map (fun f -> f.Name)
+                    else
+                        []
                 Managed = false
                 Copyable = true
                 IsLocal = isLocal
@@ -310,6 +343,7 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
                     Kind = KExn
                     TypeParams = []
                     Cases = []
+                    MutableFields = []
                     Managed = false
                     Copyable = true
                     IsLocal = isLocal
@@ -401,8 +435,11 @@ let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr
                 | EClosure _
                 | EEmit _ -> true
                 // (a constructor argument is an owning position)
+                | ECon(TEnt({ Kind = KRefRecord }, _), _, _, _) -> not conArgs
                 | ECon(_, _, xs, _) -> not conArgs && not xs.IsEmpty
                 | EExnNew _ -> not conArgs
+                // (what a field that can be assigned holds is read where the program reads it)
+                | EGet _ -> touchesMutable ir
                 | _ -> false
             ))
 
@@ -827,7 +864,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 let v = xs.Head
 
                 match kind, typeOf v with
-                | Fable.FieldGet info, TEnt(ent, _) when ent.Kind = KRecord -> EGet(v, PField info.Name, ty)
+                | Fable.FieldGet info, TEnt(ent, _) when ent.Kind = KRecord || ent.Kind = KRefRecord ->
+                    EGet(v, PField info.Name, ty)
                 | Fable.TupleIndex i, TTuple _ -> EGet(v, PItem i, ty)
                 | Fable.UnionField info, TEnt(ent, _) ->
                     let case, fields = List.item info.CaseIndex ent.Cases
@@ -954,6 +992,21 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 applyValue ctx r subst first c.Ret rest t
         | Some c -> applyValue ctx r Map.empty (fnValue ctx r applied c applied.Type) applied.Type args t
         | None -> applyValue ctx r Map.empty (lw ctx applied) applied.Type args t
+
+    // `record.Field <- value`
+    | Fable.Set(x, Fable.FieldSet name, t, value, r) ->
+        bindArgs
+            ctx
+            [ lw ctx x; lw ctx value ]
+            (fun xs ->
+                match typeOf xs[0] with
+                | TEnt(ent, _) as recTy when List.contains name ent.MutableFields ->
+                    let fieldTy =
+                        caseFields recTy "" |> List.tryFind (fun (f, _) -> f = name) |> Option.map snd
+
+                    EStore(EGet(xs[0], PField name, defaultArg fieldTy (mapType ctx r t)), xs[1])
+                | _ -> fail r "the Zig target does not support this kind of assignment yet"
+            )
 
     | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, r) ->
         match ctx.Vars.TryGetValue id.Name with
@@ -1223,6 +1276,7 @@ and liftGroup
                 Body = bodyIr
                 RetFrom = None
                 Raises = RNever
+                Stores = false
                 IsLocal = true
                 IsEntryPoint = false
                 Range = body.Range
@@ -1249,7 +1303,32 @@ and dotnetCall
         | Some this -> this :: info.Args
         | None -> info.Args
 
+    let contents (cell: Expr) =
+        match typeOf cell with
+        | TEnt(_, [ elem ]) -> EGet(cell, PField "contents", elem)
+        | _ -> fail r "internal: not a ref cell"
+
     match entity, name, args with
+    // ref cells: `ref x`, `!r` and `r.Value`, `r := x` and `r.Value <- x`, `incr`, `decr`
+    | "Microsoft.FSharp.Core.Operators", "Ref", [ x ] ->
+        bindArgsIn true ctx [ lw ctx x ] (fun xs -> ECon(TEnt(refEnt ctx.State, [ typeOf xs.Head ]), "", xs, None))
+    | "Microsoft.FSharp.Core.Operators", "op_Dereference", [ cell ]
+    | "Microsoft.FSharp.Core.FSharpRef`1", ("get_Value" | "get_contents"), cell :: _ ->
+        bindArgs ctx [ lw ctx cell ] (fun xs -> contents xs.Head)
+    | "Microsoft.FSharp.Core.Operators", "op_ColonEquals", [ cell; value ]
+    | "Microsoft.FSharp.Core.FSharpRef`1", ("set_Value" | "set_contents"), [ cell; value ] ->
+        bindArgs ctx [ lw ctx cell; lw ctx value ] (fun xs -> EStore(contents xs[0], xs[1]))
+    | "Microsoft.FSharp.Core.Operators", ("Increment" | "Decrement"), [ cell ] ->
+        let op =
+            if name = "Increment" then
+                "add"
+            else
+                "sub"
+
+        bindArgs
+            ctx
+            [ lw ctx cell ]
+            (fun xs -> EStore(contents xs.Head, EPrim(op, [ contents xs.Head; ELit("1", tI32) ], tI32)))
     // lists: what does not need a loop is a test or a field
     | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
       ("get_IsEmpty" | "IsEmpty"),
@@ -1425,6 +1504,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         Body = body
                         RetFrom = None
                         Raises = RNever
+                        Stores = false
                         IsLocal = false
                         IsEntryPoint = entry
                         Range = d.Body.Range

@@ -103,7 +103,7 @@ let private nameProjections (state: FileState) (body: Expr) : Expr =
     /// a stable path that starts at a managed variable
     let isRead (e: Expr) =
         match e with
-        | EGet _ when isStablePath e ->
+        | EGet _ when isStablePath e && not (touchesMutable e) ->
             match rootOf e with
             | Some r -> isManaged r.Ty
             | None -> false
@@ -453,6 +453,54 @@ let rec private hoistRaising (p: P) (e: Expr) : Expr =
         wrap binds e'
 
 // =============================================================================================
+// Reference records: which code can assign a field. A value read from such a field is only a
+// borrow while nothing can assign.
+// =============================================================================================
+
+/// Can evaluating `e` assign a field of a reference record? A function of another file and a
+/// function value are taken to: this file cannot see what they do.
+let rec private mayStore (p: P) (e: Expr) : bool =
+    let any (es: Expr list) = es |> List.exists (mayStore p)
+
+    match e with
+    | EStore(lv, r) ->
+        (match lv with
+         | EGet(x, _, _) ->
+             match typeOf x with
+             | TEnt({ Kind = KRefRecord }, _) -> true
+             | _ -> false
+         | _ -> false)
+        || mayStore p r
+    | ECall(f, _, xs, _) ->
+        (match p.Fns.TryGetValue f with
+         | true, g -> g.Stores
+         | _ -> true)
+        || any xs
+    | ECallClo _ -> true
+    | ELet(_, r, b)
+    | ESeq(r, b)
+    | EWhile(r, b) -> any [ r; b ]
+    | EIf(c, t, f, _) -> any [ c; t; f ]
+    | EFor(_, a, b, _, body) -> any [ a; b; body ]
+    | EAssign(_, r) -> mayStore p r
+    | ETry(b, _, h, _) -> any [ b; h ]
+    | EDrop(_, k)
+    | EUnpack(_, k)
+    | EPromote(_, k) -> mayStore p k
+    | _ -> any (flatKids e)
+
+let private inferStores (p: P) : unit =
+    let mutable changed = true
+
+    while changed do
+        changed <- false
+
+        for fn in p.State.Fns do
+            if not fn.Stores && mayStore p fn.Body then
+                fn.Stores <- true
+                changed <- true
+
+// =============================================================================================
 // Borrow inference: a managed parameter is borrowed unless the body consumes it (returns it,
 // stores it, passes it to an owning parameter) or matches on it while building the same type
 // (a reuse site).
@@ -549,6 +597,8 @@ let rec private borrowSources (p: P) (fn: FnInfo) (aliases: Map<int, Set<int>>) 
         match fn.Params |> List.tryFindIndex (fun q -> q.Id = v.Id) with
         | Some i -> Some(Set.singleton i)
         | None -> aliases.TryFind v.Id
+    // (what was read from a field that can be assigned is never returned as a borrow)
+    | EGet _ when touchesMutable e -> None
     | EGet(x, _, _) -> borrowSources p fn aliases x
     | ECon(_, _, [], _) -> Some Set.empty // a constructor without fields owns nothing
     | ECall(g, _, args, _) ->
@@ -1025,7 +1075,7 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
 /// can be assigned: it may hold another value by the time the knowledge is used.)
 let private refine (env: PEnv) (c: Expr) : PEnv * PEnv =
     match c with
-    | ETest(x, case, ty) when (pathKey x).IsSome && isStablePath x ->
+    | ETest(x, case, ty) when (pathKey x).IsSome && isStablePath x && not (touchesMutable x) ->
         let key = (pathKey x).Value
         let envT = { env with Known = env.Known.Add(key, case) }
         let excl = Set.add case (defaultArg (env.Excluded.TryFind key) Set.empty)
@@ -1150,7 +1200,23 @@ and private pcNode (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
             assign
     | EStore(lv, rhs) ->
         let lv', _, _ = rewriteFlat p env lv false (Set.union (fv rhs) L)
-        EStore(lv', pcFlat p env rhs L true)
+        // The record that is stored into has to outlive the store: when this is its last use,
+        // it is given up after the store, not once the new value has been computed.
+        let lvVars = fv lv
+        let lAfter = expand env L
+
+        let dying =
+            Set.intersect env.Owned (expand env lvVars)
+            |> Set.filter (fun x -> not (lAfter.Contains x))
+            |> Set.toList
+            |> List.map (fun x -> p.State.Vars[x])
+
+        let store = EStore(lv', pcFlat p env rhs (Set.union lvVars L) true)
+
+        if dying.IsEmpty then
+            store
+        else
+            ESeq(store, wrapDrops dying EUnit)
     | ERaise(x, ty) ->
         // the exception moves into the runtime's slot; everything else this function owns is
         // given up before it leaves
@@ -1260,7 +1326,15 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
         // reference.)
         let env1, isAlias =
             match rhs with
-            | EGet(x, proj, _) when isManaged v.Ty && not v.FMutable && isStablePath x ->
+            // (Nor is a read of a field that can be assigned, if anything while the name is in
+            // use may assign a field: the field could get another value and give this one up.
+            // A walk that only reads a mutable structure stays free of reference counting.)
+            | EGet(x, proj, _) when
+                isManaged v.Ty
+                && not v.FMutable
+                && isStablePath x
+                && (not (touchesMutable rhs) || not (mayStore p body))
+                ->
                 let env1 =
                     match rootOf x with
                     | Some r -> { env with Owners = env.Owners.Add(v.Id, [ r.Id ]) }
@@ -1282,7 +1356,8 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
                 isManaged v.Ty
                 && not v.FMutable
                 && isBorrowedRet p g
-                && p.Fns[g].RetFrom.Value |> List.forall (fun i -> isStablePath args[i])
+                && p.Fns[g].RetFrom.Value
+                   |> List.forall (fun i -> isStablePath args[i] && not (touchesMutable args[i]))
                 ->
                 // the result is a borrow of the source arguments: they stay alive while it is live
                 let srcs =
@@ -1394,6 +1469,7 @@ let run (state: FileState) : unit =
         fn.Body <- cleanup fn.Body
 
     inferRaises p
+    inferStores p
 
     for fn in state.Fns do
         located

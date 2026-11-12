@@ -42,6 +42,8 @@ Types that are plain values, also when another file declares them:
 | record without mutable fields | `struct` |
 | union that does not contain itself | `union(enum)`, one payload struct per case |
 | union that contains itself | `union(enum)` whose cases point to reference-counted cells |
+| record with mutable fields (not a struct), record that contains itself | a pointer to a reference-counted cell |
+| `ref` cell | `fable_rt.Ref(T)`, such a record of the runtime library |
 | tuple, struct tuple | `@Tuple(&.{ ... })` |
 | `option`, `voption` | `?T` |
 | `list` | `fable_rt.List(T)`, a recursive union of the runtime library |
@@ -50,9 +52,9 @@ Types that are plain values, also when another file declares them:
 
 with construction, copy-and-update, field access, pattern matching and structural equality.
 A record, union, tuple or option that holds a recursive union is still a plain value; the
-references inside it are counted. Not yet: recursive records and records with mutable fields,
-members on types, ordering comparison, module-level values that are not literals, and the
-functions of the `List` module (literals, `::`, patterns, `IsEmpty`, `Head` and `Tail` work).
+references inside it are counted. Not yet: members on types, ordering comparison, module-level
+values that are not literals, and the functions of the `List` module (literals, `::`,
+patterns, `IsEmpty`, `Head` and `Tail` work).
 
 `[<Emit("...")>]` is supported for Zig text, with `$0`, `$1`, ... standing for the arguments.
 
@@ -182,6 +184,29 @@ Functions cannot capture `let mutable` variables (F# does not allow it either).
 Not yet: a higher-order function is not specialised for the lambda it is given, so each call
 through a function value is an indirect call.
 
+## Records that can be assigned
+
+A record with mutable fields is a reference on .NET: two names for it see each other's
+assignments. So it is a pointer to a counted cell here, and so are a record that contains
+itself and a `ref` cell. Its equality is still structural, as in F#.
+
+- `r.F <- v` is `fable_rt.store(&r.F, v)`: the field takes ownership of the new value and
+  the old one is given up once the new one is in place.
+- A value read from a field that can be assigned is a borrow only while nothing can assign a
+  field: if anything in the rest of the scope may (an assignment, a call of a function that
+  assigns, of a function of another file or of a function value, which this file cannot see
+  into), the read gets a reference of its own, because the field could be given another value
+  while the read one is still in use. A function that only walks a mutable structure
+  therefore does no reference counting at all.
+- Nothing is remembered about what such a field holds, and such reads are not moved to the
+  start of their branch: they happen where the program does them.
+
+**Cycles are not collected yet.** A structure that reaches itself through a field that can be
+assigned (or through a `ref` cell captured by a function stored in it) is never freed by
+reference counting alone. In builds that count cells, the program says so when its entry
+point returns. The cycle collector (per-structure counts) is the next step; until then such
+programs leak.
+
 ## Exceptions
 
 `raise`, `try ... with`, `try ... finally` and `reraise ()`, for exceptions declared with F#'s
@@ -250,7 +275,7 @@ forced on the LLVM backend; elsewhere it is an ordinary call.
    files"). Whether a function of another file can raise will be stated the same way.
 4. ~~Closures and function values~~ (done), ~~generics~~ (done), ~~exceptions~~ (done for
    F# `exception` declarations), byrefs and spans.
-5. Mutable reference records and the cycle collector.
+5. ~~Mutable reference records~~ (done) and the cycle collector.
 6. Strings, collections and the rest of FSharp.Core through `Replacements.fs` and the library.
 7. The test suite (`tests/Zig`), starting from the tests the other targets share.
 

@@ -4,7 +4,8 @@ module QuickTest
 // functions (also recursive and across files), pattern matching, records, unions, tuples
 // and options. Heap.fs and Stress.fs cover recursive unions (reference-counted cells),
 // Functions.fs covers lambdas, local functions and function values, Generics.fs covers
-// generic types and functions and F#'s list, Exceptions.fs covers raise and try.
+// generic types and functions and F#'s list, Exceptions.fs covers raise and try,
+// Records.fs covers records that can be assigned and ref cells.
 // The entry point returns the number of failed checks as the process exit code.
 
 let limit = 10
@@ -334,3 +335,4 @@ let main _ =
     + Functions.run ()
     + Generics.run ()
     + Exceptions.run ()
+    + Records.run ()

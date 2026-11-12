@@ -4,7 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const interface_version: i32 = 6;
+pub const interface_version: i32 = 7;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -186,6 +186,7 @@ pub fn drop(x: anytype) void {
         return;
     }
     switch (@typeInfo(T)) {
+        .pointer => dropRecord(T, x),
         .optional => if (x) |v| drop(v),
         .@"struct" => |s| inline for (s.field_names) |name| drop(@field(x, name)),
         .@"union" => if (comptime isHeapUnion(T)) dropHeap(T, x) else switch (x) {
@@ -233,6 +234,37 @@ fn dropHeap(comptime T: type, x: T) void {
     }
 }
 
+/// A reference record. Its last field of the record's own type (or an option of it) is
+/// followed in a loop, so giving up a long chain of records does not use stack in proportion
+/// to its length.
+fn dropRecord(comptime P: type, x: P) void {
+    const info = @typeInfo(@typeInfo(P).pointer.child).@"struct";
+    const self_field: ?usize = comptime blk: {
+        var found: ?usize = null;
+        for (info.field_types, 0..) |F, i| {
+            if (F == P or F == ?P) found = i;
+        }
+        break :blk found;
+    };
+    var cur = x;
+    while (true) {
+        if (!releaseIsLast(cur)) return;
+        inline for (info.field_names, 0..) |name, i| {
+            if (comptime !isCount(name) and (self_field == null or self_field.? != i)) {
+                drop(@field(cur, name));
+            }
+        }
+        if (self_field) |i| {
+            const next: ?P = @field(cur, info.field_names[i]);
+            free(cur);
+            cur = next orelse return;
+        } else {
+            free(cur);
+            return;
+        }
+    }
+}
+
 /// Structural equality, as F#'s `=` on records, unions, tuples and options.
 pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     const T = @TypeOf(a);
@@ -270,6 +302,28 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
         },
         else => comptime unreachable,
     }
+}
+
+/// A new reference record (a record with mutable fields, or one that contains itself): a
+/// pointer to a counted cell that holds the fields.
+pub inline fn new(comptime P: type, init: @typeInfo(P).pointer.child) P {
+    const c = allocator.create(@typeInfo(P).pointer.child) catch @panic("fable: out of memory");
+    c.* = init;
+    if (track) stats.allocs += 1;
+    return c;
+}
+
+/// Store into a field that owns its value: the old value is given up once the new one is in
+/// place.
+pub inline fn store(place: anytype, value: @TypeOf(place.*)) void {
+    const old = place.*;
+    place.* = value;
+    drop(old);
+}
+
+/// F#'s `ref` cell.
+pub fn Ref(comptime T: type) type {
+    return *struct { @"$rc": u32 = 1, contents: T };
 }
 
 /// F#'s list.
@@ -738,6 +792,29 @@ test "an exception owns its fields and is taken by one handler" {
     // a function that calls nothing that raises has a plain result
     try std.testing.expect(@TypeOf(testPlain(1)) == i32);
     try std.testing.expect(@TypeOf(testOuter(1)) == Raised!i32);
+}
+
+const TestNode = *struct { @"$rc": u32 = 1, id: i32, next: ?TestNode };
+
+test "reference records: identity, stores and long chains" {
+    const before = stats;
+    var head: TestNode = new(TestNode, .{ .id = 0, .next = null });
+    var i: i32 = 1;
+    while (i < 200_000) : (i += 1) head = new(TestNode, .{ .id = i, .next = head });
+    const second = dup(head.next.?);
+    // the field gets a new value: the old one stays alive through `second`
+    store(&head.next, null);
+    try std.testing.expectEqual(@as(i32, 199_998), second.id);
+    const box = new(Ref(TestList), .{ .contents = testRange(3) });
+    const alias = dup(box);
+    store(&alias.contents, testRange(5));
+    try std.testing.expectEqual(@as(i32, 15), testSum(box.contents));
+    try std.testing.expect(eql(box, alias));
+    drop(head);
+    drop(second);
+    drop(box);
+    drop(alias);
+    try std.testing.expectEqual(stats.allocs - before.allocs, stats.frees - before.frees);
 }
 
 test "conv follows .NET" {

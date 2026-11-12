@@ -489,6 +489,7 @@ let rec ex (em: Em) (e: Expr) : string =
             |> String.concat ", "
 
         match t with
+        | TEnt(e, _) when e.Kind = KRefRecord -> $"fable_rt.new(%s{zigType t}, .{{ %s{inits (caseFields t case)} }})"
         | TEnt(e, _) when e.Kind = KRecord -> $"%s{zigType t}{{ %s{inits (caseFields t case)} }}"
         | TEnt _ when args.IsEmpty -> $"@as(%s{zigType t}, .%s{fieldIdent case})"
         | TEnt(e, _) when e.Kind = KHeapUnion ->
@@ -841,6 +842,24 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
             block rhs (fun lbl -> $"%s{vname em v} = %s{lbl}: {{")
 
         finishUnit em ind dest
+    // A field that owns its value: the old value is given up once the new one is in place.
+    | EStore(lv, rhs) ->
+        let place = ex em lv
+
+        let value =
+            if isFlat rhs || isSimpleIf rhs then
+                ex em rhs
+            else
+                let stored = freshName em "stored"
+                block rhs (fun lbl -> $"const %s{stored}: %s{zigType (typeOf lv)} = %s{lbl}: {{")
+                stored
+
+        if isManaged (typeOf lv) then
+            L $"fable_rt.store(&%s{place}, %s{value});"
+        else
+            L $"%s{place} = %s{value};"
+
+        finishUnit em ind dest
     | EDrop(v, k) ->
         L(dropCode (vname em v))
         stmt em ind k dest
@@ -991,6 +1010,34 @@ let ensureUsed (names: string list) (body: string) =
     |> List.map (fun n -> $"    _ = %s{n};\n")
     |> String.concat ""
 
+/// The variables that hold a value record of which a field is assigned (they are declared
+/// with `var`; a reference record is assigned through its pointer).
+let private storedInto (body: Expr) : Set<int> =
+    let found = HashSet<int>()
+
+    let rec root (e: Expr) =
+        match e with
+        | EVar v ->
+            match v.Ty with
+            | TEnt({ Kind = KRefRecord }, _) -> ()
+            | _ -> found.Add v.Id |> ignore
+        | EGet(x, _, _) ->
+            match typeOf x with
+            | TEnt({ Kind = KRefRecord }, _) -> ()
+            | _ -> root x
+        | _ -> ()
+
+    exists
+        (function
+        | EStore(lv, _) ->
+            root lv
+            false
+        | _ -> false)
+        body
+    |> ignore
+
+    Set.ofSeq found
+
 let private hasManaged (fn: FnInfo) =
     isManaged fn.Ret || fn.Params |> List.exists (fun p -> isManaged p.Ty)
 
@@ -1062,7 +1109,7 @@ let emitFunction
             Out = StringBuilder()
             Names = Dictionary()
             Used = HashSet(rootNames)
-            Mutated = assignedIn fn.Body
+            Mutated = Set.union (assignedIn fn.Body) (storedInto fn.Body)
             Loop = loop
             Self = fn
             Fns = fns
@@ -1399,6 +1446,24 @@ let emitFile (state: FileState) : string =
                 "    "
 
         match e.Kind with
+        | KRefRecord ->
+            // a pointer to a counted cell that holds the fields
+            let payload = "@\"$rc\": u32 = 1" :: fields (snd e.Cases.Head) |> String.concat ", "
+
+            match e.TypeParams with
+            | [] ->
+                out.Append($"pub const %s{topIdent e.Name} = *struct {{ %s{payload} }}")
+                |> ignore
+            | typeParams ->
+                let comptimeParams =
+                    typeParams
+                    |> List.map (fun g -> $"comptime %s{genName g}: type")
+                    |> String.concat ", "
+
+                out.Append(
+                    $"pub fn %s{topIdent e.Name}(%s{comptimeParams}) type {{\n    return *struct {{ %s{payload} }};\n}}"
+                )
+                |> ignore
         | KExn ->
             let payload = fields (snd e.Cases.Head) |> String.concat ", "
 
@@ -1435,7 +1500,14 @@ let emitFile (state: FileState) : string =
                     out.AppendLine($"%s{ind}    %s{fieldIdent c}: *struct {{ %s{payload} }},")
                     |> ignore
 
-        if e.Kind = KExn then
+        if e.Kind = KRefRecord then
+            (if e.TypeParams.IsEmpty then
+                 out.AppendLine(";")
+             else
+                 out.AppendLine())
+                .AppendLine()
+            |> ignore
+        elif e.Kind = KExn then
             out.AppendLine(";").AppendLine() |> ignore
         else
             out.AppendLine(closing).AppendLine() |> ignore
