@@ -503,9 +503,11 @@ let rec ex (em: Em) (e: Expr) : string =
             let raw = freshName em "raw"
 
             $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) (%s{raw} catch %s{edge}) else %s{raw}; }})"
-    | EEmit(macro, xs, _)
-    | ERt(macro, xs, _) ->
+    | EEmit(macro, xs, ty)
+    | ERt(macro, xs, ty) ->
         let args = xs |> List.map (ex em) |> Array.ofList
+        // (`$R` in a call into the runtime library is the type of its result)
+        let macro = macro.Replace("$R", zigType ty)
 
         Regex.Replace(
             macro,

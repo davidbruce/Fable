@@ -15,6 +15,7 @@
     <Compile Include="Cycles.fs" />
     <Compile Include="Strings.fs" />
     <Compile Include="Text.fs" />
+    <Compile Include="Arrays.fs" />
     <Compile Include="QuickTest.fs" />
   </ItemGroup>
   <ItemGroup>

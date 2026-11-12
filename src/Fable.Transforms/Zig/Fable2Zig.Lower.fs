@@ -160,9 +160,10 @@ let private settleCyclic (state: FileState) =
     let cells = state.Ents.Values |> Seq.filter isCell |> List.ofSeq
 
     /// the cell types a value of this type refers to directly (looking through plain values),
-    /// and whether it holds a function value or an exception
-    let rec targets (seen: HashSet<Ent>) (t: Ty) : Ent list * bool =
-        let all (parts: (Ent list * bool) list) =
+    /// each with whether the reference is one that can be assigned later (what an array or a
+    /// ref cell holds), and whether the value holds a function value or an exception
+    let rec targets (seen: HashSet<Ent>) (t: Ty) : (Ent * bool) list * bool =
+        let all (parts: ((Ent * bool) list * bool) list) =
             parts |> List.collect fst, parts |> List.exists snd
 
         match t with
@@ -171,13 +172,23 @@ let private settleCyclic (state: FileState) =
         | TEnt(e, args) ->
             let own =
                 if isCell e then
-                    [ e ], false
+                    [ e, false ], false
                 elif seen.Add e then
                     e.Cases |> List.collect snd |> List.map (snd >> targets seen) |> all
                 else
                     [], false
 
-            all (own :: (args |> List.map (targets seen)))
+            // (the type arguments of a cell with assignable fields are what those fields hold)
+            let assignable = isCell e && not e.MutableFields.IsEmpty
+
+            let inArgs =
+                args
+                |> List.map (fun arg ->
+                    let tgts, any = targets seen arg
+                    tgts |> List.map (fun (tgt, a) -> tgt, a || assignable), any
+                )
+
+            all (own :: inArgs)
         | TOpt t -> targets seen t
         | TTuple ts -> all (ts |> List.map (targets seen))
         | _ -> [], false
@@ -194,8 +205,8 @@ let private settleCyclic (state: FileState) =
                 if any then
                     reachesAny.Add e |> ignore
 
-                for tgt in tgts do
-                    edges.Add((e, tgt, List.contains f e.MutableFields))
+                for (tgt, assignable) in tgts do
+                    edges.Add((e, tgt, assignable || List.contains f e.MutableFields))
 
     let succ (e: Ent) =
         edges
@@ -287,6 +298,14 @@ let private settleCycles (state: FileState) =
 
                     if not (freeGens [ fieldTy ]).IsEmpty then
                         generic <- true
+        // (a new array is a cell whose items can be assigned)
+        | EEmit(_, _, TEnt({ Name = "fable_rt.Array" }, [ item ]))
+        | ERt(_, _, TEnt({ Name = "fable_rt.Array" }, [ item ])) ->
+            if reachesOpaque item then
+                holds <- true
+
+            if not (freeGens [ item ]).IsEmpty then
+                generic <- true
         | ECall(_, typeArgs, _, _)
         | EClosure(_, typeArgs, _, _) ->
             if List.exists reachesOpaque typeArgs then
@@ -390,6 +409,39 @@ let private dotnetExnEntIn (state: FileState) (fullName: string) : Ent =
         e
 
 /// F#'s `ref` cell: a generic reference record that the runtime library declares.
+/// F#'s array: a cell of the runtime library whose items can be assigned.
+let private arrayEnt (state: FileState) : Ent =
+    match state.Ents.TryGetValue "$array" with
+    | true, e -> e
+    | _ ->
+        let e =
+            {
+                Name = "fable_rt.Array"
+                Ref =
+                    {
+                        FullName = "System.Array"
+                        Path = Fable.CoreAssemblyName "System.Runtime"
+                    }
+                Kind = KRefRecord
+                TypeParams = [ "T" ]
+                Cases = [ "", [ "items", TGen "T" ] ]
+                MutableFields = [ "items" ]
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        state.Ents["$array"] <- e
+        state.UsesRuntime <- true
+        e
+
+let private isArrayTy (t: Ty) =
+    match t with
+    | TEnt({ Name = "fable_rt.Array" }, _) -> true
+    | _ -> false
+
 let private refEnt (state: FileState) : Ent =
     match state.Ents.TryGetValue refName with
     | true, e -> e
@@ -448,6 +500,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Tuple(ts, _) -> TTuple(ts |> List.map (mapType ctx r))
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
+    | Fable.Array(t, _) -> TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
     | Fable.GenericParam(name = name) -> TGen name
     | Fable.DeclaredType(ent, _) when dotnetExceptions.ContainsKey ent.FullName -> tExn
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
@@ -1125,6 +1178,21 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 ctx
                 (values |> List.map (lw ctx))
                 (fun xs -> ECon(TTuple(xs |> List.map typeOf), "", xs, None))
+        // `[| a; b |]`, and an array of a given length
+        | Fable.NewArray(Fable.ArrayValues values, t, _) ->
+            let ty = TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
+            let holes = values |> List.mapi (fun i _ -> $"$%d{i}") |> String.concat ", "
+
+            bindArgs
+                ctx
+                (values |> List.map (lw ctx))
+                (fun xs -> EEmit($"fable_rt.arrayOf($R, .{{ %s{holes} }})", xs, ty))
+        | Fable.NewArray(Fable.ArrayAlloc size, t, _) ->
+            let ty = TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
+            bindArgs ctx [ lw ctx size ] (fun xs -> ERt("fable_rt.arrayZero($R, $0)", xs, ty))
+        | Fable.NewArray(Fable.ArrayFrom(Uncast source), t, _) when source.Type = Fable.List t ->
+            let ty = TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
+            bindArgs ctx [ lw ctx source ] (fun xs -> EEmit("fable_rt.arrayOfList($R, $0)", xs, ty))
         | Fable.NewList(headAndTail, t) ->
             let ty = TEnt(listEnt ctx.State, [ mapType ctx r t ])
 
@@ -1696,6 +1764,7 @@ and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
         | Fable.Unit
         | Fable.GenericParam _ -> ()
         | Fable.Option(inner, false)
+        | Fable.Array(inner, _)
         | Fable.List inner -> go inner
         | Fable.Option(_, true) -> fail r "the Zig target cannot write a voption with %%A yet"
         | Fable.Tuple(ts, false) -> List.iter go ts
@@ -1907,7 +1976,11 @@ and applyValue
             match fTy with
             | Fable.LambdaType(_, ret) -> 1, ret
             | Fable.DelegateType(ts, ret) -> ts.Length, ret
-            | _ -> fail r "the Zig target cannot apply a value of this type"
+            | _ ->
+                // (Fable does not always say what type an item of an array has: the value does)
+                match typeOf f with
+                | TFn(ps, _) when ps.Length = args.Length -> ps.Length, finalTy
+                | other -> fail r "the Zig target cannot apply a value of this type (%A, %A)" fTy other
 
         if args.Length < take then
             fail r "the Zig target does not support applying a function to some of its arguments here yet"
@@ -2172,6 +2245,62 @@ and dotnetCall
         mapType ctx r x.Type = mapType ctx r t
         ->
         lw ctx x
+    // ---- arrays ----
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetArray", [ a; i ]
+    | "Microsoft.FSharp.Collections.ArrayModule", "Get", [ a; i ] ->
+        // (where the item is a function that is applied at once, Fable gives the read the type
+        // of the application: the type of the array is the one to go by)
+        let itemTy =
+            match a.Type with
+            | Fable.Array(item, _) -> item
+            | _ -> t
+
+        rt "fable_rt.arrayGet($0, $1)" [ a; i ] (mapType ctx r itemTy)
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "SetArray", [ a; i; x ]
+    | "Microsoft.FSharp.Collections.ArrayModule", "Set", [ a; i; x ] ->
+        rt "fable_rt.arraySet($0, $1, $2)" [ a; i; x ] tVoid
+    | "System.Array", "get_Length", [ a ]
+    | "Microsoft.FSharp.Collections.ArrayModule", "Length", [ a ] -> pure' "fable_rt.arrayLen($0)" [ a ] tI32
+    | "Microsoft.FSharp.Collections.ArrayModule", "IsEmpty", [ a ] -> pure' "(fable_rt.arrayLen($0) == 0)" [ a ] tBool
+    | "Microsoft.FSharp.Collections.ArrayModule", "Empty", [] -> pure' "fable_rt.arrayOf($R, .{})" [] (mapType ctx r t)
+    | "Microsoft.FSharp.Core.Operators.OperatorIntrinsics", "GetArraySlice", [ a; lo; hi ] ->
+        pure' "fable_rt.arraySlice($0, $1, $2)" [ a; lo; hi ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "ZeroCreate", [ n ] ->
+        rt "fable_rt.arrayZero($R, $0)" [ n ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Create", [ n; x ] ->
+        rt "fable_rt.arrayCreate($R, $0, $1)" [ n; x ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Initialize", [ n; f ] ->
+        rt "fable_rt.arrayInit($R, $0, $1)" [ n; f ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Copy", [ a ] ->
+        pure' "fable_rt.arrayCopy($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Append", [ a; b ] ->
+        pure' "fable_rt.arrayAppend($0, $1)" [ a; b ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Reverse", [ a ] ->
+        pure' "fable_rt.arrayRev($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "GetSubArray", [ a; start; n ] ->
+        rt "fable_rt.arraySub($0, $1, $2)" [ a; start; n ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Fill", [ a; start; n; x ] ->
+        rt "fable_rt.arrayFill($0, $1, $2, $3)" [ a; start; n; x ] tVoid
+    | "Microsoft.FSharp.Collections.ArrayModule", "OfList", [ xs ] ->
+        pure' "fable_rt.arrayOfList($R, $0)" [ xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "ToList", [ a ] ->
+        pure' "fable_rt.arrayToList($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Contains", [ x; a ] ->
+        pure' "fable_rt.arrayContains(@as(fable_rt.ItemOf(@TypeOf($1)), $0), $1)" [ x; a ] tBool
+    | "Microsoft.FSharp.Collections.ArrayModule", "Map", [ f; a ] ->
+        rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "MapIndexed", [ f; a ] ->
+        rt "fable_rt.arrayMapi($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Iterate", [ f; a ] -> rt "fable_rt.arrayIter($0, $1)" [ f; a ] tVoid
+    | "Microsoft.FSharp.Collections.ArrayModule", "IterateIndexed", [ f; a ] ->
+        rt "fable_rt.arrayIteri($0, $1)" [ f; a ] tVoid
+    | "Microsoft.FSharp.Collections.ArrayModule", "Fold", [ f; state; a ] ->
+        rt "fable_rt.arrayFold($0, @as($R, $1), $2)" [ f; state; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Filter", [ f; a ] ->
+        rt "fable_rt.arrayFilter($0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Exists", [ f; a ] -> rt "fable_rt.arrayExists($0, $1)" [ f; a ] tBool
+    | "Microsoft.FSharp.Collections.ArrayModule", "ForAll", [ f; a ] -> rt "fable_rt.arrayForall($0, $1)" [ f; a ] tBool
+
     // ---- chars: each code unit to what .NET maps it to (there is no current culture) ----
     | "System.Char", ("ToUpper" | "ToUpperInvariant"), [ c ] -> pure' "fable_rt.unicode.toUpper($0)" [ c ] tChar
     | "System.Char", ("ToLower" | "ToLowerInvariant"), [ c ] -> pure' "fable_rt.unicode.toLower($0)" [ c ] tChar
@@ -2494,6 +2623,11 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
         )
 
     let decls = membersOf file.Declarations
+
+    // (for work on the target: what Fable hands over for a file)
+    if System.Environment.GetEnvironmentVariable "FABLE_ZIG_DUMP" = "1" then
+        for d in file.Declarations do
+            eprintfn "DUMP %A" d
 
     // What the file declares is known before any body is lowered: bodies call each other.
     for d in decls do

@@ -47,6 +47,7 @@ Types that are plain values, also when another file declares them:
 | tuple, struct tuple | `@Tuple(&.{ ... })` |
 | `option`, `voption` | `?T` |
 | `list` | `fable_rt.List(T)`, a recursive union of the runtime library |
+| array | `fable_rt.Array(T)`, a counted cell that holds the items |
 | `string` | `fable_rt.String`, a pointer to counted UTF-16 text or null; a literal is static data |
 | generic record or union | a Zig function from its type arguments to the type |
 | `unit` | `void`; a unit argument is passed, it has no size |
@@ -201,6 +202,25 @@ itself and a `ref` cell. Its equality is still structural, as in F#.
   therefore does no reference counting at all.
 - Nothing is remembered about what such a field holds, and such reads are not moved to the
   start of their branch: they happen where the program does them.
+
+## Arrays
+
+An array is a counted cell that holds its items, with an identity as on .NET: two names for
+one array see each other's assignments, and `=` compares the items. An index outside the
+array raises `IndexOutOfRangeException`. `a.[i]` gives a reference of its own to the item;
+`a.[i] <- x` gives up the item that was there and tells the collector, because an array is
+where a cycle can be closed like a record with an assignable field (the cycle analysis takes
+what an array, a ref cell or any generic cell with assignable fields holds as assignable).
+
+`[| ... |]`, indexing, slices (`a.[1..3]`, lenient at both ends as in F#), `for x in a`,
+`.Length`, and of the `Array` module: `length`, `isEmpty`, `empty`, `get`, `set`,
+`zeroCreate`, `create`, `init`, `copy`, `append`, `rev`, `sub`, `fill`, `ofList`, `toList`,
+`contains`, `map`, `mapi`, `iter`, `iteri`, `fold`, `filter`, `exists`, `forall`.
+
+Not yet: `Array.zeroCreate n` for items that have no null here (records, unions, functions:
+only the empty array can be made that way; use `Array.create` or `Array.init`), arrays of
+more than one dimension, the rest of the `Array` module, and reading an item without a
+reference of its own where the array is only looked at.
 
 ## Cycles
 

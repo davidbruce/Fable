@@ -342,3 +342,4 @@ let main _ =
     + Cycles.run ()
     + Strings.run ()
     + Text.run ()
+    + Arrays.run ()

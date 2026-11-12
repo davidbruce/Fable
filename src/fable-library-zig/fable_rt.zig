@@ -7,7 +7,7 @@ const root = @import("root");
 pub const sgc = @import("fable_sgc.zig");
 pub const unicode = @import("fable_unicode.zig");
 
-pub const interface_version: i32 = 11;
+pub const interface_version: i32 = 12;
 
 // ---------------------------------------------------------------------------------------------
 // Cells
@@ -151,7 +151,15 @@ fn movedOut(_: void, h: *sgc.Hdr) void {
 
 pub inline fn free(c: anytype) void {
     if (track) thread.stats.frees += 1;
+    // (an array's items are a block of their own)
+    if (comptime @hasDecl(@TypeOf(c.*), "fable_array")) allocator.free(c.items);
     allocator.destroy(c);
+}
+
+/// The items of an array, as a field of its cell.
+fn isSlice(comptime T: type) bool {
+    const info = @typeInfo(T);
+    return info == .pointer and info.pointer.size == .slice;
 }
 
 /// The count and the collector's header are not part of what a cell holds.
@@ -171,6 +179,7 @@ pub fn isManaged(comptime T: type) bool {
     if (T == String) return true;
     if (isCellPtr(T)) return true;
     if (comptime isFunc(T)) return true;
+    if (isSlice(T)) return isManaged(@typeInfo(T).pointer.child);
     switch (@typeInfo(T)) {
         .optional => |o| return isManaged(o.child),
         .@"struct" => |s| {
@@ -243,6 +252,10 @@ pub fn drop(x: anytype) void {
         return;
     }
     if (T == String) return strRelease(x);
+    if (comptime isSlice(T)) {
+        for (x) |item| drop(item);
+        return;
+    }
     switch (@typeInfo(T)) {
         .pointer => dropRecord(T, x),
         .optional => if (x) |v| drop(v),
@@ -326,6 +339,15 @@ fn dropRecord(comptime P: type, x: P) void {
 /// Structural equality, as F#'s `=` on records, unions, tuples and options.
 pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     const T = @TypeOf(a);
+    if (comptime isSlice(T)) {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (!eql(x, y)) return false;
+        }
+        return true;
+    }
+    // (an array is equal to another with equal items, as F#'s `=` has it)
+    if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or eql(a.items, b.items);
     if (comptime !isManaged(T)) return std.meta.eql(a, b);
     if (comptime isFunc(T)) @compileError("function values cannot be compared");
     if (T == Exn) return a == b;
@@ -426,6 +448,321 @@ pub fn List(comptime T: type) type {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Arrays
+//
+// An F# array is a counted cell that holds its items, with an identity as on .NET: two names
+// for one array see each other's assignments. An item that is read is a reference of its own;
+// an item that is assigned gives up the one that was there. An index outside the array raises
+// what it raises on .NET.
+// ---------------------------------------------------------------------------------------------
+
+/// F#'s array of `T`.
+pub fn Array(comptime T: type) type {
+    return *struct {
+        pub const fable_array = T;
+        pub const fable_cyclic = holdsCyclic(T);
+        @"$rc": u32 = 1,
+        @"$gc": GcHdr(fable_cyclic) = undefined,
+        items: []T,
+    };
+}
+
+/// The type of the items of the array type `A`.
+pub fn ItemOf(comptime A: type) type {
+    return @typeInfo(A).pointer.child.fable_array;
+}
+
+fn arrayItems(comptime A: type, n: usize) []ItemOf(A) {
+    return allocator.alloc(ItemOf(A), n) catch @panic("fable: out of memory");
+}
+
+/// A new array that owns `items`.
+fn arrayFrom(comptime A: type, items: []ItemOf(A)) A {
+    const C = @typeInfo(A).pointer.child;
+    if (comptime hasGc(C)) gcTick();
+    const c = allocator.create(C) catch @panic("fable: out of memory");
+    c.* = .{ .items = items };
+    if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
+    if (track) thread.stats.allocs += 1;
+    return c;
+}
+
+/// `[| a; b; c |]`
+pub fn arrayOf(comptime A: type, values: anytype) A {
+    const items = arrayItems(A, values.len);
+    inline for (values, 0..) |v, i| items[i] = dup(@as(ItemOf(A), v));
+    return arrayFrom(A, items);
+}
+
+/// Is all-zero memory a value of this type? (It is .NET's null, zero, false and None.)
+fn hasZero(comptime T: type) bool {
+    if (T == String) return true;
+    return switch (@typeInfo(T)) {
+        .int, .float, .bool, .void, .optional => true,
+        .@"struct" => |s| blk: {
+            if (@hasDecl(T, "fable_func")) break :blk false;
+            for (s.field_types) |F| {
+                if (!hasZero(F)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+/// `Array.zeroCreate n`. .NET fills the array with null where the items are records, unions
+/// or functions; here those have no null, so only an empty array of them can be made this
+/// way (anything longer raises `NotSupportedException`).
+pub fn arrayZero(comptime A: type, n: i32) Raised!A {
+    if (n < 0) return countNegative(n);
+    const items = arrayItems(A, @intCast(n));
+    if (comptime hasZero(ItemOf(A))) {
+        @memset(items, comptime std.mem.zeroes(ItemOf(A)));
+    } else if (n != 0) {
+        allocator.free(items);
+        return raise(NotSupportedException, str("Array.zeroCreate of a type without a null value: use Array.create or Array.init"));
+    }
+    return arrayFrom(A, items);
+}
+
+/// `Array.create n x`
+pub fn arrayCreate(comptime A: type, n: i32, x: ItemOf(A)) Raised!A {
+    if (n < 0) return countNegative(n);
+    const items = arrayItems(A, @intCast(n));
+    for (items) |*item| item.* = dup(x);
+    return arrayFrom(A, items);
+}
+
+/// Give up the first `n` of the items that were being made for an array.
+fn arrayAbandon(items: anytype, n: usize) void {
+    for (items[0..n]) |item| drop(item);
+    allocator.free(items);
+}
+
+/// `Array.init n f`
+pub fn arrayInit(comptime A: type, n: i32, f: anytype) Raised!A {
+    if (n < 0) return countNegative(n);
+    const items = arrayItems(A, @intCast(n));
+    for (items, 0..) |*item, i| {
+        item.* = f.code(f.env, @as(i32, @intCast(i))) catch |e| {
+            arrayAbandon(items, i);
+            return e;
+        };
+    }
+    return arrayFrom(A, items);
+}
+
+pub inline fn arrayLen(a: anytype) i32 {
+    return @intCast(a.items.len);
+}
+
+fn indexOutside() Raised {
+    return raise(IndexOutOfRangeException, str("Index was outside the bounds of the array."));
+}
+
+/// `a.[i]`: a reference of its own to the item.
+pub inline fn arrayGet(a: anytype, i: i32) Raised!ItemOf(@TypeOf(a)) {
+    if (i < 0 or i >= a.items.len) return indexOutside();
+    return dup(a.items[@intCast(i)]);
+}
+
+/// `a.[i] <- value`. The collector is told what the array no longer points at and what it
+/// points at now: this is where a cycle can be closed.
+pub inline fn arraySet(a: anytype, i: i32, value: ItemOf(@TypeOf(a))) Raised!void {
+    if (i < 0 or i >= a.items.len) return indexOutside();
+    arrayPut(a, @intCast(i), dup(value));
+}
+
+fn arrayPut(a: anytype, i: usize, value: ItemOf(@TypeOf(a))) void {
+    const old = a.items[i];
+    a.items[i] = value;
+    if (gcOf(a)) |h| {
+        eachHdr(old, h, unstored);
+        eachHdr(value, h, stored);
+    } else {
+        touch(value);
+    }
+    drop(old);
+}
+
+/// A new array of the items of `a` from `from` that are `n`: they are known to be inside.
+fn arrayPart(a: anytype, from: usize, n: usize) @TypeOf(a) {
+    const A = @TypeOf(a);
+    const items = arrayItems(A, n);
+    for (items, a.items[from..][0..n]) |*to, item| to.* = dup(item);
+    return arrayFrom(A, items);
+}
+
+/// `a.[lo..hi]`: what of it is inside the array.
+pub fn arraySlice(a: anytype, lo: ?i32, hi: ?i32) @TypeOf(a) {
+    const len: i32 = @intCast(a.items.len);
+    const from: i32 = @max(lo orelse 0, 0);
+    const to: i32 = @min(hi orelse len - 1, len - 1);
+    if (to < from) return arrayPart(a, 0, 0);
+    return arrayPart(a, @intCast(from), @intCast(to - from + 1));
+}
+
+/// `Array.copy a`
+pub fn arrayCopy(a: anytype) @TypeOf(a) {
+    return arrayPart(a, 0, a.items.len);
+}
+
+/// `Array.sub a start count`
+pub fn arraySub(a: anytype, start: i32, count: i32) Raised!@TypeOf(a) {
+    if (start < 0) return raise(ArgumentException, format(.{ "The input must be non-negative.\nstartIndex = ", start, " (Parameter 'startIndex')" }));
+    if (count < 0) return countNegative(count);
+    const len: i32 = @intCast(a.items.len);
+    if (start + count > len) return raise(ArgumentOutOfRangeException, format(.{ "The index is outside the legal range.\ncount = ", count, ", array.Length = ", len, " (Parameter 'count')" }));
+    return arrayPart(a, @intCast(start), @intCast(count));
+}
+
+/// `Array.append a b`
+pub fn arrayAppend(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    const A = @TypeOf(a);
+    const items = arrayItems(A, a.items.len + b.items.len);
+    for (items[0..a.items.len], a.items) |*to, item| to.* = dup(item);
+    for (items[a.items.len..], b.items) |*to, item| to.* = dup(item);
+    return arrayFrom(A, items);
+}
+
+/// `Array.rev a`
+pub fn arrayRev(a: anytype) @TypeOf(a) {
+    const A = @TypeOf(a);
+    const n = a.items.len;
+    const items = arrayItems(A, n);
+    for (items, 0..) |*to, i| to.* = dup(a.items[n - 1 - i]);
+    return arrayFrom(A, items);
+}
+
+/// `Array.fill a start count x`
+pub fn arrayFill(a: anytype, start: i32, count: i32, x: ItemOf(@TypeOf(a))) Raised!void {
+    if (start < 0) return raise(ArgumentException, format(.{ "The input must be non-negative.\nstartIndex = ", start, " (Parameter 'startIndex')" }));
+    if (count < 0) return countNegative(count);
+    var i = start;
+    while (i < start + count) : (i += 1) {
+        if (i >= a.items.len) return indexOutside();
+        arrayPut(a, @intCast(i), dup(x));
+    }
+}
+
+/// `Array.ofList xs`
+pub fn arrayOfList(comptime A: type, xs: List(ItemOf(A))) A {
+    var n: usize = 0;
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) n += 1;
+    const items = arrayItems(A, n);
+    rest = xs;
+    for (items) |*to| {
+        to.* = dup(rest.Cons.Head);
+        rest = rest.Cons.Tail;
+    }
+    return arrayFrom(A, items);
+}
+
+/// The list of `items`, each a new reference.
+fn listOf(comptime T: type, items: []const T) List(T) {
+    var all: List(T) = .Empty;
+    var i = items.len;
+    while (i > 0) {
+        i -= 1;
+        const tail = all;
+        all = .{ .Cons = cell(List(T), .Cons, .{ .Head = dup(items[i]), .Tail = tail }) };
+    }
+    return all;
+}
+
+/// `Array.toList a`
+pub fn arrayToList(a: anytype) List(ItemOf(@TypeOf(a))) {
+    return listOf(ItemOf(@TypeOf(a)), a.items);
+}
+
+/// `Array.contains x a`
+pub fn arrayContains(x: anytype, a: Array(@TypeOf(x))) bool {
+    for (a.items) |item| {
+        if (eql(item, x)) return true;
+    }
+    return false;
+}
+
+/// `Array.map f a`
+pub fn arrayMap(comptime A: type, f: anytype, a: anytype) Raised!A {
+    const items = arrayItems(A, a.items.len);
+    for (items, 0..) |*to, i| {
+        to.* = f.code(f.env, dup(a.items[i])) catch |e| {
+            arrayAbandon(items, i);
+            return e;
+        };
+    }
+    return arrayFrom(A, items);
+}
+
+/// `Array.mapi f a`
+pub fn arrayMapi(comptime A: type, f: anytype, a: anytype) Raised!A {
+    const items = arrayItems(A, a.items.len);
+    for (items, 0..) |*to, i| {
+        to.* = apply2(ItemOf(A), f, @as(i32, @intCast(i)), dup(a.items[i])) catch |e| {
+            arrayAbandon(items, i);
+            return e;
+        };
+    }
+    return arrayFrom(A, items);
+}
+
+/// `Array.iter f a`
+pub fn arrayIter(f: anytype, a: anytype) Raised!void {
+    for (0..a.items.len) |i| try f.code(f.env, dup(a.items[i]));
+}
+
+/// `Array.iteri f a`
+pub fn arrayIteri(f: anytype, a: anytype) Raised!void {
+    for (0..a.items.len) |i| try apply2(void, f, @as(i32, @intCast(i)), dup(a.items[i]));
+}
+
+/// `Array.fold f state a`: `state` is the caller's, the result is a reference of its own.
+pub fn arrayFold(f: anytype, state: anytype, a: anytype) Raised!@TypeOf(state) {
+    var acc = dup(state);
+    for (0..a.items.len) |i| acc = try apply2(@TypeOf(state), f, acc, dup(a.items[i]));
+    return acc;
+}
+
+/// `Array.filter f a`
+pub fn arrayFilter(f: anytype, a: anytype) Raised!@TypeOf(a) {
+    const A = @TypeOf(a);
+    const keep = allocator.alloc(bool, a.items.len) catch @panic("fable: out of memory");
+    defer allocator.free(keep);
+    var n: usize = 0;
+    for (keep, 0..) |*k, i| {
+        k.* = try f.code(f.env, dup(a.items[i]));
+        n += @intFromBool(k.*);
+    }
+    const items = arrayItems(A, n);
+    var at: usize = 0;
+    for (keep, 0..) |k, i| {
+        if (k and i < a.items.len and at < n) {
+            items[at] = dup(a.items[i]);
+            at += 1;
+        }
+    }
+    return arrayFrom(A, items);
+}
+
+/// `Array.exists f a`
+pub fn arrayExists(f: anytype, a: anytype) Raised!bool {
+    for (0..a.items.len) |i| {
+        if (try f.code(f.env, dup(a.items[i]))) return true;
+    }
+    return false;
+}
+
+/// `Array.forall f a`
+pub fn arrayForall(f: anytype, a: anytype) Raised!bool {
+    for (0..a.items.len) |i| {
+        if (!try f.code(f.env, dup(a.items[i]))) return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Cycles
 //
 // Reference counting alone never frees a structure that reaches itself. A structure can only
@@ -505,6 +842,7 @@ pub fn holdsCyclic(comptime T: type) bool {
     if (T == Exn) return functions_in_cycles;
     switch (@typeInfo(T)) {
         .pointer => |p| {
+            if (p.size == .slice) return holdsCyclic(p.child);
             if (p.size != .one or @typeInfo(p.child) != .@"struct") return false;
             return @hasDecl(p.child, "fable_cyclic") and p.child.fable_cyclic;
         },
@@ -539,6 +877,10 @@ fn eachHdr(x: anytype, ctx: anytype, comptime f: anytype) void {
         if (x.env) |e| {
             if (e.gc) |h| f(ctx, h);
         }
+        return;
+    }
+    if (comptime isSlice(T)) {
+        for (x) |item| eachHdr(item, ctx, f);
         return;
     }
     switch (@typeInfo(T)) {
@@ -576,6 +918,10 @@ fn dropOutside(x: anytype) void {
             }
         }
         return drop(x);
+    }
+    if (comptime isSlice(T)) {
+        for (x) |item| dropOutside(item);
+        return;
     }
     switch (@typeInfo(T)) {
         .pointer => if (!sgc.isGarbage(&x.@"$gc")) drop(x),
@@ -2170,7 +2516,19 @@ pub const Shower = struct {
             .int => return if (T == u16) b.char(x) else b.number(x),
             .float => return b.number(x),
             .optional => return if (x) |v| b.case("Some", .{v}, prec, depth) else b.word("None"),
-            .pointer => {
+            .pointer => |ptr| {
+                if (comptime @hasDecl(ptr.child, "fable_array")) {
+                    if (x.items.len == 0) return b.word("[||]");
+                    var items: std.ArrayList(*Layout) = .empty;
+                    for (x.items) |item| {
+                        if (items.items.len == print_length) {
+                            items.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+                            break;
+                        }
+                        items.append(b.arena, b.show(item, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
+                    }
+                    return b.tight(b.tight(b.ascii(false, "[|", true), b.separated(items.items, ";")), b.ascii(true, "|]", false));
+                }
                 // a reference record
                 const addr: *const anyopaque = @ptrCast(x);
                 for (b.path[0..b.on_path]) |seen| {
@@ -3542,6 +3900,40 @@ test "exception classes derive as on .NET, division raises" {
     try expectRaised(DivideByZeroException, "Attempted to divide by zero.", rem(u8, 5, 0));
     try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", div(i32, std.math.minInt(i32), -1));
     try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", rem(i64, std.math.minInt(i64), -1));
+}
+
+test "arrays: identity, items, what they raise" {
+    const before = thread.stats;
+    const A = Array(String);
+    const bc = strConcat(str("b"), str("c"));
+    const a = arrayOf(A, .{ str("a"), bc, str("d") });
+    drop(bc);
+    try std.testing.expectEqual(@as(i32, 3), arrayLen(a));
+    try expectText("bc", try arrayGet(a, 1));
+    const made = strConcat(str("x"), str("y"));
+    try arraySet(a, 0, made);
+    drop(made);
+    try expectText("xy", try arrayGet(a, 0));
+    try expectRaised(IndexOutOfRangeException, "Index was outside the bounds of the array.", arrayGet(a, 3));
+    try expectRaised(IndexOutOfRangeException, "Index was outside the bounds of the array.", arraySet(a, -1, str("z")));
+    const copy = arrayCopy(a);
+    try std.testing.expect(eql(a, copy) and a != copy);
+    try expectAny("[|\"xy\"; \"bc\"; \"d\"|]", a);
+    const part = arraySlice(a, 1, 5);
+    try expectAny("[|\"bc\"; \"d\"|]", part);
+    const none = arraySlice(a, 2, 1);
+    try expectAny("[||]", none);
+    try expectRaised(ArgumentOutOfRangeException, "The index is outside the legal range.\ncount = 5, array.Length = 3 (Parameter 'count')", arraySub(a, 1, 5));
+    const zeros = try arrayZero(Array(?i32), 2);
+    try expectAny("[|None; None|]", zeros);
+    try expectRaised(ArgumentException, "The input must be non-negative.\ncount = -1 (Parameter 'count')", arrayZero(Array(i32), -1));
+    const list = arrayToList(a);
+    const back = arrayOfList(A, list);
+    try std.testing.expect(eql(a, back));
+    for ([_]A{ a, copy, part, none, back }) |x| drop(x);
+    drop(zeros);
+    drop(list);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }
 
 test "conv follows .NET" {
