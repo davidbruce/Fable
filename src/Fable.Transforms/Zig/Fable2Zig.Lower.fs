@@ -855,6 +855,13 @@ let private tObj = TPrim "fable_rt.Obj"
 /// `obj`: an object (of a class, or a boxed value), or null
 let private tAny = TOpt tObj
 
+/// A dictionary: .NET's, or what F#'s `dict` and `readOnlyDict` give
+let private isDictionaryName (name: string) =
+    name = "System.Collections.Generic.Dictionary`2"
+    || name = "System.Collections.Generic.IDictionary`2"
+    || name = "System.Collections.Generic.IReadOnlyDictionary`2"
+
+
 let private isClassEntity (ent: Fable.Entity) =
     not (
         ent.IsFSharpRecord
@@ -938,8 +945,13 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Text.StringBuilder" ->
         TEnt(netEnt ctx.State "StringBuilder", [])
     | Fable.Array(t, _) -> TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
-    | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Collections.Generic.Dictionary`2" ->
+    | Fable.DeclaredType(ent, [ k; v ]) when isDictionaryName ent.FullName ->
         TEnt(netEnt ctx.State "Dictionary", [ mapType ctx r k; mapType ctx r v ])
+    // (`d.Keys` and `d.Values`: the list of them)
+    | Fable.DeclaredType(ent, [ k; _ ]) when ent.FullName = "System.Collections.Generic.Dictionary`2.KeyCollection" ->
+        TEnt(listEnt ctx.State, [ mapType ctx r k ])
+    | Fable.DeclaredType(ent, [ _; v ]) when ent.FullName = "System.Collections.Generic.Dictionary`2.ValueCollection" ->
+        TEnt(listEnt ctx.State, [ mapType ctx r v ])
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Collections.Generic.HashSet`1" ->
         TEnt(netEnt ctx.State "HashSet", [ mapType ctx r t ])
     | Fable.GenericParam(name = name) -> TGen name
@@ -3766,6 +3778,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     | None -> fail r "the Zig target cannot find the member %s of this interface" info.Name
             )
 
+    // (a dictionary seen as `IDictionary` or `IReadOnlyDictionary`: the same here)
+    | Fable.TypeCast(x, Fable.DeclaredType(target, _)) when
+        isDictionaryName target.FullName
+        && (
+            match x.Type with
+            | Fable.DeclaredType(ent, _) -> isDictionaryName ent.FullName
+            | _ -> false
+        )
+        ->
+        match x with
+        // (`upcast Dictionary()`: the new dictionary is of the type it is cast to, whose type
+        // arguments F# knows)
+        | Fable.Call(callee, info, _, cr) -> lw ctx (Fable.Call(callee, info, e.Type, cr))
+        | _ -> lw ctx x
     // a collection given where a sequence is expected: a sequence that walks it
     | Fable.TypeCast(x, Fable.DeclaredType(seqRef, [ item ])) when
         seqRef.FullName = "System.Collections.Generic.IEnumerable`1"
@@ -5598,6 +5624,58 @@ and dotnetCall
             let fn = name.Substring(0, 1).ToLowerInvariant() + name.Substring(1)
             libraryCall ctx r "ResizeArray" fn info args t
         | _ -> fail r "the Zig target does not support ResizeArray.%s yet" name
+    // (F#'s `dict` and `readOnlyDict`: dictionaries that cannot be changed)
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators", ("CreateDictionary" | "CreateReadOnlyDictionary"), [ pairs ] ->
+        match forInSource ctx pairs with
+        | Some(listIr, "list") ->
+            bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.dictOfList($R, $0, true)", xs, mapType ctx r t))
+        | Some(seqIr, "seq") ->
+            let itemTy = itemOf seqIr
+
+            bindArgs
+                ctx
+                [ seqIr ]
+                (fun xs ->
+                    bindArgs
+                        ctx
+                        [
+                            ECall(
+                                libraryTarget ctx "Seq" "toList",
+                                [ itemTy ],
+                                xs,
+                                TEnt(listEnt ctx.State, [ itemTy ])
+                            )
+                        ]
+                        (fun ls -> EEmit("fable_rt.dictOfList($R, $0, true)", ls, mapType ctx r t))
+                )
+        | _ -> fail r "the Zig target does not support dict of this kind of sequence yet"
+    // `Dictionary(other)`: a copy of another dictionary or of a map
+    | "System.Collections.Generic.Dictionary`2", ".ctor", [ Uncast source ] when
+        (match source.Type with
+         | Fable.DeclaredType(ent, _) -> isDictionaryName ent.FullName || ent.FullName = mapName
+         | _ -> false)
+        ->
+        match forInSource ctx source with
+        | Some(listIr, "list") ->
+            bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.dictOfList($R, $0, false)", xs, mapType ctx r t))
+        | _ -> fail r "the Zig target cannot copy this into a Dictionary yet"
+    | ("System.Collections.Generic.IDictionary`2" | "System.Collections.Generic.IReadOnlyDictionary`2"), _, _ ->
+        dotnetCall ctx r "System.Collections.Generic.Dictionary`2" name info t
+    // (what a dictionary is as a collection of its entries)
+    | ("System.Collections.Generic.ICollection`1" | "System.Collections.Generic.IReadOnlyCollection`1"),
+      ("get_Count" | "Clear"),
+      [ d ] when
+        (match d.Type with
+         | Fable.DeclaredType(ent, _) -> isDictionaryName ent.FullName
+         | _ -> false)
+        ->
+        if name = "Clear" then
+            rt "fable_rt.htClear($0)" [ d ] tVoid
+        else
+            pure' "fable_rt.htCount($0)" [ d ] tI32
+    | ("System.Collections.Generic.Dictionary`2.KeyCollection" | "System.Collections.Generic.Dictionary`2.ValueCollection"),
+      "get_Count",
+      [ xs ] -> pure' "fable_rt.listCount($0)" [ xs ] tI32
     | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"), ".ctor", [] ->
         pure' "fable_rt.htNew($R)" [] (mapType ctx r t)
     | "System.Collections.Generic.HashSet`1", ".ctor", [ Uncast xs ] when (listItem xs.Type).IsSome ->
@@ -5609,13 +5687,13 @@ and dotnetCall
     | "System.Collections.Generic.Dictionary`2", _, d :: rest ->
         match name, rest with
         | "Add", [ k; v ] -> rt "fable_rt.dictAdd($0, $1, $2)" [ d; k; v ] tVoid
-        | "set_Item", [ k; v ] -> pure' "fable_rt.dictSet($0, $1, $2)" [ d; k; v ] tVoid
+        | "set_Item", [ k; v ] -> rt "fable_rt.dictSet($0, $1, $2)" [ d; k; v ] tVoid
         | "get_Item", [ k ] -> rt "fable_rt.dictGet($0, $1)" [ d; k ] (mapType ctx r t)
         | "ContainsKey", [ k ] -> pure' "fable_rt.dictContainsKey($0, $1)" [ d; k ] tBool
         | "ContainsValue", [ v ] -> pure' "fable_rt.dictContainsValue($0, $1)" [ d; v ] tBool
-        | "Remove", [ k ] -> pure' "fable_rt.htRemove($0, $1)" [ d; k ] tBool
+        | "Remove", [ k ] -> rt "fable_rt.htRemove($0, $1)" [ d; k ] tBool
         | "get_Count", [] -> pure' "fable_rt.htCount($0)" [ d ] tI32
-        | "Clear", [] -> pure' "fable_rt.htClear($0)" [ d ] tVoid
+        | "Clear", [] -> rt "fable_rt.htClear($0)" [ d ] tVoid
         | "get_Keys", [] -> pure' "fable_rt.dictKeys($0)" [ d ] (mapType ctx r t)
         | "get_Values", [] -> pure' "fable_rt.dictValues($0)" [ d ] (mapType ctx r t)
         | "TryGetValue", [ k; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
@@ -5645,9 +5723,9 @@ and dotnetCall
         match name, rest with
         | "Add", [ x ] -> pure' "fable_rt.setAdd($0, $1)" [ h; x ] tBool
         | "Contains", [ x ] -> pure' "fable_rt.dictContainsKey($0, $1)" [ h; x ] tBool
-        | "Remove", [ x ] -> pure' "fable_rt.htRemove($0, $1)" [ h; x ] tBool
+        | "Remove", [ x ] -> rt "fable_rt.htRemove($0, $1)" [ h; x ] tBool
         | "get_Count", [] -> pure' "fable_rt.htCount($0)" [ h ] tI32
-        | "Clear", [] -> pure' "fable_rt.htClear($0)" [ h ] tVoid
+        | "Clear", [] -> rt "fable_rt.htClear($0)" [ h ] tVoid
         | "UnionWith", [ Uncast xs ] when (listItem xs.Type).IsSome ->
             pure' "fable_rt.setUnionList($0, $1)" [ h; xs ] tVoid
         | "CopyTo", [ _ ] ->
@@ -6706,6 +6784,62 @@ and dotnetCall
             )
 
         lw ctx (Fable.Let(rid, resource, thenFinally))
+    // ---- enums: numbers of their underlying type ----
+    | "System.Enum", "HasFlag", [ v; Uncast flag ] -> pure' "(($0 & $1) == $1)" [ v; flag ] tBool
+    | "Microsoft.FSharp.Core.LanguagePrimitives", ("EnumOfValue" | "EnumToValue"), [ x ] ->
+        if mapType ctx r x.Type = mapType ctx r t then
+            lw ctx x
+        else
+            bindArgs ctx [ lw ctx x ] (fun xs -> EPrim("conv", xs, mapType ctx r t))
+    | "System.Enum", "TryParse", s :: rest ->
+        let enumTy =
+            match info.GenericArgs with
+            | [ e ] -> e
+            | _ -> fail r "internal: Enum.TryParse"
+
+        match enumTy with
+        | Fable.Number(_, Fable.NumberInfo.IsEnum entRef) ->
+            let cases =
+                match ctx.Com.TryGetEntity entRef with
+                | Some ent ->
+                    ent.FSharpFields
+                    |> List.choose (fun f ->
+                        match f.LiteralValue with
+                        | Some v when f.IsStatic -> Some(f.Name, string v)
+                        | _ -> None
+                    )
+                | None -> fail r "the Zig target cannot see the cases of %s" entRef.FullName
+
+            let num = zigTypeName (mapType ctx r enumTy)
+            let names = cases |> List.map (fun (n, _) -> "\"" + n + "\"") |> String.concat ", "
+            let values = cases |> List.map snd |> String.concat ", "
+
+            let macro =
+                $"fable_rt.enumTryParse($R, %s{num}, $0, &.{{ %s{names} }}, &[_]%s{num}{{ %s{values} }})"
+
+            let pairTy = TTuple [ tBool; mapType ctx r enumTy ]
+
+            match rest with
+            // (`Enum.TryParse(s, &v)`: the value goes to `v`)
+            | [ Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+                ctx.Vars.ContainsKey out.Name
+                ->
+                let outVar = ctx.Vars[out.Name]
+                let pair = ctx.State.NewVar("parsed", pairTy, VLocal, false)
+                ctx.State.UsesRuntime <- true
+
+                bindArgs
+                    ctx
+                    [ lw ctx s ]
+                    (fun xs ->
+                        ELet(
+                            pair,
+                            EEmit(macro, xs, pairTy),
+                            ESeq(EAssign(outVar, EGet(EVar pair, PItem 1, outVar.Ty)), EGet(EVar pair, PItem 0, tBool))
+                        )
+                    )
+            | _ -> pure' macro [ s ] pairTy
+        | _ -> fail r "the Zig target does not support Enum.TryParse of this type"
     // ---- tuples: `Tuple(a, b)`, `Tuple.Create`, struct tuples, and the conversions between
     // them (a tuple is a Zig tuple, struct or not) ----
     | ("System.Tuple`1" | "System.Tuple`2" | "System.Tuple`3" | "System.Tuple`4" | "System.Tuple`5" | "System.Tuple`6" | "System.Tuple`7" | "System.ValueTuple`1" | "System.ValueTuple`2" | "System.ValueTuple`3" | "System.ValueTuple`4" | "System.ValueTuple`5" | "System.ValueTuple`6" | "System.ValueTuple`7"),
@@ -7034,7 +7168,11 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
 
     match inner.Type with
     | Fable.List _ -> Some(lw ctx inner, "list")
-    | Fable.DeclaredType(ent, _) when ent.FullName = "System.Collections.Generic.ICollection`1" ->
+    | Fable.DeclaredType(ent, _) when
+        ent.FullName = "System.Collections.Generic.ICollection`1"
+        || ent.FullName = "System.Collections.Generic.Dictionary`2.KeyCollection"
+        || ent.FullName = "System.Collections.Generic.Dictionary`2.ValueCollection"
+        ->
         Some(lw ctx inner, "list")
     | Fable.String -> Some(lw ctx inner, "string")
     | t when isSeqType t -> Some(lw ctx inner, "seq")
@@ -7046,7 +7184,7 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
                 (fun xs -> EEmit("fable_rt.raToList($0)", xs, TEnt(listEnt ctx.State, [ itemOf xs.Head ]))),
             "list"
         )
-    | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Collections.Generic.Dictionary`2" ->
+    | Fable.DeclaredType(ent, [ k; v ]) when isDictionaryName ent.FullName ->
         let pairTy = TTuple [ mapType ctx None k; mapType ctx None v ]
 
         Some(

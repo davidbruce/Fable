@@ -1484,6 +1484,8 @@ pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type
         buckets: []i32 = &.{},
         free_list: i32 = -1,
         free_count: i32 = 0,
+        /// what F#'s `dict` and `readOnlyDict` make: changing it raises
+        read_only: bool = false,
 
         pub fn fable_free(c: *Self) void {
             if (c.capacity != 0) {
@@ -1625,20 +1627,48 @@ fn htPut(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d)), replace
 }
 
 /// `d.Add(k, v)`
+fn notMutable() Raised {
+    return raise(NotSupportedException, str("This value cannot be mutated"));
+}
+
 pub fn dictAdd(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) Raised!void {
+    if (d.read_only) return notMutable();
     if (!htPut(d, key, value, false)) {
-        return raise(ArgumentException, format(.{ "An item with the same key has already been added. Key: ", arg(.{ .kind = 'O' }, key) }));
+        return raise(ArgumentException, format(.{ "An item with the same key has already been added. Key: ", arg(.{ .kind = 'T' }, key) }));
     }
 }
 
 /// `d.[k] <- v`
-pub fn dictSet(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) void {
+pub fn dictSet(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) Raised!void {
+    if (d.read_only) return notMutable();
     _ = htPut(d, key, value, true);
+}
+
+/// `dict pairs` (`read_only`) and `Dictionary(pairs)`: a later pair of the same key replaces an
+/// earlier one
+pub fn dictOfList(comptime D: type, pairs: anytype, comptime read_only: bool) D {
+    const d = htNew(D);
+    var rest = pairs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) _ = htPut(d, rest.Cons.Head[0], rest.Cons.Head[1], true);
+    d.read_only = read_only;
+    return d;
+}
+
+/// `List.length`, of what `d.Keys` and `d.Values` give
+pub fn listCount(xs: anytype) i32 {
+    var n: i32 = 0;
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) n += 1;
+    return n;
 }
 
 /// `d.[k]`
 pub fn dictGet(d: anytype, key: KeyOf(@TypeOf(d))) Raised!ValueOf(@TypeOf(d)) {
-    const i = htFind(d, key) orelse return raise(KeyNotFoundException, format(.{ "The given key '", arg(.{ .kind = 'O' }, key), "' was not present in the dictionary." }));
+    const i = htFind(d, key) orelse {
+        // (F#'s `dict` keeps its keys in a box of its own, which is what .NET names)
+        if (d.read_only) return raise(KeyNotFoundException, str("The given key 'Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers+StructBox`1[" ++ comptime netTypeName(KeyOf(@TypeOf(d))) ++ "]' was not present in the dictionary."));
+        return raise(KeyNotFoundException, format(.{ "The given key '", arg(.{ .kind = 'T' }, key), "' was not present in the dictionary." }));
+    };
     return dup(d.entries[i].kv.?.value);
 }
 
@@ -1662,7 +1692,8 @@ pub fn dictContainsValue(d: anytype, value: ValueOf(@TypeOf(d))) bool {
 }
 
 /// `d.Remove k`
-pub fn htRemove(d: anytype, key: KeyOf(@TypeOf(d))) bool {
+pub fn htRemove(d: anytype, key: KeyOf(@TypeOf(d))) Raised!bool {
+    if (d.read_only) return notMutable();
     if (d.buckets.len == 0) return false;
     const h = hash(key);
     const bucket = htBucket(d, h);
@@ -1692,7 +1723,8 @@ pub fn htCount(d: anytype) i32 {
 }
 
 /// `d.Clear()`
-pub fn htClear(d: anytype) void {
+pub fn htClear(d: anytype) Raised!void {
+    if (d.read_only) return notMutable();
     for (d.entries) |*e| {
         if (e.kv) |kv| {
             e.kv = null;
@@ -2848,6 +2880,39 @@ pub fn defaultOf(comptime T: type) T {
 /// What a `Find` gives: the item found, or `default(T)`
 pub fn orDefault(comptime T: type, found: ?T) T {
     return found orelse defaultOf(T);
+}
+
+/// `Enum.TryParse<E>(s)`: by a name of the enum's, a number, or names and numbers joined by
+/// commas (their bitwise or), as .NET reads them. `R` is the pair it gives.
+pub fn enumTryParse(comptime R: type, comptime T: type, s: String, comptime names: []const []const u8, comptime values: []const T) R {
+    const text = trimmed(s);
+    if (text.len == 0) return .{ false, 0 };
+    var result: T = 0;
+    var rest = text;
+    while (true) {
+        const end = std.mem.indexOfScalar(u16, rest, ',') orelse rest.len;
+        var part = rest[0..end];
+        while (part.len != 0 and unicode.isWhiteSpace(part[0])) part = part[1..];
+        while (part.len != 0 and unicode.isWhiteSpace(part[part.len - 1])) part = part[0 .. part.len - 1];
+        if (part.len == 0) return .{ false, 0 };
+        const one: T = blk: {
+            inline for (names, values) |name, value| {
+                if (part.len == name.len) {
+                    var same = true;
+                    for (part, name) |c, d| {
+                        if (c != d) same = false;
+                    }
+                    if (same) break :blk value;
+                }
+            }
+            // (a number: of the enum's type, whether it names a case or not)
+            break :blk parseWhole(T, part, .dotnet) catch return .{ false, 0 };
+        };
+        result |= one;
+        if (end == rest.len) break;
+        rest = rest[end + 1 ..];
+    }
+    return .{ true, result };
 }
 
 fn objEql(a: Obj, b: Obj) bool {
@@ -8333,20 +8398,20 @@ test ".NET's collections: ResizeArray, Dictionary, HashSet" {
     defer drop(d);
     try dictAdd(d, 2, str("b"));
     try dictAdd(d, 1, str("a"));
-    dictSet(d, 3, str("c"));
-    dictSet(d, 2, str("B"));
+    try dictSet(d, 3, str("c"));
+    try dictSet(d, 2, str("B"));
     try expectAny("seq [[2, B]; [1, a]; [3, c]]", d);
     try expectRaised(ArgumentException, "An item with the same key has already been added. Key: 1", dictAdd(d, 1, str("x")));
     try expectRaised(KeyNotFoundException, "The given key '9' was not present in the dictionary.", dictGet(d, 9));
-    try std.testing.expect(htRemove(d, 2));
-    dictSet(d, 7, str("g"));
+    try std.testing.expect(try htRemove(d, 2));
+    try dictSet(d, 7, str("g"));
     try expectAny("seq [[7, g]; [1, a]; [3, c]]", d);
     try std.testing.expectEqual(@as(i32, 3), htCount(d));
     const h = setOfList(HashSet(i32), listOf(i32, &.{ 3, 1, 3 }));
     defer drop(h);
     try std.testing.expect(setAdd(h, 4) and !setAdd(h, 1));
     try expectAny("seq [3; 1; 4]", h);
-    for (0..1000) |i| dictSet(d, @intCast(i), str("n"));
+    for (0..1000) |i| try dictSet(d, @intCast(i), str("n"));
     try std.testing.expectEqual(@as(i32, 1000), htCount(d));
     _ = before;
 }
