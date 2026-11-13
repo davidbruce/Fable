@@ -549,7 +549,6 @@ let ``test Async.Parallel is lazy`` () =
         equal 3 x
     } |> Async.RunSynchronously
 
-#if !FABLE_COMPILER_ZIG // (DateTimeOffset)
 [<Fact>]
 let ``test Async.Sequential works`` () =
     async {
@@ -576,7 +575,6 @@ let ``test Async.Sequential works`` () =
         result |> equal [| 1 .. 5 |]
         result |> Seq.sum |> equal _aggregate
     } |> Async.RunSynchronously
-#endif
 
 [<Fact>]
 let ``test Async.Sequential is lazy`` () =

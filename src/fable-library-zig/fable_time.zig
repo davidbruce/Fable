@@ -15,6 +15,21 @@ pub fn nowUtcTicks() i64 {
     return unix_epoch_ticks + @as(i64, @intCast(@divFloor(ns, 100)));
 }
 
+/// Sleep the thread for `ms` milliseconds (`Async.Sleep` when nothing else is ready)
+pub fn sleepMilliseconds(ms: i64) void {
+    if (ms <= 0) return;
+    var req: std.posix.timespec = .{ .sec = @intCast(@divTrunc(ms, 1000)), .nsec = @intCast(@rem(ms, 1000) * 1_000_000) };
+    var rem: std.posix.timespec = undefined;
+    while (true) {
+        const rc = std.posix.system.nanosleep(&req, &rem);
+        if (std.posix.errno(rc) == .INTR) {
+            req = rem;
+            continue;
+        }
+        break;
+    }
+}
+
 const Zone = struct {
     /// transition times (Unix seconds), ascending, and the offset (seconds) from each
     times: []i64 = &.{},
@@ -132,4 +147,6 @@ test "the clock and the local zone" {
     try std.testing.expect(now > 638_000_000_000_000_000);
     const off = localOffsetTicks(now);
     try std.testing.expect(off > -15 * 36_000_000_000 and off < 15 * 36_000_000_000);
+    sleepMilliseconds(20);
+    try std.testing.expect(nowUtcTicks() - now >= 20 * 10_000);
 }

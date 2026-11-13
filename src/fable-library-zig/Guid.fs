@@ -190,3 +190,27 @@ let newGuid () : GuidOf =
 
 let toString (g: GuidOf) : string = g.Text "D"
 let toStringFormat (g: GuidOf) (format: string) : string = g.Text format
+
+/// `Guid.CreateVersion7(timestamp)`: version 7, of the Unix time in milliseconds (48 bits), then
+/// random bits
+let createVersion7Of (d: Fable.Library.Zig.DateTimeOffset.DateTimeOffsetOf) : GuidOf =
+    let ms = Fable.Library.Zig.DateTimeOffset.toUnixTimeMilliseconds d
+
+    if ms < 0L then
+        raise (System.ArgumentOutOfRangeException("timestamp", "The timestamp must be at or after the Unix epoch."))
+
+    let next16 () = uint64 (random.Next(0, 65536))
+    let c = int ((next16 () &&& 0x0FFFUL) ||| 0x7000UL)
+    let d = (next16 () &&& 0x3FFFUL) ||| 0x8000UL
+    let rest = (d <<< 48) ||| (next16 () <<< 32) ||| (next16 () <<< 16) ||| next16 ()
+
+    {
+        a = uint32 ((uint64 ms >>> 16) &&& 0xFFFFFFFFUL)
+        b = int (uint64 ms &&& 0xFFFFUL)
+        c = c
+        rest = rest
+    }
+
+/// `Guid.CreateVersion7()`: of the time now
+let createVersion7 () : GuidOf =
+    createVersion7Of (Fable.Library.Zig.DateTimeOffset.utcNow ())

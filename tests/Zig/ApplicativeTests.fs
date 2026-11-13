@@ -639,7 +639,6 @@ let ``test Trait calls work with record fields`` () =
     replaceById {Id=Id"ja"; Name="Voll"} ar |> Seq.head |> fun x -> equal "Sarah" x.Name
     replaceById {Id=Id"foo"; Name="Anna"} ar |> Seq.head |> fun x -> equal "Anna" x.Name
 
-#if !FABLE_COMPILER_ZIG // (DateTimeOffset)
 [<Fact>]
 let ``test Nested trait calls work`` () = // See #2468
     let i: int  = parse "123"
@@ -650,7 +649,6 @@ let ``test Nested trait calls work`` () = // See #2468
     equal true b
     equal Parseable p
     equal (DateTimeOffset(2011, 3, 4, 15, 42, 19, TimeSpan.FromHours(3.))) h
-#endif
 
 [<Fact>]
 let ``test Inline local function can call another inline function with trait call`` () =

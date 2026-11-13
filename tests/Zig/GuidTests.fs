@@ -22,7 +22,6 @@ let ``test Guid.NewGuid creates different guids`` () =
     let g2 = Guid.NewGuid()
     g = g2 |> equal false
 
-#if !FABLE_COMPILER_ZIG // (Guid.CreateVersion7 and DateTimeOffset)
 [<Fact>]
 let ``test Guid.CreateVersion7 works`` () =
     let g1 = Guid.CreateVersion7()
@@ -33,9 +32,7 @@ let ``test Guid.CreateVersion7 works`` () =
     equal '7' s1[14]
     let variantChar = s1[19]
     (variantChar = '8' || variantChar = '9' || variantChar = 'a' || variantChar = 'b') |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (Guid.CreateVersion7 and DateTimeOffset)
 [<Fact>]
 let ``test Guid.CreateVersion7 with DateTimeOffset works`` () =
     let dto = DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero)
@@ -47,9 +44,7 @@ let ``test Guid.CreateVersion7 with DateTimeOffset works`` () =
     equal '7' s1[14]
     let variantChar = s1[19]
     (variantChar = '8' || variantChar = '9' || variantChar = 'a' || variantChar = 'b') |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (Guid.CreateVersion7 and DateTimeOffset)
 [<Fact>]
 let ``test Guid.CreateVersion7 is monotonic`` () =
     [1 .. 100]
@@ -57,7 +52,6 @@ let ``test Guid.CreateVersion7 is monotonic`` () =
     |> List.map (fun dto -> Guid.CreateVersion7(dto))
     |> List.pairwise
     |> List.iter (fun (g1, g2) -> g1 < g2 |> equal true)
-#endif
 
 [<Fact>]
 let ``test Guid equality works`` () =

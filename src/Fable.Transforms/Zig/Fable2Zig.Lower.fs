@@ -1091,6 +1091,42 @@ let rec dotnetTypeName (com: Compiler) (ent: Fable.Entity) : string =
         | None -> ent.FullName
     | None -> ent.FullName
 
+/// .NET's value types that are records of the library (as the library's file and record): their
+/// `%A` and `%O` are their `ToString`
+let libraryValueTypes =
+    dict
+        [
+            "System.Uri", ("Uri", "UriOf")
+            "System.Guid", ("Guid", "GuidOf")
+            "System.TimeSpan", ("TimeSpan", "TimeSpanOf")
+            "System.DateTime", ("DateTime", "DateTimeOf")
+            "System.DateTimeOffset", ("DateTimeOffset", "DateTimeOffsetOf")
+            "System.DateOnly", ("DateOnly", "DateOnlyOf")
+            "System.TimeOnly", ("DateOnly", "TimeOnlyOf")
+        ]
+
+/// A class of the program with no constructor, fields or instance members (as the witness types
+/// of SRTP, `type Parse = static member ...`): its only value is null, which nothing can use;
+/// it is `void` here
+let isWitnessClass (ctx: Ctx) (entRef: Fable.EntityRef) : bool =
+    match entRef.Path with
+    | Fable.SourcePath _ ->
+        match ctx.Com.TryGetEntity entRef with
+        | Some ent ->
+            not ent.IsInterface
+            && not ent.IsFSharpRecord
+            && not ent.IsFSharpUnion
+            && not ent.IsFSharpModule
+            && not ent.IsValueType
+            && not ent.IsFSharpExceptionDeclaration
+            && ent.BaseType.IsNone
+            && ent.FSharpFields.IsEmpty
+            && Seq.isEmpty ent.DeclaredInterfaces
+            && ent.MembersFunctionsAndValues
+               |> Seq.forall (fun m -> not m.IsInstance && not m.IsConstructor)
+        | None -> false
+    | _ -> false
+
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
     | Fable.Unit -> tVoid
@@ -1167,6 +1203,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, _) when dotnetExceptions.ContainsKey ent.FullName -> tExn
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
+    // (a class whose only value is null: nothing)
+    | Fable.DeclaredType(ent, []) when isWitnessClass ctx ent -> tVoid
     | Fable.DeclaredType(ent, _) when (objInfo ctx r ent).IsSome -> tObj
     // an async computation: the record of the library's Async.fs; the builder has no state
     // (F#'s `Event<'T>`: the record of the library's Event.fs)
@@ -1179,17 +1217,10 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         ent.FullName.StartsWith("Microsoft.FSharp.Core.CompilerServices.Measure", System.StringComparison.Ordinal)
         ->
         tVoid
-    // (.NET's `Uri` and `Guid`: records of the library's Uri.fs and Guid.fs)
-    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Uri" -> TEnt(libRecordEnt ctx "Uri" "UriOf", [])
-    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Guid" -> TEnt(libRecordEnt ctx "Guid" "GuidOf", [])
-    | Fable.DeclaredType(ent, []) when ent.FullName = "System.TimeSpan" ->
-        TEnt(libRecordEnt ctx "TimeSpan" "TimeSpanOf", [])
-    | Fable.DeclaredType(ent, []) when ent.FullName = "System.DateTime" ->
-        TEnt(libRecordEnt ctx "DateTime" "DateTimeOf", [])
-    | Fable.DeclaredType(ent, []) when ent.FullName = "System.DateOnly" ->
-        TEnt(libRecordEnt ctx "DateOnly" "DateOnlyOf", [])
-    | Fable.DeclaredType(ent, []) when ent.FullName = "System.TimeOnly" ->
-        TEnt(libRecordEnt ctx "DateOnly" "TimeOnlyOf", [])
+    // (.NET's `Uri`, `Guid`, `TimeSpan`, the dates and times: records of the library)
+    | Fable.DeclaredType(ent, []) when libraryValueTypes.ContainsKey ent.FullName ->
+        let file, record = libraryValueTypes[ent.FullName]
+        TEnt(libRecordEnt ctx file record, [])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
@@ -1872,6 +1903,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "TimeSpanOf" -> [ "ticks", TPrim "i64" ]
             | "DateTimeOf" -> [ "ticks", TPrim "i64"; "kind", TPrim "i32" ]
             | "DateOnlyOf" -> [ "dayNumber", TPrim "i32" ]
+            | "DateTimeOffsetOf" -> [ "utcTicks", TPrim "i64"; "offsetMinutes", TPrim "i32" ]
             | "TimeOnlyOf" -> [ "timeTicks", TPrim "i64" ]
             | "GuidOf" -> [ "a", TPrim "u32"; "b", tI32; "c", tI32; "rest", TPrim "u64" ]
             | "UriOf" ->
@@ -3930,6 +3962,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         [ lw ctx source; lw ctx target[1] ]
                         (fun xs -> EEmit("fable_rt.dictTryGet($0, $1)", xs, TOpt valueTy))
                 // (`Uri.TryCreate(s, kind, &uri)` and `Uri.TryCreate(baseUri, relative, &uri)`)
+                // (`DateTimeOffset.TryParse(s[, culture[, styles]], &d)`)
+                | "TryParse" when imp.Path.EndsWith("System.DateTimeOffset", System.StringComparison.Ordinal) ->
+                    libraryCall
+                        ctx
+                        r
+                        "DateTimeOffset"
+                        "tryParseOption"
+                        { info with ThisArg = None }
+                        [ info.Args.Head ]
+                        (Fable.Option(out.Type, false))
                 // (`DateTime.TryParse(s[, culture[, styles]], &d)`)
                 | "TryParse" when imp.Path.EndsWith("System.DateTime", System.StringComparison.Ordinal) ->
                     libraryCall
@@ -5653,13 +5695,8 @@ and showShapeOf (ctx: Ctx) (r: SourceLocation option) (strict: bool) (root: Fabl
                 && entRef.FullName <> setName
                 && not (isDictionaryName entRef.FullName)
                 && entRef.FullName <> "System.Collections.Generic.HashSet`1"
-                // (a `Uri` and a `Guid` are written by their `ToString`)
-                && entRef.FullName <> "System.Uri"
-                && entRef.FullName <> "System.Guid"
-                && entRef.FullName <> "System.TimeSpan"
-                && entRef.FullName <> "System.DateTime"
-                && entRef.FullName <> "System.DateOnly"
-                && entRef.FullName <> "System.TimeOnly"
+                // (a `Uri`, a `Guid`, a date... is written by its `ToString`)
+                && not (libraryValueTypes.ContainsKey entRef.FullName)
                 && checkedSeen.Add key
             then
                 match ctx.Com.TryGetEntity entRef with
@@ -5936,13 +5973,7 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                     (letter = 'A' || letter = 'P' || letter = 'O')
                     && (
                         match args[i].Type with
-                        | Fable.DeclaredType(ent, []) ->
-                            ent.FullName = "System.Uri"
-                            || ent.FullName = "System.Guid"
-                            || ent.FullName = "System.TimeSpan"
-                            || ent.FullName = "System.DateTime"
-                            || ent.FullName = "System.DateOnly"
-                            || ent.FullName = "System.TimeOnly"
+                        | Fable.DeclaredType(ent, []) -> libraryValueTypes.ContainsKey ent.FullName
                         | _ -> false
                     )
 
@@ -7009,6 +7040,17 @@ and dotnetCall
       [ x ] -> rt "fable_rt.parseInt($R, $0)" [ x ] (mapType ctx r t)
     | ("System.Double" | "System.Single"), "Parse", [ x ] -> rt "fable_rt.parseFloat($R, $0)" [ x ] (mapType ctx r t)
     | "System.Boolean", "Parse", [ x ] -> rt "fable_rt.parseBool($0)" [ x ] tBool
+    // (`Int32.Parse(s, provider)`: the invariant culture's, as without one)
+    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single"),
+      "Parse",
+      [ x; provider ] when
+        (match provider.Type with
+         | Fable.DeclaredType(e, _) ->
+             e.FullName = "System.IFormatProvider"
+             || e.FullName = "System.Globalization.CultureInfo"
+         | _ -> false)
+        ->
+        dotnetCall ctx r entity name { info with Args = [ x ] } t
     // `TryParse(s, &v)`: what F# gives is `(ok, v)`, with `v` an out-variable of its own; or
     // `TryParse` given as a function, whose `v` is a ref cell (`f(s, r)`). On failure `v` is the
     // type's default, as on .NET.

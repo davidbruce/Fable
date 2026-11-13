@@ -1,9 +1,10 @@
 /// F#'s `async`, written in F# and compiled by the Zig target itself (see List.fs). An async
 /// computation is a function that is given what to do with its result, with an exception and
-/// with a cancellation, and the token that may cancel it: continuations. There is one thread,
-/// and nothing waits: `Async.Sleep` returns at once, `Async.Parallel` runs the computations one
-/// after the other, and a cancellation is seen where .NET looks for it, at the next bind or step
-/// of a loop. What a computation gives, raises and the order of its effects are .NET's.
+/// with a cancellation, and the token that may cancel it: continuations. There is one thread:
+/// `Async.Sleep` is a timer of the real clock, run when it is due (the thread sleeps until then
+/// when nothing else is ready), `Async.Parallel` interleaves the computations at their waits, and
+/// a cancellation is seen where .NET looks for it, at the next bind or step of a loop. What a
+/// computation gives, raises and the order of its effects are .NET's.
 module Fable.Library.Zig.Async
 
 open Fable.Library.Zig.Seq
@@ -74,8 +75,8 @@ let sourceCancel (s: CancellationSource) : unit =
         if errors.Count > 0 then
             raise (System.AggregateException("One or more errors occurred.", errors.[0]))
 
-// ---- virtual time: what waits is a timer, run in the order of its time when the computation
-// that started it is waited for (one thread: no time passes but this clock's) ----
+// ---- time: what waits is a timer of the real clock, run in the order of its time when the
+// computation that started it is waited for; the thread sleeps until the earliest is due ----
 
 type Timer =
     {
@@ -85,7 +86,17 @@ type Timer =
         mutable live: bool
     }
 
-let mutable private now = 0L
+#if FABLE_COMPILER
+[<Fable.Core.Emit("fable_rt.time.sleepMilliseconds($0)")>]
+let private sleepMilliseconds (_ms: int64) : unit = Fable.Core.Util.nativeOnly
+#else
+let private sleepMilliseconds (ms: int64) : unit = System.Threading.Thread.Sleep(int ms)
+#endif
+
+/// The real clock, in milliseconds
+let private nowMs () : int64 =
+    Fable.Library.Zig.DateTime.nowUtcTicks () / 10_000L
+
 let mutable private timerOrder = 0
 let private timers = ResizeArray<Timer>()
 
@@ -94,7 +105,7 @@ let private schedule (ms: int) (action: unit -> unit) : Timer =
     let t =
         {
             due =
-                now
+                nowMs ()
                 + (if ms > 0 then
                        int64 ms
                    else
@@ -108,7 +119,7 @@ let private schedule (ms: int) (action: unit -> unit) : Timer =
     timers.Add t
     t
 
-/// Run the earliest timer (its time becomes the clock's); false when there is none
+/// Run the earliest timer (once it is due); false when there is none
 let private runNextTimer () : bool =
     let mutable best = -1
 
@@ -128,8 +139,10 @@ let private runNextTimer () : bool =
         let t = timers.[best]
         timers.RemoveAt best
 
-        if t.due > now then
-            now <- t.due
+        let wait = t.due - nowMs ()
+
+        if wait > 0L then
+            sleepMilliseconds wait
 
         if t.live then
             t.live <- false

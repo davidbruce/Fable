@@ -37,19 +37,19 @@ let maxTicks = 3155378975999999999L
 
 #if FABLE_COMPILER
 [<Emit("fable_rt.time.nowUtcTicks()")>]
-let private nowUtcTicks () : int64 = nativeOnly
+let nowUtcTicks () : int64 = nativeOnly
 
 [<Emit("fable_rt.time.localOffsetTicks($0)")>]
-let private localOffsetTicks (_utcTicks: int64) : int64 = nativeOnly
+let localOffsetTicks (_utcTicks: int64) : int64 = nativeOnly
 #else
-let private nowUtcTicks () : int64 = System.DateTime.UtcNow.Ticks
+let nowUtcTicks () : int64 = System.DateTime.UtcNow.Ticks
 
-let private localOffsetTicks (utcTicks: int64) : int64 =
+let localOffsetTicks (utcTicks: int64) : int64 =
     System.TimeZoneInfo.Local.GetUtcOffset(System.DateTime(utcTicks, System.DateTimeKind.Utc)).Ticks
 #endif
 
 /// The offset of local time at a local time: the offset at the instant it most likely is
-let private offsetAtLocal (localTicks: int64) : int64 =
+let offsetAtLocal (localTicks: int64) : int64 =
     let guess = localOffsetTicks (localTicks - localOffsetTicks localTicks)
     localOffsetTicks (localTicks - guess)
 
@@ -475,8 +475,9 @@ let private padNum (width: int) (v: int64) = v.ToString().PadLeft(width, '0')
 let private formatError () =
     raise (System.FormatException "Input string was not in a correct format.")
 
-/// The custom format specifiers (`yyyy-MM-dd HH:mm`, quotes, `\\` and `%`)
-let formatCustom (d: DateTimeOf) (format: string) : string =
+/// The custom format specifiers (`yyyy-MM-dd HH:mm`, quotes, `\\` and `%`); a DateTimeOffset's
+/// own offset (`fixedOffset`) is the one "z" and "K" show
+let formatWith (d: DateTimeOf) (fixedOffset: int64 option) (format: string) : string =
     let sb = System.Text.StringBuilder()
     let y, mo, dd = datePart d.ticks
     let h = hour d
@@ -495,7 +496,10 @@ let formatCustom (d: DateTimeOf) (format: string) : string =
         n
 
     let offsetText (n: int) =
-        let off = offsetOf d
+        let off =
+            match fixedOffset with
+            | Some o -> o
+            | None -> offsetOf d
 
         let sign =
             if off < 0L then
@@ -644,7 +648,9 @@ let formatCustom (d: DateTimeOf) (format: string) : string =
             sb.Append(offsetText n) |> ignore
             i <- i + n
         | 'K' ->
-            if d.kind = utc then
+            if fixedOffset.IsSome then
+                sb.Append(offsetText 3) |> ignore
+            elif d.kind = utc then
                 sb.Append('Z') |> ignore
             elif d.kind = local then
                 sb.Append(offsetText 3) |> ignore
@@ -690,6 +696,8 @@ let formatCustom (d: DateTimeOf) (format: string) : string =
 
     sb.ToString()
 
+let formatCustom (d: DateTimeOf) (format: string) : string = formatWith d None format
+
 /// `d.ToString(format)`: the standard formats of the invariant culture, or a custom one
 let toStringFormat (d: DateTimeOf) (format: string) : string =
     match format with
@@ -725,7 +733,8 @@ let toLongTimeString (d: DateTimeOf) = toStringFormat d "T"
 
 // ---- parsing: ISO 8601, and the invariant culture's `M/d/yyyy h:m:s [AM|PM]` ----
 
-let private parseWith (input: string) : DateTimeOf option =
+/// The clock time and the offset written, if one is, of ISO 8601 or `M/d/yyyy h:m:s [AM|PM]`
+let parseRaw (input: string) : (int64 * int64 option) option =
     let s =
         if isNull input then
             ""
@@ -913,31 +922,34 @@ let private parseWith (input: string) : DateTimeOf option =
         | None -> None
         | Some t ->
             match zone () with
-            | Some z when i = s.Length ->
-                let ticks = dayTicks + t
-
-                match z with
-                | None ->
-                    Some
-                        {
-                            ticks = ticks
-                            kind = unspecified
-                        }
-                | Some off ->
-                    // (an instant: the local time it is, as .NET gives it)
-                    let u = ticks - off
-
-                    if u < 0L || u > maxTicks then
-                        None
-                    else
-                        Some(
-                            toLocalTime
-                                {
-                                    ticks = u
-                                    kind = utc
-                                }
-                        )
+            | Some z when i = s.Length -> Some(dayTicks + t, z)
             | _ -> None
+
+let private parseWith (input: string) : DateTimeOf option =
+    match parseRaw input with
+    | None -> None
+    | Some(ticks, z) ->
+        match z with
+        | None ->
+            Some
+                {
+                    ticks = ticks
+                    kind = unspecified
+                }
+        | Some off ->
+            // (an instant: the local time it is, as .NET gives it)
+            let u = ticks - off
+
+            if u < 0L || u > maxTicks then
+                None
+            else
+                Some(
+                    toLocalTime
+                        {
+                            ticks = u
+                            kind = utc
+                        }
+                )
 
 let parse (s: string) : DateTimeOf =
     if isNull s then

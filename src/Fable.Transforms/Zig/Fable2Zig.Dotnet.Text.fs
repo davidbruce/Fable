@@ -523,6 +523,19 @@ let call
                 }
                 [ Fable.Value(Fable.UnitConstant, None) ]
                 t
+        | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.DateTimeOffset" ->
+            libraryCall
+                ctx
+                r
+                "DateTimeOffset"
+                "minValue"
+                { info with
+                    ThisArg = None
+                    Args = []
+                    GenericArgs = []
+                }
+                [ Fable.Value(Fable.UnitConstant, None) ]
+                t
         | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.DateTime" ->
             libraryCall
                 ctx
@@ -587,6 +600,8 @@ let call
             ->
             let ent = ctx.Com.GetEntity entRef
             ECon(mapType ctx r t, ent.UnionCases.Head.Name, [], None)
+        // (a class that has no values but null, a witness of SRTP: nothing)
+        | Fable.DeclaredType(entRef, []) when isWitnessClass ctx entRef -> EUnit
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String || x.Type = Fable.Any ->
         pure' "($0 == null)" [ x ] tBool
@@ -866,6 +881,19 @@ let call
                      "toString"
                  else
                      "timeToString")
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                [ x ]
+                t
+        | Fable.DeclaredType(e, []) when e.FullName = "System.DateTimeOffset" ->
+            libraryCall
+                ctx
+                r
+                "DateTimeOffset"
+                "toString"
                 { info with
                     ThisArg = None
                     GenericArgs = []

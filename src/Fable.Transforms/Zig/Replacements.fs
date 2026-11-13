@@ -465,6 +465,19 @@ let tryType (t: Type) =
     | Boolean -> Some(Types.bool, tryCall, [])
     | Char -> Some(Types.char, tryCall, [])
     | Number(kind, _) -> numberInfo kind |> Option.map (fun (fullName, _) -> fullName, tryCall, [])
+    // (.NET's value types written in the library: their members, as any other .NET member)
+    | DeclaredType(ent, []) when
+        (match ent.FullName with
+         | "System.Guid"
+         | "System.Uri"
+         | "System.TimeSpan"
+         | "System.DateTime"
+         | "System.DateTimeOffset"
+         | "System.DateOnly"
+         | "System.TimeOnly" -> true
+         | _ -> false)
+        ->
+        Some(ent.FullName, tryCall, [])
     | _ -> None
 
 /// The value an exception is built from.

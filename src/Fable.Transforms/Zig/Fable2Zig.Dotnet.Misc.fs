@@ -498,16 +498,24 @@ let call
                 tStr
             ))
             t
-    // (`d + t`, `d1 - d2` and the other operators of DateTime, as F# gives them)
+    // (`d + t`, `d1 - d2` and the other operators of the dates and times, as F# gives them)
     | "Microsoft.FSharp.Core.Operators", ("op_Addition" | "op_Subtraction"), (a :: _ as args) when
         (match a.Type with
-         | Fable.DeclaredType(e, _) -> e.FullName = "System.DateTime"
+         | Fable.DeclaredType(e, _) ->
+             e.FullName = "System.DateTime"
+             || e.FullName = "System.DateTimeOffset"
+             || e.FullName = "System.TimeOnly"
          | _ -> false)
         ->
+        let typ =
+            match a.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName
+            | _ -> "System.DateTime"
+
         dotnetCall
             ctx
             r
-            "System.DateTime"
+            typ
             name
             { info with
                 ThisArg = None
@@ -638,6 +646,83 @@ let call
                 tBool
             )
         | _ -> fail r "the Zig target does not support %s.%s with these arguments yet" (typ.Substring 7) name
+    // ---- `System.DateTimeOffset`: the library's DateTimeOffset.fs ----
+    | "System.DateTimeOffset", name, args ->
+        let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]
+
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "DateTimeOffset"
+                fn
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                xs
+                t
+
+        let isType (fullName: string) (x: Fable.Expr) =
+            match x.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = fullName
+            | _ -> false
+
+        let lowerFirst (n: string) =
+            n.Substring(0, 1).ToLowerInvariant() + n.Substring 1
+
+        match name, args with
+        | ".ctor", [] -> call "minValue" unitArg
+        | (".ctor" | "op_Implicit"), [ d ] -> call "ofDateTime" [ d ]
+        | ".ctor", [ d; o ] when isType "System.DateTime" d -> call "ofDateTimeOffset" [ d; o ]
+        | ".ctor", [ ticks; o ] -> call "ofTicks" [ ticks; o ]
+        | ".ctor", [ d; tm; o ] -> call "ofDateAndTime" [ d; tm; o ]
+        | ".ctor", [ y; mo; d; h; mi; s; o ] -> call "create7" [ y; mo; d; h; mi; s; o ]
+        | ".ctor", [ y; mo; d; h; mi; s; ms; o ] -> call "create8" [ y; mo; d; h; mi; s; ms; o ]
+        | ".ctor", [ y; mo; d; h; mi; s; ms; us; o ] -> call "create9" [ y; mo; d; h; mi; s; ms; us; o ]
+        | ("get_Now" | "get_UtcNow" | "get_MinValue" | "get_MaxValue" | "get_UnixEpoch"), [] ->
+            call (lowerFirst (name.Substring 4)) unitArg
+        | ("FromUnixTimeSeconds" | "FromUnixTimeMilliseconds"), [ v ] -> call (lowerFirst name) [ v ]
+        | getter, [ x ] when getter.StartsWith("get_", System.StringComparison.Ordinal) ->
+            call (lowerFirst (getter.Substring 4)) [ x ]
+        | ("Add" | "op_Addition"), [ a; b ] -> call "add" [ a; b ]
+        | ("Subtract" | "op_Subtraction"), [ a; b ] when isType "System.DateTimeOffset" b ->
+            call "subtractOffset" [ a; b ]
+        | ("Subtract" | "op_Subtraction"), [ a; b ] -> call "subtract" [ a; b ]
+        | ("AddTicks" | "AddDays" | "AddHours" | "AddMinutes" | "AddSeconds" | "AddMilliseconds" | "AddMicroseconds" | "AddMonths" | "AddYears" | "ToOffset"),
+          [ a; v ] -> call (lowerFirst name) [ a; v ]
+        | ("ToUniversalTime" | "ToLocalTime" | "ToUnixTimeSeconds" | "ToUnixTimeMilliseconds"), [ a ] ->
+            call (lowerFirst name) [ a ]
+        | ("Compare" | "CompareTo"), [ a; b ] -> call "compare" [ a; b ]
+        | "Equals", [ a; b ] -> call "equals" [ a; b ]
+        | "EqualsExact", [ a; b ] -> call "equalsExact" [ a; b ]
+        | ("op_Equality" | "op_Inequality" | "op_LessThan" | "op_LessThanOrEqual" | "op_GreaterThan" | "op_GreaterThanOrEqual"),
+          [ a; b ] ->
+            let op =
+                match name with
+                | "op_Equality" -> "=="
+                | "op_Inequality" -> "!="
+                | "op_LessThan" -> "<"
+                | "op_LessThanOrEqual" -> "<="
+                | "op_GreaterThan" -> ">"
+                | _ -> ">="
+
+            EPrim(op, [ call "compare" [ a; b ]; ELit("0", tI32) ], tBool)
+        | "ToString", [ x ] -> call "toString" [ x ]
+        | "ToString", x :: format :: _ when format.Type = Fable.String -> call "toStringFormat" [ x; format ]
+        | "ToString", [ x; _ ] -> call "toString" [ x ]
+        | "Parse", s :: _ -> call "parse" [ s ]
+        | "TryParse", s :: rest when
+            (match t with
+             | Fable.Tuple _ -> true
+             | _ -> false)
+            && rest.Length <= 2
+            ->
+            call "tryParse" [ s ]
+        | "TryParse", s :: rest when (outArgOf ctx rest).IsSome ->
+            tryParseInto ctx r info "DateTimeOffset" s (outArgOf ctx rest).Value
+        | _ -> fail r "the Zig target does not support DateTimeOffset.%s with these arguments yet" name
     // ---- `System.DateTime`: the library's DateTime.fs ----
     | "System.DateTime", name, args ->
         let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]
@@ -903,6 +988,7 @@ let call
         (match name with
          | ".ctor"
          | "NewGuid"
+         | "CreateVersion7"
          | "get_Empty"
          | "Parse"
          | "TryParse"
@@ -930,6 +1016,8 @@ let call
         | ".ctor", [ s ] when s.Type = Fable.String -> call "parse" [ s ]
         | ".ctor", [ bytes ] -> call "ofBytes" [ bytes ]
         | "NewGuid", [] -> call "newGuid" unitArg
+        | "CreateVersion7", [] -> call "createVersion7" unitArg
+        | "CreateVersion7", [ d ] -> call "createVersion7Of" [ d ]
         | "Parse", [ s ] -> call "parse" [ s ]
         | "TryParse", [ s ] -> call "tryParse" [ s ]
         // (`Guid.TryParse(s, &g)`: the Guid goes to `g`)
