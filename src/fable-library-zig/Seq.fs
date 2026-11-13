@@ -586,3 +586,9 @@ let rangeFloat (start: float) (step: float) (stop: float) : SeqOf<float> =
     )
 
 let where<'T> (predicate: 'T -> bool) (source: SeqOf<'T>) : SeqOf<'T> = filter predicate source
+
+let tail<'T> (source: SeqOf<'T>) : SeqOf<'T> =
+    if isEmpty source then
+        invalidArg "source" "The input sequence has an insufficient number of elements."
+
+    skip 1 source

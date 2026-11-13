@@ -28,5 +28,7 @@
   <ItemGroup>
     <Compile Include="Util.fs" />
     <Compile Include="OptionTests.fs" />
+    <Compile Include="ResultTests.fs" />
+    <Compile Include="ListTests.fs" />
   </ItemGroup>
 </Project>

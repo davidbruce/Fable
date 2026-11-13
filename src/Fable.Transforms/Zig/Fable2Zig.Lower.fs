@@ -901,7 +901,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
-    | Fable.AnonymousRecordType(names, genArgs, _) -> TEnt(anonEnt ctx.State names, genArgs |> List.map (mapType ctx r))
+    | Fable.AnonymousRecordType(names, genArgs, _) ->
+        TEnt(anonEnt ctx.State names, genArgs |> List.map (mapTypeArg ctx r))
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Lazy`1" -> TEnt(lazyEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.WeakReference`1" ->
         TEnt(netEnt ctx.State "Weak", [ mapType ctx r t ])
@@ -958,8 +959,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.ICollection`1" ->
         TEnt(listEnt ctx.State, [ mapType ctx r item ])
     | Fable.DeclaredType(ent, genArgs) when ent.FullName = mapName || ent.FullName = setName ->
-        TEnt(treeEnt ctx (ent.FullName = mapName), genArgs |> List.map (mapType ctx r))
-    | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapType ctx r))
+        TEnt(treeEnt ctx (ent.FullName = mapName), genArgs |> List.map (mapTypeArg ctx r))
+    | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapTypeArg ctx r))
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
 
 /// A type argument: `obj` stands for the item type of something empty (an `obj` value cannot be
@@ -2064,10 +2065,16 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
              Partition Indexed Pairwise Distinct ExactlyOne OfArray ToArray SortWith Sort SortBy SortDescending
              SortByDescending Max Min MaxBy MinBy DistinctBy GroupBy CountBy Except Scan SplitAt ChunkBySize
              Windowed Iterate2 ForAll2 Exists2 Fold2 Map3 Zip3 Head Permute AllPairs TryExactlyOne Where Get
-             Cons Empty IsEmpty Transpose InsertAt RemoveAt UpdateAt"
+             Cons Empty IsEmpty Transpose InsertAt RemoveAt UpdateAt MapFold MapFoldBack Unzip3 Unfold TryFindIndexBack
+             TryFindBack FindIndexBack FindBack SplitInto ScanBack ReduceBack MapIndexed2 IterateIndexed2 FoldBack2
+             InsertManyAt RemoveManyAt"
         ->
         Some("List", small name)
     // (a value option is an option here: its module is the same functions)
+    | "Microsoft.FSharp.Collections.FSharpList`1" when name = "GetSlice" -> Some("List", "getSlice")
+    | "Microsoft.FSharp.Collections.FSharpList`1" when name = "Cons" -> Some("List", "cons")
+    | "Microsoft.FSharp.Collections.ListModule" when name = "ToSeq" -> Some("Seq", "ofList")
+    | "Microsoft.FSharp.Collections.SeqModule" when name = "Tail" -> Some("Seq", "tail")
     | "Microsoft.FSharp.Core.OptionModule"
     | "Microsoft.FSharp.Core.ValueOption" when
         has
@@ -2085,7 +2092,12 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
         Some("Option", "isNone")
     | ("Microsoft.FSharp.Core.FSharpOption`1" | "Microsoft.FSharp.Core.FSharpValueOption`1") when name = "get_Value" ->
         Some("Option", "memberValue")
-    | "Microsoft.FSharp.Core.ResultModule" when has "Map Bind MapError" -> Some("Result", small name)
+    | "Microsoft.FSharp.Core.ResultModule" when
+        has
+            "Map Bind MapError IsOk IsError Contains Count DefaultValue DefaultWith Exists ForAll Fold FoldBack
+             Iterate ToArray ToList ToOption ToValueOption"
+        ->
+        Some("Result", small name)
     | "Microsoft.FSharp.Collections.MapModule" when
         has
             "Empty IsEmpty Add Find TryFind ContainsKey Remove Change Iterate Fold FoldBack ToList ToArray OfList OfArray
@@ -2131,7 +2143,8 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
              TryFindBack TryPick Pick Choose Collect Concat FoldBack Reduce Scan Max Min MaxBy MinBy SortWith Sort SortBy
              SortDescending SortByDescending SortInPlaceWith SortInPlace SortInPlaceBy Distinct DistinctBy GroupBy
              CountBy Indexed Zip Unzip Map2 Iterate2 Fold2 Exists2 ForAll2 Partition Take Truncate Skip TakeWhile
-             SkipWhile SplitAt ChunkBySize Windowed Pairwise AllPairs Except CopyTo"
+             SkipWhile SplitAt ChunkBySize Windowed Pairwise AllPairs Except CopyTo InsertAt InsertManyAt RemoveAt
+             RemoveManyAt UpdateAt"
         ->
         Some(
             "Array",
@@ -2858,11 +2871,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             let ent = (tryExnEnt ctx r entRef).Value
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> EExnNew(ent, xs))
         | Fable.NewRecord(values, entRef, genArgs) ->
-            let ty = TEnt(entOf ctx r entRef, genArgs |> List.map (mapType ctx r))
+            let ty = TEnt(entOf ctx r entRef, genArgs |> List.map (mapTypeArg ctx r))
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
         | Fable.NewUnion(values, tag, entRef, genArgs) ->
             let ent = entOf ctx r entRef
-            let ty = TEnt(ent, genArgs |> List.map (mapType ctx r))
+            let ty = TEnt(ent, genArgs |> List.map (mapTypeArg ctx r))
             let case = fst (List.item tag ent.Cases)
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, case, xs, None))
         | Fable.NewTuple(values, _) ->
@@ -2872,7 +2885,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 (values |> List.map (lw ctx))
                 (fun xs -> ECon(TTuple(xs |> List.map typeOf), "", xs, None))
         | Fable.NewAnonymousRecord(values, names, genArgs, _) ->
-            let ty = TEnt(anonEnt ctx.State names, genArgs |> List.map (mapType ctx r))
+            let ty = TEnt(anonEnt ctx.State names, genArgs |> List.map (mapTypeArg ctx r))
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
         // `[| a; b |]`, and an array of a given length
         | Fable.NewArray(Fable.ArrayValues values, t, _) ->
@@ -3398,7 +3411,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             bindArgs
                 ctx
                 (lw ctx inner :: args)
-                (fun xs -> ECall(target, genArgs |> List.map (mapType ctx r), xs, mapType ctx r t))
+                (fun xs -> ECall(target, genArgs |> List.map (mapTypeArg ctx r), xs, mapType ctx r t))
         | _ -> fail r "internal: not a declared type"
 
     // A call that the replacements kept under its .NET name.
@@ -4699,10 +4712,29 @@ and dotnetCall
     | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
       ("get_IsEmpty" | "IsEmpty"),
       x :: _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ETest(xs.Head, "Empty", typeOf xs.Head))
-    | "Microsoft.FSharp.Collections.FSharpList`1", "get_Head", x :: _ ->
-        bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PCase("Cons", "Head"), mapType ctx r t))
-    | "Microsoft.FSharp.Collections.FSharpList`1", "get_Tail", x :: _ ->
-        bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PCase("Cons", "Tail"), mapType ctx r t))
+    // (`xs.Head` and `xs.Tail` of an empty list raise, as on .NET)
+    | "Microsoft.FSharp.Collections.FSharpList`1", ("get_Head" | "get_Tail"), x :: _ ->
+        let field =
+            if name = "get_Head" then
+                "Head"
+            else
+                "Tail"
+
+        let ty = mapType ctx r t
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                let empty = ELit(stringLiteral "The input list was empty.", tStr)
+
+                EIf(
+                    ETest(xs.Head, "Empty", typeOf xs.Head),
+                    raiseDotnet ctx r "System.InvalidOperationException" empty t,
+                    EGet(xs.Head, PCase("Cons", field), ty),
+                    ty
+                )
+            )
     // structural equality of records, unions, tuples and options: plain values, compared
     // field by field
     | "Microsoft.FSharp.Core.Operators", "op_Equality", [ a; b ] ->
@@ -5442,6 +5474,9 @@ and dotnetCall
     | "System.String", "IsNullOrEmpty", [ s ] -> pure' "fable_rt.strIsNullOrEmpty($0)" [ s ] tBool
     | "System.String", "IsNullOrWhiteSpace", [ s ] -> pure' "fable_rt.strIsNullOrWhiteSpace($0)" [ s ] tBool
     | "System.String", "CompareOrdinal", [ a; b ] -> pure' "fable_rt.strCompare($0, $1)" [ a; b ] tI32
+    // `x.Equals y` of a value of F#'s: its equality (structural for records, unions, lists, ...)
+    | "System.Object", "Equals", a :: Uncast b :: _ when a.Type = b.Type && a.Type <> Fable.String ->
+        bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("eql", xs, tBool))
     | "System.String", "Equals", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
         if info.ThisArg.IsSome then
             rt "fable_rt.strEquals($0, $1)" [ a; b ] tBool
@@ -5749,6 +5784,7 @@ and dotnetCall
                     TOpt tStr
                 )
             )
+    | "Microsoft.FSharp.Collections.FSharpList`1", "get_Empty", _ -> ECon(mapType ctx r t, "Empty", [], None)
     | "System.IO.Path", "GetFileName", [ path ] -> pure' "fable_rt.pathFileName($0)" [ path ] tStr
     | "System.Exception", "get_InnerException", [ x ] -> rt "fable_rt.exnInner($0)" [ x ] tExn
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ Fable.Call(Fable.Import(imp, _, _), inner, _, _) ] when

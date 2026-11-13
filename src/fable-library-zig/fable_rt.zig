@@ -6165,6 +6165,9 @@ pub inline fn across(
     comptime uses: anytype,
     args: anytype,
 ) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+    // (inlined, its loops count against the quota of the function it is in: a function with
+    // many calls of other files would run out of it)
+    @setEvalBranchQuota(1_000_000);
     var a: std.meta.ArgsTuple(@TypeOf(f)) = undefined;
     inline for (uses, 0..) |use, i| {
         const u: Use = use;

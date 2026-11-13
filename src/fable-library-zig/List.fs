@@ -596,3 +596,328 @@ let cons<'T> (head: 'T) (tail: 'T list) : 'T list = head :: tail
 
 /// `List.ofSeq` of what is a list here already (a list, `Map.keys`, ...).
 let ofSeq<'T> (source: 'T list) : 'T list = source
+
+let mapFold<'Result, 'State, 'T>
+    (mapping: 'State -> 'T -> 'Result * 'State)
+    (state: 'State)
+    (list: 'T list)
+    : 'Result list * 'State
+    =
+    let rec go (acc: 'Result list) (state: 'State) (list: 'T list) : 'Result list * 'State =
+        match list with
+        | [] -> reverse acc, state
+        | x :: rest ->
+            let y, next = mapping state x
+            go (y :: acc) next rest
+
+    go [] state list
+
+let mapFoldBack<'Result, 'State, 'T>
+    (mapping: 'T -> 'State -> 'Result * 'State)
+    (list: 'T list)
+    (state: 'State)
+    : 'Result list * 'State
+    =
+    let rec go (acc: 'Result list) (state: 'State) (list: 'T list) : 'Result list * 'State =
+        match list with
+        | [] -> acc, state
+        | x :: rest ->
+            let y, next = mapping x state
+            go (y :: acc) next rest
+
+    go [] state (reverse list)
+
+let unzip3<'T1, 'T2, 'T3> (list: ('T1 * 'T2 * 'T3) list) : 'T1 list * 'T2 list * 'T3 list =
+    let rec go (a: 'T1 list) (b: 'T2 list) (c: 'T3 list) (list: ('T1 * 'T2 * 'T3) list) =
+        match list with
+        | [] -> reverse a, reverse b, reverse c
+        | (x, y, z) :: rest -> go (x :: a) (y :: b) (z :: c) rest
+
+    go [] [] [] list
+
+let unfold<'State, 'T> (generator: 'State -> ('T * 'State) option) (state: 'State) : 'T list =
+    let rec go (acc: 'T list) (state: 'State) : 'T list =
+        match generator state with
+        | Some(x, next) -> go (x :: acc) next
+        | None -> reverse acc
+
+    go [] state
+
+let tryFindIndexBack<'T> (predicate: 'T -> bool) (list: 'T list) : int option =
+    let rec go (i: int) (found: int option) (list: 'T list) : int option =
+        match list with
+        | [] -> found
+        | x :: rest ->
+            go
+                (i + 1)
+                (if predicate x then
+                     Some i
+                 else
+                     found)
+                rest
+
+    go 0 None list
+
+let findIndexBack<'T> (predicate: 'T -> bool) (list: 'T list) : int =
+    match tryFindIndexBack predicate list with
+    | Some i -> i
+    | None -> notFound ()
+
+let tryFindBack<'T> (predicate: 'T -> bool) (list: 'T list) : 'T option =
+    let rec go (found: 'T option) (list: 'T list) : 'T option =
+        match list with
+        | [] -> found
+        | x :: rest ->
+            go
+                (if predicate x then
+                     Some x
+                 else
+                     found)
+                rest
+
+    go None list
+
+let findBack<'T> (predicate: 'T -> bool) (list: 'T list) : 'T =
+    match tryFindBack predicate list with
+    | Some x -> x
+    | None -> notFound ()
+
+let splitInto<'T> (count: int) (list: 'T list) : 'T list list =
+    if count <= 0 then
+        invalidArg "count" ("The input must be positive.\ncount = " + string count)
+
+    let n = length list
+
+    let parts =
+        if n < count then
+            n
+        else
+            count
+
+    let size =
+        if parts = 0 then
+            0
+        else
+            n / parts
+
+    let extra =
+        if parts = 0 then
+            0
+        else
+            n % parts
+
+    let rec go (k: int) (list: 'T list) : 'T list list =
+        if k = parts then
+            []
+        else
+            let here =
+                if k < extra then
+                    size + 1
+                else
+                    size
+
+            let chunk, rest = splitAt here list
+            chunk :: go (k + 1) rest
+
+    go 0 list
+
+let scanBack<'State, 'T> (folder: 'T -> 'State -> 'State) (list: 'T list) (state: 'State) : 'State list =
+    let rec go (acc: 'State list) (state: 'State) (list: 'T list) : 'State list =
+        match list with
+        | [] -> acc
+        | x :: rest ->
+            let next = folder x state
+            go (next :: acc) next rest
+
+    go [ state ] state (reverse list)
+
+let reduceBack<'T> (reduction: 'T -> 'T -> 'T) (list: 'T list) : 'T =
+    match reverse list with
+    | [] -> emptyList ()
+    | last :: rest -> fold (fun acc x -> reduction x acc) last rest
+
+let mapIndexed2<'T1, 'T2, 'U> (mapping: int -> 'T1 -> 'T2 -> 'U) (list1: 'T1 list) (list2: 'T2 list) : 'U list =
+    let rec go (i: int) (a: 'T1 list) (b: 'T2 list) : 'U list =
+        match a, b with
+        | x :: restA, y :: restB -> mapping i x y :: go (i + 1) restA restB
+        | [], [] -> []
+        | [], rest -> differentLengths "list1" "list2" (length rest)
+        | rest, [] -> differentLengths "list2" "list1" (length rest)
+
+    go 0 list1 list2
+
+let iterateIndexed2<'T1, 'T2> (action: int -> 'T1 -> 'T2 -> unit) (list1: 'T1 list) (list2: 'T2 list) : unit =
+    let rec go (i: int) (a: 'T1 list) (b: 'T2 list) : unit =
+        match a, b with
+        | x :: restA, y :: restB ->
+            action i x y
+            go (i + 1) restA restB
+        | [], [] -> ()
+        | [], rest -> differentLengths "list1" "list2" (length rest)
+        | rest, [] -> differentLengths "list2" "list1" (length rest)
+
+    go 0 list1 list2
+
+let foldBack2<'State, 'T1, 'T2>
+    (folder: 'T1 -> 'T2 -> 'State -> 'State)
+    (list1: 'T1 list)
+    (list2: 'T2 list)
+    (state: 'State)
+    : 'State
+    =
+    let n1 = length list1
+    let n2 = length list2
+
+    if n1 <> n2 then
+        invalidArg
+            "list1, list2"
+            ("The lists had different lengths.\nlist1.Length = "
+             + string n1
+             + ", list2.Length = "
+             + string n2)
+
+    let rec go (acc: 'State) (a: 'T1 list) (b: 'T2 list) : 'State =
+        match a, b with
+        | x :: restA, y :: restB -> go (folder x y acc) restA restB
+        | _ -> acc
+
+    go state (reverse list1) (reverse list2)
+
+/// `list.[lo..hi]`: what of it is inside the list
+let getSlice<'T> (list: 'T list) (lower: int option) (upper: int option) : 'T list =
+    let n = length list
+
+    let lo =
+        match lower with
+        | Some l when l > 0 -> l
+        | _ -> 0
+
+    let hi =
+        match upper with
+        | Some h when h < n - 1 -> h
+        | _ -> n - 1
+
+    if hi < lo then
+        []
+    else
+        take (hi - lo + 1) (skip lo list)
+
+let private outsideList () =
+    invalidArg "index" "index must be within bounds of the list"
+
+let insertAt<'T> (index: int) (value: 'T) (source: 'T list) : 'T list =
+    if index < 0 || index > length source then
+        outsideList ()
+
+    let before, after = splitAt index source
+    append before (value :: after)
+
+let insertManyAt<'T> (index: int) (values: 'T list) (source: 'T list) : 'T list =
+    if index < 0 || index > length source then
+        outsideList ()
+
+    let before, after = splitAt index source
+    append before (append values after)
+
+let removeAt<'T> (index: int) (source: 'T list) : 'T list =
+    if index < 0 || index >= length source then
+        outsideList ()
+
+    let before, after = splitAt index source
+    append before after.Tail
+
+let removeManyAt<'T> (index: int) (count: int) (source: 'T list) : 'T list =
+    if index < 0 || index + count > length source then
+        outsideList ()
+
+    let before, after = splitAt index source
+    append before (skip count after)
+
+let updateAt<'T> (index: int) (value: 'T) (source: 'T list) : 'T list =
+    if index < 0 || index >= length source then
+        outsideList ()
+
+    let before, after = splitAt index source
+    append before (value :: after.Tail)
+
+let empty<'T> () : 'T list = []
+
+let isEmpty<'T> (list: 'T list) : bool =
+    match list with
+    | [] -> true
+    | _ -> false
+
+let private differentLengths3 (n1: int) (n2: int) (n3: int) =
+    invalidArg
+        "list1, list2, list3"
+        ("The lists had different lengths.\n list1.Length = "
+         + string n1
+         + ", list2.Length = "
+         + string n2
+         + ", list3.Length = "
+         + string n3)
+
+let map3<'T1, 'T2, 'T3, 'U>
+    (mapping: 'T1 -> 'T2 -> 'T3 -> 'U)
+    (list1: 'T1 list)
+    (list2: 'T2 list)
+    (list3: 'T3 list)
+    : 'U list
+    =
+    // (as FSharp.Core: the common prefix is mapped before the lengths are found to differ)
+    let rec go (a: 'T1 list) (b: 'T2 list) (c: 'T3 list) : 'U list =
+        match a, b, c with
+        | x :: ra, y :: rb, z :: rc ->
+            let y = mapping x y z
+            y :: go ra rb rc
+        | [], [], [] -> []
+        | _ -> differentLengths3 (length list1) (length list2) (length list3)
+
+    go list1 list2 list3
+
+let zip3<'T1, 'T2, 'T3> (list1: 'T1 list) (list2: 'T2 list) (list3: 'T3 list) : ('T1 * 'T2 * 'T3) list =
+    let rec go (a: 'T1 list) (b: 'T2 list) (c: 'T3 list) : ('T1 * 'T2 * 'T3) list =
+        match a, b, c with
+        | x :: ra, y :: rb, z :: rc -> (x, y, z) :: go ra rb rc
+        | [], [], [] -> []
+        | _ -> differentLengths3 (length a) (length b) (length c)
+
+    go list1 list2 list3
+
+let permute<'T> (indexMap: int -> int) (list: 'T list) : 'T list =
+    let items = toArray list
+    let n = items.Length
+    let result: 'T option[] = Array.create n None
+
+    for i in 0 .. n - 1 do
+        let j = indexMap i
+
+        if j < 0 || j >= n || result.[j].IsSome then
+            invalidArg "indexMap" "The function did not compute a permutation."
+
+        result.[j] <- Some items.[i]
+
+    ofArray (Array.map (fun (x: 'T option) -> x.Value) result)
+
+let transpose<'T> (lists: 'T list list) : 'T list list =
+    match lists with
+    | [] -> []
+    | first :: _ ->
+        let n = length first
+
+        lists
+        |> iterateIndexed (fun i l ->
+            let m = length l
+
+            if m < n then
+                differentLengths ("list.[" + string i + "]") "list.[0]" (n - m)
+            elif m > n then
+                differentLengths "list.[0]" ("list.[" + string i + "]") (m - n)
+        )
+
+        let rec go (rows: 'T list list) : 'T list list =
+            match rows with
+            | [] :: _ -> []
+            | _ -> map head rows :: go (map tail rows)
+
+        go lists

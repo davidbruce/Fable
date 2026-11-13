@@ -55,3 +55,16 @@ let doesntThrow (f: unit -> 'a) : unit =
     match run f with
     | Ok() -> ()
     | Error msg -> failwith ("Expected no exception, got: " + msg)
+
+/// The class of what `f` raises, the most specific first.
+let raisedExceptionType (f: unit -> 'a) : string =
+    try
+        f () |> ignore
+        "no exception"
+    with
+    | :? ArgumentOutOfRangeException -> "ArgumentOutOfRangeException"
+    | :? ArgumentNullException -> "ArgumentNullException"
+    | :? ArgumentException -> "ArgumentException"
+    | :? InvalidOperationException -> "InvalidOperationException"
+    | :? FormatException -> "FormatException"
+    | e -> "Unexpected exception: " + e.Message

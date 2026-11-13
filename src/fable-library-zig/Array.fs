@@ -431,3 +431,77 @@ let blit<'T> (source: 'T[]) (sourceIndex: int) (target: 'T[]) (targetIndex: int)
 
     for i in 0 .. count - 1 do
         target.[targetIndex + i] <- items.[i]
+
+let private outsideIndex () =
+    invalidArg "index" "index must be within bounds of the array"
+
+let insertAt<'T> (index: int) (value: 'T) (source: 'T[]) : 'T[] =
+    if index < 0 || index > source.Length then
+        outsideIndex ()
+
+    Array.init
+        (source.Length + 1)
+        (fun i ->
+            if i < index then
+                source.[i]
+            elif i = index then
+                value
+            else
+                source.[i - 1]
+        )
+
+let insertManyAt<'T> (index: int) (values: 'T list) (source: 'T[]) : 'T[] =
+    if index < 0 || index > source.Length then
+        outsideIndex ()
+
+    let more = Array.ofList values
+
+    Array.init
+        (source.Length + more.Length)
+        (fun i ->
+            if i < index then
+                source.[i]
+            elif i < index + more.Length then
+                more.[i - index]
+            else
+                source.[i - more.Length]
+        )
+
+let removeAt<'T> (index: int) (source: 'T[]) : 'T[] =
+    if index < 0 || index >= source.Length then
+        outsideIndex ()
+
+    Array.init
+        (source.Length - 1)
+        (fun i ->
+            if i < index then
+                source.[i]
+            else
+                source.[i + 1]
+        )
+
+let removeManyAt<'T> (index: int) (count: int) (source: 'T[]) : 'T[] =
+    if index < 0 || index + count > source.Length then
+        outsideIndex ()
+
+    Array.init
+        (source.Length - count)
+        (fun i ->
+            if i < index then
+                source.[i]
+            else
+                source.[i + count]
+        )
+
+let updateAt<'T> (index: int) (value: 'T) (source: 'T[]) : 'T[] =
+    if index < 0 || index >= source.Length then
+        outsideIndex ()
+
+    Array.init
+        source.Length
+        (fun i ->
+            if i = index then
+                value
+            else
+                source.[i]
+        )
