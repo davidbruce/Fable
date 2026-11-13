@@ -38,9 +38,6 @@
     <Compile Include="CharTests.fs" />
     <Compile Include="ArithmeticTests.fs" />
     <Compile Include="ComparisonTests.fs" />
-    <Compile Include="RecordTypeTests.fs" />
-    <Compile Include="TupleTypeTests.fs" />
-    <Compile Include="UnionTypeTests.fs" />
     <Compile Include="AnonRecordsTests.fs" />
     <Compile Include="SeqExpressionTests.fs" />
     <Compile Include="HashSetTests.fs" />
@@ -55,5 +52,7 @@
     <Compile Include="InlineIfLambdaTests.fs" />
     <Compile Include="QueueTests.fs" />
     <Compile Include="StackTests.fs" />
+    <Compile Include="NullableTests.fs" />
+    <Compile Include="RandomTests.fs" />
   </ItemGroup>
 </Project>

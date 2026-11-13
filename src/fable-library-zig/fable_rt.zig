@@ -2915,6 +2915,12 @@ pub fn enumTryParse(comptime R: type, comptime T: type, s: String, comptime name
     return .{ true, result };
 }
 
+/// `n.Value` of a `Nullable<T>` (an option here)
+pub fn nullableValue(n: anytype) Raised!@typeInfo(@TypeOf(n)).optional.child {
+    const v = n orelse return raise(InvalidOperationException, str("Nullable object must have a value."));
+    return dup(v);
+}
+
 fn objEql(a: Obj, b: Obj) bool {
     if (a == b) return true;
     if (a.type.equals) |f| return f(a, b);
@@ -6028,6 +6034,131 @@ pub fn joinList(sep: String, items: anytype) String {
 // StringBuilder
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// System.Random: a seeded one is .NET's own generator for seeds (Knuth's subtractive one, which
+// .NET keeps for `Random(seed)`), so it gives the numbers .NET gives; an unseeded one is seeded
+// from what differs between runs
+// ---------------------------------------------------------------------------------------------
+
+const mbig: i32 = std.math.maxInt(i32);
+
+pub const Random = *struct {
+    pub const fable_identity = {};
+    @"$rc": u32 = 1,
+    seed: [56]i32 = @splat(0),
+    inext: usize = 0,
+    inextp: usize = 21,
+
+    fn sample(r: anytype) i32 {
+        var i = r.inext + 1;
+        if (i >= 56) i = 1;
+        var p = r.inextp + 1;
+        if (p >= 56) p = 1;
+        var v = r.seed[i] -% r.seed[p];
+        if (v == mbig) v -= 1;
+        if (v < 0) v +%= mbig;
+        r.seed[i] = v;
+        r.inext = i;
+        r.inextp = p;
+        return v;
+    }
+
+    fn unit(r: anytype) f64 {
+        return @as(f64, @floatFromInt(sample(r))) * (1.0 / @as(f64, @floatFromInt(mbig)));
+    }
+
+    fn largeRange(r: anytype) f64 {
+        var result = sample(r);
+        if (@rem(sample(r), 2) == 0) result = -result;
+        var d: f64 = @floatFromInt(result);
+        d += @as(f64, @floatFromInt(mbig - 1));
+        d /= 2.0 * @as(f64, @floatFromInt(mbig)) - 1.0;
+        return d;
+    }
+};
+
+/// `Random(seed)`
+pub fn randomNew(seed: i32) Random {
+    const c = allocator.create(@typeInfo(Random).pointer.child) catch @panic("fable: out of memory");
+    c.* = .{};
+    const subtraction: i32 = if (seed == std.math.minInt(i32)) mbig else @intCast(@abs(seed));
+    var mj: i32 = 161803398 - subtraction;
+    c.seed[55] = mj;
+    var mk: i32 = 1;
+    var ii: usize = 0;
+    for (1..55) |_| {
+        ii += 21;
+        if (ii >= 55) ii -= 55;
+        c.seed[ii] = mk;
+        mk = mj -% mk;
+        if (mk < 0) mk +%= mbig;
+        mj = c.seed[ii];
+    }
+    for (1..5) |_| {
+        for (1..56) |i| {
+            var n = i + 30;
+            if (n >= 55) n -= 55;
+            c.seed[i] -%= c.seed[1 + n];
+            if (c.seed[i] < 0) c.seed[i] +%= mbig;
+        }
+    }
+    if (track) thread.stats.allocs += 1;
+    return c;
+}
+
+var random_count: u64 = 0;
+
+/// `Random()`: seeded from what differs between runs and calls here: where the stack and the
+/// heap are (the system places them anew each run) and a count of the generators made
+pub fn randomUnseeded() Random {
+    random_count +%= 1;
+    const r = randomNew(0);
+    var local: u8 = 0;
+    const mix = [_]u64{ @intFromPtr(&local), @intFromPtr(r), random_count };
+    const h = std.hash.Wyhash.hash(0x9E3779B97F4A7C15, std.mem.sliceAsBytes(&mix));
+    const fresh = randomNew(@intCast(h & 0x7fffffff));
+    drop(r);
+    return fresh;
+}
+
+var random_shared: ?Random = null;
+
+/// `Random.Shared`: one for the whole program
+pub fn randomShared() Random {
+    if (random_shared == null) random_shared = randomUnseeded();
+    return dup(random_shared.?);
+}
+
+/// `r.Next()`
+pub fn randomNext(r: Random) i32 {
+    return @TypeOf(r.*).sample(r);
+}
+
+/// `r.Next(maxValue)`
+pub fn randomNextMax(r: Random, max: i32) Raised!i32 {
+    if (max < 0) return raise(ArgumentOutOfRangeException, format(.{ "maxValue ('", max, "') must be a non-negative value. (Parameter 'maxValue')" }));
+    return @intFromFloat(@TypeOf(r.*).unit(r) * @as(f64, @floatFromInt(max)));
+}
+
+/// `r.Next(minValue, maxValue)`
+pub fn randomNextRange(r: Random, min: i32, max: i32) Raised!i32 {
+    if (min > max) return raise(ArgumentOutOfRangeException, str("'minValue' cannot be greater than maxValue. (Parameter 'minValue')"));
+    const range: i64 = @as(i64, max) - min;
+    const R = @TypeOf(r.*);
+    if (range <= std.math.maxInt(i32)) return @as(i32, @intFromFloat(R.unit(r) * @as(f64, @floatFromInt(range)))) + min;
+    return @intCast(@as(i64, @intFromFloat(R.largeRange(r) * @as(f64, @floatFromInt(range)))) + min);
+}
+
+/// `r.NextDouble()`
+pub fn randomNextDouble(r: Random) f64 {
+    return @TypeOf(r.*).unit(r);
+}
+
+/// `r.NextBytes(buffer)`
+pub fn randomNextBytes(r: Random, buffer: Array(u8)) void {
+    for (buffer.items) |*b| b.* = @truncate(@as(u32, @bitCast(@TypeOf(r.*).sample(r))));
+}
+
 pub const StringBuilder = *struct {
     pub const fable_identity = {};
     @"$rc": u32 = 1,
@@ -8656,4 +8787,24 @@ test "box" {
     defer drop(t);
     try std.testing.expect(strEql(t, str("x")));
     try std.testing.expect(box(@as(String, null)) == null);
+}
+
+test "Random(seed) gives .NET's numbers" {
+    const r = randomNew(1234);
+    defer drop(r);
+    // (what `Random(1234)` gives on .NET: Next(), Next(100), Next(1000, 10000), NextDouble())
+    try std.testing.expectEqual(@as(i32, 857019877), randomNext(r));
+    try std.testing.expectEqual(@as(i32, 89), try randomNextMax(r, 100));
+    try std.testing.expectEqual(@as(i32, 3872), try randomNextRange(r, 1000, 10000));
+    try std.testing.expectEqual(@as(f64, 0.9467375338760845), randomNextDouble(r));
+    const b = arrayFrom(Array(u8), allocator.alloc(u8, 6) catch unreachable);
+    defer drop(b);
+    const r2 = randomNew(5432);
+    defer drop(r2);
+    randomNextBytes(r2, b);
+    try std.testing.expectEqualSlices(u8, &.{ 152, 238, 227, 30, 153, 56 }, b.items);
+    const r3 = randomNew(-7);
+    defer drop(r3);
+    try std.testing.expectEqual(@as(i32, 766440938), try randomNextRange(r3, -2000000000, 2000000000));
+    try std.testing.expectEqual(@as(i32, 1419354884), randomNext(r3));
 }

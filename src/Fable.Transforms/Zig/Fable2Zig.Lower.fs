@@ -695,7 +695,8 @@ let private netEnt (state: FileState) (name: string) : Ent =
             match name with
             | "Dictionary" -> [ "K"; "V" ], [ "key", TGen "K"; "value", TGen "V" ]
             | "HashSet" -> [ "T" ], [ "key", TGen "T" ]
-            | "StringBuilder" -> [], []
+            | "StringBuilder"
+            | "Random" -> [], []
             // (a weak reference holds nothing that keeps its target alive)
             | "Weak" -> [ "T" ], []
             | _ -> [ "T" ], [ "items", TGen "T" ]
@@ -708,6 +709,8 @@ let private netEnt (state: FileState) (name: string) : Ent =
                         FullName =
                             (if name = "StringBuilder" then
                                  "System.Text."
+                             elif name = "Random" then
+                                 "System."
                              else
                                  "System.Collections.Generic.")
                             + name
@@ -928,6 +931,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TTuple [ mapType ctx r t ]
     // (`None` and `[]` whose item type F# leaves as `obj` are of `obj` here too)
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
+    // (`Nullable<T>`: an option)
+    | Fable.Nullable(t, _) -> TOpt(mapType ctx r t)
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
     | Fable.AnonymousRecordType(names, genArgs, _) ->
@@ -955,6 +960,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TSlice(item, ent.FullName = "System.ReadOnlySpan`1")
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Text.StringBuilder" ->
         TEnt(netEnt ctx.State "StringBuilder", [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Random" -> TEnt(netEnt ctx.State "Random", [])
     | Fable.Array(t, _) -> TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, [ k; v ]) when isDictionaryName ent.FullName ->
         TEnt(netEnt ctx.State "Dictionary", [ mapType ctx r k; mapType ctx r v ])
@@ -6167,7 +6173,8 @@ and dotnetCall
         | Fable.Char -> ELit("0", mapType ctx r t)
         | Fable.Boolean -> ELit("false", tBool)
         | Fable.Any -> ELit("@as(fable_rt.Any, null)", tAny)
-        | Fable.Option(inner, _) -> ECon(mapType ctx r t, "None", [], None)
+        | Fable.Option(inner, _)
+        | Fable.Nullable(inner, _) -> ECon(mapType ctx r t, "None", [], None)
         // (a union of one case without fields has one value, which stands for it; null on
         // .NET, where nothing but a test for null tells them apart)
         | Fable.DeclaredType(entRef, []) when
@@ -6889,6 +6896,85 @@ and dotnetCall
                     tBool
                 )
             )
+    // ---- System.Random ----
+    | "System.Random", ".ctor", [] -> pure' "fable_rt.randomUnseeded()" [] (mapType ctx r t)
+    | "System.Random", ".ctor", [ seed ] -> pure' "fable_rt.randomNew($0)" [ seed ] (mapType ctx r t)
+    | "System.Random", "get_Shared", [] -> pure' "fable_rt.randomShared()" [] (mapType ctx r t)
+    | "System.Random", "Next", [ rnd ] -> pure' "fable_rt.randomNext($0)" [ rnd ] tI32
+    | "System.Random", "Next", [ rnd; max ] -> rt "fable_rt.randomNextMax($0, $1)" [ rnd; max ] tI32
+    | "System.Random", "Next", [ rnd; min; max ] -> rt "fable_rt.randomNextRange($0, $1, $2)" [ rnd; min; max ] tI32
+    | "System.Random", "NextDouble", [ rnd ] -> pure' "fable_rt.randomNextDouble($0)" [ rnd ] tF64
+    | "System.Random", "NextBytes", [ rnd; buffer ] -> pure' "fable_rt.randomNextBytes($0, $1)" [ rnd; buffer ] tVoid
+    // ---- `Nullable<T>`: an option ----
+    | "System.Nullable`1", ".ctor", [] -> ECon(mapType ctx r t, "None", [], None)
+    | "System.Nullable`1", ".ctor", [ x ] ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> ECon(mapType ctx r t, "Some", xs, None))
+    | "System.Nullable`1", "get_HasValue", [ n ] ->
+        bindArgs ctx [ lw ctx n ] (fun xs -> EPrim("not", [ ETest(xs.Head, "None", typeOf xs.Head) ], tBool))
+    | "System.Nullable`1", "get_Value", [ n ] -> rt "fable_rt.nullableValue($0)" [ n ] (mapType ctx r t)
+    | "System.Nullable`1", "GetValueOrDefault", [ n ] when hasDefault t ->
+        pure' "fable_rt.orDefault($R, $0)" [ n ] (mapType ctx r t)
+    | "System.Nullable`1", "GetValueOrDefault", [ n; d ] -> pure' "($0 orelse $1)" [ n; d ] (mapType ctx r t)
+    // `Nullable.int n` and the other conversions of a nullable: the value converted, if any
+    | "Microsoft.FSharp.Linq.NullableModule", conv, [ value ] when
+        conv.StartsWith("To", System.StringComparison.Ordinal)
+        ->
+        let sourceType =
+            match value.Type with
+            | Fable.Nullable(s, _)
+            | Fable.Option(s, _) -> s
+            | s -> s
+
+        let targetType =
+            match t with
+            | Fable.Nullable(s, _)
+            | Fable.Option(s, _) -> s
+            | s -> s
+
+        let v = AST.makeTypedIdent sourceType "v"
+
+        let converted =
+            if conv = "ToEnum" then
+                Fable.TypeCast(Fable.IdentExpr v, targetType)
+            else
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = conv
+                            Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    Fable.CallInfo.Create(args = [ Fable.IdentExpr v ], genArgs = [ sourceType ]),
+                    targetType,
+                    r
+                )
+
+        let mapping = Fable.Delegate([ v ], converted, None, [])
+
+        lw
+            ctx
+            (Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "Map"
+                        Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.OptionModule"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                { info with
+                    Args = [ mapping; value ]
+                    GenericArgs = [ sourceType; targetType ]
+                    SignatureArgTypes = []
+                    MemberRef = None
+                },
+                Fable.Option(targetType, false),
+                r
+            ))
     // ---- .NET's stack and queue: the library's Stack.fs and Queue.fs ----
     | ("System.Collections.Generic.Stack`1" | "System.Collections.Generic.Queue`1"), _, _ ->
         let file =
