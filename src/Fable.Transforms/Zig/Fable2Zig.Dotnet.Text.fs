@@ -224,18 +224,38 @@ let call
          | _ -> false)
         ->
         rt "fable_rt.strJoinRange($0, $1, $2, $3)" [ sep; values; start; n ] tStr
+    | "System.String", "Compare", [ a; ia; b; ib; n ] ->
+        rt "fable_rt.strCompareCultureRange($0, $1, $2, $3, $4, false)" [ a; ia; b; ib; n ] tI32
+    | "System.String", "Compare", [ a; ia; b; ib; n; ignoreCase ] when ignoreCase.Type = Fable.Boolean ->
+        rt "fable_rt.strCompareCultureRange($0, $1, $2, $3, $4, $5)" [ a; ia; b; ib; n; ignoreCase ] tI32
+    | "System.String", "Compare", [ a; ia; b; ib; n; ignoreCase; culture ] when
+        ignoreCase.Type = Fable.Boolean && isCulture culture
+        ->
+        rt "fable_rt.strCompareCultureRange($0, $1, $2, $3, $4, $5)" [ a; ia; b; ib; n; ignoreCase ] tI32
+    | "System.String", "Compare", [ a; ia; b; ib; n; culture ] when isCulture culture ->
+        rt "fable_rt.strCompareCultureRange($0, $1, $2, $3, $4, false)" [ a; ia; b; ib; n ] tI32
     | "System.String",
       "Compare",
       [ a; ia; b; ib; n; Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 kind, _), _) ] when
-        kind = 4 || kind = 5
+        kind >= 0 && kind <= 5
         ->
-        rt
-            (if kind = 5 then
-                 "fable_rt.strCompareRange($0, $1, $2, $3, $4, true)"
-             else
-                 "fable_rt.strCompareRange($0, $1, $2, $3, $4, false)")
-            [ a; ia; b; ib; n ]
-            tI32
+        match kind with
+        | 4 -> rt "fable_rt.strCompareRange($0, $1, $2, $3, $4, false)" [ a; ia; b; ib; n ] tI32
+        | 5 -> rt "fable_rt.strCompareRange($0, $1, $2, $3, $4, true)" [ a; ia; b; ib; n ] tI32
+        | _ ->
+            let ig =
+                if kind = 1 || kind = 3 then
+                    "true"
+                else
+                    "false"
+
+            rt $"fable_rt.strCompareCultureRange($0, $1, $2, $3, $4, %s{ig})" [ a; ia; b; ib; n ] tI32
+    | "System.String", "Compare", [ a; ia; b; ib; n; cmp ] when
+        (match cmp.Type with
+         | Fable.Number(_, Fable.NumberInfo.IsEnum ent) -> ent.FullName = "System.StringComparison"
+         | _ -> false)
+        ->
+        rt "fable_rt.strCompareRangeWith($0, $1, $2, $3, $4, $5)" [ a; ia; b; ib; n; cmp ] tI32
     // (`String.Concat` of a sequence, a list or an array of strings: their join)
     | "System.String", "Concat", [ Uncast values ] when values.Type <> Fable.String ->
         dotnetCall
@@ -294,8 +314,26 @@ let call
                 ThisArg = None
             }
             t
-    // comparisons that say how: ordinal, or ordinal with the case ignored (a culture's order is
-    // not known here)
+    | "System.String", "CompareTo", [ a; b ] -> rt "fable_rt.strCompareTo($0, $1)" [ a; b ] tI32
+    | "System.String", "Compare", [ a; b ] -> pure' "fable_rt.strCompareCulture($0, $1, false)" [ a; b ] tI32
+    | "System.String", "Compare", [ a; b; ignoreCase ] when ignoreCase.Type = Fable.Boolean ->
+        pure' "fable_rt.strCompareCulture($0, $1, $2)" [ a; b; ignoreCase ] tI32
+    | "System.String", "Compare", [ a; b; culture ] when isCulture culture ->
+        pure' "fable_rt.strCompareCulture($0, $1, false)" [ a; b ] tI32
+    | "System.String", "Compare", [ a; b; ignoreCase; culture ] when
+        ignoreCase.Type = Fable.Boolean && isCulture culture
+        ->
+        pure' "fable_rt.strCompareCulture($0, $1, $2)" [ a; b; ignoreCase ] tI32
+    | "System.String", "StartsWith", [ s; x; ignoreCase; culture ] when
+        ignoreCase.Type = Fable.Boolean && isCulture culture
+        ->
+        rt "fable_rt.strStartsWithOpt($0, $1, $2)" [ s; x; ignoreCase ] tBool
+    | "System.String", "EndsWith", [ s; x; ignoreCase; culture ] when
+        ignoreCase.Type = Fable.Boolean && isCulture culture
+        ->
+        rt "fable_rt.strEndsWithOpt($0, $1, $2)" [ s; x; ignoreCase ] tBool
+    // comparisons that say how: ordinal or culture-based (current culture is treated as
+    // invariant culture here)
     | "System.String", ("Equals" | "StartsWith" | "EndsWith" | "IndexOf" | "Compare" | "Contains"), _ when
         (match List.tryLast args with
          | Some last ->
@@ -317,8 +355,13 @@ let call
             | [ a; b; _ ] -> a, b
             | _ -> fail r "the Zig target does not support this String.%s yet" name
 
-        match how with
-        | 4 ->
+        match name, how with
+        | "Compare", 4 -> pure' "fable_rt.strCompare($0, $1)" [ a; b ] tI32
+        | "Compare", 5 -> pure' "fable_rt.strCompareIgnoreCase($0, $1)" [ a; b ] tI32
+        | "Compare", (0 | 2) -> pure' "fable_rt.strCompareCulture($0, $1, false)" [ a; b ] tI32
+        | "Compare", (1 | 3) -> pure' "fable_rt.strCompareCulture($0, $1, true)" [ a; b ] tI32
+        | "Compare", -1 -> rt "fable_rt.strCompareWith($0, $1, $2)" args tI32
+        | _, (0 | 2 | 4) ->
             match name with
             | "Equals" -> pure' "fable_rt.strEql($0, $1)" [ a; b ] tBool
             | "StartsWith" -> rt "fable_rt.strStartsWith($0, $1)" [ a; b ] tBool
@@ -328,24 +371,23 @@ let call
             | "Contains" when b.Type = Fable.Char -> rt "fable_rt.strContainsChar($0, $1)" [ a; b ] tBool
             | "Contains" -> rt "fable_rt.strContains($0, $1)" [ a; b ] tBool
             | _ -> pure' "fable_rt.strCompare($0, $1)" [ a; b ] tI32
-        | 5 ->
+        | _, (1 | 3 | 5) ->
             match name with
             | "Equals" -> pure' "fable_rt.strEqualsIgnoreCase($0, $1)" [ a; b ] tBool
             | "StartsWith" -> rt "fable_rt.strStartsWithIgnoreCase($0, $1)" [ a; b ] tBool
             | "EndsWith" -> rt "fable_rt.strEndsWithIgnoreCase($0, $1)" [ a; b ] tBool
+            | "IndexOf" when b.Type = Fable.Char -> rt "fable_rt.strIndexOfCharIgnoreCase($0, $1)" [ a; b ] tI32
             | "IndexOf" -> rt "fable_rt.strIndexOfIgnoreCase($0, $1)" [ a; b ] tI32
             | "Contains" ->
-                bindArgs
-                    ctx
-                    [ rt "fable_rt.strIndexOfIgnoreCase($0, $1)" [ a; b ] tI32 ]
-                    (fun xs -> EPrim("ge", [ xs.Head; ELit("0", tI32) ], tBool))
+                let call =
+                    if b.Type = Fable.Char then
+                        rt "fable_rt.strIndexOfCharIgnoreCase($0, $1)" [ a; b ] tI32
+                    else
+                        rt "fable_rt.strIndexOfIgnoreCase($0, $1)" [ a; b ] tI32
+
+                bindArgs ctx [ call ] (fun xs -> EPrim("ge", [ xs.Head; ELit("0", tI32) ], tBool))
             | _ -> pure' "fable_rt.strCompareIgnoreCase($0, $1)" [ a; b ] tI32
-        | _ ->
-            fail
-                r
-                "the Zig target does not support comparing strings by a culture (String.%s with StringComparison %d): use Ordinal or OrdinalIgnoreCase"
-                name
-                how
+        | _ -> fail r "the Zig target does not support String.%s with StringComparison %d" name how
 
     // ---- chars: each code unit to what .NET maps it to (there is no current culture) ----
     | "System.Char", ("ToUpper" | "ToUpperInvariant"), [ c ] -> pure' "fable_rt.unicode.toUpper($0)" [ c ] tChar

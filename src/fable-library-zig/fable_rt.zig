@@ -5212,11 +5212,18 @@ pub const splitDone = text_split.splitDone;
 pub const splitPush = text_split.splitPush;
 pub const strCharCategory = text_split.strCharCategory;
 pub const strCharIs = text_split.strCharIs;
+pub const strCompareCulture = text_split.strCompareCulture;
+pub const strCompareCultureRange = text_split.strCompareCultureRange;
 pub const strCompareIgnoreCase = text_split.strCompareIgnoreCase;
 pub const strCompareRange = text_split.strCompareRange;
+pub const strCompareRangeWith = text_split.strCompareRangeWith;
+pub const strCompareTo = text_split.strCompareTo;
+pub const strCompareWith = text_split.strCompareWith;
 pub const strEndsWithIgnoreCase = text_split.strEndsWithIgnoreCase;
+pub const strEndsWithOpt = text_split.strEndsWithOpt;
 pub const strEqualsIgnoreCase = text_split.strEqualsIgnoreCase;
 pub const strIndexOfAny = text_split.strIndexOfAny;
+pub const strIndexOfCharIgnoreCase = text_split.strIndexOfCharIgnoreCase;
 pub const strIndexOfIgnoreCase = text_split.strIndexOfIgnoreCase;
 pub const strJoinRange = text_split.strJoinRange;
 pub const strLastIndexOfCharFrom = text_split.strLastIndexOfCharFrom;
@@ -5228,6 +5235,7 @@ pub const strSplitChars = text_split.strSplitChars;
 pub const strSplitString = text_split.strSplitString;
 pub const strSplitStrings = text_split.strSplitStrings;
 pub const strStartsWithIgnoreCase = text_split.strStartsWithIgnoreCase;
+pub const strStartsWithOpt = text_split.strStartsWithOpt;
 pub const strToChar = text_split.strToChar;
 pub const strToChars = text_split.strToChars;
 pub const strToCharsRange = text_split.strToCharsRange;
@@ -7206,4 +7214,18 @@ test "managed span operations maintain reference counts" {
         try std.testing.expect(sp[0] == null and sp[1] == null and sp[2] == null);
     }
     try std.testing.expectEqual(start_stats.allocs - start_stats.frees, thread.stats.allocs - thread.stats.frees);
+}
+
+test "culture string comparison matches .NET InvariantCulture weights" {
+    try std.testing.expectEqual(@as(i32, 1), try strCompareTo(str("ABC"), str("abc")));
+    try std.testing.expectEqual(@as(i32, -1), try strCompareTo(str("aBc"), str("Abc")));
+    try std.testing.expectEqual(@as(i32, -1), strCompareCulture(str("ab"), str("ABC"), false));
+    try std.testing.expectEqual(@as(i32, -1), strCompareCulture(str("_"), str("0"), false));
+    try std.testing.expectEqual(@as(i32, -1), strCompareCulture(str("0"), str("a"), false));
+    try std.testing.expectEqual(@as(i32, 0), strCompareCulture(str("ABC"), str("abc"), true));
+    try std.testing.expect(try strCompareCultureRange(str("ABC"), 1, str("bcd"), 0, 2, false) > 0);
+    try std.testing.expectEqual(@as(i32, 0), try strCompareRangeWith(str("ABC"), 1, str("bcd"), 0, 2, 5));
+    try std.testing.expect(try strStartsWithOpt(str("ABCD"), str("ab"), true));
+    try std.testing.expect(try strEndsWithOpt(str("ABCD"), str("cd"), true));
+    try std.testing.expectEqual(@as(i32, 1), try strIndexOfCharIgnoreCase(str("aBc"), 'B'));
 }

@@ -502,27 +502,25 @@ let ``test System.String.Equals works`` () =
     "ABC".Equals("abc", StringComparison.Ordinal) |> equal false
     "ABC".Equals("abc", StringComparison.OrdinalIgnoreCase) |> equal true
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
 [<Fact>]
 let ``test String.Compare works`` () =
-    // TODO: "ABC".CompareTo("abc") > 0 |> equal true
+    "ABC".CompareTo("abc") > 0 |> equal true
     System.String.Compare("abc", "abc") |> equal 0
-    // TODO: System.String.Compare("ABC", "abc") |> equal 1
+    System.String.Compare("ABC", "abc") |> equal 1
     System.String.Compare("abc", "abd") |> equal -1
     System.String.Compare("bbc", "abd") |> equal 1
-    // TODO: System.String.Compare("ABC", "abc", false) |> equal 1
+    System.String.Compare("ABC", "abc", false) |> equal 1
     System.String.Compare("ABC", "abc", true) |> equal 0
     System.String.Compare("ABC", "abd", true) |> equal -1
     System.String.Compare("BBC", "abd", true) |> equal 1
-    // TODO: System.String.Compare("ABC", "abc", StringComparison.CurrentCulture) > 0 |> equal true
+    System.String.Compare("ABC", "abc", StringComparison.CurrentCulture) > 0 |> equal true
     System.String.Compare("ABC", "abc", StringComparison.Ordinal) < 0 |> equal true
     System.String.Compare("ABC", "abc", StringComparison.OrdinalIgnoreCase) |> equal 0
-    // TODO: System.String.Compare("abc", 0, "bcd", 0, 3) |> equal -1
-    // System.String.Compare("abc", 1, "bcd", 0, 2) |> equal 0
-    // TODO: System.String.Compare("ABC", 1, "bcd", 0, 2, StringComparison.CurrentCulture) > 0 |> equal true
+    System.String.Compare("abc", 0, "bcd", 0, 3) |> equal -1
+    System.String.Compare("abc", 1, "bcd", 0, 2) |> equal 0
+    System.String.Compare("ABC", 1, "bcd", 0, 2, StringComparison.CurrentCulture) > 0 |> equal true
     System.String.Compare("ABC", 1, "bcd", 0, 2, StringComparison.Ordinal) < 0 |> equal true
-    // TODO: System.String.Compare("ABC", 1, "bcd", 0, 2, StringComparison.OrdinalIgnoreCase) |> equal 0
-#endif
+    System.String.Compare("ABC", 1, "bcd", 0, 2, StringComparison.OrdinalIgnoreCase) |> equal 0
 
 
 [<Fact>]
@@ -550,13 +548,11 @@ let ``test String.Contains with empty pattern works`` () =
     "ABC".Contains("") |> equal true
     "".Contains("") |> equal true
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
 [<Fact>]
 let ``test String.Contains with StringComparison works`` () =
     "ABC".Contains("b", StringComparison.Ordinal) |> equal false
     "ABC".Contains("b", StringComparison.OrdinalIgnoreCase) |> equal true
     "ABC".Contains("b", StringComparison.InvariantCultureIgnoreCase) |> equal true
-#endif
 
 [<Fact>]
 let ``test String.Split works`` () =
@@ -710,14 +706,12 @@ let ``test String.StartsWith with OrdinalIgnoreCase works`` () =
         "ABCD".StartsWith(fst arg, StringComparison.OrdinalIgnoreCase)
         |> equal (snd arg)
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
 [<Fact>]
 let ``test String.StartsWith with ignoreCase boolean works`` () =
     let args = [("ab", true); ("AB", true); ("BC", false); ("cd", false); ("abcdx", false); ("abcd", true); ("", true)]
     for arg in args do
         "ABCD".StartsWith(fst arg, true, CultureInfo.InvariantCulture)
         |> equal (snd arg)
-#endif
 
 [<Fact>]
 let ``test String.EndsWith works`` () =
@@ -733,14 +727,12 @@ let ``test String.EndsWith with OrdinalIgnoreCase works`` () =
         "ABCD".EndsWith(fst arg, StringComparison.OrdinalIgnoreCase)
         |> equal (snd arg)
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
 [<Fact>]
 let ``test String.EndsWith with ignoreCase boolean works`` () =
     let args = [("ab", false); ("CD", true); ("cd", true); ("bc", false); ("xabcd", false); ("abcd", true); ("", true)]
     for arg in args do
         "ABCD".EndsWith(fst arg, true, CultureInfo.InvariantCulture)
         |> equal (snd arg)
-#endif
 
 [<Fact>]
 let ``test String.Trim works`` () =

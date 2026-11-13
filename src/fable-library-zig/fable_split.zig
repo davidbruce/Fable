@@ -226,22 +226,53 @@ pub fn strJoinRange(sep: String, values: Array(String), start: i32, n: i32) Rais
     return b.finish();
 }
 
+fn strRangeSlices(a: String, ia: i32, b: String, ib: i32, length: i32) Raised!struct { xs: []const u16, ys: []const u16 } {
+    if (ia < 0 or ib < 0 or length < 0) return argRange("length", "Value must be positive.");
+    const x = unitsOf(a);
+    const y = unitsOf(b);
+    if ((a == null or b == null) and length != 0) return argRange("strA", "Specified argument was out of the range of valid values.");
+    if (ia > x.len or ib > y.len) return argRange("indexA", "Specified argument was out of the range of valid values.");
+    const xs = x[@intCast(ia)..];
+    const ys = y[@intCast(ib)..];
+    const n: usize = @intCast(length);
+    return .{ .xs = xs[0..@min(xs.len, n)], .ys = ys[0..@min(ys.len, n)] };
+}
+
 /// `String.Compare(a, ia, b, ib, length, comparison)`: by code unit (and case), as .NET's
 /// ordinal comparisons, which give the difference of the first units that differ
 pub fn strCompareRange(a: String, ia: i32, b: String, ib: i32, length: i32, ignore_case: bool) Raised!i32 {
-    const x = unitsOf(a);
-    const y = unitsOf(b);
-    if (ia < 0 or ib < 0 or length < 0) return argRange("length", "Value must be positive.");
-    const xs = x[@min(@as(usize, @intCast(ia)), x.len)..];
-    const ys = y[@min(@as(usize, @intCast(ib)), y.len)..];
-    const nx = @min(xs.len, @as(usize, @intCast(length)));
-    const ny = @min(ys.len, @as(usize, @intCast(length)));
-    for (xs[0..@min(nx, ny)], ys[0..@min(nx, ny)]) |c0, d0| {
+    if (a == null or b == null) {
+        if (ia < 0 or ib < 0 or length < 0) return argRange("length", "Value must be positive.");
+        if (length != 0) return argRange("strA", "Specified argument was out of the range of valid values.");
+        return @as(i32, @intFromBool(a != null)) - @as(i32, @intFromBool(b != null));
+    }
+    const r = try strRangeSlices(a, ia, b, ib, length);
+    for (r.xs[0..@min(r.xs.len, r.ys.len)], r.ys[0..@min(r.xs.len, r.ys.len)]) |c0, d0| {
         const c = if (ignore_case) unicode.toUpper(c0) else c0;
         const d = if (ignore_case) unicode.toUpper(d0) else d0;
         if (c != d) return @as(i32, c) - @as(i32, d);
     }
-    return @as(i32, @intCast(nx)) - @as(i32, @intCast(ny));
+    return @as(i32, @intCast(r.xs.len)) - @as(i32, @intCast(r.ys.len));
+}
+
+pub fn strCompareCultureRange(a: String, ia: i32, b: String, ib: i32, length: i32, ignore_case: bool) Raised!i32 {
+    if (a == null or b == null) {
+        if (ia < 0 or ib < 0 or length < 0) return argRange("length", "Value must be positive.");
+        if (length != 0) return argRange("strA", "Specified argument was out of the range of valid values.");
+        return @as(i32, @intFromBool(a != null)) - @as(i32, @intFromBool(b != null));
+    }
+    const r = try strRangeSlices(a, ia, b, ib, length);
+    return strCompareCultureUnits(r.xs, r.ys, ignore_case);
+}
+
+pub fn strCompareRangeWith(a: String, ia: i32, b: String, ib: i32, length: i32, how: i32) Raised!i32 {
+    return switch (how) {
+        0, 2 => strCompareCultureRange(a, ia, b, ib, length, false),
+        1, 3 => strCompareCultureRange(a, ia, b, ib, length, true),
+        4 => strCompareRange(a, ia, b, ib, length, false),
+        5 => strCompareRange(a, ia, b, ib, length, true),
+        else => argRange("comparisonType", "The string comparison type passed in is currently not supported."),
+    };
 }
 
 /// `s.[lo..hi]`: what of it is inside the string
@@ -435,6 +466,102 @@ pub fn strIndexOfIgnoreCase(s: String, value: String) Raised!i32 {
         if (foldUnits(u[i..][0..v.len], v.units())) return @intCast(i);
     }
     return -1;
+}
+
+pub fn strIndexOfCharIgnoreCase(s: String, c: u16) Raised!i32 {
+    const p = s orelse return nullRef();
+    const cu = unicode.toUpper(c);
+    for (p.units(), 0..) |u, i| {
+        if (unicode.toUpper(u) == cu) return @intCast(i);
+    }
+    return -1;
+}
+
+pub fn strStartsWithOpt(s: String, value: String, ignore_case: bool) Raised!bool {
+    return if (ignore_case) strStartsWithIgnoreCase(s, value) else rt.strStartsWith(s, value);
+}
+
+pub fn strEndsWithOpt(s: String, value: String, ignore_case: bool) Raised!bool {
+    return if (ignore_case) strEndsWithIgnoreCase(s, value) else rt.strEndsWith(s, value);
+}
+
+// Primary ASCII linguistic weights matching .NET's InvariantCulture sort order
+// (punctuation/symbols < digits < letters, case folded).
+const ascii_primary: [128]u8 = blk: {
+    @setEvalBranchQuota(10000);
+    var tbl: [128]u8 = @splat(0);
+    var w: u8 = 0;
+    for (0..32) |i| {
+        tbl[i] = w;
+        w += 1;
+    }
+    tbl[127] = w;
+    w += 1;
+    const order = " _-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$0123456789";
+    for (order) |c| {
+        tbl[c] = w;
+        w += 1;
+    }
+    for ('a'..'z' + 1) |c| {
+        tbl[c] = w;
+        tbl[c - 'a' + 'A'] = w;
+        w += 1;
+    }
+    break :blk tbl;
+};
+
+fn primaryWeight(c: u16) u32 {
+    if (c < 128) return ascii_primary[c];
+    return 0x100 + @as(u32, unicode.toUpper(c));
+}
+
+fn caseWeight(c: u16) u2 {
+    if (unicode.toUpper(c) != c) return 0;
+    if (unicode.toLower(c) != c) return 1;
+    return 2;
+}
+
+/// Linguistic / InvariantCulture ordering of two UTF-16 unit slices: primary base weight
+/// first (case-insensitive), then lowercase before uppercase when primary weights match.
+pub fn strCompareCultureUnits(x: []const u16, y: []const u16, ignore_case: bool) i32 {
+    const n = @min(x.len, y.len);
+    for (x[0..n], y[0..n]) |c, d| {
+        const pc = primaryWeight(c);
+        const pd = primaryWeight(d);
+        if (pc != pd) return if (pc < pd) -1 else 1;
+    }
+    if (x.len != y.len) return if (x.len < y.len) -1 else 1;
+    if (ignore_case) return 0;
+    for (x, y) |c, d| {
+        if (c != d) {
+            const wc = caseWeight(c);
+            const wd = caseWeight(d);
+            if (wc != wd) return if (wc < wd) -1 else 1;
+            return if (c < d) -1 else 1;
+        }
+    }
+    return 0;
+}
+
+pub fn strCompareCulture(a: String, b: String, ignore_case: bool) i32 {
+    if (a == null or b == null) return @as(i32, @intFromBool(a != null)) - @as(i32, @intFromBool(b != null));
+    return strCompareCultureUnits(unitsOf(a), unitsOf(b), ignore_case);
+}
+
+pub fn strCompareTo(a: String, b: String) Raised!i32 {
+    const p = a orelse return nullRef();
+    if (b == null) return 1;
+    return strCompareCultureUnits(p.units(), unitsOf(b), false);
+}
+
+pub fn strCompareWith(a: String, b: String, how: i32) Raised!i32 {
+    return switch (how) {
+        0, 2 => strCompareCulture(a, b, false),
+        1, 3 => strCompareCulture(a, b, true),
+        4 => rt.strCompare(a, b),
+        5 => strCompareIgnoreCase(a, b),
+        else => argRange("comparisonType", "The string comparison type passed in is currently not supported."),
+    };
 }
 
 /// `Path.GetFileName path`: what follows the last directory separator (`/`, and `\\` on Windows).
