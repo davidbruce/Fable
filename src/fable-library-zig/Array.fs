@@ -977,3 +977,80 @@ let listRandomSampleBy<'T> (randomizer: unit -> float) (count: int) (source: 'T 
 
 let listRandomSample<'T> (count: int) (source: 'T list) : 'T list =
     listRandomSampleWith System.Random.Shared count source
+
+// ---- System.Array.BinarySearch ----
+
+/// .NET's search of a sorted range: the index of an element equal to `value` (the comparer is
+/// given the array's element first), or the complement of where it would go
+let private searchBy (order: 'T -> 'T -> int) (array: 'T[]) (index: int) (length: int) (value: 'T) : int =
+    if index < 0 then
+        raise (System.ArgumentOutOfRangeException("index", "Non-negative number required."))
+
+    if length < 0 then
+        raise (System.ArgumentOutOfRangeException("length", "Non-negative number required."))
+
+    if array.Length - index < length then
+        raise (
+            System.ArgumentException(
+                "Offset and length were out of bounds for the array or count is greater than the number of elements from index to the end of the source collection."
+            )
+        )
+
+    let mutable lo = index
+    let mutable hi = index + length - 1
+    let mutable found = -1
+
+    while found < 0 && lo <= hi do
+        let i = lo + ((hi - lo) >>> 1)
+        let c = order array.[i] value
+
+        if c = 0 then
+            found <- i
+        elif c < 0 then
+            lo <- i + 1
+        else
+            hi <- i - 1
+
+    if found >= 0 then
+        found
+    else
+        ~~~lo
+
+/// `Array.BinarySearch(array, [index, length,] value)`: by F#'s comparison
+let binarySearch (array: 'T[]) (index: int) (length: int) (value: 'T) : int =
+    searchBy compare array index length value
+
+/// The same of strings: by the culture, as .NET's default comparer of strings
+let binarySearchStrings (array: string[]) (index: int) (length: int) (value: string) : int =
+    searchBy (fun (a: string) (b: string) -> System.String.Compare(a, b)) array index length value
+
+/// The same by a comparer
+let binarySearchWith
+    (array: 'T[])
+    (index: int)
+    (length: int)
+    (value: 'T)
+    (comparer: System.Collections.Generic.IComparer<'T>)
+    : int
+    =
+    searchBy (fun a b -> comparer.Compare(a, b)) array index length value
+
+/// `ComparisonIdentity.FromFunction(f)`: a comparer of `f`
+let comparerOfFunction (f: 'T -> 'T -> int) : System.Collections.Generic.IComparer<'T> =
+    { new System.Collections.Generic.IComparer<'T> with
+        member _.Compare(a, b) = f a b
+    }
+
+/// `ComparisonIdentity.Structural`: F#'s comparison
+let structuralComparer<'T when 'T: comparison> () : System.Collections.Generic.IComparer<'T> =
+    { new System.Collections.Generic.IComparer<'T> with
+        member _.Compare(a, b) = compare a b
+    }
+
+let binarySearchAll (array: 'T[]) (value: 'T) : int = binarySearch array 0 array.Length value
+
+let binarySearchStringsAll (array: string[]) (value: string) : int =
+    binarySearchStrings array 0 array.Length value
+
+let binarySearchWithAll (array: 'T[]) (value: 'T) (comparer: System.Collections.Generic.IComparer<'T>) : int =
+    binarySearchWith array 0 array.Length value comparer

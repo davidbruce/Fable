@@ -1766,6 +1766,8 @@ pub const ObjType = struct {
     equals: ?*const fn (Obj, Obj) bool = null,
     hash: ?*const fn (Obj) i32 = null,
     compare: ?*const fn (Obj, Obj) i32 = null,
+    /// a boxed array (`o :? System.Array`)
+    is_array: bool = false,
 };
 
 pub const ObjHeader = struct {
@@ -1975,6 +1977,7 @@ pub fn boxType(comptime T: type) *const ObjType {
             .equals = boxEquals,
             .hash = boxHash,
             .compare = if (comparable(T)) boxCompare else null,
+            .is_array = @typeInfo(T) == .pointer and @hasDecl(@typeInfo(T).pointer.child, "fable_array"),
         };
         pub fn boxText(_: ?*Env, o: Obj, _: void) Raised!String {
             defer drop(o);
@@ -2035,6 +2038,12 @@ pub fn tryUnbox(comptime OT: type, o: Any) OT {
     if (T == Any or T == Obj) return dup(p);
     if (p.type == boxType(T)) return dup(boxed(T, p).value);
     return null;
+}
+
+/// `o :? System.Array`: a boxed array
+pub fn isArray(o: Any) bool {
+    const p = o orelse return false;
+    return p.type.is_array;
 }
 
 /// `o :? C` of a class

@@ -537,7 +537,6 @@ let ``test System.Array.IndexOf works with non-primitive types`` () =
     System.Array.IndexOf(myArray, Dog 3, 0, 1) |> equal -1
     System.Array.IndexOf(myArray, Duck 5, 1) |> equal -1
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -548,16 +547,12 @@ let ``test System.Array.BinarySearch works`` () =
     System.Array.BinarySearch(xs, 8) |> equal -5
     System.Array.BinarySearch(xs, 10) |> equal -6
     System.Array.BinarySearch(([||]: int[]), 3) |> equal -1
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works with duplicates`` () =
     System.Array.BinarySearch([|2; 2; 2; 2; 2; 2; 2; 2|], 2) |> equal 3
     System.Array.BinarySearch([|1; 2; 2; 2; 2; 3; 4; 5; 6|], 2) |> equal 4
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works with a range`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -567,9 +562,7 @@ let ``test System.Array.BinarySearch works with a range`` () =
     System.Array.BinarySearch(xs, 1, 2, 9) |> equal -4
     System.Array.BinarySearch(xs, 2, 0, 5) |> equal -3
     System.Array.BinarySearch(xs, 5, 0, 5) |> equal -6
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support Microsoft.FSharp.Collections.ComparisonIdentity.)
 [<Fact>]
 let ``test System.Array.BinarySearch works with a comparer`` () =
     let desc = ComparisonIdentity.FromFunction(fun (a: int) b -> compare b a)
@@ -579,9 +572,7 @@ let ``test System.Array.BinarySearch works with a comparer`` () =
     System.Array.BinarySearch(ys, 1, 3, 3, desc) |> equal 3
     let xs = [|1; 3; 5; 7; 9|]
     System.Array.BinarySearch(xs, 7, (null: System.Collections.Generic.IComparer<int>)) |> equal 3
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test System.Array.BinarySearch passes the array element to the comparer first`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -596,9 +587,7 @@ let ``test System.Array.BinarySearch passes the array element to the comparer fi
     calls.Clear()
     System.Array.BinarySearch(xs, 4, logging) |> equal -3
     List.ofSeq calls |> equal [(5, 4); (1, 4); (3, 4)]
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test System.Array.BinarySearch works with other element types`` () =
     let strings = [|"apple"; "banana"; "cherry"|]
@@ -617,17 +606,13 @@ let ``test System.Array.BinarySearch works with other element types`` () =
     let unions = [|Duck 1; Duck 4; Dog 0|]
     System.Array.BinarySearch(unions, Dog 0) |> equal 2
     System.Array.BinarySearch(unions, Duck 2) |> equal -2
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works with a range and a null comparer`` () =
     let xs = [|1; 3; 5; 7; 9|]
     System.Array.BinarySearch(xs, 1, 3, 7, null) |> equal 3
     System.Array.BinarySearch(xs, 1, 3, 2, null) |> equal -2
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works with a single element and a large array`` () =
     System.Array.BinarySearch([|5|], 5) |> equal 0
@@ -636,9 +621,7 @@ let ``test System.Array.BinarySearch works with a single element and a large arr
     let big = Array.init 1000 (fun i -> i * 2)
     System.Array.BinarySearch(big, 998) |> equal 499
     System.Array.BinarySearch(big, 999) |> equal -501
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test System.Array.BinarySearch works with more element types`` () =
     System.Array.BinarySearch([|1uy; 3uy; 5uy|], 3uy) |> equal 1
@@ -658,9 +641,7 @@ let ``test System.Array.BinarySearch works with more element types`` () =
     System.Array.BinarySearch([|1I; 5I; 10I|], 11I) |> equal -4
     System.Array.BinarySearch([|None; Some 1; Some 3|], Some 1) |> equal 1
     System.Array.BinarySearch([|None; Some 1; Some 3|], Some 2) |> equal -3
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test System.Array.BinarySearch with a range passes the array element to the comparer first`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -672,18 +653,14 @@ let ``test System.Array.BinarySearch with a range passes the array element to th
                     compare x y }
     System.Array.BinarySearch(xs, 1, 3, 4, logging) |> equal -3
     List.ofSeq calls |> equal [(5, 4); (3, 4)]
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch non-generic overloads work`` () =
     let xs = [|1; 3; 5; 7; 9|]
     System.Array.BinarySearch(xs :> System.Array, box 7) |> equal 3
     System.Array.BinarySearch(xs :> System.Array, box 4) |> equal -3
     System.Array.BinarySearch(xs :> System.Array, 1, 3, box 5) |> equal 2
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch with a range checks its arguments`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -700,7 +677,6 @@ let ``test System.Array.BinarySearch with a range checks its arguments`` () =
     raised (fun () -> System.Array.BinarySearch(xs, 1, -1, 5)) |> equal "ArgumentOutOfRangeException"
     raised (fun () -> System.Array.BinarySearch(xs, 3, 3, 5)) |> equal "ArgumentException"
     raised (fun () -> System.Array.BinarySearch(xs, 6, 0, 5)) |> equal "ArgumentException"
-#endif
 
 [<Fact>]
 let ``test Array.findIndex works`` () =
@@ -1330,7 +1306,7 @@ let ``test Array.allPairs works`` () =
           (3, 'c'); (3, 'd'); (3, 'e'); (3, 'f'); (4, 'a'); (4, 'b'); (4, 'c');
           (4, 'd'); (4, 'e'); (4, 'f')|]
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
+#if !FABLE_COMPILER_ZIG // (System.Array as a value (a sequence of obj))
 [<Fact>]
 let ``test Casting to System.Array works`` () =
     let xs = [|1;2;3;4|] :> System.Array // Numeric array
@@ -1343,7 +1319,6 @@ let ``test Casting to System.Array works`` () =
           (4, 'd'); (4, 'e'); (4, 'f') ]
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test Testing against System.Array works`` () =
     let xs = box [|1;2;3;4|]
@@ -1352,7 +1327,6 @@ let ``test Testing against System.Array works`` () =
     xs :? System.Array |> equal true
     ys :? System.Array |> equal true
     zs :? System.Array |> equal false
-#endif
 
 [<Fact>]
 let ``test System.Array.Copy works with numeric arrays`` () =

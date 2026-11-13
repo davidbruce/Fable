@@ -32,8 +32,95 @@ let call
     let decLit = decLit ctx
     let contents = contents r
 
+    // (a call of the library's Array.fs; the strings' functions are not generic)
+    let arrayLib (fn: string) (xs: Fable.Expr list) =
+        libraryCall
+            ctx
+            r
+            "Array"
+            fn
+            { info with
+                ThisArg = None
+                SignatureArgTypes = []
+                GenericArgs =
+                    if fn.StartsWith("binarySearchStrings", System.StringComparison.Ordinal) then
+                        []
+                    else
+                        // (of the array's items: the non-generic overloads have none)
+                        match xs with
+                        | a :: _ ->
+                            match a.Type with
+                            | Fable.Array(item, _) -> [ item ]
+                            | _ -> info.GenericArgs
+                        | [] -> info.GenericArgs
+            }
+            xs
+            t
+
+    // (`null` given for a comparer, as F# gives it: the default comparer)
+    let isNullArg (x: Fable.Expr) =
+        match x with
+        | Uncast(Fable.Value(Fable.Null _, _)) -> true
+        | Uncast(Fable.Call(Fable.Import(imp, _, _), _, _, _)) -> imp.Selector = "DefaultOf"
+        | _ -> false
+
+    let isStringArray (x: Fable.Expr) =
+        match x.Type with
+        | Fable.Array(Fable.String, _) -> true
+        | _ -> false
+
     match entity, name, args with
     // ---- arrays ----
+    // `Array.BinarySearch`: the library's Array.fs, by the comparer given or the default one (a
+    // culture's for strings)
+    | "System.Array", "BinarySearch", (Uncast a :: rest) when
+        (match a.Type with
+         | Fable.Array _ -> true
+         | _ -> false)
+        ->
+        let strings = isStringArray a
+
+        // (the value of the non-generic overloads is boxed: the value itself)
+        let item =
+            match a.Type with
+            | Fable.Array(item, _) -> item
+            | _ -> Fable.Any
+
+        let rest =
+            rest
+            |> List.map (fun x ->
+                match x with
+                | Fable.Call(Fable.Import(imp, _, _), boxInfo, _, _) when
+                    imp.Selector = "Box" && boxInfo.Args.Length = 1 && boxInfo.Args.Head.Type = item
+                    ->
+                    boxInfo.Args.Head
+                | Unboxed inner when x.Type = Fable.Any && inner.Type = item -> inner
+                | _ -> x
+            )
+
+        match rest with
+        | [ v ]
+        | [ v; _ ] when rest.Length = 1 || isNullArg rest.[1] ->
+            arrayLib
+                (if strings then
+                     "binarySearchStringsAll"
+                 else
+                     "binarySearchAll")
+                [ a; v ]
+        | [ v; c ] -> arrayLib "binarySearchWithAll" [ a; v; c ]
+        | [ i; n; v ]
+        | [ i; n; v; _ ] when rest.Length = 3 || isNullArg rest.[3] ->
+            arrayLib
+                (if strings then
+                     "binarySearchStrings"
+                 else
+                     "binarySearch")
+                [ a; i; n; v ]
+        | [ i; n; v; c ] -> arrayLib "binarySearchWith" [ a; i; n; v; c ]
+        | _ -> fail r "the Zig target does not support this Array.BinarySearch yet"
+    | "Microsoft.FSharp.Collections.ComparisonIdentity", "FromFunction", [ f ] -> arrayLib "comparerOfFunction" [ f ]
+    | "Microsoft.FSharp.Collections.ComparisonIdentity", "Structural", [] ->
+        arrayLib "structuralComparer" [ Fable.Value(Fable.UnitConstant, None) ]
     // ---- two-dimensional arrays: arrays that know their rows and columns ----
     | "Microsoft.FSharp.Collections.Array2DModule", "ZeroCreate", [ rows; cols ] ->
         rt "fable_rt.array2DZero($R, $0, $1)" [ rows; cols ] (mapType ctx r t)

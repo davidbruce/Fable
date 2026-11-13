@@ -3681,6 +3681,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     // `o :? T` of an `obj` (not one F# made by boxing a value of a known type, as `use` does)
     | Fable.Test(x, Fable.TypeTest t, r) when x.Type = Fable.Any && (let (Unboxed inner) = x in inner.Type = Fable.Any) ->
         match t with
+        // (`o :? System.Array`: any array)
+        | Fable.DeclaredType(cls, []) when cls.FullName = "System.Array" ->
+            ctx.State.UsesRuntime <- true
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.isArray($0)", xs, tBool))
         | Fable.DeclaredType(cls, _) when (objInfo ctx r cls).IsSome ->
             let o = (objInfo ctx r cls).Value
             ctx.State.UsesRuntime <- true
