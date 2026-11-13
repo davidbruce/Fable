@@ -2830,6 +2830,26 @@ pub fn genericText(x: anytype) Raised!String {
     };
 }
 
+/// .NET's `default(T)` of a type that has one here (numbers, chars, bools, strings, options,
+/// tuples of them)
+pub fn defaultOf(comptime T: type) T {
+    if (T == BigInt) return bigOf(@as(i32, 0));
+    if (T == NetDecimal) return .{};
+    return switch (@typeInfo(T)) {
+        .@"struct" => |st| blk: {
+            var x: T = undefined;
+            inline for (st.field_names) |name| @field(x, name) = defaultOf(@FieldType(T, name));
+            break :blk x;
+        },
+        else => std.mem.zeroes(T),
+    };
+}
+
+/// What a `Find` gives: the item found, or `default(T)`
+pub fn orDefault(comptime T: type, found: ?T) T {
+    return found orelse defaultOf(T);
+}
+
 fn objEql(a: Obj, b: Obj) bool {
     if (a == b) return true;
     if (a.type.equals) |f| return f(a, b);

@@ -3264,11 +3264,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ERaise(
             failure,
             match t with
-            | Fable.Any -> tAny
+            | Fable.Any -> tVoid
             | _ -> mapType ctx r t
         )
 
-    // a function with several arguments that is used one argument at a time
     // (F#'s own `raise` of an exception value, as a `with` that does not match passes it on)
     | Fable.Extended(Fable.Throw(Some x, t), _) ->
         bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx e.Range t))
@@ -3276,6 +3275,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         match ctx.CaughtExn with
         | Some exV -> ERaise(EVar exV, mapType ctx r t)
         | None -> fail r "`reraise ()` is only possible inside a `with` handler"
+    // a function with several arguments that is used one argument at a time
     | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
 
     // `match w.TryGetTarget() with | true, x -> ...` where x's type has no default value (null on
@@ -4841,6 +4841,16 @@ and applyValue
 
 /// A function that is called by name, used as a value of type `valueTy`.
 and fnValue (ctx: Ctx) (r: SourceLocation option) (orig: Fable.Expr) (c: Callable) (valueTy: Fable.Type) : Expr =
+    // (a function of several arguments given as a value is uncurried, as Fable passes it to
+    // functions and keeps it in fields: `let sum a b = ...` given to `Seq.fold`)
+    let valueTy =
+        match valueTy with
+        | Fable.LambdaType _ when c.Arity > 1 ->
+            match FableTransforms.uncurryType valueTy with
+            | Fable.DelegateType(ts, _) as uncurried when ts.Length = c.Arity -> uncurried
+            | _ -> valueTy
+        | _ -> valueTy
+
     let sameShape =
         match valueTy with
         | Fable.LambdaType _ -> c.Arity = 1
@@ -5546,6 +5556,9 @@ and dotnetCall
         | [ Uncast x ] when (listItem x.Type).IsSome -> pure' "fable_rt.raOfList($R, $0)" [ x ] ty
         | [ n ] -> bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.raNew($R)" [] ty)
         | _ -> pure' "fable_rt.raNew($R)" [] ty
+    // (from any other sequence)
+    | "System.Collections.Generic.List`1", ".ctor", [ items ] when not (isInt items) ->
+        libraryCall ctx r "ResizeArray" "ofSeq" info args t
     | "System.Collections.Generic.List`1", _, r0 :: rest ->
         match name, rest with
         | "Add", [ x ] -> pure' "fable_rt.raAdd($0, $1)" [ r0; x ] tVoid
@@ -5563,11 +5576,36 @@ and dotnetCall
         | "Reverse", [] -> pure' "fable_rt.raReverse($0)" [ r0 ] tVoid
         | "Sort", [] -> pure' "fable_rt.raSort($0)" [ r0 ] tVoid
         | "ToArray", [] -> pure' "fable_rt.raToArray($0)" [ r0 ] (mapType ctx r t)
+        // (`Find` gives `default(T)` when nothing matches: the library's `tryFind`, and the
+        // default where the type has one)
+        | ("Find" | "FindLast"), [ _ ] ->
+            if not (hasDefault t) then
+                fail
+                    r
+                    "the Zig target does not support ResizeArray.%s of items whose default is null on .NET; use a function of the List or Seq module"
+                    name
+
+            let found =
+                libraryCall ctx r "ResizeArray" ("try" + name) info args (Fable.Option(t, false))
+
+            bindArgs ctx [ found ] (fun xs -> EEmit("fable_rt.orDefault($R, $0)", xs, mapType ctx r t))
+        | "IndexOf", [ _; _ ] -> libraryCall ctx r "ResizeArray" "indexOfFrom" info args t
+        | "IndexOf", [ _; _; _ ] -> libraryCall ctx r "ResizeArray" "indexOfRange" info args t
+        | "BinarySearch", [ _ ] -> libraryCall ctx r "ResizeArray" "binarySearch" info args t
+        | ("FindAll" | "FindIndex" | "FindLastIndex" | "Exists" | "TrueForAll" | "ForEach" | "RemoveAll" | "RemoveRange" | "GetRange" | "InsertRange"),
+          _
+        | "AddRange", [ _ ] ->
+            let fn = name.Substring(0, 1).ToLowerInvariant() + name.Substring(1)
+            libraryCall ctx r "ResizeArray" fn info args t
         | _ -> fail r "the Zig target does not support ResizeArray.%s yet" name
     | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"), ".ctor", [] ->
         pure' "fable_rt.htNew($R)" [] (mapType ctx r t)
     | "System.Collections.Generic.HashSet`1", ".ctor", [ Uncast xs ] when (listItem xs.Type).IsSome ->
         pure' "fable_rt.setOfList($R, $0)" [ xs ] (mapType ctx r t)
+    // (a capacity: nothing to do here)
+    | "System.Collections.Generic.HashSet`1", ".ctor", [ n ] when isInt n ->
+        bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.htNew($R)" [] (mapType ctx r t))
+    | "System.Collections.Generic.HashSet`1", ".ctor", [ _ ] -> libraryCall ctx r "HashSet" "ofSeq" info args t
     | "System.Collections.Generic.Dictionary`2", _, d :: rest ->
         match name, rest with
         | "Add", [ k; v ] -> rt "fable_rt.dictAdd($0, $1, $2)" [ d; k; v ] tVoid
@@ -5612,6 +5650,23 @@ and dotnetCall
         | "Clear", [] -> pure' "fable_rt.htClear($0)" [ h ] tVoid
         | "UnionWith", [ Uncast xs ] when (listItem xs.Type).IsSome ->
             pure' "fable_rt.setUnionList($0, $1)" [ h; xs ] tVoid
+        | "CopyTo", [ _ ] ->
+            libraryCall
+                ctx
+                r
+                "HashSet"
+                "copyTo"
+                { info with SignatureArgTypes = [] }
+                (args
+                 @ [
+                     Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 0, Fable.NumberInfo.Empty), None)
+                 ])
+                t
+        | "CopyTo", [ _; _; _ ] -> libraryCall ctx r "HashSet" "copyToCount" info args t
+        | ("UnionWith" | "IntersectWith" | "ExceptWith" | "SymmetricExceptWith" | "Overlaps" | "SetEquals" | "IsSubsetOf" | "IsSupersetOf" | "IsProperSubsetOf" | "IsProperSupersetOf" | "CopyTo"),
+          _ ->
+            let fn = name.Substring(0, 1).ToLowerInvariant() + name.Substring(1)
+            libraryCall ctx r "HashSet" fn info args t
         | _ -> fail r "the Zig target does not support HashSet.%s yet" name
 
     // ---- lazy ----
@@ -7179,7 +7234,14 @@ and libraryCall
         args
         |> List.map (fun arg ->
             match arg with
-            | _ when file = "Seq" || file = "Async" || file = "Task" -> arg
+            | _ when
+                file = "Seq"
+                || file = "Async"
+                || file = "Task"
+                || file = "ResizeArray"
+                || file = "HashSet"
+                ->
+                arg
             | Fable.Value(Fable.NewOption(None, Fable.Any, isStruct), r) ->
                 Fable.Value(Fable.NewOption(None, emptyItem, isStruct), r)
             | Uncast inner when
@@ -7299,7 +7361,15 @@ and libraryCall
     // holds)
     let lowerArg (arg: Fable.Expr) : Expr =
         match arg with
-        | _ when file = "Seq" || file = "Async" || file = "Task" -> lw ctx arg
+        // (these modules take sequences as they are)
+        | _ when
+            file = "Seq"
+            || file = "Async"
+            || file = "Task"
+            || file = "ResizeArray"
+            || file = "HashSet"
+            ->
+            lw ctx arg
         // (a sequence given to a function that takes a list: the list of what it gives)
         | Fable.TypeCast(inner, _)
         | inner when isSeqType inner.Type && isSeqType arg.Type ->
