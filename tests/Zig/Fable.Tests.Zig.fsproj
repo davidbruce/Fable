@@ -27,6 +27,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Util.fs" />
+    <Compile Include="Misc/Aether.fs" />
     <Compile Include="MiscTestsHelper.fs" />
     <Compile Include="OptionTests.fs" />
     <Compile Include="ResultTests.fs" />
