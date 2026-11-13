@@ -648,6 +648,9 @@ type FileState() =
     member val Values = List<string * Ty * string>()
     /// the classes that take part in inheritance that this file declares
     member val Objs = List<ObjDecl>()
+    /// the functions marked as tests (`[<Fact>]`, `[<Test>]`): what the test is called, and
+    /// the function; each becomes a Zig `test` that `zig test` runs
+    member val Tests = List<string * string>()
     /// what is known of such classes (see `objInfo`), by full name
     member val ObjInfos = Dictionary<string, obj>()
     /// imports of other files: path -> local alias

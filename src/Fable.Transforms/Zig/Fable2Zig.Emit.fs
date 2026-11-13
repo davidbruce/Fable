@@ -458,9 +458,13 @@ let rec ex (em: Em) (e: Expr) : string =
 
             $"%s{zigType t}{{ .%s{c} = %s{cell} }}"
         | TEnt _ -> $"%s{zigType t}{{ .%s{fieldIdent case} = .{{ %s{inits (caseFields t case)} }} }}"
-        | TOpt _ ->
+        | TOpt inner ->
             if case = "Some" then
-                $"@as(%s{zigType t}, %s{args.Head})"
+                match inner with
+                // (`Some None`: the inner null is given its type, or Zig would take it for the
+                // outer one)
+                | TOpt _ -> $"@as(%s{zigType t}, @as(%s{zigType inner}, %s{args.Head}))"
+                | _ -> $"@as(%s{zigType t}, %s{args.Head})"
             else
                 $"@as(%s{zigType t}, null)"
         | TTuple _ -> args |> String.concat ", " |> sprintf "@as(%s, .{ %s })" (zigType t)
@@ -1831,6 +1835,16 @@ let emitFile (state: FileState) : string =
 
     for a in adapters.Values do
         emitAdapter out fns a
+
+    for (name, fn) in state.Tests do
+        let quoted = name.Replace("\\", "\\\\").Replace("\"", "\\\"")
+
+        out
+            .AppendLine("test \"" + quoted + "\" {")
+            .AppendLine("    try fable_rt.testInit(@\"$init\");")
+            .AppendLine($"    try fable_rt.testCase(%s{callTarget fn});")
+            .AppendLine("}")
+        |> ignore
 
     // The F# entry point returns the process exit code as an int; Zig's `main` returns a u8.
     // In builds that count cells, a program that ends with cells still allocated says so.

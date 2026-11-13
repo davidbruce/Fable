@@ -34,3 +34,22 @@ let handle (args: string list) =
 
     if not noDotnet then
         Command.Run("dotnet", "run", workingDirectory = projectDir)
+
+    // tests/Zig: the tests the other targets share, ported; each `[<Fact>]` is a Zig `test`
+    let testsDir = Path.Resolve("tests", "Zig")
+
+    Command.Fable(
+        CmdLine.empty
+        |> CmdLine.appendRaw testsDir
+        |> CmdLine.appendPrefix "--lang" "zig"
+        |> CmdLine.appendPrefix "--extension" ".zig"
+        |> CmdLine.appendPrefix "--exclude" "Fable.Core"
+        |> CmdLine.appendRaw "--noCache",
+        workingDirectory = testsDir
+    )
+
+    for file in System.IO.Directory.GetFiles(testsDir, "*Tests.zig") |> Array.sort do
+        Command.Run("zig", $"test %s{System.IO.Path.GetFileName file}", workingDirectory = testsDir)
+
+    if not noDotnet then
+        Command.Run("dotnet", "test", workingDirectory = testsDir)

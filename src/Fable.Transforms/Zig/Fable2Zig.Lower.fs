@@ -893,6 +893,11 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.LambdaType(arg, ret) -> TFn([ mapType ctx r arg ], mapType ctx r ret)
     | Fable.DelegateType(args, ret) -> TFn(args |> List.map (mapType ctx r), mapType ctx r ret)
     | Fable.Tuple(ts, _) -> TTuple(ts |> List.map (mapType ctx r))
+    // (`None` and `[]` whose type F# leaves as `obj`: they hold nothing, so any item type is
+    // theirs)
+    | Fable.Option(Fable.Any, _) -> TOpt tVoid
+    | Fable.List Fable.Any -> TEnt(listEnt ctx.State, [ tVoid ])
+    | Fable.Array(Fable.Any, kind) -> mapType ctx r (Fable.Array(Fable.Unit, kind))
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
@@ -956,6 +961,13 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(treeEnt ctx (ent.FullName = mapName), genArgs |> List.map (mapType ctx r))
     | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapType ctx r))
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
+
+/// A type argument: `obj` stands for the item type of something empty (an `obj` value cannot be
+/// made here), so any type is right for it.
+and mapTypeArg (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
+    match t with
+    | Fable.Any -> tVoid
+    | _ -> mapType ctx r t
 
 /// The record or union behind an entity reference. Immutable, non-recursive records and
 /// unions are plain Zig values: a `struct`, or a `union(enum)` with one payload per case.
@@ -2055,14 +2067,24 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
              Cons Empty IsEmpty Transpose InsertAt RemoveAt UpdateAt"
         ->
         Some("List", small name)
-    | "Microsoft.FSharp.Core.OptionModule" when
+    // (a value option is an option here: its module is the same functions)
+    | "Microsoft.FSharp.Core.OptionModule"
+    | "Microsoft.FSharp.Core.ValueOption" when
         has
             "Map Bind DefaultValue DefaultWith IsSome IsNone GetValue Iterate Filter Exists ForAll Fold OrElse
-             OrElseWith ToList ToArray Count Contains Flatten Map2"
+             OrElseWith ToList ToArray Count Contains Flatten Map2 FoldBack Map3 OfValueOption ToValueOption"
         ->
         Some("Option", small name)
-    | "Microsoft.FSharp.Core.FSharpOption`1" when name = "get_IsSome" -> Some("Option", "isSome")
-    | "Microsoft.FSharp.Core.FSharpOption`1" when name = "get_IsNone" -> Some("Option", "isNone")
+    | "Microsoft.FSharp.Core.ValueOption" when name = "ToOption" -> Some("Option", "ofValueOption")
+    | "Microsoft.FSharp.Core.ValueOption" when name = "OfOption" -> Some("Option", "toValueOption")
+    | "Microsoft.FSharp.Core.Operators" when name = "DefaultArg" || name = "DefaultValueArg" ->
+        Some("Option", "defaultArg")
+    | ("Microsoft.FSharp.Core.FSharpOption`1" | "Microsoft.FSharp.Core.FSharpValueOption`1") when name = "get_IsSome" ->
+        Some("Option", "isSome")
+    | ("Microsoft.FSharp.Core.FSharpOption`1" | "Microsoft.FSharp.Core.FSharpValueOption`1") when name = "get_IsNone" ->
+        Some("Option", "isNone")
+    | ("Microsoft.FSharp.Core.FSharpOption`1" | "Microsoft.FSharp.Core.FSharpValueOption`1") when name = "get_Value" ->
+        Some("Option", "memberValue")
     | "Microsoft.FSharp.Core.ResultModule" when has "Map Bind MapError" -> Some("Result", small name)
     | "Microsoft.FSharp.Collections.MapModule" when
         has
@@ -2854,7 +2876,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
         // `[| a; b |]`, and an array of a given length
         | Fable.NewArray(Fable.ArrayValues values, t, _) ->
-            let ty = TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
+            let ty = TEnt(arrayEnt ctx.State, [ mapTypeArg ctx r t ])
             let holes = values |> List.mapi (fun i _ -> $"$%d{i}") |> String.concat ", "
 
             bindArgs
@@ -2862,20 +2884,22 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 (values |> List.map (lw ctx))
                 (fun xs -> EEmit($"fable_rt.arrayOf($R, .{{ %s{holes} }})", xs, ty))
         | Fable.NewArray(Fable.ArrayAlloc size, t, _) ->
-            let ty = TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
+            let ty = TEnt(arrayEnt ctx.State, [ mapTypeArg ctx r t ])
             bindArgs ctx [ lw ctx size ] (fun xs -> ERt("fable_rt.arrayZero($R, $0)", xs, ty))
         | Fable.NewArray(Fable.ArrayFrom(Uncast source), t, _) when source.Type = Fable.List t ->
-            let ty = TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
+            let ty = TEnt(arrayEnt ctx.State, [ mapTypeArg ctx r t ])
             bindArgs ctx [ lw ctx source ] (fun xs -> EEmit("fable_rt.arrayOfList($R, $0)", xs, ty))
         | Fable.NewList(headAndTail, t) ->
-            let ty = TEnt(listEnt ctx.State, [ mapType ctx r t ])
+            let ty = mapType ctx r (Fable.List t)
 
             match headAndTail with
             | Some(head, tail) ->
                 bindArgsIn true ctx [ lw ctx head; lw ctx tail ] (fun xs -> ECon(ty, "Cons", xs, None))
             | None -> ECon(ty, "Empty", [], None)
-        | Fable.NewOption(value, t, _) ->
-            let ty = TOpt(mapType ctx r t)
+        // (a `None` whose item type Fable lost: Zig's `null` fits the option it is given to)
+        | Fable.NewOption(None, Fable.Any, _) -> ELit("null", TOpt tVoid)
+        | Fable.NewOption(value, t, isStruct) ->
+            let ty = mapType ctx r (Fable.Option(t, isStruct))
 
             match value with
             | Some v -> bindArgsIn true ctx [ lw ctx v ] (fun xs -> ECon(ty, "Some", xs, None))
@@ -3938,7 +3962,7 @@ and typeArgsOf
     else
         let tys =
             match given with
-            | Some given when given.Length = c.TypeParams.Length -> given |> List.map (mapType ctx r)
+            | Some given when given.Length = c.TypeParams.Length -> given |> List.map (mapTypeArg ctx r)
             | _ ->
                 let found = Dictionary<string, Fable.Type>()
 
@@ -3951,7 +3975,7 @@ and typeArgsOf
                 c.TypeParams
                 |> List.map (fun name ->
                     match found.TryGetValue name with
-                    | true, t -> mapType ctx r t
+                    | true, t -> mapTypeArg ctx r t
                     | _ ->
                         fail
                             r
@@ -6091,6 +6115,18 @@ and dotnetCall
                     fail r "the Zig target does not support %s.%s yet" entity name
             )
     | _ ->
+        // (where the value is a function that is applied at once, Fable gives the read the type
+        // of the application: the option's item type is the one to go by)
+        let t =
+            match entity, name, args with
+            | ("Microsoft.FSharp.Core.FSharpOption`1" | "Microsoft.FSharp.Core.FSharpValueOption`1"),
+              "get_Value",
+              o :: _ ->
+                match o.Type with
+                | Fable.Option(item, _) -> item
+                | _ -> t
+            | _ -> t
+
         match libraryFunction entity name with
         | Some(file, fn) -> libraryCall ctx r file fn info args t
         | None -> fail r "the Zig target does not support %s.%s yet" entity name
@@ -6252,13 +6288,19 @@ and libraryCall
     // (where FSharp.Core takes a sequence and is given a list, the library takes the list; an
     // empty value whose item type F# left open, `obj` on .NET, gets `unit`: nothing can depend
     // on it)
+    // (a function of one type argument: an untyped `None` given to it is of that type)
+    let emptyItem =
+        match info.GenericArgs with
+        | [ only ] when only <> Fable.Any -> only
+        | _ -> Fable.Unit
+
     let args =
         args
         |> List.map (fun arg ->
             match arg with
             | _ when file = "Seq" || file = "Async" || file = "Task" -> arg
             | Fable.Value(Fable.NewOption(None, Fable.Any, isStruct), r) ->
-                Fable.Value(Fable.NewOption(None, Fable.Unit, isStruct), r)
+                Fable.Value(Fable.NewOption(None, emptyItem, isStruct), r)
             | Fable.Value(Fable.NewList(None, Fable.Any), r) -> Fable.Value(Fable.NewList(None, Fable.Unit), r)
             | Uncast inner when
                 (match arg.Type with
@@ -6504,6 +6546,13 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         entOf (newCtx c.Name) None c.Entity |> ignore
                     with ZigError(msg, r) ->
                         report r msg
+                // (an attribute: only the compiler looks at it)
+                | Some ent when
+                    (match ent.BaseType with
+                     | Some bt -> bt.Entity.FullName = "System.Attribute"
+                     | None -> false)
+                    ->
+                    ()
                 | Some ent when
                     not (ent.IsFSharpExceptionDeclaration || ent.IsFSharpModule)
                     && (try
@@ -6714,6 +6763,18 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 | None -> ()
 
                 let body = lw ctx d.Body
+
+                // a test (xUnit's `[<Fact>]`, NUnit's `[<Test>]`): `zig test` runs it
+                if
+                    info.Attributes
+                    |> Seq.exists (fun a ->
+                        let n = a.Entity.FullName
+
+                        n.EndsWith("FactAttribute", System.StringComparison.Ordinal)
+                        || n.EndsWith(".TestAttribute", System.StringComparison.Ordinal)
+                    )
+                then
+                    state.Tests.Add((info.DisplayName, d.Name))
 
                 state.Fns.Add
                     {

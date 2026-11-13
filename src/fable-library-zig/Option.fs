@@ -100,3 +100,36 @@ let toArray<'T> (option: 'T option) : 'T[] =
     match option with
     | Some x -> [| x |]
     | None -> [||]
+
+let foldBack<'State, 'T> (folder: 'T -> 'State -> 'State) (option: 'T option) (state: 'State) : 'State =
+    match option with
+    | Some x -> folder x state
+    | None -> state
+
+let map3<'T1, 'T2, 'T3, 'U>
+    (mapping: 'T1 -> 'T2 -> 'T3 -> 'U)
+    (option1: 'T1 option)
+    (option2: 'T2 option)
+    (option3: 'T3 option)
+    : 'U option
+    =
+    match option1, option2, option3 with
+    | Some a, Some b, Some c -> Some(mapping a b c)
+    | _ -> None
+
+/// `defaultArg option value`
+let defaultArg<'T> (option: 'T option) (value: 'T) : 'T =
+    match option with
+    | Some x -> x
+    | None -> value
+
+/// (an option and a value option are one type here)
+let ofValueOption<'T> (option: 'T option) : 'T option = option
+
+let toValueOption<'T> (option: 'T option) : 'T option = option
+
+/// `o.Value`: .NET raises NullReferenceException for None (it is null there)
+let memberValue<'T> (option: 'T option) : 'T =
+    match option with
+    | Some x -> x
+    | None -> raise (System.NullReferenceException())

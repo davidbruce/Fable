@@ -6105,6 +6105,32 @@ pub fn exnMessage(e: Exn) String {
     return anyText(e);
 }
 
+/// The module values of a file with tests, before the first test of it runs.
+pub fn testInit(init: anytype) !void {
+    const r = init();
+    if (comptime isRaised(@TypeOf(r))) {
+        r catch {
+            uncaught();
+            return error.TestFailed;
+        };
+    }
+}
+
+/// A test that `zig test` runs (an F# function marked `[<Fact>]`): it fails if it raises,
+/// and the exception is written as an unhandled one would be.
+pub fn testCase(f: anytype) !void {
+    const n = @typeInfo(@TypeOf(f)).@"fn".param_types.len;
+    const r = if (n == 0) f() else f({});
+    if (comptime isRaised(@TypeOf(r))) {
+        if (r) |v| {
+            drop(v);
+        } else |_| {
+            uncaught();
+            return error.TestFailed;
+        }
+    } else drop(r);
+}
+
 /// The program's entry point let an exception escape: say which, and give it up.
 pub fn uncaught() void {
     const e = take();
