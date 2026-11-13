@@ -34,6 +34,40 @@ let call
     let contents = contents r
 
     match entity, name, args with
+    // `(s :> IEnumerable<'T>).GetEnumerator()` of a sequence: an enumerator over a walk of it
+    | "System.Collections.Generic.IEnumerable`1", "GetEnumerator", [ Uncast source ] when
+        isSeqType source.Type || (forInSource ctx source).IsSome
+        ->
+        // (a list or an array: the sequence of it)
+        let source =
+            if isSeqType source.Type then
+                source
+            else
+                match t with
+                | Fable.DeclaredType(_, [ item ]) ->
+                    Fable.TypeCast(
+                        source,
+                        Fable.DeclaredType(
+                            {
+                                FullName = "System.Collections.Generic.IEnumerable`1"
+                                Path = Fable.CoreAssemblyName "System.Runtime"
+                            },
+                            [ item ]
+                        )
+                    )
+                | _ -> source
+
+        libraryCall
+            ctx
+            r
+            "Seq"
+            "getEnumerator"
+            { info with
+                ThisArg = None
+                SignatureArgTypes = []
+            }
+            [ source ]
+            t
     // `source.Add f` and `source.Subscribe f` of an observable: the Observable module's
     | "Microsoft.FSharp.Control.CommonExtensions", ("AddToObservable" | "SubscribeToObservable"), [ source; f ] ->
         // (an event is given as the observable it also is)

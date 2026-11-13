@@ -54,6 +54,7 @@
     <Compile Include="QueueTests.fs" />
     <Compile Include="StackTests.fs" />
     <Compile Include="ConvertTests.fs" />
+    <Compile Include="EnumerableTests.fs" />
     <Compile Include="EventTests.fs" />
     <Compile Include="ObservableTests.fs" />
     <Compile Include="NullableTests.fs" />

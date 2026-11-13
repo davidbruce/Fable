@@ -1330,3 +1330,50 @@ let randomSampleBy<'T> (randomizer: unit -> float) (count: int) (source: SeqOf<'
 
 let randomSample<'T> (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
     randomSampleWith System.Random.Shared count source
+
+// ---- enumerators: what a program's own `IEnumerable<'T>` gives, and what `GetEnumerator` of a
+// sequence gives ----
+
+/// A sequence that walks what a `GetEnumerator` of the program's gives (each walk asks anew;
+/// the enumerator is disposed at the end)
+let ofGetEnumerator<'T> (get: unit -> System.Collections.Generic.IEnumerator<'T>) : SeqOf<'T> =
+    make (fun () ->
+        let e = get ()
+        let mutable ended = false
+
+        walker
+        <| fun () ->
+            if ended then
+                None
+            elif e.MoveNext() then
+                Some e.Current
+            else
+                ended <- true
+                e.Dispose()
+                None
+    )
+
+/// `(s :> IEnumerable<'T>).GetEnumerator()`: an enumerator over a walk of the sequence
+let getEnumerator<'T> (source: SeqOf<'T>) : System.Collections.Generic.IEnumerator<'T> =
+    let w = walk source
+    let mutable current: 'T option = None
+
+    let value () =
+        match current with
+        | Some x -> x
+        | None -> invalidOp "Enumeration has either not started or has already finished."
+
+    { new System.Collections.Generic.IEnumerator<'T> with
+        member _.Current = value ()
+      interface System.Collections.IEnumerator with
+          member _.Current = box (value ())
+
+          member _.MoveNext() =
+              current <- w.next ()
+              current.IsSome
+
+          member _.Reset() =
+              raise (System.NotSupportedException "Specified method is not supported.")
+      interface System.IDisposable with
+          member _.Dispose() = ()
+    }

@@ -4083,6 +4083,38 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.Array(_, Fable.MutableArray)
         | Fable.Array(_, Fable.ImmutableArray) ->
             bindArgs ctx [ lw ctx x ] (fun xs -> ECall(libraryTarget ctx "Seq" "ofArray", [ itemTy ], xs, seqTy))
+        // (an object of the program's that implements `IEnumerable<'T>`: what its
+        // `GetEnumerator` gives)
+        | Fable.DeclaredType({ Path = Fable.SourcePath _ }, _) when
+            implements ctx.Com x.Type "System.Collections.Generic.IEnumerable`1" = Some true
+            ->
+            let obj = AST.makeTypedIdent x.Type "enumerable"
+
+            let getEnumerator =
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = "GetEnumerator"
+                            Path = Replacements.DotnetPrefix + "System.Collections.Generic.IEnumerable`1"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    Fable.CallInfo.Create(thisArg = Fable.IdentExpr obj),
+                    Fable.DeclaredType(
+                        {
+                            FullName = "System.Collections.Generic.IEnumerator`1"
+                            Path = Fable.CoreAssemblyName "System.Runtime"
+                        },
+                        [ item ]
+                    ),
+                    e.Range
+                )
+
+            let v = ctx.State.NewVar("enumerable", mapType ctx e.Range x.Type, VLocal, false)
+            ctx.Vars[obj.Name] <- v
+            ELet(v, lw ctx x, lowerSeqOfGetEnumerator ctx e.Range item getEnumerator)
         // (a string: its chars)
         | Fable.String ->
             let chars = TEnt(arrayEnt ctx.State, [ TPrim "u16" ])
@@ -4297,6 +4329,28 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         bindArgs ctx [ lw ctx value ] (fun xs -> EEmit($"fable_rt.objNew(&%s{objTypeName info}, $0)", xs, tObj))
 
+    // an object expression of `IEnumerable<'T>`: a sequence of its `GetEnumerator`
+    | Fable.ObjectExpr(members, Fable.DeclaredType(seqRef, [ item ]), None) when
+        seqRef.FullName = "System.Collections.Generic.IEnumerable`1"
+        ->
+        let getEnumerator =
+            members
+            |> List.tryFind (fun m ->
+                match m.Body.Type with
+                | Fable.DeclaredType(e, [ _ ]) -> e.FullName = "System.Collections.Generic.IEnumerator`1"
+                | _ -> false
+            )
+
+        match getEnumerator with
+        | Some m ->
+            let body =
+                match m.Args with
+                | this :: _ when liveUse this.Name m.Body ->
+                    fail e.Range "the Zig target does not support `this` in an object expression yet"
+                | _ -> m.Body
+
+            lowerSeqOfGetEnumerator ctx e.Range item body
+        | None -> fail e.Range "the Zig target cannot find GetEnumerator in this object expression"
     | Fable.ObjectExpr(members, ifaceType, None) when isInterfaceType ctx.Com ifaceType ->
         let ifaceTy = mapType ctx e.Range ifaceType
 
@@ -4317,10 +4371,46 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | Fable.IdentExpr id -> id.Name = name
             | _ -> getSubExpressions e |> List.exists (usesIdent name)
 
+        // (two members of one name, as `IEnumerator<'T>.Current` and `IEnumerator.Current`: the one
+        // whose result is the type the struct keeps)
+        let candidates =
+            members
+            |> List.map (fun m ->
+                let compiled =
+                    match ctx.Com.TryGetMember m.MemberRef with
+                    | Some info -> info.CompiledName
+                    | None -> m.Name
+
+                compiled, m
+            )
+
+        let pick (f: string) (fty: Ty) =
+            match candidates |> List.filter (fun (n, _) -> n = f) with
+            | [] -> None
+            | [ (_, m) ] -> Some m
+            | several ->
+                let returns (m: Fable.ObjectExprMember) =
+                    match fty with
+                    | TFn(_, ret) -> mapType ctx e.Range m.Body.Type = ret
+                    | _ -> false
+
+                let notObj (m: Fable.ObjectExprMember) = m.Body.Type <> Fable.Any
+
+                match several |> List.tryFind (snd >> returns) with
+                | Some(_, m) -> Some m
+                | None ->
+                    match several |> List.tryFind (snd >> notObj) with
+                    | Some(_, m) -> Some m
+                    | None -> Some(snd several.Head)
+
         let closures =
             caseFields ifaceTy ""
-            |> List.map (fun (f, _) ->
-                match byName.TryGetValue f with
+            |> List.map (fun (f, fty) ->
+                match
+                    pick f fty
+                    |> Option.map (fun m -> true, m)
+                    |> Option.defaultValue (false, Unchecked.defaultof<_>)
+                with
                 | true, m ->
                     match m.Args with
                     | this :: args ->
@@ -5178,6 +5268,24 @@ and applyValue
         applyValue ctx r subst call ret rest finalTy
 
 /// A function that is called by name, used as a value of type `valueTy`.
+/// `Seq.ofGetEnumerator (fun () -> getEnumerator)`: a sequence that walks what an
+/// `IEnumerable<'T>` of the program's gives
+and lowerSeqOfGetEnumerator
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (item: Fable.Type)
+    (getEnumerator: Fable.Expr)
+    : Expr
+    =
+    let unitArg = AST.makeTypedIdent Fable.Unit "unitVar"
+    let itemTy = mapTypeArg ctx r item
+    let seqTy = TEnt(seqEnt ctx, [ itemTy ])
+
+    bindArgs
+        ctx
+        [ lw ctx (Fable.Delegate([ unitArg ], getEnumerator, None, [])) ]
+        (fun xs -> ECall(libraryTarget ctx "Seq" "ofGetEnumerator", [ itemTy ], xs, seqTy))
+
 and fnValue (ctx: Ctx) (r: SourceLocation option) (orig: Fable.Expr) (c: Callable) (valueTy: Fable.Type) : Expr =
     // (a function of several arguments given as a value is uncurried, as Fable passes it to
     // functions and keeps it in fields: `let sum a b = ...` given to `Seq.fold`)
