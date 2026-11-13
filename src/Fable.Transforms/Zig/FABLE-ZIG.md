@@ -384,6 +384,12 @@ only the empty array can be made that way; use `Array.create` or `Array.init`), 
 more than one dimension, the rest of the `Array` module, and reading an item without a
 reference of its own where the array is only looked at.
 
+A two-dimensional array is an array whose cell also holds its rows and columns (Fable gives it
+the type of a one-dimensional array): its items are row after row. `a.[i, j]`, `GetLength`,
+`Array2D.init`/`create`/`zeroCreate`/`get`/`set`/`length1`/`length2`/`copy`/`map`/`mapi`/
+`iter`/`iteri` work with .NET's errors, `%A` writes it as F# does, and `=` compares the shape
+too. Not yet: `array2D`, `blit`, `sub`, `rebase`, and arrays of more dimensions.
+
 ## .NET's collections, and loops over collections
 
 `ResizeArray`, `Dictionary` and `HashSet` are cells of the runtime library, equal only to

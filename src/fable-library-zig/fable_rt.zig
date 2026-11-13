@@ -491,7 +491,7 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     // (.NET's mutable collections are equal only to themselves)
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity")) return a == b;
     // (an array is equal to another with equal items, as F#'s `=` has it)
-    if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or eql(a.items, b.items);
+    if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or (eql(a.items, b.items) and std.meta.eql(a.shape, b.shape));
     if (comptime !isManaged(T) and !holdsDecimal(T)) return std.meta.eql(a, b);
     if (comptime isFunc(T)) @compileError("function values cannot be compared");
     if (T == Obj) return a == b;
@@ -921,6 +921,8 @@ pub fn Array(comptime T: type) type {
         @"$rc": u32 = 1,
         @"$gc": GcHdr(fable_cyclic) = undefined,
         items: []T,
+        /// a two-dimensional array: its rows and columns, the items row after row
+        shape: ?[2]usize = null,
     };
 }
 
@@ -2580,6 +2582,122 @@ pub inline fn objStore(o: Obj, place: anytype, value: @TypeOf(place.*)) void {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Two-dimensional arrays: an array whose `shape` says its rows and columns
+// ---------------------------------------------------------------------------------------------
+
+fn dimNegative(n: i32, comptime param: []const u8) Raised {
+    return raise(ArgumentException, format(.{ "The input must be non-negative.\n" ++ param ++ " = ", n, " (Parameter '" ++ param ++ "')" }));
+}
+
+fn shaped(a: anytype, rows: usize, cols: usize) @TypeOf(a) {
+    a.shape = .{ rows, cols };
+    return a;
+}
+
+/// `Array2D.zeroCreate rows cols`
+pub fn array2DZero(comptime A: type, rows: i32, cols: i32) Raised!A {
+    if (rows < 0) return dimNegative(rows, "length1");
+    if (cols < 0) return dimNegative(cols, "length2");
+    return shaped(try arrayZero(A, rows * cols), @intCast(rows), @intCast(cols));
+}
+
+/// `Array2D.create rows cols x`
+pub fn array2DCreate(comptime A: type, rows: i32, cols: i32, x: ItemOf(A)) Raised!A {
+    if (rows < 0) return dimNegative(rows, "length1");
+    if (cols < 0) return dimNegative(cols, "length2");
+    return shaped(try arrayCreate(A, rows * cols, x), @intCast(rows), @intCast(cols));
+}
+
+/// `Array2D.init rows cols f`
+pub fn array2DInit(comptime A: type, rows: i32, cols: i32, f: anytype) Raised!A {
+    if (rows < 0) return dimNegative(rows, "length1");
+    if (cols < 0) return dimNegative(cols, "length2");
+    const r: usize = @intCast(rows);
+    const c: usize = @intCast(cols);
+    const items = arrayItems(A, r * c);
+    for (0..r) |i| {
+        for (0..c) |j| {
+            items[i * c + j] = apply2(ItemOf(A), f, @as(i32, @intCast(i)), @as(i32, @intCast(j))) catch |e| {
+                arrayAbandon(items, i * c + j);
+                return e;
+            };
+        }
+    }
+    return shaped(arrayFrom(A, items), r, c);
+}
+
+fn shapeOf(a: anytype) [2]usize {
+    return a.shape orelse .{ a.items.len, 1 };
+}
+
+fn at2D(a: anytype, i: i32, j: i32) Raised!usize {
+    const shape = shapeOf(a);
+    if (i < 0 or j < 0 or i >= shape[0] or j >= shape[1]) return indexOutside();
+    return @as(usize, @intCast(i)) * shape[1] + @as(usize, @intCast(j));
+}
+
+/// `a.[i, j]`: a reference of its own to the item.
+pub fn array2DGet(a: anytype, i: i32, j: i32) Raised!ItemOf(@TypeOf(a)) {
+    return dup(a.items[try at2D(a, i, j)]);
+}
+
+/// `a.[i, j] <- value`
+pub fn array2DSet(a: anytype, i: i32, j: i32, value: ItemOf(@TypeOf(a))) Raised!void {
+    arrayPut(a, try at2D(a, i, j), dup(value));
+}
+
+/// `Array2D.length1 a`, `Array2D.length2 a`
+pub fn array2DLength(a: anytype, comptime dim: usize) i32 {
+    return @intCast(shapeOf(a)[dim]);
+}
+
+/// `a.GetLength d`
+pub fn arrayGetLength(a: anytype, dim: i32) Raised!i32 {
+    if (a.shape) |shape| {
+        if (dim == 0 or dim == 1) return @intCast(shape[@intCast(dim)]);
+    } else if (dim == 0) return @intCast(a.items.len);
+    return indexOutside();
+}
+
+/// `Array2D.copy a`
+pub fn array2DCopy(a: anytype) @TypeOf(a) {
+    const c = arrayCopy(a);
+    c.shape = a.shape;
+    return c;
+}
+
+/// `Array2D.map f a`
+pub fn array2DMap(comptime A: type, f: anytype, a: anytype) Raised!A {
+    const m = try arrayMap(A, f, a);
+    m.shape = a.shape;
+    return m;
+}
+
+/// `Array2D.mapi f a`
+pub fn array2DMapi(comptime A: type, f: anytype, a: anytype) Raised!A {
+    const shape = shapeOf(a);
+    const items = arrayItems(A, a.items.len);
+    for (items, 0..) |*to, k| {
+        to.* = apply3(ItemOf(A), f, @as(i32, @intCast(k / shape[1])), @as(i32, @intCast(k % shape[1])), dup(a.items[k])) catch |e| {
+            arrayAbandon(items, k);
+            return e;
+        };
+    }
+    return shaped(arrayFrom(A, items), shape[0], shape[1]);
+}
+
+/// `Array2D.iter f a`
+pub fn array2DIter(f: anytype, a: anytype) Raised!void {
+    return arrayIter(f, a);
+}
+
+/// `Array2D.iteri f a`
+pub fn array2DIteri(f: anytype, a: anytype) Raised!void {
+    const shape = shapeOf(a);
+    for (0..a.items.len) |k| try apply3(void, f, @as(i32, @intCast(k / shape[1])), @as(i32, @intCast(k % shape[1])), dup(a.items[k]));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Weak references
 //
 // `WeakReference<'T>` points at a cell without keeping it alive. It holds a handle, shared by
@@ -3229,7 +3347,7 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
             // a cell: a reference record, an array, or what a case of a recursive union holds
             if (a == b) return 0;
             inline for (@typeInfo(p.child).@"struct".field_names) |name| {
-                if (comptime !isCount(name)) {
+                if (comptime !isCount(name) and !std.mem.eql(u8, name, "shape")) {
                     const c = compare(@field(a, name), @field(b, name));
                     if (c != 0) return c;
                 }
@@ -3335,7 +3453,7 @@ pub fn hash(x: anytype) i32 {
                 return h;
             }
             inline for (@typeInfo(p.child).@"struct".field_names) |name| {
-                if (comptime !isCount(name)) h = hashWith(h, hash(@field(x, name)));
+                if (comptime !isCount(name) and !std.mem.eql(u8, name, "shape")) h = hashWith(h, hash(@field(x, name)));
             }
             return h;
         },
@@ -3671,6 +3789,21 @@ fn countNegative(count: i32) Raised {
 
 /// Apply a function value to two values: at once if it takes both, one after the other if it
 /// is a function that gives a function.
+/// Apply a function value to three values, as `apply2` does to two.
+inline fn apply3(comptime R: type, f: anytype, a: anytype, b: anytype, c: anytype) Raised!R {
+    const Code = @typeInfo(@FieldType(@TypeOf(f), "code")).pointer.child;
+    const n = @typeInfo(Code).@"fn".param_types.len;
+    if (comptime n == 4) return f.code(f.env, a, b, c);
+    if (comptime n == 3) {
+        const g = try f.code(f.env, a, b);
+        defer drop(g);
+        return g.code(g.env, c);
+    }
+    const g = try f.code(f.env, a);
+    defer drop(g);
+    return apply2(R, g, b, c);
+}
+
 inline fn apply2(comptime R: type, f: anytype, a: anytype, b: anytype) Raised!R {
     const Code = @typeInfo(@FieldType(@TypeOf(f), "code")).pointer.child;
     if (comptime @typeInfo(Code).@"fn".param_types.len == 3) return f.code(f.env, a, b);
@@ -4755,6 +4888,25 @@ pub const Shower = struct {
         return if (@backingInt(prec) <= @backingInt(Prec.bracket_if_tuple_or_not_atomic)) b.bracket(whole) else whole;
     }
 
+    /// A two-dimensional array: `[[a; b]` and every further row on a line of its own, `]`.
+    fn array2D(b: *Shower, items: anytype, shape: [2]usize, depth: i32) *Layout {
+        var all: ?*Layout = null;
+        for (0..shape[0]) |i| {
+            var row: std.ArrayList(*Layout) = .empty;
+            for (items[i * shape[1] ..][0..shape[1]]) |item| {
+                if (row.items.len == print_length) {
+                    row.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+                    break;
+                }
+                row.append(b.arena, b.show(item, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
+            }
+            const inner = if (row.items.len == 0) b.word("[]") else b.tight(b.tight(b.ascii(false, "[", true), b.separated(row.items, ";")), b.ascii(true, "]", false));
+            all = if (all) |above| b.join(above, inner, .{ .broken = 0 }) else inner;
+        }
+        const body = all orelse return b.word("[]");
+        return b.tight(b.tight(b.ascii(false, "[", true), body), b.ascii(true, "]", false));
+    }
+
     /// `{ A = 1` and every further field on a line of its own.
     fn record(b: *Shower, fields: anytype, depth: i32) *Layout {
         var all: ?*Layout = null;
@@ -4872,6 +5024,7 @@ pub const Shower = struct {
             .pointer => |ptr| {
                 if (comptime @hasDecl(ptr.child, "fable_identity")) return ptr.child.fable_show(b, x, depth);
                 if (comptime @hasDecl(ptr.child, "fable_array")) {
+                    if (x.shape) |shape| return b.array2D(x.items, shape, depth);
                     if (x.items.len == 0) return b.word("[||]");
                     var items: std.ArrayList(*Layout) = .empty;
                     for (x.items) |item| {

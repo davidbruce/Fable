@@ -60,8 +60,69 @@ let run () : int =
     let target = Array.create 5 0
     Array.blit a 1 target 2 3
 
+    let grid = Array2D.init 2 3 (fun i j -> i * 10 + j)
+    grid.[0, 0] <- 99
+    let mutable gridSum = 0
+
+    for i in 0 .. Array2D.length1 grid - 1 do
+        for j in 0 .. Array2D.length2 grid - 1 do
+            gridSum <- gridSum + grid.[i, j]
+
+    let mutable visits = ""
+
+    Array2D.init 2 2 (fun i j -> i + j)
+    |> Array2D.iteri (fun i j x -> visits <- visits + sprintf "(%d,%d)=%d " i j x)
+
+    let gridOutside =
+        try
+            string grid.[2, 0]
+        with :? System.IndexOutOfRangeException as e ->
+            e.Message
+
+    let gridNegative =
+        try
+            sprintf "%A" (Array2D.zeroCreate<int> -1 2)
+        with :? System.ArgumentException as e ->
+            e.Message
+
     let failed =
-        check (
+        same
+            "[[99; 1; 2]\n [10; 11; 12]]|[[100; 2; 3]\n [11; 12; 13]]|[[0; 0]\n [0; 0]]|[[\"x\"; \"x\"]]"
+            (sprintf
+                "%A|%A|%A|%A"
+                grid
+                (Array2D.map (fun x -> x + 1) grid)
+                (Array2D.zeroCreate<int> 2 2)
+                (Array2D.create 1 2 "x"))
+        + same
+            "23|135|6|(0,0)=0 (0,1)=1 (1,0)=1 (1,1)=2 "
+            (string (Array2D.length1 grid)
+             + string (Array2D.length2 grid)
+             + "|"
+             + string gridSum
+             + "|"
+             + string grid.Length
+             + "|"
+             + visits)
+        + same
+            "Index was outside the bounds of the array.|The input must be non-negative.\nlength1 = -1 (Parameter 'length1')|[]|[[]\n []]"
+            (gridOutside
+             + "|"
+             + gridNegative
+             + "|"
+             + sprintf "%A" (Array2D.zeroCreate<int> 0 0)
+             + "|"
+             + sprintf "%A" (Array2D.zeroCreate<int> 2 0))
+        + same
+            "True|False|[[0; 2]\n [101; 103]]|3"
+            (string (Array2D.copy grid = grid)
+             + "|"
+             + string (Array2D.zeroCreate<int> 2 3 = Array2D.zeroCreate<int> 3 2)
+             + "|"
+             + sprintf "%A" (Array2D.mapi (fun i j x -> i * 100 + j + x) (Array2D.init 2 2 (fun i j -> i + j)))
+             + "|"
+             + string (grid.GetLength 1))
+        + check (
             Array.head a = 5
             && Array.last a = 3
             && Array.item 2 a = 9

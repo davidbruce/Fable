@@ -4709,6 +4709,39 @@ and dotnetCall
     | _, "get_Current", [ Fable.IdentExpr e ] when ctx.Enumerators.ContainsKey e.Name -> EVar ctx.Enumerators[e.Name]
 
     // ---- arrays ----
+    // ---- two-dimensional arrays: arrays that know their rows and columns ----
+    | "Microsoft.FSharp.Collections.Array2DModule", "ZeroCreate", [ rows; cols ] ->
+        rt "fable_rt.array2DZero($R, $0, $1)" [ rows; cols ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "Create", [ rows; cols; x ] ->
+        rt "fable_rt.array2DCreate($R, $0, $1, $2)" [ rows; cols; x ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "Initialize", [ rows; cols; f ] ->
+        rt "fable_rt.array2DInit($R, $0, $1, $2)" [ rows; cols; f ] (mapType ctx r t)
+    | ("Microsoft.FSharp.Collections.Array2DModule" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
+      ("Get" | "GetArray2D"),
+      [ a; i; j ] -> rt "fable_rt.array2DGet($0, $1, $2)" [ a; i; j ] (mapType ctx r t)
+    | ("Microsoft.FSharp.Collections.Array2DModule" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
+      ("Set" | "SetArray2D"),
+      [ a; i; j; v ] -> rt "fable_rt.array2DSet($0, $1, $2, $3)" [ a; i; j; v ] tVoid
+    | "Microsoft.FSharp.Collections.Array2DModule", ("Length1" | "Length2"), [ a ] ->
+        pure'
+            $"""fable_rt.array2DLength($0, %s{if name = "Length1" then
+                                                  "0"
+                                              else
+                                                  "1"})"""
+            [ a ]
+            tI32
+    | "Microsoft.FSharp.Collections.Array2DModule", ("Base1" | "Base2"), [ a ] -> ESeq(lwStmt ctx a, ELit("0", tI32))
+    | "System.Array", "GetLength", [ a; d ] -> rt "fable_rt.arrayGetLength($0, $1)" [ a; d ] tI32
+    | "Microsoft.FSharp.Collections.Array2DModule", "Copy", [ a ] ->
+        pure' "fable_rt.array2DCopy($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "Map", [ f; a ] ->
+        rt "fable_rt.array2DMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "MapIndexed", [ f; a ] ->
+        rt "fable_rt.array2DMapi($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "Iterate", [ f; a ] ->
+        rt "fable_rt.array2DIter($0, $1)" [ f; a ] tVoid
+    | "Microsoft.FSharp.Collections.Array2DModule", "IterateIndexed", [ f; a ] ->
+        rt "fable_rt.array2DIteri($0, $1)" [ f; a ] tVoid
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetArray", [ a; i ]
     | "Microsoft.FSharp.Collections.ArrayModule", "Get", [ a; i ] ->
         // (where the item is a function that is applied at once, Fable gives the read the type
