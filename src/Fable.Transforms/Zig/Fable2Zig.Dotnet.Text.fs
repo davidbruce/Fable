@@ -412,6 +412,19 @@ let call
             entRef.FullName = "System.Span`1" || entRef.FullName = "System.ReadOnlySpan`1"
             ->
             pure' "fable_rt.spanEmpty($R)" [] (mapType ctx r t)
+        | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.Guid" ->
+            libraryCall
+                ctx
+                r
+                "Guid"
+                "create"
+                { info with
+                    ThisArg = None
+                    Args = []
+                    GenericArgs = []
+                }
+                [ Fable.Value(Fable.UnitConstant, None) ]
+                t
         | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.Uri" ->
             libraryCall
                 ctx
@@ -696,6 +709,8 @@ let call
         // (a `Uri`: the library's Uri.fs writes it)
         | Fable.DeclaredType(e, []) when e.FullName = "System.Uri" ->
             libraryCall ctx r "Uri" "toString" { info with ThisArg = None } [ x ] t
+        | Fable.DeclaredType(e, []) when e.FullName = "System.Guid" ->
+            libraryCall ctx r "Guid" "toString" { info with ThisArg = None } [ x ] t
         // (an object: its class's ToString, or .NET's name of its class)
         | Fable.DeclaredType _ when (objOfType ctx r x.Type).IsSome -> rt "fable_rt.objText($0)" [ x ] tStr
         | Fable.Char ->

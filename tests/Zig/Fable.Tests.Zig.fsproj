@@ -69,5 +69,6 @@
     <Compile Include="UriTests.fs" />
     <Compile Include="RandomTests.fs" />
     <Compile Include="NullnessTests.fs" />
+    <Compile Include="GuidTests.fs" />
   </ItemGroup>
 </Project>

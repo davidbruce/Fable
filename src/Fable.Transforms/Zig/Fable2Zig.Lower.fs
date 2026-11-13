@@ -1153,8 +1153,9 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         ent.FullName.StartsWith("Microsoft.FSharp.Core.CompilerServices.Measure", System.StringComparison.Ordinal)
         ->
         tVoid
-    // (.NET's `Uri`: the record of the library's Uri.fs)
+    // (.NET's `Uri` and `Guid`: records of the library's Uri.fs and Guid.fs)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Uri" -> TEnt(libRecordEnt ctx "Uri" "UriOf", [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Guid" -> TEnt(libRecordEnt ctx "Guid" "GuidOf", [])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
@@ -1783,6 +1784,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                 [
                     "handlers", TEnt(netEnt ctx.State "ResizeArray", [ TFn([ tAny; TGen "T" ], tVoid) ])
                 ]
+            | "GuidOf" -> [ "a", TPrim "u32"; "b", tI32; "c", tI32; "rest", TPrim "u64" ]
             | "UriOf" ->
                 [
                     "original", tStr
@@ -1825,7 +1827,12 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                          [])
                 Cases = [ "", fields ]
                 MutableFields = mutableFields
-                Managed = true
+                // (as the library's own declaration has it: a record of numbers only, as `GuidOf`,
+                // is a plain value)
+                Managed =
+                    not mutableFields.IsEmpty
+                    || fields.IsEmpty
+                    || fields |> List.exists (snd >> isManaged)
                 Cyclic = false
                 ReachesOpaque = false
                 Copyable = true
@@ -3673,6 +3680,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         [ lw ctx source; lw ctx target[1] ]
                         (fun xs -> EEmit("fable_rt.dictTryGet($0, $1)", xs, TOpt valueTy))
                 // (`Uri.TryCreate(s, kind, &uri)` and `Uri.TryCreate(baseUri, relative, &uri)`)
+                // (`Guid.TryParse(s, &g)`)
+                | "TryParse" when imp.Path.EndsWith("System.Guid", System.StringComparison.Ordinal) ->
+                    libraryCall
+                        ctx
+                        r
+                        "Guid"
+                        "tryParseOption"
+                        { info with ThisArg = None }
+                        [ info.Args.Head ]
+                        (Fable.Option(out.Type, false))
                 | "TryCreate" when imp.Path.EndsWith("System.Uri", System.StringComparison.Ordinal) ->
                     let args = info.Args |> List.take (info.Args.Length - 1)
 
@@ -5144,8 +5161,9 @@ and showShapeOf (ctx: Ctx) (r: SourceLocation option) (strict: bool) (root: Fabl
                 && entRef.FullName <> setName
                 && not (isDictionaryName entRef.FullName)
                 && entRef.FullName <> "System.Collections.Generic.HashSet`1"
-                // (a `Uri` is written by its `ToString`)
+                // (a `Uri` and a `Guid` are written by their `ToString`)
                 && entRef.FullName <> "System.Uri"
+                && entRef.FullName <> "System.Guid"
                 && checkedSeen.Add key
             then
                 match ctx.Com.TryGetEntity entRef with
@@ -5422,7 +5440,7 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                     (letter = 'A' || letter = 'P' || letter = 'O')
                     && (
                         match args[i].Type with
-                        | Fable.DeclaredType(ent, []) -> ent.FullName = "System.Uri"
+                        | Fable.DeclaredType(ent, []) -> ent.FullName = "System.Uri" || ent.FullName = "System.Guid"
                         | _ -> false
                     )
 
