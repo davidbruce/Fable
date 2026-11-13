@@ -308,6 +308,9 @@ let call
         rt "fable_rt.sbSetChar($0, $1, $2)" [ sb; i; c ] tVoid
     | "System.Text.StringBuilder", "ToString", [ sb; start; n ] ->
         rt "fable_rt.sbToStringRange($0, $1, $2)" [ sb; start; n ] tStr
+    | "System.Text.StringBuilder", "Remove", [ sb; start; n ] ->
+        rt "fable_rt.sbRemove($0, $1, $2)" [ sb; start; n ] (mapType ctx r t)
+    | "System.Text.StringBuilder", "set_Length", [ sb; n ] -> rt "fable_rt.sbSetLength($0, $1)" [ sb; n ] tVoid
     | "System.Text.StringBuilder", "Replace", [ sb; a; b ] when a.Type = Fable.Char ->
         pure' "fable_rt.sbReplaceChar($0, $1, $2)" [ sb; a; b ] (mapType ctx r t)
     | "System.Text.StringBuilder", "Append", [ sb; c; n ] when c.Type = Fable.Char && isInt n ->
@@ -504,6 +507,19 @@ let call
                 )
 
             ECon(mapType ctx r t, "", defaults, None)
+        | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.DateTime" ->
+            libraryCall
+                ctx
+                r
+                "DateTime"
+                "minValue"
+                { info with
+                    ThisArg = None
+                    Args = []
+                    GenericArgs = []
+                }
+                [ Fable.Value(Fable.UnitConstant, None) ]
+                t
         | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.TimeSpan" ->
             libraryCall
                 ctx
@@ -817,6 +833,19 @@ let call
                 ctx
                 r
                 "Uri"
+                "toString"
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                [ x ]
+                t
+        | Fable.DeclaredType(e, []) when e.FullName = "System.DateTime" ->
+            libraryCall
+                ctx
+                r
+                "DateTime"
                 "toString"
                 { info with
                     ThisArg = None

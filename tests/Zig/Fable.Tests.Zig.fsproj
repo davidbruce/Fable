@@ -79,5 +79,6 @@
     <Compile Include="NullnessTests.fs" />
     <Compile Include="GuidTests.fs" />
     <Compile Include="TimeSpanTests.fs" />
+    <Compile Include="DateTimeTests.fs" />
   </ItemGroup>
 </Project>

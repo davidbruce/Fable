@@ -11,6 +11,38 @@ open Fable.Transforms.Zig.IR
 open Fable.Transforms.Zig.Lower
 open Fable.Transforms.Zig.DotnetHelpers
 
+/// `X.TryParse(s, ..., &v)`: the variable of the last argument, a local's address
+let private outArgOf (ctx: Ctx) (rest: Fable.Expr list) : Fable.Ident option =
+    match List.tryLast rest with
+    | Some(Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _)) when
+        ctx.Vars.ContainsKey out.Name
+        ->
+        Some out
+    | _ -> None
+
+/// `X.TryParse(s, ..., &v)` of a library type: its `tryParse` gives the pair, the value goes to
+/// `v` and the flag is the result
+let private tryParseInto (ctx: Ctx) r (info: Fable.CallInfo) (lib: string) (s: Fable.Expr) (out: Fable.Ident) =
+    let outVar = ctx.Vars[out.Name]
+
+    let pairIr =
+        libraryCall
+            ctx
+            r
+            lib
+            "tryParse"
+            { info with
+                ThisArg = None
+                GenericArgs = []
+                SignatureArgTypes = []
+            }
+            [ s ]
+            (Fable.Tuple([ Fable.Boolean; out.Type ], false))
+
+    let pair = ctx.State.NewVar("parsed", typeOf pairIr, VLocal, false)
+
+    ELet(pair, pairIr, ESeq(EAssign(outVar, EGet(EVar pair, PItem 1, outVar.Ty)), EGet(EVar pair, PItem 0, tBool)))
+
 /// The lowered call, or null when the member is not one of this file's.
 let call
     (ctx: Ctx)
@@ -466,6 +498,22 @@ let call
                 tStr
             ))
             t
+    // (`d + t`, `d1 - d2` and the other operators of DateTime, as F# gives them)
+    | "Microsoft.FSharp.Core.Operators", ("op_Addition" | "op_Subtraction"), (a :: _ as args) when
+        (match a.Type with
+         | Fable.DeclaredType(e, _) -> e.FullName = "System.DateTime"
+         | _ -> false)
+        ->
+        dotnetCall
+            ctx
+            r
+            "System.DateTime"
+            name
+            { info with
+                ThisArg = None
+                Args = args
+            }
+            t
     // (`t1 + t2` and the other operators of TimeSpan, as F# gives them)
     | "Microsoft.FSharp.Core.Operators",
       ("op_Addition" | "op_Subtraction" | "op_Multiply" | "op_Division" | "op_UnaryNegation" | "op_UnaryPlus"),
@@ -487,6 +535,113 @@ let call
                 Args = args
             }
             t
+    // ---- `System.DateTime`: the library's DateTime.fs ----
+    | "System.DateTime", name, args ->
+        let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]
+
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "DateTime"
+                fn
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                xs
+                t
+
+        let isType (fullName: string) (x: Fable.Expr) =
+            match x.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = fullName
+            | Fable.Number(_, Fable.NumberInfo.IsEnum e) -> e.FullName = fullName
+            | _ -> false
+
+        let isKind = isType "System.DateTimeKind"
+        let isTimeSpan = isType "System.TimeSpan"
+        let isDate = isType "System.DateTime"
+
+        // (a DateTimeKind, an enum, as its number)
+        let kindArg (x: Fable.Expr) =
+            Fable.TypeCast(x, Fable.Number(Int32, Fable.NumberInfo.Empty))
+
+        let lowerFirst (n: string) =
+            n.Substring(0, 1).ToLowerInvariant() + n.Substring 1
+
+        match name, args with
+        | ".ctor", [] -> call "minValue" unitArg
+        | ".ctor", [ ticks ] -> call "ofTicks" [ ticks ]
+        | ".ctor", [ ticks; k ] when isKind k -> call "ofTicksKind" [ ticks; kindArg k ]
+        | ".ctor", [ y; m; d ] -> call "create3" [ y; m; d ]
+        | ".ctor", [ y; mo; d; h; mi; s ] -> call "create6" [ y; mo; d; h; mi; s ]
+        | ".ctor", [ y; mo; d; h; mi; s; k ] when isKind k -> call "create6Kind" [ y; mo; d; h; mi; s; kindArg k ]
+        | ".ctor", [ y; mo; d; h; mi; s; ms ] -> call "create7" [ y; mo; d; h; mi; s; ms ]
+        | ".ctor", [ y; mo; d; h; mi; s; ms; k ] when isKind k ->
+            call "create7Kind" [ y; mo; d; h; mi; s; ms; kindArg k ]
+        | ".ctor", [ y; mo; d; h; mi; s; ms; us ] -> call "create8" [ y; mo; d; h; mi; s; ms; us ]
+        | ".ctor", [ y; mo; d; h; mi; s; ms; us; k ] when isKind k ->
+            call "create8Kind" [ y; mo; d; h; mi; s; ms; us; kindArg k ]
+        | ("get_Now" | "get_UtcNow" | "get_Today" | "get_MinValue" | "get_MaxValue"), [] ->
+            call (lowerFirst (name.Substring 4)) unitArg
+        | "get_UnixEpoch", [] ->
+            call
+                "ofTicksKind"
+                [
+                    Fable.Value(
+                        Fable.NumberConstant(Fable.NumberValue.Int64 621355968000000000L, Fable.NumberInfo.Empty),
+                        None
+                    )
+                    Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 1, Fable.NumberInfo.Empty), None)
+                ]
+        | getter, [ x ] when getter.StartsWith("get_", System.StringComparison.Ordinal) ->
+            call (lowerFirst (getter.Substring 4)) [ x ]
+        | ("IsLeapYear" | "DaysInMonth" | "SpecifyKind"), _ ->
+            call
+                (lowerFirst name)
+                (args
+                 |> List.map (fun a ->
+                     if isKind a then
+                         kindArg a
+                     else
+                         a
+                 ))
+        | ("Add" | "op_Addition"), [ a; b ] when isTimeSpan b -> call "add" [ a; b ]
+        | ("Subtract" | "op_Subtraction"), [ a; b ] when isTimeSpan b -> call "subtract" [ a; b ]
+        | ("Subtract" | "op_Subtraction"), [ a; b ] when isDate b -> call "subtractDate" [ a; b ]
+        | ("AddTicks" | "AddDays" | "AddHours" | "AddMinutes" | "AddSeconds" | "AddMilliseconds" | "AddMicroseconds" | "AddMonths" | "AddYears"),
+          [ a; v ] -> call (lowerFirst name) [ a; v ]
+        | ("ToUniversalTime" | "ToLocalTime" | "ToShortDateString" | "ToLongDateString" | "ToShortTimeString" | "ToLongTimeString"),
+          [ a ] -> call (lowerFirst name) [ a ]
+        | ("Compare" | "CompareTo"), [ a; b ] -> call "compare" [ a; b ]
+        | "Equals", [ a; b ] -> call "equals" [ a; b ]
+        | ("op_Equality" | "op_Inequality" | "op_LessThan" | "op_LessThanOrEqual" | "op_GreaterThan" | "op_GreaterThanOrEqual"),
+          [ a; b ] ->
+            let op =
+                match name with
+                | "op_Equality" -> "=="
+                | "op_Inequality" -> "!="
+                | "op_LessThan" -> "<"
+                | "op_LessThanOrEqual" -> "<="
+                | "op_GreaterThan" -> ">"
+                | _ -> ">="
+
+            EPrim(op, [ call "compare" [ a; b ]; ELit("0", tI32) ], tBool)
+        | "ToString", [ x ] -> call "toString" [ x ]
+        | "ToString", x :: format :: _ when format.Type = Fable.String -> call "toStringFormat" [ x; format ]
+        | "ToString", [ x; _ ] -> call "toString" [ x ]
+        | "Parse", s :: _ -> call "parse" [ s ]
+        | "TryParse", s :: rest when
+            (match t with
+             | Fable.Tuple _ -> true
+             | _ -> false)
+            && rest.Length <= 2
+            ->
+            call "tryParse" [ s ]
+        | "TryParse", s :: rest when (outArgOf ctx rest).IsSome ->
+            tryParseInto ctx r info "DateTime" s (outArgOf ctx rest).Value
+        | _ -> fail r "the Zig target does not support DateTime.%s with these arguments yet" name
     // ---- `System.TimeSpan`: the library's TimeSpan.fs ----
     | "System.TimeSpan", name, args ->
         let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]
@@ -637,41 +792,8 @@ let call
             && rest.Length <= 1
             ->
             call "tryParse" [ s ]
-        // (`TimeSpan.TryParse(s, &t)`, with a culture or not: the value goes to `t`)
-        | "TryParse", s :: rest when
-            (match List.last rest with
-             | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ->
-                 ctx.Vars.ContainsKey out.Name
-             | _ -> false)
-            ->
-            let out =
-                match List.last rest with
-                | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) -> out
-                | _ -> fail r "internal: TryParse"
-
-            let outVar = ctx.Vars[out.Name]
-
-            let pairIr =
-                libraryCall
-                    ctx
-                    r
-                    "TimeSpan"
-                    "tryParse"
-                    { info with
-                        ThisArg = None
-                        GenericArgs = []
-                        SignatureArgTypes = []
-                    }
-                    [ s ]
-                    (Fable.Tuple([ Fable.Boolean; out.Type ], false))
-
-            let pair = ctx.State.NewVar("parsed", typeOf pairIr, VLocal, false)
-
-            ELet(
-                pair,
-                pairIr,
-                ESeq(EAssign(outVar, EGet(EVar pair, PItem 1, outVar.Ty)), EGet(EVar pair, PItem 0, tBool))
-            )
+        | "TryParse", s :: rest when (outArgOf ctx rest).IsSome ->
+            tryParseInto ctx r info "TimeSpan" s (outArgOf ctx rest).Value
         | _ -> fail r "the Zig target does not support TimeSpan.%s with these arguments yet" name
     // ---- `System.Guid`: the library's Guid.fs ----
     | "System.Guid", name, args when

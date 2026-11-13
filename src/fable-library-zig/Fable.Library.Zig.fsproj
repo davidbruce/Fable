@@ -22,6 +22,7 @@
     <Compile Include="Uri.fs" />
     <Compile Include="Guid.fs" />
     <Compile Include="TimeSpan.fs" />
+    <Compile Include="DateTime.fs" />
     <Compile Include="Async.fs" />
     <Compile Include="Task.fs" />
     <Compile Include="Map.fs" />

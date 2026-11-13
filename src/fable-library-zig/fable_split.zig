@@ -389,6 +389,26 @@ pub fn sbAppendRepeat(sb: StringBuilder, c: u16, n: i32) Raised!StringBuilder {
     return dup(sb);
 }
 
+/// `sb.Remove(start, length)`
+pub fn sbRemove(sb: StringBuilder, start: i32, n: i32) Raised!StringBuilder {
+    if (start < 0) return argRange("startIndex", "StartIndex cannot be less than zero.");
+    if (n < 0) return argRange("length", "Length cannot be less than zero.");
+    if (start + n > sb.units.items.len) return argRange("length", "Index was out of range. Must be non-negative and less than the size of the collection.");
+    sb.units.replaceRangeAssumeCapacity(@intCast(start), @intCast(n), &.{});
+    return dup(sb);
+}
+
+/// `sb.Length <- n`: cut, or padded with '\0'
+pub fn sbSetLength(sb: StringBuilder, n: i32) Raised!void {
+    if (n < 0) return argRange("value", "Length cannot be less than zero.");
+    const len: usize = @intCast(n);
+    if (len <= sb.units.items.len) {
+        sb.units.shrinkRetainingCapacity(len);
+    } else {
+        sb.units.appendNTimes(rt.allocator, 0, len - sb.units.items.len) catch @panic("fable: out of memory");
+    }
+}
+
 /// `sb.Replace(oldChar, newChar)`
 pub fn sbReplaceChar(sb: StringBuilder, old: u16, new_: u16) StringBuilder {
     for (sb.units.items) |*c| {

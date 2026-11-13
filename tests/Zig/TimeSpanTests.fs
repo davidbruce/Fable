@@ -196,7 +196,6 @@ let ``test TimeSpan Addition works`` () =
     test -2000. 0. -2000.
     test 0. 0. 0.
 
-#if !FABLE_COMPILER_ZIG // (DateTime)
 [<Fact>]
 let ``test DateTime and TimeSpan Addition works`` () =
     let test (ms: float) expected =
@@ -209,7 +208,6 @@ let ``test DateTime and TimeSpan Addition works`` () =
 
     DateTime(2014,9,12,0,0,1,DateTimeKind.Utc) |> test 1000.
     DateTime(2014,9,11,23,59,59,DateTimeKind.Utc) |> test -1000.
-#endif
 
 [<Fact>]
 let ``test TimeSpan implementation coherence`` () =

@@ -1184,6 +1184,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Guid" -> TEnt(libRecordEnt ctx "Guid" "GuidOf", [])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.TimeSpan" ->
         TEnt(libRecordEnt ctx "TimeSpan" "TimeSpanOf", [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.DateTime" ->
+        TEnt(libRecordEnt ctx "DateTime" "DateTimeOf", [])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
@@ -1864,6 +1866,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                     "handlers", TEnt(netEnt ctx.State "ResizeArray", [ TFn([ tAny; TGen "T" ], tVoid) ])
                 ]
             | "TimeSpanOf" -> [ "ticks", TPrim "i64" ]
+            | "DateTimeOf" -> [ "ticks", TPrim "i64"; "kind", TPrim "i32" ]
             | "GuidOf" -> [ "a", TPrim "u32"; "b", tI32; "c", tI32; "rest", TPrim "u64" ]
             | "UriOf" ->
                 [
@@ -3921,6 +3924,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         [ lw ctx source; lw ctx target[1] ]
                         (fun xs -> EEmit("fable_rt.dictTryGet($0, $1)", xs, TOpt valueTy))
                 // (`Uri.TryCreate(s, kind, &uri)` and `Uri.TryCreate(baseUri, relative, &uri)`)
+                // (`DateTime.TryParse(s[, culture[, styles]], &d)`)
+                | "TryParse" when imp.Path.EndsWith("System.DateTime", System.StringComparison.Ordinal) ->
+                    libraryCall
+                        ctx
+                        r
+                        "DateTime"
+                        "tryParseOption"
+                        { info with ThisArg = None }
+                        [ info.Args.Head ]
+                        (Fable.Option(out.Type, false))
                 // (`TimeSpan.TryParse(s[, culture], &t)`)
                 | "TryParse" when imp.Path.EndsWith("System.TimeSpan", System.StringComparison.Ordinal) ->
                     libraryCall
@@ -5638,6 +5651,7 @@ and showShapeOf (ctx: Ctx) (r: SourceLocation option) (strict: bool) (root: Fabl
                 && entRef.FullName <> "System.Uri"
                 && entRef.FullName <> "System.Guid"
                 && entRef.FullName <> "System.TimeSpan"
+                && entRef.FullName <> "System.DateTime"
                 && checkedSeen.Add key
             then
                 match ctx.Com.TryGetEntity entRef with
@@ -5918,6 +5932,7 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                             ent.FullName = "System.Uri"
                             || ent.FullName = "System.Guid"
                             || ent.FullName = "System.TimeSpan"
+                            || ent.FullName = "System.DateTime"
                         | _ -> false
                     )
 

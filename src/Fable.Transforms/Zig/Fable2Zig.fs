@@ -14,7 +14,7 @@ type ZigFile =
         Body: string
     }
 
-let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
+let private transformFileHere (com: Compiler) (file: Fable.File) : ZigFile =
     // (the .NET members by domain, which come after the lowering, given to it)
     Lower.domainCalls <-
         function
@@ -83,3 +83,28 @@ let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
                 None
         Body = body
     }
+
+/// The file's Zig, made on a thread of a large stack: lowering, Perceus and emission recurse once
+/// per nested expression, and a long function of statements nests deeply.
+let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
+    let mutable result = Unchecked.defaultof<ZigFile>
+    let mutable error: exn = null
+
+    let worker =
+        System.Threading.Thread(
+            (fun () ->
+                try
+                    result <- transformFileHere com file
+                with e ->
+                    error <- e
+            ),
+            256 * 1024 * 1024
+        )
+
+    worker.Start()
+    worker.Join()
+
+    if not (isNull error) then
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw()
+
+    result

@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const root = @import("root");
 pub const sgc = @import("fable_sgc.zig");
 pub const unicode = @import("fable_unicode.zig");
+pub const time = @import("fable_time.zig");
 
 pub const interface_version: i32 = 12;
 
@@ -2286,7 +2287,9 @@ pub fn Hook(comptime M: type, comptime name: []const u8) type {
             comptime var uses: [params.len]Use = undefined;
             inline for (0..params.len) |i| {
                 if (i < args.len) {
-                    a[i] = args[i];
+                    // (a struct's `this` is lent as a pointer)
+                    const P = @TypeOf(a[i]);
+                    a[i] = if (comptime @typeInfo(P) == .pointer and @TypeOf(args[i]) == @typeInfo(P).pointer.child) &args[i] else args[i];
                     uses[i] = if (i == 0) .keep else .give;
                 } else {
                     a[i] = {};
@@ -5301,6 +5304,8 @@ pub const sbCharAt = text_split.sbCharAt;
 pub const sbReplace = text_split.sbReplace;
 pub const sbReplaceChar = text_split.sbReplaceChar;
 pub const sbSetChar = text_split.sbSetChar;
+pub const sbRemove = text_split.sbRemove;
+pub const sbSetLength = text_split.sbSetLength;
 pub const sbToStringRange = text_split.sbToStringRange;
 pub const splitDone = text_split.splitDone;
 pub const splitPush = text_split.splitPush;
