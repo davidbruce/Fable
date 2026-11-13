@@ -1880,9 +1880,29 @@ fn bigFrom(m: Big) BigInt {
 /// `bigint x` of a whole number
 pub fn bigOf(x: anytype) BigInt {
     var m = bigEmpty();
-    switch (@typeInfo(@TypeOf(x))) {
-        .float => {
-            _ = m.setFloat(@trunc(x), .trunc) catch |e| bigOom(e);
+    const T = @TypeOf(x);
+    if (comptime isDecimal(T)) {
+        // (a decimal: its whole part)
+        var whole = x.m;
+        var i: u8 = 0;
+        while (i < x.scale) : (i += 1) whole = @divTrunc(whole, 10);
+        m.set(whole) catch |e| bigOom(e);
+        return bigFrom(m);
+    }
+    switch (@typeInfo(T)) {
+        .float, .comptime_float => {
+            // (its whole part: the bits of the mantissa, shifted by the exponent)
+            const t: f64 = @trunc(@as(f64, x));
+            if (@abs(t) < 1.0e18) {
+                m.set(@as(i64, @intFromFloat(t))) catch |e| bigOom(e);
+            } else {
+                const bits: u64 = @bitCast(t);
+                const exp: i32 = @as(i32, @intCast((bits >> 52) & 0x7ff)) - 1075;
+                const mant: u64 = (bits & ((1 << 52) - 1)) | (1 << 52);
+                m.set(mant) catch |e| bigOom(e);
+                if (exp > 0) m.shiftLeft(&m, @intCast(exp)) catch |e| bigOom(e);
+                if (t < 0) m.negate();
+            }
         },
         else => m.set(x) catch |e| bigOom(e),
     }
@@ -2269,6 +2289,11 @@ fn decHash(a: NetDecimal) i32 {
 pub fn decOf(x: anytype) Raised!NetDecimal {
     const T = @TypeOf(x);
     if (comptime @typeInfo(T) == .float or @typeInfo(T) == .comptime_float) return decOfFloat(x);
+    if (comptime isBigInt(T)) {
+        const v = x.value.toInt(i128) catch return decOverflow();
+        if (@abs(v) > dec_max) return decOverflow();
+        return .{ .m = v };
+    }
     if (@abs(@as(i256, x)) > dec_max) return decOverflow();
     return .{ .m = @intCast(x) };
 }
@@ -2879,7 +2904,8 @@ pub fn defaultOf(comptime T: type) T {
 
 /// What a `Find` gives: the item found, or `default(T)`
 pub fn orDefault(comptime T: type, found: ?T) T {
-    return found orelse defaultOf(T);
+    // (it borrows `found`: the value given is a reference of its own)
+    return if (found) |v| dup(v) else defaultOf(T);
 }
 
 /// `Enum.TryParse<E>(s)`: by a name of the enum's, a number, or names and numbers joined by
@@ -7240,6 +7266,258 @@ pub fn clamp(x: anytype, lo: @TypeOf(x), hi: @TypeOf(x)) Raised!@TypeOf(x) {
 }
 
 /// The name .NET gives a whole-number type in an overflow message.
+// ---------------------------------------------------------------------------------------------
+// System.Convert's text in a base, and System.BitConverter, Base64 and hex: of bytes as .NET lays
+// them out (little-endian)
+// ---------------------------------------------------------------------------------------------
+
+fn overflowOf(comptime T: type) Raised {
+    return raise(OverflowException, str("Value was either too large or too small for " ++ netIntName(T) ++ "."));
+}
+
+/// `TryParse` of any type that has a `Parse` here: the value, or null (and what `Parse` raised is
+/// dropped)
+pub fn tryParseAny(comptime T: type, s: String) ?T {
+    const v = (if (T == NetDecimal)
+        decParse(s, false)
+    else if (T == BigInt)
+        bigParse(s)
+    else if (T == bool)
+        parseBool(s)
+    else if (comptime @typeInfo(T) == .float)
+        parseFloat(T, s)
+    else
+        parseInt(T, s)) catch {
+        drop(take());
+        return null;
+    };
+    return v;
+}
+
+/// `Int32.Parse(s, NumberStyles.HexNumber)`: hex digits (the bits of the number), white space
+/// around them
+pub fn parseHex(comptime T: type, s: String) Raised!T {
+    const u = trimmed(s);
+    const bits = @typeInfo(T).int.bits;
+    if (u.len == 0) return badFormat(s);
+    var v: u128 = 0;
+    for (u) |c| {
+        const d = std.fmt.charToDigit(@intCast(@min(c, 127)), 16) catch return badFormat(s);
+        v = v * 16 + d;
+        if (v > std.math.maxInt(@Int(.unsigned, bits))) return overflowOf(T);
+    }
+    return @bitCast(@as(@Int(.unsigned, bits), @intCast(v)));
+}
+
+/// `Convert.ToInt32(x)` of a float: rounded half to even; what does not fit raises
+pub fn convFloatToInt(comptime T: type, x: anytype) Raised!T {
+    const r = roundEven(@as(f64, x));
+    if (!(r >= @as(f64, @floatFromInt(std.math.minInt(T))) and r <= @as(f64, @floatFromInt(std.math.maxInt(T))))) return overflowOf(T);
+    return @intFromFloat(r);
+}
+
+/// `Convert.ToInt32(s)` and the others: as `Parse`, but null is 0
+pub fn convParse(comptime T: type, s: String) Raised!T {
+    if (T == bool) return if (s == null) false else parseBool(s);
+    if (s == null) return 0;
+    if (comptime @typeInfo(T) == .float) return parseFloat(T, s);
+    return parseInt(T, s);
+}
+
+/// `Convert.ToInt32(s, base)`: base 10 is signed; in base 2, 8 and 16 the digits are the bits of
+/// the number (`"ff"` is -1 as an sbyte), and base 16 may start with `0x`
+pub fn convParseBase(comptime T: type, s: String, base: i32) Raised!T {
+    if (base != 2 and base != 8 and base != 10 and base != 16) return raise(ArgumentException, str("Invalid Base."));
+    if (s == null) return 0;
+    var u = unitsOf(s);
+    const bits = @typeInfo(T).int.bits;
+    if (base == 10) {
+        var negative = false;
+        if (u.len != 0 and u[0] == '-') {
+            negative = true;
+            u = u[1..];
+        }
+        var v: i128 = 0;
+        var n: usize = 0;
+        while (n < u.len and u[n] >= '0' and u[n] <= '9') : (n += 1) {
+            v = v * 10 + (u[n] - '0');
+            if (v > (1 << 64)) return overflowOf(T);
+        }
+        if (n == 0) return raise(FormatException, str("Could not find any recognizable digits."));
+        if (n != u.len) return raise(FormatException, str("Additional non-parsable characters are at the end of the string."));
+        if (negative) v = -v;
+        // (a narrower type is read as an Int32 first, as .NET does)
+        if (v < std.math.minInt(T) or v > std.math.maxInt(T)) return overflowOf(T);
+        return @intCast(v);
+    }
+    if (base == 16 and u.len >= 2 and u[0] == '0' and (u[1] == 'x' or u[1] == 'X')) u = u[2..];
+    var v: u128 = 0;
+    var n: usize = 0;
+    while (n < u.len) : (n += 1) {
+        const d: u32 = std.fmt.charToDigit(@intCast(@min(u[n], 127)), @intCast(base)) catch break;
+        v = v * @as(u128, @intCast(base)) + d;
+        if (v > std.math.maxInt(@Int(.unsigned, bits))) return overflowOf(T);
+    }
+    if (n == 0) return raise(FormatException, str("Could not find any recognizable digits."));
+    if (n != u.len) return raise(FormatException, str("Additional non-parsable characters are at the end of the string."));
+    return @bitCast(@as(@Int(.unsigned, bits), @intCast(v)));
+}
+
+/// `Convert.ToString(x, base)`: in base 2, 8 and 16 the bits of the number (two's complement)
+pub fn convToStringBase(x: anytype, base: i32) Raised!String {
+    const T = @TypeOf(x);
+    if (base != 2 and base != 8 and base != 10 and base != 16) return raise(ArgumentException, str("Invalid Base."));
+    if (base == 10) return format(.{x});
+    const U = @Int(.unsigned, @typeInfo(T).int.bits);
+    var v: U = @bitCast(x);
+    var buf: [130]u8 = undefined;
+    var i: usize = buf.len;
+    if (v == 0) {
+        i -= 1;
+        buf[i] = '0';
+    }
+    while (v != 0) {
+        i -= 1;
+        buf[i] = "0123456789abcdef"[@intCast(v % @as(U, @intCast(base)))];
+        v /= @as(U, @intCast(base));
+    }
+    var b: TextBuilder = .{};
+    b.addAscii(buf[i..]);
+    return b.finish();
+}
+
+/// `BitConverter.GetBytes x`
+pub fn bitGetBytes(x: anytype) Array(u8) {
+    const T = @TypeOf(x);
+    const bytes: []const u8 = if (T == bool) &.{@intFromBool(x)} else std.mem.asBytes(&x);
+    const items = allocator.alloc(u8, bytes.len) catch @panic("fable: out of memory");
+    @memcpy(items, bytes);
+    return arrayFrom(Array(u8), items);
+}
+
+/// `BitConverter.ToInt32(bytes, index)` and the others
+pub fn bitTo(comptime T: type, bytes: Array(u8), index: i32) Raised!T {
+    const b = bytes.items;
+    if (index < 0 or index >= b.len) return argRange("startIndex", "Index was out of range. Must be non-negative and less than the size of the collection.");
+    const size = if (T == bool) 1 else @sizeOf(T);
+    const at: usize = @intCast(index);
+    if (at + size > b.len) return raise(ArgumentException, str("The array starting from the specified index is not long enough to read a value of the specified type. (Parameter 'value')"));
+    if (T == bool) return b[at] != 0;
+    var v: T = undefined;
+    @memcpy(std.mem.asBytes(&v), b[at..][0..size]);
+    return v;
+}
+
+/// `BitConverter.ToString(bytes, start, length)`: `01-AB-FF`
+pub fn bitToString(bytes: Array(u8), start: ?i32, length: ?i32) Raised!String {
+    const b = bytes.items;
+    const from = start orelse 0;
+    if (from < 0 or (from >= b.len and b.len != 0)) return argRange("startIndex", "Index was out of range. Must be non-negative and less than the size of the collection.");
+    const n = length orelse @as(i32, @intCast(b.len)) - from;
+    if (n < 0 or from + n > b.len) return raise(ArgumentException, str("Destination array is not long enough to copy all the items in the collection. Check array index and length."));
+    var t: TextBuilder = .{};
+    for (b[@intCast(from)..][0..@intCast(n)], 0..) |byte, i| {
+        if (i > 0) t.addOne('-');
+        var hex: [2]u8 = undefined;
+        _ = std.fmt.bufPrint(&hex, "{X:0>2}", .{byte}) catch unreachable;
+        t.addAscii(&hex);
+    }
+    return t.finish();
+}
+
+/// `Convert.ToHexString(bytes, offset, length)` (`lower`: `ToHexStringLower`)
+pub fn hexOf(bytes: Array(u8), offset: ?i32, length: ?i32, comptime lower: bool) Raised!String {
+    const b = bytes.items;
+    const off = offset orelse 0;
+    const n = length orelse @as(i32, @intCast(b.len));
+    if (n < 0) return raise(ArgumentOutOfRangeException, format(.{ "length ('", n, "') must be a non-negative value. (Parameter 'length')\nActual value was ", n, "." }));
+    if (off < 0) return raise(ArgumentOutOfRangeException, format(.{ "offset ('", off, "') must be a non-negative value. (Parameter 'offset')\nActual value was ", off, "." }));
+    const most = @as(i32, @intCast(b.len)) - n;
+    if (off > most) return raise(ArgumentOutOfRangeException, format(.{ "offset ('", off, "') must be less than or equal to '", most, "'. (Parameter 'offset')\nActual value was ", off, "." }));
+    var t: TextBuilder = .{};
+    for (b[@intCast(off)..][0..@intCast(n)]) |byte| {
+        var hex: [2]u8 = undefined;
+        _ = (if (lower) std.fmt.bufPrint(&hex, "{x:0>2}", .{byte}) else std.fmt.bufPrint(&hex, "{X:0>2}", .{byte})) catch unreachable;
+        t.addAscii(&hex);
+    }
+    return t.finish();
+}
+
+/// `Convert.FromHexString s`
+pub fn hexParse(s: String) Raised!Array(u8) {
+    if (s == null) return argNull("s");
+    const u = unitsOf(s);
+    if (u.len % 2 != 0) return raise(FormatException, str("The input is not a valid hex string as its length is not a multiple of 2."));
+    const items = allocator.alloc(u8, u.len / 2) catch @panic("fable: out of memory");
+    for (items, 0..) |*o, i| {
+        const hi = std.fmt.charToDigit(@intCast(@min(u[2 * i], 127)), 16) catch {
+            allocator.free(items);
+            return raise(FormatException, str("The input is not a valid hex string as it contains a non-hex character."));
+        };
+        const lo = std.fmt.charToDigit(@intCast(@min(u[2 * i + 1], 127)), 16) catch {
+            allocator.free(items);
+            return raise(FormatException, str("The input is not a valid hex string as it contains a non-hex character."));
+        };
+        o.* = hi * 16 + lo;
+    }
+    return arrayFrom(Array(u8), items);
+}
+
+/// `Convert.ToBase64String bytes`
+pub fn base64Of(bytes: Array(u8)) String {
+    const enc = std.base64.standard.Encoder;
+    const buf = allocator.alloc(u8, enc.calcSize(bytes.items.len)) catch @panic("fable: out of memory");
+    defer allocator.free(buf);
+    const text = enc.encode(buf, bytes.items);
+    var t: TextBuilder = .{};
+    t.addAscii(text);
+    return t.finish();
+}
+
+/// `Convert.FromBase64String s` (white space is skipped, as .NET does)
+pub fn base64Parse(s: String) Raised!Array(u8) {
+    if (s == null) return argNull("s");
+    const u = unitsOf(s);
+    var ascii: std.ArrayList(u8) = .empty;
+    defer ascii.deinit(allocator);
+    for (u) |c| {
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
+        if (c > 127) return badBase64();
+        ascii.append(allocator, @intCast(c)) catch @panic("fable: out of memory");
+    }
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(ascii.items) catch return badBase64();
+    const items = allocator.alloc(u8, n) catch @panic("fable: out of memory");
+    dec.decode(items, ascii.items) catch {
+        allocator.free(items);
+        return badBase64();
+    };
+    return arrayFrom(Array(u8), items);
+}
+
+fn badBase64() Raised {
+    return raise(FormatException, str("The input is not a valid Base-64 string as it contains a non-base 64 character, more than two padding characters, or an illegal character among the padding characters."));
+}
+
+test "Convert and BitConverter" {
+    try std.testing.expectEqual(@as(i8, -1), try convParseBase(i8, str("ff"), 16));
+    try std.testing.expectEqual(@as(i32, 31), try convParseBase(i32, str("0x1f"), 16));
+    const t = try convToStringBase(@as(i32, -5), 16);
+    defer drop(t);
+    try std.testing.expect(strEql(t, str("fffffffb")));
+    const b = bitGetBytes(@as(i32, 258));
+    defer drop(b);
+    try std.testing.expectEqual(@as(i32, 258), try bitTo(i32, b, 0));
+    const h = try bitToString(b, null, null);
+    defer drop(h);
+    try std.testing.expect(strEql(h, str("02-01-00-00")));
+    const e = base64Of(b);
+    defer drop(e);
+    const back = try base64Parse(e);
+    defer drop(back);
+    try std.testing.expectEqualSlices(u8, b.items, back.items);
+}
+
 fn netIntName(comptime T: type) []const u8 {
     return switch (T) {
         i8 => "a signed byte",

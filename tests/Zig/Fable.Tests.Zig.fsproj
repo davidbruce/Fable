@@ -52,6 +52,7 @@
     <Compile Include="InlineIfLambdaTests.fs" />
     <Compile Include="QueueTests.fs" />
     <Compile Include="StackTests.fs" />
+    <Compile Include="ConvertTests.fs" />
     <Compile Include="NullableTests.fs" />
     <Compile Include="RandomTests.fs" />
   </ItemGroup>

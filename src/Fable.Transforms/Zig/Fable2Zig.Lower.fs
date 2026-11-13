@@ -5197,6 +5197,11 @@ and dotnetCall
     | "Microsoft.FSharp.Core.Operators", "NaNSingle", [] -> ELit("std.math.nan(f32)", TPrim "f32")
     | "Microsoft.FSharp.Core.Operators", "Infinity", [] -> ELit("std.math.inf(f64)", TPrim "f64")
     | "Microsoft.FSharp.Core.Operators", "InfinitySingle", [] -> ELit("std.math.inf(f32)", TPrim "f32")
+    // `box x :? int`: a test of what an `obj` holds
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
+        x.Type = Fable.Any && info.GenericArgs.Length = 1
+        ->
+        lw ctx (Fable.Test(x, Fable.TypeTest info.GenericArgs.Head, r))
     // `x :? T` where Fable keeps it a call: of an exception class, or of a class of objects
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
         (match info.GenericArgs with
@@ -6917,6 +6922,91 @@ and dotnetCall
             pure' "fable_rt.optToObj($0)" [ x ] (mapType ctx r t)
         else
             pure' "fable_rt.optOfObj($0)" [ x ] (mapType ctx r t)
+    // ---- System.Convert's text in a base, BitConverter, Base64 and hex ----
+    | "System.BitConverter", "GetBytes", [ x ] ->
+        pure' $"fable_rt.bitGetBytes(%s{typedArg ctx r x 0})" [ x ] (mapType ctx r t)
+    | "System.BitConverter", "get_IsLittleEndian", [] ->
+        ELit("(@import(\"builtin\").cpu.arch.endian() == .little)", tBool)
+    | "System.BitConverter",
+      ("Int64BitsToDouble" | "DoubleToInt64Bits" | "Int32BitsToSingle" | "SingleToInt32Bits" | "UInt64BitsToDouble" | "DoubleToUInt64Bits" | "UInt32BitsToSingle" | "SingleToUInt32Bits"),
+      [ x ] -> pure' $"@as($R, @bitCast(%s{typedArg ctx r x 0}))" [ x ] (mapType ctx r t)
+    | "System.BitConverter", "ToString", b :: rest ->
+        match rest with
+        | [] -> rt "fable_rt.bitToString($0, null, null)" [ b ] tStr
+        | [ start ] -> rt "fable_rt.bitToString($0, $1, null)" [ b; start ] tStr
+        | [ start; n ] -> rt "fable_rt.bitToString($0, $1, $2)" [ b; start; n ] tStr
+        | _ -> fail r "the Zig target does not support this BitConverter.ToString yet"
+    | "System.BitConverter", conv, [ b; i ] when conv.StartsWith("To", System.StringComparison.Ordinal) ->
+        rt "fable_rt.bitTo($R, $0, $1)" [ b; i ] (mapType ctx r t)
+    | "System.Convert", ("ToHexString" | "ToHexStringLower"), b :: rest ->
+        let lower =
+            if name = "ToHexStringLower" then
+                "true"
+            else
+                "false"
+
+        match rest with
+        | [] -> rt $"fable_rt.hexOf($0, null, null, %s{lower})" [ b ] tStr
+        | [ o; n ] -> rt $"fable_rt.hexOf($0, $1, $2, %s{lower})" [ b; o; n ] tStr
+        | _ -> fail r "the Zig target does not support this Convert.%s yet" name
+    | "System.Convert", "FromHexString", [ s ] -> rt "fable_rt.hexParse($0)" [ s ] (mapType ctx r t)
+    | "System.Convert", "ToBase64String", [ b ] -> pure' "fable_rt.base64Of($0)" [ b ] tStr
+    | "System.Convert", "FromBase64String", [ s ] -> rt "fable_rt.base64Parse($0)" [ s ] (mapType ctx r t)
+    | "System.Convert", "ToString", [ x; b ] when
+        isInt b
+        && (
+            match x.Type with
+            | Fable.Number _ -> true
+            | _ -> false
+        )
+        ->
+        rt $"fable_rt.convToStringBase(%s{typedArg ctx r x 0}, $1)" [ x; b ] tStr
+    | "System.Convert", conv, [ s; b ] when
+        conv.StartsWith("To", System.StringComparison.Ordinal)
+        && s.Type = Fable.String
+        && isInt b
+        ->
+        rt "fable_rt.convParseBase($R, $0, $1)" [ s; b ] (mapType ctx r t)
+    | "System.Convert", conv, [ s ] when
+        conv.StartsWith("To", System.StringComparison.Ordinal)
+        && s.Type = Fable.String
+        && conv <> "ToString"
+        && conv <> "ToChar"
+        ->
+        rt "fable_rt.convParse($R, $0)" [ s ] (mapType ctx r t)
+    | "System.Convert", "ToChar", [ c ] when c.Type = Fable.Char -> lw ctx c
+    // (of a char: its number, which must fit)
+    | "System.Convert", conv, [ c ] when c.Type = Fable.Char && conv <> "ToString" ->
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators.Checked" conv info t
+    // (of a float: rounded half to even, and raising where it does not fit)
+    | "System.Convert", conv, [ x ] when
+        conv.StartsWith("To", System.StringComparison.Ordinal)
+        && (
+            match x.Type with
+            | Fable.Number((Float32 | Float64), _) -> true
+            | _ -> false
+        )
+        && intBits (mapType ctx r t) > 0
+        ->
+        rt $"fable_rt.convFloatToInt($R, %s{typedArg ctx r x 0})" [ x ] (mapType ctx r t)
+    // (of a whole number: the value, which must fit, as a checked conversion has it)
+    | "System.Convert", conv, [ x ] when
+        conv.StartsWith("To", System.StringComparison.Ordinal)
+        && conv <> "ToString"
+        && (
+            match x.Type with
+            | Fable.Number((Int8 | UInt8 | Int16 | UInt16 | Int32 | UInt32 | Int64 | UInt64 | NativeInt | UNativeInt), _) ->
+                true
+            | _ -> false
+        )
+        && intBits (mapType ctx r t) > 0
+        ->
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators.Checked" conv info t
+    | "System.Convert", ("ToSingle" | "ToDouble"), [ x ] ->
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators", ("ToSingle" | "ToDouble"), [ x ] when x.Type <> Fable.String ->
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
+    | "System.Convert", "ToChar", [ x ] -> dotnetCall ctx r "Microsoft.FSharp.Core.Operators.Checked" "ToChar" info t
     // ---- System.Random ----
     | "System.Random", ".ctor", [] -> pure' "fable_rt.randomUnseeded()" [] (mapType ctx r t)
     | "System.Random", ".ctor", [ seed ] -> pure' "fable_rt.randomNew($0)" [ seed ] (mapType ctx r t)
@@ -7252,37 +7342,76 @@ and dotnetCall
       [ x ] -> rt "fable_rt.parseInt($R, $0)" [ x ] (mapType ctx r t)
     | ("System.Double" | "System.Single"), "Parse", [ x ] -> rt "fable_rt.parseFloat($R, $0)" [ x ] (mapType ctx r t)
     | "System.Boolean", "Parse", [ x ] -> rt "fable_rt.parseBool($0)" [ x ] tBool
-    // `TryParse(s, &v)`: what F# gives is `(ok, v)`, with `v` an out-variable of its own
-    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single"),
+    // `TryParse(s, &v)`: what F# gives is `(ok, v)`, with `v` an out-variable of its own; or
+    // `TryParse` given as a function, whose `v` is a ref cell (`f(s, r)`). On failure `v` is the
+    // type's default, as on .NET.
+    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single" | "System.Decimal" | "System.Boolean" | "System.Numerics.BigInteger"),
       "TryParse",
-      [ x; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
-        ctx.Vars.ContainsKey out.Name
+      [ x; out ] when
+        (match out with
+         | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr o), _, _, _) -> ctx.Vars.ContainsKey o.Name
+         // (`&r.contents` of a ref cell)
+         | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.Get(cell, Fable.FieldGet info, _, _)), _, _, _) ->
+             info.Name = "contents"
+             && (
+                 match cell.Type with
+                 | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
+                 | _ -> false
+             )
+         | _ ->
+             match out.Type with
+             | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
+             | _ -> false)
         ->
-        let outVar = ctx.Vars[out.Name]
-        let ty = outVar.Ty
+        let valueType =
+            match out with
+            | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr o), _, _, _) -> unByref o.Type
+            | Fable.Operation(Fable.Unary(UnaryAddressOf, (Fable.Get _ as place)), _, _, _) -> place.Type
+            | _ ->
+                match out.Type with
+                | Fable.DeclaredType(_, [ v ]) -> v
+                | _ -> fail r "internal: TryParse"
 
-        let f =
-            if isFloatTy ty then
-                "tryParseFloat"
-            else
-                "tryParseInt"
+        let ty = mapType ctx r valueType
+        let tmp = AST.makeTypedIdent (Fable.Option(valueType, false)) "parsed"
 
-        ctx.State.UsesRuntime <- true
-        let tmp = ctx.State.NewVar("parsed", TOpt ty, VLocal, false)
-
-        bindArgs
-            ctx
-            [ lw ctx x ]
-            (fun xs ->
-                ELet(
-                    tmp,
-                    EEmit($"fable_rt.%s{f}($R, $0)".Replace("$R", zigTypeName ty), xs, TOpt ty),
-                    ESeq(
-                        EAssign(outVar, EEmit("($0 orelse 0)", [ EVar tmp ], ty)),
-                        EEmit("($0 != null)", [ EVar tmp ], tBool)
-                    )
-                )
+        let parsed =
+            Fable.Emit(
+                {
+                    Macro = $"fable_rt.tryParseAny(%s{zigTypeName ty}, $0)"
+                    IsStatement = false
+                    CallInfo = Fable.CallInfo.Create(args = [ x ])
+                },
+                Fable.Option(valueType, false),
+                r
             )
+
+        let orDefault =
+            Fable.Emit(
+                {
+                    Macro = $"fable_rt.orDefault(%s{zigTypeName ty}, $0)"
+                    IsStatement = false
+                    CallInfo = Fable.CallInfo.Create(args = [ Fable.IdentExpr tmp ])
+                },
+                valueType,
+                r
+            )
+
+        let store =
+            match out with
+            | Fable.Operation(Fable.Unary(UnaryAddressOf, (Fable.IdentExpr _ as v)), _, _, _) ->
+                Fable.Set(v, Fable.ValueSet, valueType, orDefault, r)
+            | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.Get(cell, _, _, _)), _, _, _) ->
+                Fable.Set(cell, Fable.FieldSet "contents", valueType, orDefault, r)
+            | refCell -> Fable.Set(refCell, Fable.FieldSet "contents", valueType, orDefault, r)
+
+        let isSome = Fable.Test(Fable.IdentExpr tmp, Fable.OptionTest true, r)
+
+        lw ctx (Fable.Let(tmp, parsed, Fable.Sequential [ store; isSome ]))
+    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64"),
+      "Parse",
+      [ s; Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32(512 | 515), _), _) ] ->
+        rt "fable_rt.parseHex($R, $0)" [ s ] (mapType ctx r t)
     // sums and averages: the runtime adds with `+` of the item type
     | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] when mapType ctx r t = TPrim "fable_rt.NetDecimal" ->
         rt "fable_rt.listSumDec($0)" [ xs ] (mapType ctx r t)
