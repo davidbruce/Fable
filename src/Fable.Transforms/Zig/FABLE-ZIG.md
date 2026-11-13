@@ -390,7 +390,9 @@ A two-dimensional array is an array whose cell also holds its rows and columns (
 the type of a one-dimensional array): its items are row after row. `a.[i, j]`, `GetLength`,
 `Array2D.init`/`create`/`zeroCreate`/`get`/`set`/`length1`/`length2`/`copy`/`map`/`mapi`/
 `iter`/`iteri` work with .NET's errors, `%A` writes it as F# does, and `=` compares the shape
-too. Not yet: `array2D`, `blit`, `sub`, `rebase`, and arrays of more dimensions.
+too. `array2D` of a list or an array of lists or arrays, `Array2D.blit` (item after item, as
+FSharp.Core does) and `rebase`, and slices `a.[1..2, ..]` work. Not yet: `array2D` of other
+sequences, and arrays of more dimensions.
 
 ## .NET's collections, and loops over collections
 

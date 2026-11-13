@@ -2686,6 +2686,107 @@ pub fn array2DMapi(comptime A: type, f: anytype, a: anytype) Raised!A {
     return shaped(arrayFrom(A, items), shape[0], shape[1]);
 }
 
+fn isListType(comptime T: type) bool {
+    return @typeInfo(T) == .@"union" and @hasDecl(T, "fable_list");
+}
+
+fn rowCount(row: anytype) usize {
+    const R = @TypeOf(row);
+    if (comptime isListType(R)) {
+        var n: usize = 0;
+        var rest = row;
+        while (rest == .Cons) : (rest = rest.Cons.Tail) n += 1;
+        return n;
+    }
+    return row.items.len;
+}
+
+fn rowFill(row: anytype, to: anytype) void {
+    const R = @TypeOf(row);
+    if (comptime isListType(R)) {
+        var rest = row;
+        var i: usize = 0;
+        while (rest == .Cons) : (rest = rest.Cons.Tail) {
+            to[i] = dup(rest.Cons.Head);
+            i += 1;
+        }
+    } else {
+        for (row.items, 0..) |x, i| to[i] = dup(x);
+    }
+}
+
+/// `array2D rows`: rows given as a list or an array of lists or arrays, all of one length.
+pub fn array2DOfRows(comptime A: type, rows: anytype) Raised!A {
+    var all: std.ArrayList(RowOf(@TypeOf(rows))) = .empty;
+    defer all.deinit(allocator);
+    if (comptime isListType(@TypeOf(rows))) {
+        var rest = rows;
+        while (rest == .Cons) : (rest = rest.Cons.Tail) all.append(allocator, rest.Cons.Head) catch @panic("fable: out of memory");
+    } else {
+        for (rows.items) |r| all.append(allocator, r) catch @panic("fable: out of memory");
+    }
+    const cols: usize = if (all.items.len == 0) 0 else rowCount(all.items[0]);
+    for (all.items) |r| {
+        if (rowCount(r) != cols) return raise(ArgumentException, str("The arrays have different lengths. (Parameter 'vals')"));
+    }
+    const items = arrayItems(A, all.items.len * cols);
+    for (all.items, 0..) |r, i| rowFill(r, items[i * cols ..][0..cols]);
+    return shaped(arrayFrom(A, items), all.items.len, cols);
+}
+
+fn RowOf(comptime Rows: type) type {
+    if (isListType(Rows)) return @FieldType(@typeInfo(@FieldType(Rows, "Cons")).pointer.child, "Head");
+    return ItemOf(Rows);
+}
+
+fn blitRange(comptime param: []const u8, value: i32, comptime what: []const u8, bound: i32) Raised {
+    return raise(ArgumentOutOfRangeException, format(.{ "The index is outside the legal range.\n" ++ param ++ " = ", value, ", " ++ what ++ " = ", bound, " (Parameter '" ++ param ++ "')" }));
+}
+
+/// `Array2D.blit source i1 i2 target j1 j2 count1 count2`: item after item, as FSharp.Core does
+pub fn array2DBlit(source: anytype, si: i32, sj: i32, target: @TypeOf(source), ti: i32, tj: i32, n1: i32, n2: i32) Raised!void {
+    const ss = shapeOf(source);
+    const ts = shapeOf(target);
+    const sx: i32 = @intCast(ss[0]);
+    const sy: i32 = @intCast(ss[1]);
+    const tx: i32 = @intCast(ts[0]);
+    const ty: i32 = @intCast(ts[1]);
+    if (si < 0) return blitRange("sourceIndex1", si, "source axis-0 lower bound", 0);
+    if (sj < 0) return blitRange("sourceIndex2", sj, "source axis-1 lower bound", 0);
+    if (ti < 0) return blitRange("targetIndex1", ti, "target axis-0 lower bound", 0);
+    if (tj < 0) return blitRange("targetIndex2", tj, "target axis-1 lower bound", 0);
+    if (si + n1 > sx) return raise(ArgumentOutOfRangeException, format(.{ "The index is outside the legal range.\ncount1 = ", n1, ", source axis-0 end index = ", si + n1, " source axis-0 upper bound = ", sx, " (Parameter 'count1')" }));
+    if (sj + n2 > sy) return raise(ArgumentOutOfRangeException, format(.{ "The index is outside the legal range.\ncount2 = ", n2, ", source axis-1 end index = ", sj + n2, " source axis-1 upper bound = ", sy, " (Parameter 'count2')" }));
+    if (ti + n1 > tx) return raise(ArgumentOutOfRangeException, format(.{ "The index is outside the legal range.\ncount1 = ", n1, ", target axis-0 end index = ", ti + n1, " target axis-0 upper bound = ", tx, " (Parameter 'count1')" }));
+    if (tj + n2 > ty) return raise(ArgumentOutOfRangeException, format(.{ "The index is outside the legal range.\ncount2 = ", n2, ", target axis-1 end index = ", tj + n2, " target axis-1 upper bound = ", ty, " (Parameter 'count2')" }));
+    var i: i32 = 0;
+    while (i < n1) : (i += 1) {
+        var j: i32 = 0;
+        while (j < n2) : (j += 1) {
+            const from: usize = @intCast((si + i) * sy + sj + j);
+            const to: usize = @intCast((ti + i) * ty + tj + j);
+            arrayPut(target, to, dup(source.items[from]));
+        }
+    }
+}
+
+/// `a.[lo1..hi1, lo2..hi2]`: what of it is inside the array
+pub fn array2DSlice(a: anytype, lo1: ?i32, hi1: ?i32, lo2: ?i32, hi2: ?i32) @TypeOf(a) {
+    const shape = shapeOf(a);
+    const r0: i32 = @max(lo1 orelse 0, 0);
+    const r1: i32 = @min(hi1 orelse @as(i32, @intCast(shape[0])) - 1, @as(i32, @intCast(shape[0])) - 1);
+    const c0: i32 = @max(lo2 orelse 0, 0);
+    const c1: i32 = @min(hi2 orelse @as(i32, @intCast(shape[1])) - 1, @as(i32, @intCast(shape[1])) - 1);
+    const rows: usize = if (r1 < r0) 0 else @intCast(r1 - r0 + 1);
+    const cols: usize = if (c1 < c0) 0 else @intCast(c1 - c0 + 1);
+    const A = @TypeOf(a);
+    const items = arrayItems(A, rows * cols);
+    for (0..rows) |i| {
+        for (0..cols) |j| items[i * cols + j] = dup(a.items[(@as(usize, @intCast(r0)) + i) * shape[1] + @as(usize, @intCast(c0)) + j]);
+    }
+    return shaped(arrayFrom(A, items), rows, cols);
+}
+
 /// `Array2D.iter f a`
 pub fn array2DIter(f: anytype, a: anytype) Raised!void {
     return arrayIter(f, a);

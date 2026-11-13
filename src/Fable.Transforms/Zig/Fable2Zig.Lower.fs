@@ -5016,8 +5016,20 @@ and dotnetCall
             tI32
     | "Microsoft.FSharp.Collections.Array2DModule", ("Base1" | "Base2"), [ a ] -> ESeq(lwStmt ctx a, ELit("0", tI32))
     | "System.Array", "GetLength", [ a; d ] -> rt "fable_rt.arrayGetLength($0, $1)" [ a; d ] tI32
-    | "Microsoft.FSharp.Collections.Array2DModule", "Copy", [ a ] ->
+    | "Microsoft.FSharp.Collections.Array2DModule", ("Copy" | "Rebase"), [ a ] ->
         pure' "fable_rt.array2DCopy($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "CopyTo", [ src; si; sj; dst; ti; tj; n1; n2 ] ->
+        rt "fable_rt.array2DBlit($0, $1, $2, $3, $4, $5, $6, $7)" [ src; si; sj; dst; ti; tj; n1; n2 ] tVoid
+    | "Microsoft.FSharp.Core.Operators.OperatorIntrinsics", "GetArraySlice2D", [ a; lo1; hi1; lo2; hi2 ] ->
+        pure' "fable_rt.array2DSlice($0, $1, $2, $3, $4)" [ a; lo1; hi1; lo2; hi2 ] (mapType ctx r t)
+    // `array2D rows`: rows given as a list or an array of lists or arrays
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators", "CreateArray2D", [ Uncast rows ] when
+        (match rows.Type with
+         | Fable.List(Fable.List _ | Fable.Array _)
+         | Fable.Array((Fable.List _ | Fable.Array _), _) -> true
+         | _ -> false)
+        ->
+        rt "fable_rt.array2DOfRows($R, $0)" [ rows ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.Array2DModule", "Map", [ f; a ] ->
         rt "fable_rt.array2DMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.Array2DModule", "MapIndexed", [ f; a ] ->

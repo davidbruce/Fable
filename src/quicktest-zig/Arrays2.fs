@@ -85,8 +85,39 @@ let run () : int =
         with :? System.ArgumentException as e ->
             e.Message
 
+    let rows = array2D [ [ 1; 2 ]; [ 3; 4 ] ]
+    let into = Array2D.zeroCreate<int> 3 3
+    Array2D.blit rows 0 0 into 1 1 2 2
+    let square = Array2D.init 3 3 (fun i j -> i * 10 + j)
+
+    let blitOutside =
+        try
+            Array2D.blit rows 0 0 into 2 2 2 2
+            "ok"
+        with :? System.ArgumentOutOfRangeException as e ->
+            e.Message
+
+    let ragged =
+        try
+            sprintf "%A" (array2D [ [ 1; 2 ]; [ 3 ] ])
+        with :? System.ArgumentException as e ->
+            e.Message
+
     let failed =
         same
+            "[[0; 0; 0]\n [0; 1; 2]\n [0; 3; 4]]|[[1; 2]\n [3; 4]]|[[\"a\"]\n [\"b\"]]|[[10; 11]\n [20; 21]]|[[20; 21]]|[]"
+            (sprintf
+                "%A|%A|%A|%A|%A|%A"
+                into
+                into.[1..2, 1..2]
+                (array2D [| [| "a" |]; [| "b" |] |])
+                square.[1..5, 0..1]
+                square.[2.., ..1]
+                square.[2..1, 0..0])
+        + same
+            "The index is outside the legal range.\ncount1 = 2, target axis-0 end index = 4 target axis-0 upper bound = 3 (Parameter 'count1')|The arrays have different lengths. (Parameter 'vals')"
+            (blitOutside + "|" + ragged)
+        + same
             "[[99; 1; 2]\n [10; 11; 12]]|[[100; 2; 3]\n [11; 12; 13]]|[[0; 0]\n [0; 0]]|[[\"x\"; \"x\"]]"
             (sprintf
                 "%A|%A|%A|%A"
