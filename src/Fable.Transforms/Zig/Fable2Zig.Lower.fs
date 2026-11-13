@@ -1269,6 +1269,13 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Tasks.Task" ->
         TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ tVoid ])
+    // (a task's awaiter is the task itself)
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Runtime.CompilerServices.TaskAwaiter`1" ->
+        TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ mapType ctx r item ])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Runtime.CompilerServices.TaskAwaiter" ->
+        TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ tVoid ])
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Threading.Tasks.TaskCompletionSource`1" ->
+        TEnt(libRecordEnt ctx "Task" "TaskSourceOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = taskCodeName ->
         TEnt(libRecordEnt ctx "Task" "TaskCode_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, []) when ent.FullName = "Microsoft.FSharp.Control.TaskBuilder" -> tVoid
@@ -1906,7 +1913,8 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                     "disposed", tBool
                 ]
             | "CancellationTokenOf" -> [ "source", TEnt(libRecordEnt ctx "Async" "CancellationSource", []) ]
-            | "TaskOf_1" -> [ "fable_task", TEnt(resultEnt ctx.State, [ TGen "T"; tExn ]) ]
+            | "TaskOf_1" -> [ "fable_task", TOpt(TEnt(resultEnt ctx.State, [ TGen "T"; tExn ])) ]
+            | "TaskSourceOf_1" -> [ "task", TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ TGen "T" ]) ]
             | "TaskCode_1" -> [ "code", TFn([ tVoid ], TGen "T") ]
             | "StackOf_1" -> [ "items", TEnt(netEnt ctx.State "ResizeArray", [ TGen "T" ]) ]
             | "QueueOf_1" ->
@@ -1948,6 +1956,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "HandOver" -> [ "handedOver" ]
             | "Timer" -> [ "live" ]
             | "StopwatchOf" -> [ "elapsed"; "startedAt"; "running" ]
+            | "TaskOf_1" -> [ "fable_task" ]
             | _ -> []
 
         let e =
@@ -2931,6 +2940,7 @@ let typeTaskBuilders (body: Fable.Expr) : Fable.Expr =
                 | "Combine", [ _; second ] -> second.Type
                 | ("While" | "For"), _ -> taskCodeOf Fable.Unit
                 | ("TryWith" | "TryFinally"), b :: _ -> b.Type
+                | "Using", [ _; binder ] -> retOf binder.Type
                 | _ -> Fable.Any
 
             Fable.Call(callee, info, t, r)
@@ -4769,6 +4779,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.flexSeq($R, $0, %s{seqModule})", xs, seqTy))
                 | _ -> fail e.Range "the Zig target cannot use a value of this type as a sequence yet (%A)" x.Type
 
+    // (a cancellation source given as an `IDisposable`: what the library's Async.fs makes of it)
+    | Fable.TypeCast(x, Fable.DeclaredType(target, _)) when
+        target.FullName = "System.IDisposable"
+        && (
+            match x.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = "System.Threading.CancellationTokenSource"
+            | _ -> false
+        )
+        ->
+        libraryCall ctx e.Range "Async" "sourceAsDisposable" (Fable.CallInfo.Create(args = [ x ])) [ x ] e.Type
     // an interface given where an interface it inherits is expected: the members that one has
     | Fable.TypeCast(x, (Fable.DeclaredType _ as ifaceType)) when
         isInterfaceType ctx.Com ifaceType
@@ -5475,16 +5495,6 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ctx.Vars[id.Name] <- iv
         bindArgs ctx [ lw ctx start; lw ctx limit ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, lwStmt ctx body))
 
-    // (a cancellation source given as an `IDisposable`: what the library's Async.fs makes of it)
-    | Fable.TypeCast(x, Fable.DeclaredType(target, _)) when
-        target.FullName = "System.IDisposable"
-        && (
-            match x.Type with
-            | Fable.DeclaredType(e, _) -> e.FullName = "System.Threading.CancellationTokenSource"
-            | _ -> false
-        )
-        ->
-        libraryCall ctx e.Range "Async" "sourceAsDisposable" (Fable.CallInfo.Create(args = [ x ])) [ x ] e.Type
     // (`box e.InnerException`: null when there is none)
     | Fable.TypeCast(Fable.Call(Fable.Import(imp, _, _), info, _, _), Fable.Any) when
         imp.Selector = "get_InnerException" && info.ThisArg.IsSome

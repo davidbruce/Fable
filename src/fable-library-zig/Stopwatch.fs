@@ -9,13 +9,10 @@ open Fable.Library.Zig.TimeSpan
 [<Fable.Core.Emit("fable_rt.time.monotonicNs()")>]
 let private monotonicNs () : int64 = Fable.Core.Util.nativeOnly
 
-[<Fable.Core.Emit("fable_rt.time.sleepMilliseconds($0)")>]
-let private sleepMs (_ms: int64) : unit = Fable.Core.Util.nativeOnly
 #else
 let private monotonicNs () : int64 =
     System.Diagnostics.Stopwatch.GetTimestamp()
 
-let private sleepMs (ms: int64) : unit = System.Threading.Thread.Sleep(int ms)
 #endif
 
 type StopwatchOf =
@@ -81,15 +78,3 @@ let getElapsedTime (start: int64) (finish: int64) : TimeSpanOf =
     { TimeSpanOf.ticks = (finish - start) / 100L }
 
 let getElapsedTimeSince (start: int64) : TimeSpanOf = getElapsedTime start (monotonicNs ())
-
-/// `Thread.Sleep(ms)`
-let sleep (ms: int) : unit =
-    if ms < -1 then
-        raise (
-            System.ArgumentOutOfRangeException(
-                "millisecondsTimeout",
-                "Number must be either non-negative and less than or equal to Int32.MaxValue or -1."
-            )
-        )
-
-    sleepMs (int64 ms)

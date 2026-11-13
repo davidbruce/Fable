@@ -607,7 +607,6 @@ let ``test Interaction between Async and Task works`` () =
         equal true res
     } |> Async.RunSynchronously
 
-#if !FABLE_COMPILER_ZIG // (TaskCompletionSource)
 [<Fact>]
 let ``test Tasks can be cancelled`` () =
     async {
@@ -626,7 +625,6 @@ let ``test Tasks can be cancelled`` () =
         | Choice2Of2 (:? System.Threading.Tasks.TaskCanceledException) -> ()
         | _ -> failwith "Expected TaskCanceledException through the error continuation"
     } |> Async.RunSynchronously
-#endif
 
 [<Fact>]
 let ``test TaskCanceledException preserves message and inner exception`` () =

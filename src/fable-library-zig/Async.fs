@@ -139,12 +139,13 @@ let private runNextTimer () : bool =
         let t = timers.[best]
         timers.RemoveAt best
 
-        let wait = t.due - nowMs ()
-
-        if wait > 0L then
-            sleepMilliseconds wait
-
+        // (a timer that was cancelled is not waited for)
         if t.live then
+            let wait = t.due - nowMs ()
+
+            if wait > 0L then
+                sleepMilliseconds wait
+
             t.live <- false
             t.action ()
 
@@ -244,6 +245,40 @@ let private drive (finished: unit -> bool) (f: unit -> unit) : unit =
             drain ()
     finally
         depth <- saved
+
+/// The time the earliest timer that is still live is due (Int64.MaxValue when there is none)
+let private earliestDue () : int64 =
+    let mutable due = System.Int64.MaxValue
+
+    for t in timers do
+        if t.live && t.due < due then
+            due <- t.due
+
+    due
+
+/// `Thread.Sleep(ms)`: the time passes, and the timers due within it run meanwhile (they stand
+/// for the other threads of .NET, which go on while this one sleeps)
+let threadSleep (ms: int) : unit =
+    if ms < -1 then
+        raise (
+            System.ArgumentOutOfRangeException(
+                "millisecondsTimeout",
+                "Number must be either non-negative and less than or equal to Int32.MaxValue or -1."
+            )
+        )
+
+    let deadline = nowMs () + int64 ms
+    drive (fun () -> earliestDue () > deadline) ignore
+    let rest = deadline - nowMs ()
+
+    if rest > 0L then
+        sleepMilliseconds rest
+
+/// Run the timers (and what they leave) until `finished` or none is left; whether it finished
+/// (a task waited for, as `.Result` waits: what would complete it runs meanwhile)
+let waitUntil (finished: unit -> bool) : bool =
+    drive finished ignore
+    finished ()
 
 let private make (run: Cont<'T> -> unit) : AsyncOf<'T> = { fable_async = run }
 
@@ -467,11 +502,13 @@ let runSynchronouslyToken<'T> (computation: AsyncOf<'T>) (token: CancellationTok
 
 /// `Async.StartImmediate` and `Async.Start` (with a token): an exception is raised again; a
 /// cancellation ends it quietly, as on .NET
+/// (as .NET's `StartImmediate` returns at the computation's first wait, the timers are left
+/// for what waits: RunSynchronously, a task's result, Thread.Sleep)
 let private startImmediateWith (computation: AsyncOf<unit>) (token: CancellationTokenOf) : unit =
     let mutable finished = false
 
     drive
-        (fun () -> finished)
+        (fun () -> true)
         (fun () ->
             start
                 computation
@@ -508,8 +545,9 @@ let startWithContinuationsToken<'T>
     let token = defaultArg token (tokenNone ())
     let mutable finished = false
 
+    // (it runs until it waits: what is left goes on when something waits for the timers)
     drive
-        (fun () -> finished)
+        (fun () -> true)
         (fun () ->
             start
                 computation
@@ -687,7 +725,8 @@ let catch<'T> (computation: AsyncOf<'T>) : AsyncOf<Choice<'T, exn>> =
     )
 
 /// `Async.Parallel` and `Async.Sequential`: one after the other, the results in order.
-let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
+/// `Async.Sequential`: one after the other, the results in order
+let sequential<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
     let rec loop (rest: AsyncOf<'T> list) (acc: 'T list) : AsyncOf<'T[]> =
         make (fun k ->
             match rest with
@@ -697,6 +736,51 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
 
     make (fun k -> start (loop (Seq.toList computations) []) k)
 
-let sequential<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> = parallelAll computations
+/// `Async.Parallel`: all start (each runs until it waits, then they go on as their timers come
+/// due), the results in order; the first failure cancels the others and is the result, as on
+/// .NET
+let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
+    make (fun k ->
+        let cs = Array.ofList (Seq.toList computations)
+        let n = cs.Length
+
+        if n = 0 then
+            k.ok [||]
+        else
+            let results: 'T option[] = Array.create n None
+            let mutable remaining = n
+            let mutable finished = false
+            // (the computations' own source: cancelled with the caller's token, or by a failure)
+            let inner = sourceCreate ()
+            let link = tokenRegister k.token (fun () -> sourceCancel inner)
+
+            let finish (f: unit -> unit) =
+                if not finished then
+                    finished <- true
+                    link.Dispose()
+                    f ()
+
+            for i in 0 .. n - 1 do
+                start
+                    cs.[i]
+                    {
+                        ok =
+                            fun x ->
+                                results.[i] <- Some x
+                                remaining <- remaining - 1
+
+                                if remaining = 0 then
+                                    finish (fun () -> k.ok (results |> Array.map Option.get))
+                        fail =
+                            fun e ->
+                                finish (fun () ->
+                                    sourceCancel inner
+                                    k.fail e
+                                )
+                        cancel = fun e -> finish (fun () -> k.cancel e)
+                        token = sourceToken inner
+                        handOver = None
+                    }
+    )
 
 let returnValue<'T> (value: 'T) : AsyncOf<'T> = builderReturn value

@@ -715,8 +715,23 @@ let call
         let lowerFirst (n: string) =
             n.Substring(0, 1).ToLowerInvariant() + n.Substring 1
 
+        // (`Thread.Sleep`: the library's Async.fs, whose timers run while it sleeps)
+        let sleep ms =
+            libraryCall
+                ctx
+                r
+                "Async"
+                "threadSleep"
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                [ ms ]
+                t
+
         match name, args with
-        | "Sleep", [ ms ] when ms.Type = Fable.Number(Int32, Fable.NumberInfo.Empty) -> call "sleep" [ ms ]
+        | "Sleep", [ ms ] when ms.Type = Fable.Number(Int32, Fable.NumberInfo.Empty) -> sleep ms
         | "Sleep", [ span ] ->
             // (`Thread.Sleep(timeSpan)`: its whole milliseconds)
             let ms =
@@ -735,7 +750,7 @@ let call
                     r
                 )
 
-            call "sleep" [ Fable.TypeCast(ms, Fable.Number(Int32, Fable.NumberInfo.Empty)) ]
+            sleep (Fable.TypeCast(ms, Fable.Number(Int32, Fable.NumberInfo.Empty)))
         | ".ctor", [] -> call "create" unitArg
         | ("StartNew" | "GetTimestamp" | "get_Frequency" | "get_IsHighResolution"), [] ->
             let n =

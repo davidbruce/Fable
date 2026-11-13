@@ -110,17 +110,43 @@ let call
             }
             [ task ]
             t
-    | "Microsoft.FSharp.Control.FSharpAsync", "StartAsTask", c :: _ ->
+    | "Microsoft.FSharp.Control.FSharpAsync", "StartAsTask", c :: rest ->
+        // (the token, F#'s optional argument, is the last)
+        let token =
+            match rest with
+            | [ _; tk ]
+            | [ tk ] when
+                (match tk.Type with
+                 | Fable.Option(Fable.DeclaredType(e, _), _) -> e.FullName = "System.Threading.CancellationToken"
+                 | _ -> false)
+                ->
+                tk
+            | _ ->
+                Fable.Value(
+                    Fable.NewOption(
+                        None,
+                        Fable.DeclaredType(
+                            {
+                                FullName = "System.Threading.CancellationToken"
+                                Path = Fable.CoreAssemblyName "System.Runtime"
+                            },
+                            []
+                        ),
+                        false
+                    ),
+                    None
+                )
+
         libraryCall
             ctx
             r
             "Task"
-            "startAsTask"
+            "startAsTaskToken"
             { info with
                 ThisArg = None
                 SignatureArgTypes = []
             }
-            [ c ]
+            [ c; token ]
             t
     | "Microsoft.FSharp.Control.FSharpAsync", "RunSynchronously", [ c; _; tk ] when
         tk.Type <> Fable.Option(Fable.Any, false)
@@ -168,12 +194,20 @@ let call
             | "Combine", [ _; second ] -> [ itemOf second.Type ]
             | ("TryWith" | "TryFinally"), b :: _ -> [ itemOf b.Type ]
             | "For", [ sq; _ ] -> [ itemOf sq.Type ]
+            | "Using", [ resource; binder ] -> [ resource.Type; retItem binder ]
             | _ -> []
+
+        // (`use`: the resource, and the same seen as an IDisposable to dispose of)
+        let given =
+            match member', given with
+            | "Using", [ resource; binder ] -> [ resource; disposable resource; binder ]
+            | _ -> given
 
         let resultTy =
             match member' with
             | "Run" -> t
             | _ when t <> Fable.Any -> t
+            | "Using" -> taskCodeOf (List.last typeArgs)
             | _ -> taskCodeOf (List.tryHead typeArgs |> Option.defaultValue Fable.Unit)
 
         libraryCall
@@ -244,6 +278,83 @@ let call
             }
             [ task ]
             t
+    // (`t.GetAwaiter()`: the task; `GetResult()`: its result, or its exception itself)
+    | ("System.Threading.Tasks.Task`1" | "System.Threading.Tasks.Task"), "GetAwaiter", [ task ] -> lw ctx task
+    | ("System.Runtime.CompilerServices.TaskAwaiter`1" | "System.Runtime.CompilerServices.TaskAwaiter"),
+      "GetResult",
+      [ awaiter ] ->
+        let item =
+            match awaiter.Type with
+            | Fable.DeclaredType(_, [ item ]) -> item
+            | _ -> Fable.Unit
+
+        libraryCall
+            ctx
+            r
+            "Task"
+            "getResult"
+            { info with
+                GenericArgs = [ item ]
+                SignatureArgTypes = []
+                MemberRef = None
+                ThisArg = None
+                Args = [ awaiter ]
+            }
+            [ awaiter ]
+            t
+    | "System.Threading.Tasks.Task", "FromException", [ e ] ->
+        let item =
+            match t with
+            | Fable.DeclaredType(_, [ item ]) -> item
+            | _ -> Fable.Unit
+
+        libraryCall
+            ctx
+            r
+            "Task"
+            "fromException"
+            { info with
+                GenericArgs = [ item ]
+                SignatureArgTypes = []
+                MemberRef = None
+            }
+            [ e ]
+            t
+    // `TaskCompletionSource<'T>`: the library's TaskSourceOf
+    | "System.Threading.Tasks.TaskCompletionSource`1", name, args ->
+        let item =
+            match
+                (if name = ".ctor" then
+                     t
+                 else
+                     args.Head.Type)
+            with
+            | Fable.DeclaredType(_, [ item ]) -> item
+            | _ -> Fable.Unit
+
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "Task"
+                fn
+                { info with
+                    GenericArgs = [ item ]
+                    SignatureArgTypes = []
+                    MemberRef = None
+                    ThisArg = None
+                }
+                xs
+                t
+
+        match name, args with
+        | ".ctor", _ -> call "sourceCreate" [ Fable.Value(Fable.UnitConstant, None) ]
+        | "get_Task", [ s ] -> call "sourceTask" [ s ]
+        | ("SetResult" | "TrySetResult" | "SetException" | "TrySetException"), [ s; x ] ->
+            call (name.Substring(0, 1).ToLowerInvariant() + name.Substring 1) [ s; x ]
+        | ("SetCanceled" | "TrySetCanceled"), s :: _ ->
+            call (name.Substring(0, 1).ToLowerInvariant() + name.Substring 1) [ s ]
+        | _ -> fail r "the Zig target does not support TaskCompletionSource.%s with these arguments yet" name
     | "System.Threading.Tasks.Task", "FromResult", [ x ] ->
         libraryCall
             ctx

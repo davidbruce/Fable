@@ -9,7 +9,15 @@ open Fable.AST
 exception ZigError of message: string * range: SourceLocation option
 
 let fail (r: SourceLocation option) fmt =
-    Printf.kprintf (fun s -> raise (ZigError(s, r))) fmt
+    Printf.kprintf
+        (fun s ->
+            // (FABLE_ZIG_TRACE=1: where in the compiler an error is raised)
+            if System.Environment.GetEnvironmentVariable "FABLE_ZIG_TRACE" = "1" then
+                eprintfn "ZIGTRACE %s\n%s" s (System.Diagnostics.StackTrace(true).ToString())
+
+            raise (ZigError(s, r))
+        )
+        fmt
 
 type EntKind =
     /// value struct
