@@ -66,6 +66,26 @@ declares the type or in another. A `ToString` that a type overrides is called wh
 calls it: by `x.ToString()`, `string x`, `{x}` and `%O` (`%A` does not use it, as on .NET).
 Not yet: other overrides and interface implementations, classes, object expressions.
 
+## Classes, interfaces, object expressions
+
+A class is a counted cell of its fields (all of which can be assigned, so a class can close a
+cycle). Its constructor is a function that computes the fields in order, as locals, and makes
+the cell of them at the end; `this` cannot be used in a constructor yet. Members are functions
+whose first argument is the object, as for records.
+
+An interface value is a struct of function values, one per member (a property is a function of
+unit). A value of a class given where an interface is expected becomes that struct: each member
+is a function value that holds the object and calls the class's implementation
+(`Counter__Probe_IShape_Area`). An object expression is the same struct made of the lambdas of
+its members. A call of an interface member is a call of a function value. So interfaces reuse
+what function values already do: ownership, raising, cycles; the cost is a function value per
+member when a value is made an interface. `use` works with a class that implements
+`IDisposable` (the test and the call are settled from the class's type).
+
+Not yet: inheritance and abstract classes, `this` in a constructor or an object expression,
+interfaces that inherit interfaces, generic interface members, type tests against interfaces at
+run time, and overrides other than `ToString`.
+
 A module-level value that is not a literal is computed when the program starts: every file
 has an `$init` that first runs those of the files it uses and then fills its own values in
 their order, and `main` calls the one of its file before the entry point (an exception there

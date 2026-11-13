@@ -90,7 +90,8 @@ let isReservedIdent (s: string) =
 let cleanIdent (s: string) =
     let s = Regex.Replace(s, "[^A-Za-z0-9_]", "_")
 
-    if s = "" then
+    // (`_` alone is not a name in Zig: F#'s `member _.X` names the object so)
+    if s = "" || s = "_" then
         "v"
     elif System.Char.IsDigit s[0] then
         "_" + s
@@ -140,6 +141,8 @@ type Adapter =
         Target: string
         TypeArgs: Ty list
         NCaptures: int
+        /// the types of the captured values (needed for a function of another file)
+        CaptureTys: Ty list
         FnTy: Ty
         /// the type parameters of the surrounding function that the types above mention: the
         /// adapter is generic in them
@@ -444,8 +447,9 @@ let rec ex (em: Em) (e: Expr) : string =
                         Target = target
                         TypeArgs = typeArgs
                         NCaptures = caps.Length
+                        CaptureTys = caps |> List.map typeOf
                         FnTy = ty
-                        Gens = freeGens (ty :: typeArgs)
+                        Gens = freeGens (ty :: typeArgs @ (caps |> List.map typeOf))
                     }
 
                 em.Adapters[key] <- a
@@ -1440,30 +1444,56 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
         finish $"%s{fnRef a.Target a.TypeArgs}(%s{args})" fn.RetFrom.IsSome dropAfter
     | _ ->
         // a function of another file: what it borrows is settled when the Zig is compiled
+        if a.NCaptures > 0 then
+            let fields =
+                a.CaptureTys
+                |> List.mapi (fun i t -> $"c%d{i}: %s{zigType t}")
+                |> String.concat ", "
+
+            line $"const Env = struct {{ %s{fields} }};"
+
         line $"fn code(%s{sigParams}) fable_rt.Raised!%s{zigType ret} {{"
-        line "    _ = env;"
+
+        if a.NCaptures > 0 then
+            line "    const c = fable_rt.captured(Env, env);"
+        else
+            line "    _ = env;"
 
         let tuple (items: string list) =
             match items with
             | [] -> ".{}"
             | _ -> items |> String.concat ", " |> sprintf ".{ %s }"
 
-        if isManaged ret || argTys |> List.exists isManaged then
+        let capturedArgs = a.CaptureTys |> List.mapi (fun i _ -> $"c.c%d{i}")
+
+        if
+            isManaged ret
+            || argTys |> List.exists isManaged
+            || a.CaptureTys |> List.exists isManaged
+        then
+            // (the environment keeps what it captured; the arguments are given)
             let uses =
-                argTys
-                |> List.map (fun t ->
-                    if isManaged t then
-                        ".give"
-                    else
-                        ".plain"
-                )
+                (a.CaptureTys
+                 |> List.map (fun t ->
+                     if isManaged t then
+                         ".keep"
+                     else
+                         ".plain"
+                 ))
+                @ (argTys
+                   |> List.map (fun t ->
+                       if isManaged t then
+                           ".give"
+                       else
+                           ".plain"
+                   ))
 
             finish
-                $"fable_rt.across(%s{fnRef a.Target a.TypeArgs}, %s{sigName a.Target}, %s{tuple uses}, %s{tuple (ps |> List.map fst)})"
+                $"fable_rt.across(%s{fnRef a.Target a.TypeArgs}, %s{sigName a.Target}, %s{tuple uses}, %s{tuple (capturedArgs @ (ps |> List.map fst))})"
                 false
                 []
         else
-            let args = ps |> List.map fst |> String.concat ", "
+            let args = capturedArgs @ (ps |> List.map fst) |> String.concat ", "
             finish $"%s{fnRef a.Target a.TypeArgs}(%s{args})" false []
 
     line "}"

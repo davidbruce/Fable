@@ -95,6 +95,30 @@ let private exprKind (e: Fable.Expr) =
     | Fable.Extended _ -> "raise"
     | _ -> "this construct"
 
+/// The function that implements a member of an interface for a type: `Counter__Probe_IShape_Area`
+/// (the compiled name of the implementation is the interface's name and the member's).
+let private implName (typeName: string) (compiledName: string) : string =
+    typeName
+    + "__"
+    + System.Text.RegularExpressions.Regex.Replace(compiledName, "[^A-Za-z0-9_]", "_")
+
+/// The members of an interface, as the fields of the struct of function values that stands
+/// for it: the compiled name (`Area`, `get_Name`), and the types of the arguments and result.
+let private interfaceMembers (ent: Fable.Entity) : (string * Fable.Type list * Fable.Type) list =
+    ent.MembersFunctionsAndValues
+    // (a property is there as itself and as its getter)
+    |> Seq.filter (fun m -> m.IsDispatchSlot && not (m.IsProperty && not m.IsGetter && not m.IsSetter))
+    |> Seq.distinctBy (fun m -> m.CompiledName)
+    |> Seq.map (fun m ->
+        let args =
+            match m.CurriedParameterGroups |> List.concat |> List.map (fun p -> p.Type) with
+            | [] -> [ Fable.Unit ]
+            | ts -> ts
+
+        m.CompiledName, args, m.ReturnParameter.Type
+    )
+    |> List.ofSeq
+
 /// Does a record or union contain itself, directly or through other records and unions?
 /// With `throughUnions = false` the search stops at unions.
 let private reachesSelf (com: Compiler) (throughUnions: bool) (start: Fable.Entity) : bool =
@@ -712,7 +736,22 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
             | Some e -> e
             | None -> fail r "the Zig target cannot find the type %s" entRef.FullName
 
-        if not (ent.IsFSharpRecord || ent.IsFSharpUnion) then
+        // A class is a reference: a counted cell of its fields, which can all be assigned. An
+        // interface is a struct of function values, one for each of its members.
+        let isClass =
+            not (ent.IsFSharpRecord || ent.IsFSharpUnion || ent.IsInterface || ent.IsFSharpModule)
+
+        if isClass then
+            match ent.BaseType with
+            | Some bt when bt.Entity.FullName <> "System.Object" ->
+                fail
+                    r
+                    "the Zig target does not support inheritance yet (%s inherits %s)"
+                    entRef.FullName
+                    bt.Entity.FullName
+            | _ -> ()
+
+        if not (ent.IsFSharpRecord || ent.IsFSharpUnion || ent.IsInterface || isClass) then
             fail r "the Zig target does not support the type %s yet" entRef.FullName
 
         let recursive = reachesSelf ctx.Com true ent
@@ -720,9 +759,10 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
         // A record that can be assigned to (and is not a struct), or that contains itself, is a
         // reference: a pointer to a counted cell.
         let isReference =
-            ent.IsFSharpRecord
-            && ((recursive && reachesSelf ctx.Com false ent)
-                || (not ent.IsValueType && ent.FSharpFields |> List.exists (fun f -> f.IsMutable)))
+            isClass
+            || ent.IsFSharpRecord
+               && ((recursive && reachesSelf ctx.Com false ent)
+                   || (not ent.IsValueType && ent.FSharpFields |> List.exists (fun f -> f.IsMutable)))
 
         // a name in this file, or `alias.name` for a type another file declares
         let name, isLocal =
@@ -747,7 +787,9 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 TypeParams = ent.GenericParameters |> List.map (fun g -> g.Name)
                 Cases = []
                 MutableFields =
-                    if ent.IsFSharpRecord then
+                    if isClass then
+                        ent.FSharpFields |> List.map (fun f -> f.Name)
+                    elif ent.IsFSharpRecord then
                         ent.FSharpFields
                         |> List.filter (fun f -> f.IsMutable)
                         |> List.map (fun f -> f.Name)
@@ -765,7 +807,15 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
 
         try
             e.Cases <-
-                if ent.IsFSharpUnion then
+                if ent.IsInterface then
+                    [
+                        "",
+                        interfaceMembers ent
+                        |> List.map (fun (name, args, ret) ->
+                            name, TFn(args |> List.map (mapType ctx r), mapType ctx r ret)
+                        )
+                    ]
+                elif ent.IsFSharpUnion then
                     ent.UnionCases
                     |> List.map (fun c ->
                         c.Name, c.UnionCaseFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
@@ -1498,6 +1548,116 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
     | "Microsoft.FSharp.Core.Operators" when name = "op_Append" -> Some("List", "append")
     | _ -> None
 
+/// The expression under the casts and unboxing that F# puts around `x` in `use x = ...`.
+let rec private (|Unboxed|) (e: Fable.Expr) : Fable.Expr =
+    match e with
+    | Fable.TypeCast(Unboxed inner, _) -> inner
+    | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
+        (imp.Selector = "UnboxGeneric" || imp.Selector = "UnboxFast")
+        && info.Args.Length = 1
+        ->
+        let (Unboxed inner) = info.Args.Head
+        inner
+    | _ -> e
+
+/// Does a declared type (not an interface) implement the interface? None when that is not
+/// known here.
+let private implements (com: Compiler) (t: Fable.Type) (ifaceFullName: string) : bool option =
+    match t with
+    | Fable.DeclaredType(entRef, _) ->
+        match com.TryGetEntity entRef with
+        | Some ent when not ent.IsInterface ->
+            Some(
+                ent.DeclaredInterfaces
+                |> Seq.exists (fun i -> i.Entity.FullName = ifaceFullName)
+            )
+        | _ -> None
+    | _ -> None
+
+/// Is this the type of an interface?
+let private isInterfaceType (com: Compiler) (t: Fable.Type) : bool =
+    match t with
+    | Fable.DeclaredType(entRef, _) ->
+        match com.TryGetEntity entRef with
+        | Some ent -> ent.IsInterface
+        | None -> false
+    | _ -> false
+
+/// A class's constructor as a function that makes the object: the fields are computed in
+/// order, as locals, and the object is made of them at the end. (`this` cannot be used before
+/// all its fields are there.)
+let private constructorBody
+    (classRef: Fable.EntityRef)
+    (genArgs: Fable.Type list)
+    (fieldNames: string list)
+    (body: Fable.Expr)
+    : Fable.Expr
+    =
+    let fieldIdent (name: string) (t: Fable.Type) : Fable.Ident =
+        {
+            Name = "field_" + name
+            Type = t
+            IsMutable = false
+            IsThisArgument = false
+            IsCompilerGenerated = true
+            Range = None
+            IsInlineIfLambda = false
+        }
+
+    let set = Dictionary<string, Fable.Ident>()
+
+    let rec usesThis (e: Fable.Expr) =
+        match e with
+        | Fable.Value(Fable.ThisValue _, _) -> true
+        | _ -> getSubExpressions e |> List.exists usesThis
+
+    let rec fieldsOf (e: Fable.Expr) : Fable.Expr =
+        match e with
+        | Fable.Get(Fable.Value(Fable.ThisValue _, _), Fable.FieldGet info, t, _) when set.ContainsKey info.Name ->
+            Fable.IdentExpr set[info.Name]
+        | _ ->
+            match e with
+            | Fable.Value(Fable.ThisValue _, r) ->
+                raise (ZigError("the Zig target does not support using `this` in a constructor yet", r))
+            | _ -> e |> AST.visit fieldsOf
+
+    let rec build (stmts: Fable.Expr list) : Fable.Expr =
+        match stmts with
+        | [] ->
+            let values =
+                fieldNames
+                |> List.map (fun f ->
+                    match set.TryGetValue f with
+                    | true, id -> Fable.IdentExpr id
+                    | _ ->
+                        raise (
+                            ZigError(
+                                $"the Zig target needs every field of a class to be given a value in its constructor (`%s{f}`)",
+                                None
+                            )
+                        )
+                )
+
+            Fable.Value(Fable.NewRecord(values, classRef, genArgs), None)
+        | stmt :: rest ->
+            match stmt with
+            | Fable.Sequential xs -> build (xs @ rest)
+            | Fable.Value(Fable.UnitConstant, _) -> build rest
+            // (the constructor of System.Object)
+            | Fable.Call(Fable.Import(imp, _, _), _, _, _) when
+                imp.Selector = ".ctor" && imp.Path.EndsWith "System.Object"
+                ->
+                build rest
+            | Fable.Set(Fable.Value(Fable.ThisValue _, _), Fable.FieldSet name, t, value, _) ->
+                let id = fieldIdent name t
+                let value = fieldsOf value
+                set[name] <- id
+                Fable.Let(id, value, build rest)
+            | Fable.Let(id, value, body) -> Fable.Let(id, fieldsOf value, build (body :: rest))
+            | other -> Fable.Sequential [ fieldsOf other; build rest ]
+
+    build [ body ]
+
 /// A module-level value, of this file or (`alias.name`) of another.
 let private globalVar (name: string) (ty: Ty) (isMutable: bool) : Expr =
     EVar
@@ -1516,6 +1676,7 @@ let private usedInFunction (name: string) (e: Fable.Expr) : bool =
         | Fable.IdentExpr id -> inside && id.Name = name
         | Fable.Lambda(_, body, _)
         | Fable.Delegate(_, body, _, _) -> go true body
+        | Fable.ObjectExpr(members, _, _) -> members |> List.exists (fun m -> go true m.Body)
         | _ -> getSubExpressions e |> List.exists (go inside)
 
     go false e
@@ -1991,6 +2152,49 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     | PrintfCall(selector, fmt, holes) -> formatted ctx e.Range selector fmt holes e.Type
 
+    // `x :? IDisposable` where the type of x is known (what `use` asks): true if the type
+    // implements the interface
+    | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _) as ifaceType), _) when
+        isInterfaceType ctx.Com ifaceType
+        && (implements ctx.Com inner.Type ifaceRef.FullName).IsSome
+        ->
+        ESeq(
+            lwStmt ctx inner,
+            ELit(
+                string ((implements ctx.Com inner.Type ifaceRef.FullName).Value)
+                |> fun b -> b.ToLowerInvariant(), tBool
+            )
+        )
+
+    // a member of an interface called on a value whose type is known: the type's own function
+    | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
+        imp.Path.StartsWith(Replacements.DotnetPrefix, System.StringComparison.Ordinal)
+        && info.ThisArg.IsSome
+        && (
+            match info.ThisArg.Value with
+            | Unboxed inner ->
+                (implements ctx.Com inner.Type (imp.Path.Substring Replacements.DotnetPrefix.Length)) = Some true
+        )
+        ->
+        let (Unboxed inner) = info.ThisArg.Value
+        let iface = imp.Path.Substring Replacements.DotnetPrefix.Length
+
+        match inner.Type with
+        | Fable.DeclaredType(typeRef, genArgs) ->
+            let ent = entOf ctx r typeRef
+            let target = implName ent.Name (iface + "." + imp.Selector)
+
+            let args =
+                match info.Args |> List.filter (fun a -> not (isUnit a.Type)) with
+                | [] -> [ EUnit ]
+                | given -> given |> List.map (lw ctx)
+
+            bindArgs
+                ctx
+                (lw ctx inner :: args)
+                (fun xs -> ECall(target, genArgs |> List.map (mapType ctx r), xs, mapType ctx r t))
+        | _ -> fail r "internal: not a declared type"
+
     // A call that the replacements kept under its .NET name.
     | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
         imp.Path.StartsWith(Replacements.DotnetPrefix, System.StringComparison.Ordinal)
@@ -2027,6 +2231,87 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         let ty = mapType ctx r t
         bindArgs ctx [ lw ctx x ] (fun xs -> EExnGet(xs.Head, ent, info.Name, ty))
+
+    // a member of an interface: a field of its struct of function values (a property is read
+    // by calling its getter)
+    | Fable.Get(x, Fable.FieldGet info, t, r) when isInterfaceType ctx.Com x.Type ->
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                let fields = caseFields (typeOf xs.Head) ""
+
+                match fields |> List.tryFind (fun (f, _) -> f = info.Name) with
+                | Some(f, fty) -> EGet(xs.Head, PField f, fty)
+                | None ->
+                    match fields |> List.tryFind (fun (f, _) -> f = "get_" + info.Name) with
+                    | Some(f, fty) -> ECallClo(EGet(xs.Head, PField f, fty), [ EUnit ], mapType ctx r t)
+                    | None -> fail r "the Zig target cannot find the member %s of this interface" info.Name
+            )
+
+    // a value given where an interface is expected: each member, a function value that
+    // holds the object
+    | Fable.TypeCast(x, (Fable.DeclaredType(ifaceRef, _) as ifaceType)) when
+        isInterfaceType ctx.Com ifaceType && not (isInterfaceType ctx.Com x.Type)
+        ->
+        let ifaceTy = mapType ctx e.Range ifaceType
+
+        let typeName, typeArgs =
+            match x.Type with
+            | Fable.DeclaredType(classRef, genArgs) ->
+                (entOf ctx e.Range classRef).Name, genArgs |> List.map (mapType ctx e.Range)
+            | other -> fail e.Range "the Zig target cannot make an interface of a value of this type yet (%A)" other
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                let members =
+                    caseFields ifaceTy ""
+                    |> List.map (fun (f, fty) ->
+                        EClosure(implName typeName (ifaceRef.FullName + "." + f), typeArgs, [ xs.Head ], fty)
+                    )
+
+                ECon(ifaceTy, "", members, None)
+            )
+
+    // `{ new IShape with ... }`: each member, a function value of its own
+    | Fable.ObjectExpr(members, ifaceType, None) when isInterfaceType ctx.Com ifaceType ->
+        let ifaceTy = mapType ctx e.Range ifaceType
+
+        let byName =
+            members
+            |> List.map (fun m ->
+                let compiled =
+                    match ctx.Com.TryGetMember m.MemberRef with
+                    | Some info -> info.CompiledName
+                    | None -> m.Name
+
+                compiled, m
+            )
+            |> dict
+
+        let rec usesIdent (name: string) (e: Fable.Expr) =
+            match e with
+            | Fable.IdentExpr id -> id.Name = name
+            | _ -> getSubExpressions e |> List.exists (usesIdent name)
+
+        let closures =
+            caseFields ifaceTy ""
+            |> List.map (fun (f, _) ->
+                match byName.TryGetValue f with
+                | true, m ->
+                    match m.Args with
+                    | this :: args ->
+                        if usesIdent this.Name m.Body then
+                            fail e.Range "the Zig target does not support `this` in an object expression yet"
+
+                        lw ctx (Fable.Delegate(args, m.Body, None, []))
+                    | [] -> fail e.Range "internal: a member without its object"
+                | _ -> fail e.Range "the Zig target cannot find the member %s in this object expression" f
+            )
+
+        bindArgsIn true ctx closures (fun xs -> ECon(ifaceTy, "", xs, None))
 
     | Fable.Get(x, kind, t, r) ->
         let ty = mapType ctx r t
@@ -3625,11 +3910,25 @@ and libraryCall
         else
             importAlias ctx (Fable.Transforms.AST.getLibPath ctx.Com file) + "." + fn
 
-    // (a property is read with a unit argument that the library function does not take)
+    // (a property is read with a unit argument that the library function does not take; a
+    // collection given where FSharp.Core takes a sequence is walked as the list of what it
+    // holds)
+    let lowerArg (arg: Fable.Expr) : Expr =
+        match arg with
+        | Fable.TypeCast(inner, Fable.DeclaredType(seq, _)) when
+            seq.FullName = "System.Collections.Generic.IEnumerable`1"
+            && (listItem inner.Type).IsNone
+            && (forInSource ctx inner).IsSome
+            ->
+            match forInSource ctx inner with
+            | Some(listExpr, "list") -> listExpr
+            | _ -> lw ctx arg
+        | _ -> lw ctx arg
+
     let args =
         match args |> List.filter (fun arg -> not (isUnit arg.Type)) with
         | [] -> [ EUnit ]
-        | given -> given |> List.map (lw ctx)
+        | given -> given |> List.map lowerArg
 
     bindArgs ctx args (fun xs -> ECall(target, typeArgs, xs, mapType ctx r t))
 
@@ -3684,19 +3983,42 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 []
             | Fable.ClassDeclaration c ->
                 match com.TryGetEntity c.Entity with
-                | Some ent when ent.IsFSharpRecord || ent.IsFSharpUnion ->
+                | Some ent when ent.IsInterface ->
                     try
                         entOf (newCtx c.Name) None c.Entity |> ignore
                     with ZigError(msg, r) ->
                         report r msg
+                | Some ent when not (ent.IsFSharpExceptionDeclaration || ent.IsFSharpModule) ->
+                    try
+                        entOf (newCtx c.Name) None c.Entity |> ignore
 
-                    // What a type overrides is a function like its other members. So far only
-                    // `ToString` is called where .NET would call it.
+                        // a class: its constructor makes the object
+                        match c.Constructor with
+                        | Some ctor when not (ent.IsFSharpRecord || ent.IsFSharpUnion) ->
+                            let genArgs =
+                                ent.GenericParameters
+                                |> List.map (fun g -> Fable.GenericParam(g.Name, false, []))
+
+                            let fields = ent.FSharpFields |> List.map (fun f -> f.Name)
+                            attached.Add { ctor with Body = constructorBody c.Entity genArgs fields ctor.Body }
+                        | _ -> ()
+                    with ZigError(msg, r) ->
+                        report r msg
+
+                    // What a type overrides or implements is a function like its other members:
+                    // `ToString`, and the members of the interfaces it implements.
                     attached.AddRange(
                         c.AttachedMembers
                         |> List.choose (fun m ->
+                            let compiled =
+                                match com.TryGetMember m.MemberRef with
+                                | Some info -> info.CompiledName
+                                | None -> m.Name
+
                             if m.Name = "ToString" then
                                 Some { m with Name = c.Name + "__ToString" }
+                            elif compiled.Contains "." then
+                                Some { m with Name = implName c.Name compiled }
                             else
                                 report
                                     m.Body.Range

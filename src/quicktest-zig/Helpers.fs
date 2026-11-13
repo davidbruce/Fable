@@ -145,3 +145,20 @@ let visit (who: string) : int =
     hits <- hits + 1
     lastSeen <- who + "#" + string hits
     hits
+
+/// (an interface and a class that another file uses)
+type IGreeter =
+    abstract Greet: string -> string
+    abstract Count: int
+
+type Greeter(prefix: string) =
+    let mutable count = 0
+
+    member _.Prefix = prefix
+
+    interface IGreeter with
+        member _.Greet(name: string) =
+            count <- count + 1
+            prefix + ", " + name
+
+        member _.Count = count

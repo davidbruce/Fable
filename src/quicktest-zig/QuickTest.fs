@@ -351,3 +351,4 @@ let main _ =
     + Maps.run ()
     + Loops.run ()
     + Features.run ()
+    + Classes.run ()

@@ -24,6 +24,7 @@
     <Compile Include="Maps.fs" />
     <Compile Include="Loops.fs" />
     <Compile Include="Features.fs" />
+    <Compile Include="Classes.fs" />
     <Compile Include="QuickTest.fs" />
   </ItemGroup>
   <ItemGroup>
