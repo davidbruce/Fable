@@ -859,12 +859,11 @@ let mailboxStartNew<'Msg>
 /// `mb.Post(msg)`: to the Receive that waits (it goes on from a timer: posting returns at once),
 /// or to the queue
 let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
-    if not mb.token.source.cancelled then
-        match mb.waiting with
-        | Some resume when mb.started ->
-            mb.waiting <- None
-            schedule 0 (fun () -> resume msg) |> ignore
-        | _ -> mb.queue.Add msg
+    match mb.waiting with
+    | Some resume ->
+        mb.waiting <- None
+        schedule 0 (fun () -> resume msg) |> ignore
+    | None -> mb.queue.Add msg
 
 let mailboxQueueLength<'Msg> (mb: MailboxOf<'Msg>) : int = mb.queue.Count
 
@@ -897,6 +896,10 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
                 else
                     None
 
+            // (cancelled while it waits: it reports the cancellation, and what is posted later
+            // is queued)
+            let mutable registration: System.IDisposable option = None
+
             mb.waiting <-
                 Some(fun msg ->
                     if not done' then
@@ -906,8 +909,32 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
                         | Some t -> t.live <- false
                         | None -> ()
 
+                        match registration with
+                        | Some d -> d.Dispose()
+                        | None -> ()
+
                         k.ok (Some msg)
+                    else
+                        mb.queue.Add msg
                 )
+
+            if not done' then
+                registration <-
+                    Some(
+                        tokenRegister
+                            k.token
+                            (fun () ->
+                                if not done' then
+                                    done' <- true
+                                    mb.waiting <- None
+
+                                    match timer with
+                                    | Some t -> t.live <- false
+                                    | None -> ()
+
+                                    k.cancel (canceled ())
+                            )
+                    )
     )
 
 /// `inbox.Receive([timeout])`: the next message (TimeoutException when the time is up first)
@@ -1060,3 +1087,17 @@ let awaitEvent<'Del, 'T when 'Del: delegate<'T, unit> and 'Del :> System.Delegat
                         )
                 )
     )
+
+/// `Async.Sleep(timeSpan)`: its whole milliseconds
+let sleepSpan (span: Fable.Library.Zig.TimeSpan.TimeSpanOf) : AsyncOf<unit> =
+    let ms = span.ticks / 10_000L
+
+    if ms < -1L || ms > int64 System.Int32.MaxValue then
+        raise (
+            System.ArgumentOutOfRangeException(
+                "dueTime",
+                "The value needs to translate in milliseconds to -1 (signifying an infinite timeout), 0, or a positive integer less than or equal to the maximum allowed timer duration."
+            )
+        )
+
+    sleep (int ms)

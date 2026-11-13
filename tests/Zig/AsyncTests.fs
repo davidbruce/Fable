@@ -435,7 +435,7 @@ let ``test Try ... with ... expressions inside async expressions work the same``
     equal "abcdef" result.Value
 
 // Disable this test for dotnet as it's failing too many times in Appveyor
-#if FABLE_COMPILER && !FABLE_COMPILER_ZIG // (timers: nothing waits on the Zig target)
+#if FABLE_COMPILER
 
 [<Fact>]
 let ``test async cancellation works`` () =
@@ -918,7 +918,6 @@ let ``test Can use custom exceptions in async workflows #2396`` () =
         equal 7 res
     } |> Async.StartImmediate
 
-#if !FABLE_COMPILER_ZIG // (TimeSpan)
 [<Fact>]
 let ``test Async.Sleep works correctly with TimeSpan argument`` () =
     async {
@@ -957,7 +956,6 @@ let ``test Async.Sleep works correctly with TimeSpan argument`` () =
         let isReasonableTime = elapsedMs >= 150.0 && elapsedMs <= 500.0
         equal true isReasonableTime
     } |> Async.StartImmediate
-#endif
 
 [<Fact>]
 let ``test Async.AwaitEvent fires continuation when event is triggered`` () =
@@ -1187,7 +1185,6 @@ let ``test failed Sleep installation releases its registration`` () =
     equal 0 result.scheduled
 #endif
 
-#if !FABLE_COMPILER_ZIG // (MailboxProcessor)
 [<Fact>]
 let ``test cancelling a waiting Receive reports cancel and keeps later posts queued`` () =
     async {
@@ -1202,9 +1199,7 @@ let ``test cancelling a waiting Receive reports cancel and keeps later posts que
         let! next = mailbox.Receive()
         equal 42 next
     } |> Async.RunSynchronously
-#endif
 
-#if !FABLE_COMPILER_ZIG // (MailboxProcessor)
 [<Fact>]
 let ``test cancelling the mailbox token cancels a body waiting in Receive`` () =
     async {
@@ -1224,7 +1219,6 @@ let ``test cancelling the mailbox token cancels a body waiting in Receive`` () =
                 |> ignore)
         equal "cancelled" outcome
     } |> Async.RunSynchronously
-#endif
 
 [<Fact>]
 let ``test TryFinally installs cleanup before pre-cancellation`` () =

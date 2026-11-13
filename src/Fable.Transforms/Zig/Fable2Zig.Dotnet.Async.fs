@@ -98,6 +98,12 @@ let call
     | "Microsoft.FSharp.Control.FSharpAsync", "get_CancellationToken", [] -> lib "cancellationToken" unitArg
     | "Microsoft.FSharp.Control.FSharpAsync", "TryCancelled", [ c; f ] -> lib "tryCancelled" [ c; f ]
     | "Microsoft.FSharp.Control.FSharpAsync", "Sequential", [ cs ] -> lib "sequential" [ cs ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "Sleep", [ span ] when
+        (match span.Type with
+         | Fable.DeclaredType(e, _) -> e.FullName = "System.TimeSpan"
+         | _ -> false)
+        ->
+        lib "sleepSpan" [ span ]
     | "Microsoft.FSharp.Control.FSharpAsync", "AwaitEvent", ev :: rest ->
         let cancelAction =
             match rest with
