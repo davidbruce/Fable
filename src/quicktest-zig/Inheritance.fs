@@ -103,6 +103,18 @@ let both =
         member _.B() = 20
     }
 
+type Point(x: int, y: int) =
+    new() = Point(0, 0)
+    new(v: int) = Point(v, v)
+    member _.X = x
+    member _.Y = y
+
+let custom (k: float) =
+    { new Shape("custom") with
+        member _.Area() = k * 3.0
+        member this.Scale(f) = ignore (this.Area() * f)
+    }
+
 let total (shapes: Shape list) =
     shapes |> List.sumBy (fun s -> s.Area())
 
@@ -163,6 +175,14 @@ let run () : int =
         + check (tree = 4.0)
         + check (t.Count = 3)
         + same "Inheritance+Circle" (string (Circle 1.0))
+        + same
+            "custom with area 6.00|0|6"
+            ((custom 2.0).Describe()
+             + "|"
+             + string (custom 1.0).Corners
+             + "|"
+             + string (total [ custom 1.0; Circle 1.0 ]))
+        + check ((Point()).X = 0 && (Point 5).Y = 5 && (Point(1, 2)).Y = 2)
         + check (
             viaDerived (Both()) = 3
             && viaBase (Both()) = 1

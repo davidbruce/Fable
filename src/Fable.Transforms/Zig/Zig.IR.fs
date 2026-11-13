@@ -622,6 +622,10 @@ type ObjDecl =
         Tables: (Ty * (string * string * Ty) list) option list
         /// the function of the class's `ToString` (its own or the nearest inherited one)
         ToString: string option
+        /// (an object expression's class) the functions of its table that call the function
+        /// values it holds: name, pointer type of its fields, the Zig names of the structs of
+        /// fields of its chain, the field, and the type of the function value
+        Thunks: (string * Ty * string * string * Ty) list
     }
 
 type FileState() =

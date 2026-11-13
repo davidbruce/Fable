@@ -2403,6 +2403,7 @@ let private objDecl (com: Compiler) (r: SourceLocation option) (o: ObjInfo) (dot
             ancestors o
             |> List.tryFind (fun k -> classImplements com k "ToString")
             |> Option.map (fun k -> k.Prefix + "__ToString")
+        Thunks = []
     }
 
 /// A constructor as a function that computes the fields in order and ends with `finish` of
@@ -3449,6 +3450,138 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             )
 
     // `{ new IShape with ... }`: each member, a function value of its own
+    // `{ new Shape("x") with member _.Area() = ... }`: an object of a class of its own that
+    // derives from Shape. Its fields are the function values of its members (which hold what
+    // they capture); its table calls them.
+    | Fable.ObjectExpr(members, Fable.DeclaredType(baseRef, _), Some(Fable.Call(callee, call, _, cr))) when
+        (objInfo ctx e.Range baseRef).IsSome
+        ->
+        let parent = (objInfo ctx e.Range baseRef).Value
+        let n = ctx.State.ObjInfos.Count
+        let prefix = $"%s{cleanIdent ctx.FnBase}__obj%d{n}"
+
+        let slots =
+            members
+            |> List.map (fun m ->
+                let slot =
+                    match ctx.Com.TryGetMember m.MemberRef with
+                    | Some info -> info.CompiledName
+                    | None -> m.Name
+
+                match virtualSlot parent slot with
+                | Some(_, ty) -> slot, ty, m
+                | None -> fail e.Range "the Zig target does not support %s in this object expression yet" slot
+            )
+
+        let synth (suffix: string) (cases: (string * Ty) list) : Ent =
+            {
+                Name = prefix + "__" + suffix
+                Ref =
+                    {
+                        FullName = parent.FullName + "$" + prefix + "$" + suffix
+                        Path = baseRef.Path
+                    }
+                Kind = KRecord
+                TypeParams = []
+                Cases = [ "", cases ]
+                MutableFields = []
+                Managed = false
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = true
+                Hooks = None
+            }
+
+        let part = synth "part" (slots |> List.map (fun (slot, ty, _) -> slot, ty))
+        let chain = synth "chain" [ "base", TEnt(parent.Chain, []); "own", TEnt(part, []) ]
+
+        for ent in [ part; chain ] do
+            ctx.State.Ents[ent.Ref.FullName] <- ent
+            ctx.State.LocalEnts.Add ent
+
+        if ctx.State.EntDepth = 0 then
+            settleManaged ctx.State
+
+        let info =
+            {
+                Ref =
+                    {
+                        FullName = parent.FullName + "$" + prefix
+                        Path = baseRef.Path
+                    }
+                FullName = parent.FullName + "$" + prefix
+                Prefix = prefix
+                Depth = parent.Depth + 1
+                Parent = Some parent
+                Part = part
+                Chain = chain
+                Slots = []
+                Table = None
+                IsAbstract = false
+                IsLocal = true
+            }
+
+        ctx.State.ObjInfos[info.FullName] <- box info
+        let overridden = slots |> List.map (fun (slot, _, _) -> slot) |> set
+
+        let tables =
+            ancestors info
+            |> List.rev
+            |> List.map (fun level ->
+                match level.Table with
+                | Some vt ->
+                    let entries =
+                        level.Slots
+                        |> List.map (fun (slot, slotTy) ->
+                            let target =
+                                if overridden.Contains slot then
+                                    "@raw:" + prefix + "__" + slot
+                                else
+                                    implementationOf ctx.Com e.Range parent slot
+
+                            slot, target, slotTy
+                        )
+
+                    Some(TEnt(vt, []), entries)
+                | None -> None
+            )
+
+        ctx.State.Objs.Add
+            {
+                TypeName = prefix + "__type"
+                Chain = TEnt(chain, [])
+                DotnetName = parent.FullName.Substring(parent.FullName.LastIndexOf '.' + 1) + "@" + string n
+                Parent = Some(parent.Prefix + "__type")
+                Tables = tables
+                ToString =
+                    ancestors parent
+                    |> List.tryFind (fun k -> classImplements ctx.Com k "ToString")
+                    |> Option.map (fun k -> k.Prefix + "__ToString")
+                Thunks =
+                    slots
+                    |> List.map (fun (slot, ty, _) ->
+                        prefix + "__" + slot, TPtr(TEnt(part, []), false), partNames info, slot, ty
+                    )
+            }
+
+        let baseChain = Fable.Call(callee, call, chainType parent, cr)
+
+        let closures =
+            slots |> List.map (fun (_, _, m) -> Fable.Delegate(m.Args, m.Body, None, []))
+
+        let value =
+            Fable.Value(
+                Fable.NewRecord(
+                    [ baseChain; Fable.Value(Fable.NewRecord(closures, part.Ref, []), None) ],
+                    chain.Ref,
+                    []
+                ),
+                None
+            )
+
+        bindArgs ctx [ lw ctx value ] (fun xs -> EEmit($"fable_rt.objNew(&%s{objTypeName info}, $0)", xs, tObj))
+
     | Fable.ObjectExpr(members, ifaceType, None) when isInterfaceType ctx.Com ifaceType ->
         let ifaceTy = mapType ctx e.Range ifaceType
 
@@ -6212,6 +6345,44 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
         decls
         |> List.collect (fun d ->
             match d with
+            // a secondary constructor of a class: like the primary one, it gives the chain of
+            // fields (that the primary constructor computes)
+            | Fable.MemberDeclaration m when
+                (match com.TryGetMember m.MemberRef with
+                 | Some info when info.IsConstructor ->
+                     match info.DeclaringEntity with
+                     | Some cls ->
+                         (try
+                             (objInfo (newCtx m.Name) None cls).IsSome
+                          with ZigError _ ->
+                              false)
+                     | None -> false
+                 | _ -> false)
+                ->
+                let cls = (com.TryGetMember m.MemberRef).Value.DeclaringEntity.Value
+                let o = (objInfo (newCtx m.Name) None cls).Value
+
+                let rec chainTail (e: Fable.Expr) : Fable.Expr =
+                    match e with
+                    | Fable.Call(callee, call, Fable.DeclaredType(c, _), r) when
+                        c.FullName = o.FullName && isConstructorCall com call
+                        ->
+                        Fable.Call(callee, call, chainType o, r)
+                    | Fable.Let(id, v, b) -> Fable.Let(id, v, chainTail b)
+                    | Fable.LetRec(bs, b) -> Fable.LetRec(bs, chainTail b)
+                    | Fable.Sequential xs ->
+                        let rev = List.rev xs
+                        Fable.Sequential(List.rev (chainTail rev.Head :: rev.Tail))
+                    | Fable.IfThenElse(c, a, b, r) -> Fable.IfThenElse(c, chainTail a, chainTail b, r)
+                    | Fable.TypeCast(x, _) -> chainTail x
+                    | _ ->
+                        report
+                            e.Range
+                            $"the Zig target does not support this secondary constructor of %s{o.FullName} yet"
+
+                        e
+
+                [ { m with Body = chainTail m.Body } ]
             | Fable.MemberDeclaration m -> [ m ]
             | Fable.ModuleDeclaration m -> membersOf m.Members
             | Fable.ActionDeclaration a ->

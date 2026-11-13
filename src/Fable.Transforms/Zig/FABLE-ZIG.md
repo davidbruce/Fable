@@ -89,7 +89,10 @@ most derived implementations. `base.M()` calls the parent's implementation direc
 walks the chain of classes; `:?>` raises `InvalidCastException` with .NET's message. A class's
 `ToString` override is in its type too, so `string x` finds it whatever the static type; without
 one the text is .NET's name of the class (`Probe+Circle`). An interface that a base class
-implements works on objects of derived classes. An interface that inherits interfaces has their
+implements works on objects of derived classes. An object expression that derives from a class
+(`{ new Shape("x") with member _.Area() = k }`) is an object of a class of its own: its fields
+are the function values of its members, which hold what they capture, and its table calls
+them. A secondary constructor gives the fields its primary constructor computes. An interface that inherits interfaces has their
 members too, and is given where one of them is expected by taking those members. Objects are equal only to themselves, as on
 .NET.
 
@@ -102,9 +105,8 @@ what function values already do: ownership, raising, cycles; the cost is a funct
 member when a value is made an interface. `use` works with a class that implements
 `IDisposable` (the test and the call are settled from the class's type).
 
-Not yet: generic classes that take part in inheritance, overloaded virtual members, object
-expressions that derive from a class, secondary constructors of derived classes, `this` in a
-constructor or an object expression, generic interface members, type tests against interfaces at run time, `%A` of an object using its `ToString`, and
+Not yet: generic classes that take part in inheritance, overloaded virtual members, `this` in a
+constructor or in an object expression that implements an interface, generic interface members, type tests against interfaces at run time, `%A` of an object using its `ToString`, and
 overrides of `Equals` and `GetHashCode`.
 
 A module-level value that is not a literal is computed when the program starts: every file

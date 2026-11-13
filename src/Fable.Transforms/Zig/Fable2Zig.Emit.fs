@@ -1705,6 +1705,32 @@ let emitFile (state: FileState) : string =
     // the classes that take part in inheritance: the type of each, with its tables of virtual
     // members (function values of the functions that implement them)
     for d in state.Objs do
+        // (an object expression's class: each member calls the function value the object holds)
+        for (name, partPtr, parts, field, fnTy) in d.Thunks do
+            match fnTy with
+            | TFn(_ :: args, ret) ->
+                let ps =
+                    args
+                    |> List.mapi (fun i t -> $"a%d{i}: %s{zigType t}")
+                    |> List.map (fun p -> ", " + p)
+                    |> String.concat ""
+
+                let xs = args |> List.mapi (fun i _ -> $", a%d{i}") |> String.concat ""
+
+                out
+                    .AppendLine(
+                        $"fn %s{topIdent name}(env: ?*fable_rt.Env, this: fable_rt.Obj%s{ps}) fable_rt.Raised!%s{zigType ret} {{"
+                    )
+                    .AppendLine("    _ = env;")
+                    .AppendLine(
+                        $"    const f = fable_rt.dup(fable_rt.objPart(%s{zigType partPtr}, &[_]type{{ %s{parts} }}, this).%s{fieldIdent field});"
+                    )
+                    .AppendLine("    defer fable_rt.drop(f);")
+                    .AppendLine($"    return f.code(f.env, this%s{xs});")
+                    .AppendLine("}")
+                |> ignore
+            | _ -> ()
+
         let tables =
             d.Tables
             |> List.mapi (fun i t ->
@@ -1715,27 +1741,31 @@ let emitFile (state: FileState) : string =
                     let inits =
                         entries
                         |> List.map (fun (slot, target, fnTy) ->
-                            let key = target + "<>"
+                            if target.StartsWith("@raw:", System.StringComparison.Ordinal) then
+                                // (a function of this file with the calling convention of a function value)
+                                $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{topIdent (target.Substring 5)} }}"
+                            else
+                                let key = target + "<>"
 
-                            let adapter =
-                                match adapters.TryGetValue key with
-                                | true, a -> a
-                                | _ ->
-                                    let a =
-                                        {
-                                            Name = $"@\"%s{target}$fn%d{adapters.Count}\""
-                                            Target = target
-                                            TypeArgs = []
-                                            NCaptures = 0
-                                            CaptureTys = []
-                                            FnTy = fnTy
-                                            Gens = []
-                                        }
+                                let adapter =
+                                    match adapters.TryGetValue key with
+                                    | true, a -> a
+                                    | _ ->
+                                        let a =
+                                            {
+                                                Name = $"@\"%s{target}$fn%d{adapters.Count}\""
+                                                Target = target
+                                                TypeArgs = []
+                                                NCaptures = 0
+                                                CaptureTys = []
+                                                FnTy = fnTy
+                                                Gens = []
+                                            }
 
-                                    adapters[key] <- a
-                                    a
+                                        adapters[key] <- a
+                                        a
 
-                            $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{adapterRef adapter}.code }}"
+                                $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{adapterRef adapter}.code }}"
                         )
                         |> String.concat ", "
 
