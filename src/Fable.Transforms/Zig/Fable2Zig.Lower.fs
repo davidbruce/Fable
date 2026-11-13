@@ -858,16 +858,105 @@ let private tObj = TPrim "fable_rt.Obj"
 /// `obj`: an object (of a class, or a boxed value), or null
 let private tAny = TOpt tObj
 
-/// Is `name` read in `e`? (Not by a binding of a read that is itself never read: such
-/// bindings are left out.)
-let rec private liveUse (name: string) (e: Fable.Expr) : bool =
+/// The names that `e` reads. (Not those read only by a binding of a read that is itself never
+/// read: such bindings are left out.) One walk of `e`.
+let rec private namesRead (e: Fable.Expr) : Set<string> =
     match e with
-    | Fable.IdentExpr i -> i.Name = name
-    | Fable.Let(other, (Fable.Get(Fable.IdentExpr _, _, _, _) | Fable.IdentExpr _), body) when
-        not other.IsMutable && not (liveUse other.Name body)
+    | Fable.IdentExpr i -> Set.singleton i.Name
+    | Fable.Let(other, (Fable.Get(Fable.IdentExpr _, _, _, _) | Fable.IdentExpr _ as value), body) when
+        not other.IsMutable
         ->
-        liveUse name body
-    | _ -> AST.getSubExpressions e |> List.exists (liveUse name)
+        let inBody = namesRead body
+
+        if inBody.Contains other.Name then
+            Set.union (inBody.Remove other.Name) (namesRead value)
+        else
+            inBody
+    | _ ->
+        AST.getSubExpressions e
+        |> List.fold (fun acc x -> Set.union acc (namesRead x)) Set.empty
+
+let private liveUse (name: string) (e: Fable.Expr) : bool = (namesRead e).Contains name
+
+/// The targets of a decision tree, where each that several leaves reach and that is not small
+/// is a call of a function of its own: otherwise its code would be written out once per leaf,
+/// and a target that holds the rest of a match (as a `when` that fails goes on to) would
+/// multiply with each.
+let mutable private sharedTargetCount = 0
+
+let private sharedTargets
+    (targets: (Fable.Ident list * Fable.Expr) list)
+    (expr: Fable.Expr)
+    : (Fable.Ident * Fable.Expr) list * (Fable.Ident list * Fable.Expr) list
+    =
+    let uses = Array.zeroCreate (List.length targets)
+
+    let rec count (e: Fable.Expr) =
+        match e with
+        | Fable.DecisionTreeSuccess(i, values, _) ->
+            if i < uses.Length then
+                uses[i] <- uses[i] + 1
+
+            values |> List.iter count
+        // (a tree inside has targets of its own)
+        | Fable.DecisionTree _ -> ()
+        | _ -> AST.getSubExpressions e |> List.iter count
+
+    count expr
+
+    let rec size (limit: int) (e: Fable.Expr) : int =
+        if limit <= 0 then
+            0
+        else
+            AST.getSubExpressions e
+            |> List.fold
+                (fun acc x ->
+                    if acc >= limit then
+                        acc
+                    else
+                        acc + size (limit - acc) x
+                )
+                1
+
+    let fns = List<Fable.Ident * Fable.Expr>()
+
+    let small =
+        targets
+        |> List.mapi (fun i (ids, body) ->
+            if uses[i] > 1 && size 40 body >= 40 then
+                sharedTargetCount <- sharedTargetCount + 1
+
+                let unitArg = AST.makeTypedIdent Fable.Unit "unitVar"
+
+                let args =
+                    if ids.IsEmpty then
+                        [ unitArg ]
+                    else
+                        ids
+
+                let fnId =
+                    AST.makeTypedIdent
+                        (Fable.DelegateType(args |> List.map (fun a -> a.Type), body.Type))
+                        $"match_target_%d{sharedTargetCount}"
+
+                let call =
+                    Fable.CurriedApply(
+                        Fable.IdentExpr fnId,
+                        (if ids.IsEmpty then
+                             [ Fable.Value(Fable.UnitConstant, None) ]
+                         else
+                             ids |> List.map Fable.IdentExpr),
+                        body.Type,
+                        None
+                    )
+
+                fns.Add((fnId, Fable.Delegate(args, body, None, [])))
+                ids, call
+            else
+                ids, body
+        )
+
+    List.ofSeq fns, small
 
 /// A dictionary: .NET's, or what F#'s `dict` and `readOnlyDict` give
 let private isDictionaryName (name: string) =
@@ -1039,6 +1128,8 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
 
         if isClass then
             match ent.BaseType with
+            // (a struct's base is System.ValueType: it is a plain value here)
+            | Some bt when bt.Entity.FullName = "System.ValueType" && ent.IsValueType -> ()
             | Some bt when bt.Entity.FullName <> "System.Object" ->
                 fail
                     r
@@ -1071,7 +1162,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
         // A record that can be assigned to (and is not a struct), or that contains itself, is a
         // reference: a pointer to a counted cell.
         let isReference =
-            isClass
+            (isClass && not ent.IsValueType)
             || ent.IsFSharpRecord
                && (byReference
                    || (recursive && reachesSelf ctx.Com false ent)
@@ -1275,7 +1366,8 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
             match entRef.Path with
             | Fable.SourcePath _ ->
                 match ctx.Com.TryGetEntity entRef with
-                | Some ent when isClassEntity ent ->
+                // (a struct is a value, not an object)
+                | Some ent when isClassEntity ent && not ent.IsValueType ->
                     let derives =
                         match ent.BaseType with
                         | Some bt -> bt.Entity.FullName <> "System.Object"
@@ -4362,7 +4454,15 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     // Pattern matching arrives as a decision tree whose leaves name a target and the values
     // its variables are bound to. A target reached from several leaves is lowered once per leaf.
-    | Fable.DecisionTree(expr, targets) -> lw { ctx with DecisionTargets = targets } expr
+    | Fable.DecisionTree(expr, targets) ->
+        match sharedTargets targets expr with
+        | [], _ -> lw { ctx with DecisionTargets = targets } expr
+        | fns, small ->
+            // (the functions are declared before the tree: a target sees only what is outside it
+            // and what its leaf binds)
+            lw
+                ctx
+                (List.foldBack (fun (fnId, fn) rest -> Fable.Let(fnId, fn, rest)) fns (Fable.DecisionTree(expr, small)))
 
     | Fable.DecisionTreeSuccess(idx, boundValues, _) ->
         let idents, target = List.item idx ctx.DecisionTargets
@@ -4455,7 +4555,11 @@ and ownToString (ctx: Ctx) (t: Fable.Type) : string option =
     | Fable.DeclaredType(entRef, _) ->
         match ctx.Com.TryGetEntity entRef with
         | Some ent when
-            (ent.IsFSharpRecord || ent.IsFSharpUnion)
+            // (a record, a union, or a class that is not an object of a hierarchy: a struct, say;
+            // an object's `ToString` is found through its class)
+            (ent.IsFSharpRecord
+             || ent.IsFSharpUnion
+             || (not ent.IsInterface && (objInfo ctx None entRef).IsNone))
             && ent.MembersFunctionsAndValues
                |> Seq.exists (fun m -> m.CompiledName = "ToString" && m.IsOverrideOrExplicitInterfaceImplementation)
             ->
@@ -6402,7 +6506,23 @@ and dotnetCall
         else
             rt "fable_rt.anyToString($0, true)" [ x ] tStr
     | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when (ownToString ctx x.Type).IsSome ->
-        bindArgs ctx [ lw ctx x ] (fun xs -> ECall((ownToString ctx x.Type).Value, [], xs @ [ EUnit ], tStr))
+        let fn = (ownToString ctx x.Type).Value
+
+        // (a member of a struct class takes its object by reference)
+        let byRef =
+            match x.Type with
+            | Fable.DeclaredType(e, _) ->
+                match ctx.Com.TryGetEntity e with
+                | Some ent -> ent.IsValueType && not (ent.IsFSharpRecord || ent.IsFSharpUnion)
+                | None -> false
+            | _ -> false
+
+        if byRef then
+            let ir = lw ctx x
+            let v = ctx.State.NewVar("this", typeOf ir, VLocal, false)
+            ELet(v, ir, ECall(fn, [], [ EAddr(EVar v, true); EUnit ], tStr))
+        else
+            bindArgs ctx [ lw ctx x ] (fun xs -> ECall(fn, [], xs @ [ EUnit ], tStr))
     | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when x.Type <> unByref x.Type ->
         dotnetCall
             ctx

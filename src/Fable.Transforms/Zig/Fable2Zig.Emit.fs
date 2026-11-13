@@ -1043,19 +1043,30 @@ let dropUnreadPaths (body: string) =
     // (what the comments say is not a use)
     let code = Regex.Replace(body, "//[^\n]*", "")
 
+    // how often each name is written, not as a field (`.name`): one walk of the text
+    let counts = Dictionary<string, int>()
+
+    for m in Regex.Matches(code, @"(?<![\w.@""])\w+") do
+        let n = m.Value
+
+        match counts.TryGetValue n with
+        | true, c -> counts[n] <- c + 1
+        | _ -> counts[n] <- 1
+
     let unread =
         lines
         |> Array.choose (fun l ->
             let m = decl.Match l
 
-            if m.Success then
-                let name = m.Groups[1].Value
-                let uses = Regex.Matches(code, $@"(?<![\w.@""])%s{Regex.Escape name}\b").Count
-
-                if uses = 1 then
-                    Some l
-                else
-                    None
+            if
+                m.Success
+                && (
+                    match counts.TryGetValue m.Groups[1].Value with
+                    | true, 1 -> true
+                    | _ -> false
+                )
+            then
+                Some l
             else
                 None
         )

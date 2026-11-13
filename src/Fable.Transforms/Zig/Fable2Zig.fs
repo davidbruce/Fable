@@ -15,12 +15,28 @@ type ZigFile =
     }
 
 let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
+    let timing = System.Environment.GetEnvironmentVariable "FABLE_ZIG_TIME" = "1"
+    let sw = System.Diagnostics.Stopwatch.StartNew()
     let state = Lower.lowerFile com file
+
+    if timing then
+        eprintfn "ZIGTIME lower %s %dms" com.CurrentFile sw.ElapsedMilliseconds
 
     let body =
         try
+            sw.Restart()
             Perceus.run state
-            Emit.emitFile state
+
+            if timing then
+                eprintfn "ZIGTIME perceus %dms" sw.ElapsedMilliseconds
+
+            sw.Restart()
+            let text = Emit.emitFile state
+
+            if timing then
+                eprintfn "ZIGTIME emit %dms" sw.ElapsedMilliseconds
+
+            text
         with ZigError(msg, r) ->
             com.AddLog(msg, Severity.Error, ?range = r, fileName = com.CurrentFile)
             ""
