@@ -5635,6 +5635,23 @@ and dotnetCall
       ("IsDigit" | "IsLetter" | "IsLetterOrDigit" | "IsUpper" | "IsLower" | "IsNumber" | "IsPunctuation" | "IsSymbol" | "IsSeparator" | "IsControl" | "IsSurrogate"),
       [ c ] -> pure' $"fable_rt.unicode.is%s{name.Substring 2}($0)" [ c ] tBool
     | "System.Char", "GetNumericValue", [ c ] -> pure' "fable_rt.charNumericValue($0)" [ c ] tF64
+    | "System.Char",
+      ("IsDigit" | "IsLetter" | "IsLetterOrDigit" | "IsUpper" | "IsLower" | "IsNumber" | "IsPunctuation" | "IsSymbol" | "IsSeparator" | "IsControl" | "IsSurrogate" | "IsWhiteSpace"),
+      [ s; i ] when s.Type = Fable.String ->
+        rt $"fable_rt.strCharIs($0, $1, fable_rt.unicode.is%s{name.Substring 2})" [ s; i ] tBool
+    | "System.Char", "GetUnicodeCategory", [ c ] -> pure' "fable_rt.charCategory($0)" [ c ] tI32
+    | "System.Char", "GetUnicodeCategory", [ s; i ] -> rt "fable_rt.strCharCategory($0, $1)" [ s; i ] tI32
+    | "System.Char", "ToString", [ c ] when c.Type = Fable.Char ->
+        dotnetCall
+            ctx
+            r
+            "Microsoft.FSharp.Core.Operators"
+            "ToString"
+            { info with
+                Args = [ c ]
+                ThisArg = None
+            }
+            t
     // comparisons that say how: ordinal, or ordinal with the case ignored (a culture's order is
     // not known here)
     | "System.String", ("Equals" | "StartsWith" | "EndsWith" | "IndexOf" | "Compare" | "Contains"), _ when

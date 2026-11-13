@@ -5659,6 +5659,24 @@ pub fn strSplitString(s: String, separator: String, count: i32, options: i32) Ra
     return strSplitStrings(s, &.{separator}, count, options);
 }
 
+/// `Char.IsLetter(s, i)` and the other classes: of the char at `i`
+pub fn strCharIs(s: String, i: i32, comptime class: fn (u16) bool) Raised!bool {
+    const p = s orelse return argNull("s");
+    if (i < 0 or i >= p.len) return argRange("index", "Index was out of range. Must be non-negative and less than the size of the collection.");
+    return class(p.units()[@intCast(i)]);
+}
+
+/// `Char.GetUnicodeCategory c`: .NET's number of the category
+pub fn charCategory(c: u16) i32 {
+    return @intCast(@backingInt(unicode.category(c)));
+}
+
+pub fn strCharCategory(s: String, i: i32) Raised!i32 {
+    const p = s orelse return argNull("s");
+    if (i < 0 or i >= p.len) return argRange("index", "Index was out of range. Must be non-negative and less than the size of the collection.");
+    return charCategory(p.units()[@intCast(i)]);
+}
+
 /// `char s` and `Char.Parse s`: a string of exactly one char
 pub fn strToChar(s: String) Raised!u16 {
     const p = s orelse return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
