@@ -1,0 +1,36 @@
+module Build.Test.Zig
+
+open Build.FableLibrary
+open Build.Utils
+open BlackFox.CommandLine
+open SimpleExec
+
+/// The Zig target's tests: the runtime library's own tests (`zig test`), then the
+/// self-checking quicktest suite (`src/quicktest-zig`) compiled to Zig and run in Debug and in
+/// ReleaseSafe (its exit code is the number of failed checks), and run on .NET as well, which
+/// checks that what it expects is what .NET does.
+let handle (args: string list) =
+    let forceFableLibrary = args |> List.contains "--force-fable-library"
+    let noDotnet = args |> List.contains "--no-dotnet"
+
+    BuildFableLibraryZig().Run(forceFableLibrary)
+
+    Command.Run("zig", "test fable_rt.zig", workingDirectory = Path.Resolve("src", "fable-library-zig"))
+
+    let projectDir = Path.Resolve("src", "quicktest-zig")
+
+    Command.Fable(
+        CmdLine.empty
+        |> CmdLine.appendRaw projectDir
+        |> CmdLine.appendPrefix "--lang" "zig"
+        |> CmdLine.appendPrefix "--extension" ".zig"
+        |> CmdLine.appendPrefix "--exclude" "Fable.Core"
+        |> CmdLine.appendRaw "--noCache",
+        workingDirectory = projectDir
+    )
+
+    for mode in [ "Debug"; "ReleaseSafe" ] do
+        Command.Run("zig", $"run -O %s{mode} QuickTest.zig", workingDirectory = projectDir)
+
+    if not noDotnet then
+        Command.Run("dotnet", "run", workingDirectory = projectDir)

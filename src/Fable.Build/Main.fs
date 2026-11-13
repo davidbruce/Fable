@@ -44,6 +44,7 @@ Available commands:
             dart                    Run the tests for Dart
             rust                    Run the tests for Rust
             beam                    Run the tests for BEAM (Erlang)
+            zig                     Run the tests for Zig (runtime library and quicktest suite)
             integration             Run the integration test suite
             standalone              Tests the standalone version of Fable
                                     (Fable running on top of Node.js)
@@ -154,6 +155,7 @@ let main argv =
             | "dart" :: args -> Test.Dart.handle args
             | "rust" :: args -> Test.Rust.handle args
             | "beam" :: args -> Test.Beam.handle args
+            | "zig" :: args -> Test.Zig.handle args
             | "integration" :: args -> Test.Integration.handle args
             | "standalone" :: _ -> Test.Standalone.handle args
             // This test is using quicktest project for now,

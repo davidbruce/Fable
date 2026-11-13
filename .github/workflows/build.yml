@@ -329,6 +329,25 @@ jobs:
       - name: Fable Tests - Beam
         run: ./build.sh test beam
 
+  # Separate build job for Zig
+  build-zig:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup .NET
+        uses: ./.github/actions/setup-dotnet
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Fable Tests - Zig
+        run: ./build.sh test zig
+
   # Separate job to run F# analyzers
   analyzers:
     runs-on: ubuntu-latest

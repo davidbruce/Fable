@@ -25,6 +25,7 @@
     <Compile Include="Test/JavaScript.fs" />
     <Compile Include="Test/Python.fs" />
     <Compile Include="Test/Rust.fs" />
+    <Compile Include="Test/Zig.fs" />
     <Compile Include="Test/Dart.fs" />
     <Compile Include="Test/TypeScript.fs" />
     <Compile Include="Test/Beam.fs" />
