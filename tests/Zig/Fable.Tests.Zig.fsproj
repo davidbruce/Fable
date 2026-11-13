@@ -86,5 +86,6 @@
     <Compile Include="RegexTests.fs" />
     <Compile Include="TaskTests.fs" />
     <Compile Include="MailboxProcessorTests.fs" />
+    <Compile Include="SystemIOTests.fs" />
   </ItemGroup>
 </Project>

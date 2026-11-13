@@ -7,6 +7,7 @@ const root = @import("root");
 pub const sgc = @import("fable_sgc.zig");
 pub const unicode = @import("fable_unicode.zig");
 pub const time = @import("fable_time.zig");
+pub const io = @import("fable_io.zig");
 
 pub const interface_version: i32 = 12;
 

@@ -1,7 +1,7 @@
 //! The clock and the local time zone, for `DateTime` (the library's DateTime.fs): the time now,
-//! and the offset of the local time zone at an instant, read from /etc/localtime (TZif), as .NET
-//! reads it on Unix when `TZ` is not set. (The `TZ` variable is not read: the program's
-//! environment reaches only its `main` in Zig.) Without a readable zone, local time is UTC.
+//! and the offset of the local time zone at an instant, read as .NET reads it on Unix: the zone
+//! of `TZ` (UTC, or a TZif file under TZDIR), or /etc/localtime. Without a readable zone, local
+//! time is UTC.
 const std = @import("std");
 
 /// .NET's ticks (100 ns since 0001-01-01) of the Unix epoch
@@ -126,6 +126,24 @@ fn loadZone() Zone {
     const allocator = std.heap.page_allocator;
     const buf = allocator.alloc(u8, 1 << 20) catch return .{};
     defer allocator.free(buf);
+    // `TZ`, as .NET reads it on Unix: empty or UTC is UTC; a name is a file under TZDIR
+    // (/usr/share/zoneinfo); without it, /etc/localtime
+    if (@import("fable_io.zig").envBytes("TZ")) |tz_raw| {
+        const tz = if (tz_raw.len > 0 and tz_raw[0] == ':') tz_raw[1..] else tz_raw;
+        if (tz.len == 0 or std.mem.eql(u8, tz, "UTC") or std.mem.eql(u8, tz, "UTC0") or std.mem.eql(u8, tz, "GMT")) return .{};
+        var path_buf: [1024]u8 = undefined;
+        const dir = @import("fable_io.zig").envBytes("TZDIR") orelse "/usr/share/zoneinfo";
+        const written = (if (tz[0] == '/')
+            std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], "{s}", .{tz})
+        else
+            std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], "{s}/{s}", .{ dir, tz })) catch return .{};
+        path_buf[written.len] = 0;
+        const path: [*:0]const u8 = path_buf[0..written.len :0];
+        if (readFile(path, buf)) |data| {
+            if (parse(data, allocator)) |z| return z;
+        }
+        return .{};
+    }
     if (readFile("/etc/localtime", buf)) |data| {
         if (parse(data, allocator)) |z| return z;
     }

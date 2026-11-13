@@ -1238,6 +1238,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Regex -> TEnt(libRecordEnt ctx "Regex" "RegexOf", [])
     | Fable.DeclaredType(ent, []) when regexTypes.ContainsKey ent.FullName ->
         TEnt(libRecordEnt ctx "Regex" regexTypes[ent.FullName], [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.IO.DirectoryInfo" ->
+        TEnt(libRecordEnt ctx "Path" "DirectoryInfoOf", [])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Diagnostics.Stopwatch" ->
         TEnt(libRecordEnt ctx "Stopwatch" "StopwatchOf", [])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
@@ -1944,6 +1946,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "DateTimeOffsetOf" -> [ "utcTicks", TPrim "i64"; "offsetMinutes", TPrim "i32" ]
             | "TimeOnlyOf" -> [ "timeTicks", TPrim "i64" ]
             | "StopwatchOf" -> [ "elapsed", TPrim "i64"; "startedAt", TPrim "i64"; "running", tBool ]
+            | "DirectoryInfoOf" -> [ "fullName", tStr ]
             | "GuidOf" -> [ "a", TPrim "u32"; "b", tI32; "c", tI32; "rest", TPrim "u64" ]
             | "UriOf" ->
                 [
@@ -4557,7 +4560,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             |> List.filter (fun a -> not (isUnit a.Type))
             |> List.map (lw ctx)
 
-        bindArgs ctx args (fun xs -> EEmit(info.Macro, xs, ty))
+        // (`[<Emit("try f($0)")>]`: a call that may raise, whose exception goes on as F#'s does)
+        if info.Macro.StartsWith("try ", System.StringComparison.Ordinal) then
+            bindArgs ctx args (fun xs -> ERt(info.Macro.Substring 4, xs, ty))
+        else
+            bindArgs ctx args (fun xs -> EEmit(info.Macro, xs, ty))
 
     // a field of an exception, which is known to be of the declared type
     | Fable.Get(x, Fable.FieldGet info, t, r) when
@@ -6945,7 +6952,6 @@ and dotnetCall
                 )
             )
     | "Microsoft.FSharp.Collections.FSharpList`1", "get_Empty", _ -> ECon(mapType ctx r t, "Empty", [], None)
-    | "System.IO.Path", "GetFileName", [ path ] -> pure' "fable_rt.pathFileName($0)" [ path ] tStr
     | "System.Exception", "get_InnerException", [ x ] -> rt "fable_rt.exnInner($0)" [ x ] tExn
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ Fable.Call(Fable.Import(imp, _, _), inner, _, _) ] when
         imp.Selector = "get_InnerException"

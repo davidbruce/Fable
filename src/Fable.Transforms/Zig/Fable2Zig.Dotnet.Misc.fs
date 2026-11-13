@@ -543,6 +543,110 @@ let call
                 Args = args
             }
             t
+    // ---- files, directories, paths, the environment: the library's Path.fs and fable_io.zig ----
+    | ("System.IO.Path" | "System.IO.File" | "System.IO.Directory" | "System.IO.DirectoryInfo" | "System.Environment"),
+      name,
+      args when
+        not (
+            entity = "System.Environment"
+            && name <> "GetEnvironmentVariable"
+            && name <> "get_CurrentDirectory"
+        )
+        ->
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "Path"
+                fn
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                xs
+                t
+
+        let io (fn: string) (xs: Fable.Expr list) (ty: Ty) =
+            ctx.State.UsesRuntime <- true
+            let holes = xs |> List.mapi (fun i _ -> $"${i}") |> String.concat ", "
+            rt $"fable_rt.io.%s{fn}(%s{holes})" xs ty
+
+        let pure'' (fn: string) (xs: Fable.Expr list) (ty: Ty) =
+            ctx.State.UsesRuntime <- true
+            let holes = xs |> List.mapi (fun i _ -> $"${i}") |> String.concat ", "
+            pure' $"fable_rt.io.%s{fn}(%s{holes})" xs ty
+
+        let lowerFirst (n: string) =
+            n.Substring(0, 1).ToLowerInvariant() + n.Substring 1
+
+        let boolConst (b: bool) = Fable.Value(Fable.BoolConstant b, None)
+
+        // (Path.Combine(a, b, c) and the array form: an array of the parts)
+        let partsArray (parts: Fable.Expr list) =
+            match parts with
+            | [ single ] when
+                (match single.Type with
+                 | Fable.Array _ -> true
+                 | _ -> false)
+                ->
+                single
+            | _ -> Fable.Value(Fable.NewArray(Fable.ArrayValues parts, Fable.String, Fable.MutableArray), None)
+
+        match entity, name, args with
+        // Path
+        | "System.IO.Path",
+          ("GetFileName" | "GetExtension" | "HasExtension" | "GetFileNameWithoutExtension" | "GetDirectoryName" | "IsPathRooted" | "GetPathRoot"),
+          [ p ] -> call (lowerFirst name) [ p ]
+        | "System.IO.Path", "ChangeExtension", [ p; e ] -> call "changeExtension" [ p; e ]
+        | "System.IO.Path", "Combine", parts -> call "combineAll" [ partsArray parts ]
+        | "System.IO.Path", "Join", parts -> call "joinAll" [ partsArray parts ]
+        | "System.IO.Path", "GetFullPath", [ p ] -> io "fullPath" [ p ] tStr
+        | "System.IO.Path", "GetTempPath", [] -> pure'' "tempPath" [] tStr
+        | "System.IO.Path", "GetTempFileName", [] -> io "tempFileName" [] tStr
+        | "System.IO.Path", "GetRandomFileName", [] -> pure'' "randomFileName" [] tStr
+        | "System.IO.Path",
+          ("get_DirectorySeparatorChar" | "get_AltDirectorySeparatorChar" | "get_PathSeparator" | "get_VolumeSeparatorChar"),
+          [] -> call (lowerFirst (name.Substring 4)) [ Fable.Value(Fable.UnitConstant, None) ]
+        | "System.IO.Path", ("GetInvalidFileNameChars" | "GetInvalidPathChars"), [] ->
+            call (lowerFirst name) [ Fable.Value(Fable.UnitConstant, None) ]
+        // File
+        | "System.IO.File", "ReadAllText", p :: _ -> io "readAllText" [ p ] tStr
+        | "System.IO.File", "ReadAllBytes", [ p ] -> io "readAllBytes" [ p ] (mapType ctx r t)
+        | "System.IO.File", "WriteAllText", p :: text :: _ -> io "writeAllText" [ p; text; boolConst false ] tVoid
+        | "System.IO.File", "AppendAllText", p :: text :: _ -> io "writeAllText" [ p; text; boolConst true ] tVoid
+        | "System.IO.File", "WriteAllBytes", [ p; bytes ] -> io "writeAllBytes" [ p; bytes ] tVoid
+        | "System.IO.File", "ReadAllLines", p :: _ -> call "readAllLines" [ p ]
+        | "System.IO.File", "WriteAllLines", p :: lines :: _ when
+            (match lines.Type with
+             | Fable.Array _ -> true
+             | _ -> false)
+            ->
+            call "writeAllLines" [ p; lines ]
+        | "System.IO.File", "AppendAllLines", p :: lines :: _ when
+            (match lines.Type with
+             | Fable.Array _ -> true
+             | _ -> false)
+            ->
+            call "appendAllLines" [ p; lines ]
+        | "System.IO.File", "Exists", [ p ] -> pure'' "fileExists" [ p ] tBool
+        | "System.IO.File", "Delete", [ p ] -> io "deleteFile" [ p ] tVoid
+        // Directory
+        | "System.IO.Directory", "Exists", [ p ] -> pure'' "dirExists" [ p ] tBool
+        | "System.IO.Directory", "CreateDirectory", [ p ] -> call "createDirectory" [ p ]
+        | "System.IO.Directory", "Delete", [ p ] -> io "deleteDirectory" [ p ] tVoid
+        | "System.IO.Directory", "GetCurrentDirectory", [] -> pure'' "currentDirectory" [] tStr
+        | "System.IO.DirectoryInfo", "get_FullName", [ d ] -> call "directoryInfoFullName" [ d ]
+        | "System.IO.DirectoryInfo", "get_Name", [ d ] -> call "directoryInfoName" [ d ]
+        // Environment
+        | "System.Environment", "GetEnvironmentVariable", [ n ] -> pure'' "getEnv" [ n ] tStr
+        | "System.Environment", "get_CurrentDirectory", [] -> pure'' "currentDirectory" [] tStr
+        | _ ->
+            fail
+                r
+                "the Zig target does not support %s.%s with these arguments yet"
+                (entity.Substring(entity.LastIndexOf '.' + 1))
+                name
     // ---- regular expressions: the library's Regex.fs ----
     | ("System.Text.RegularExpressions.Regex" | "System.Text.RegularExpressions.Match" | "System.Text.RegularExpressions.Group" | "System.Text.RegularExpressions.Capture" | "System.Text.RegularExpressions.MatchCollection" | "System.Text.RegularExpressions.GroupCollection"),
       name,
