@@ -3004,6 +3004,27 @@ pub fn argNull(comptime param: []const u8) Raised {
     return raise(ArgumentNullException, str("Value cannot be null. (Parameter '" ++ param ++ "')"));
 }
 
+// ---- F#'s nullness operators: a value is null only of a type that has null here (a string,
+// `obj`, an option); of any other type it never is ----
+
+pub fn isNullValue(x: anytype) bool {
+    return if (comptime @typeInfo(@TypeOf(x)) == .optional) x == null else false;
+}
+
+/// `nonNull x`, the `NonNull` and `NonNullQuick` patterns
+pub fn nonNullValue(x: anytype) Raised!@TypeOf(x) {
+    if (isNullValue(x)) return nullRef();
+    return dup(x);
+}
+
+/// `nullArgCheck name x`
+pub fn nullArgCheck(name: String, x: anytype) Raised!@TypeOf(x) {
+    if (!isNullValue(x)) return dup(x);
+    const head = strConcat(str("Value cannot be null. (Parameter '"), name);
+    defer drop(head);
+    return raise(ArgumentNullException, strConcat(head, str("')")));
+}
+
 pub fn argRange(comptime param: []const u8, comptime text: []const u8) Raised {
     return raise(ArgumentOutOfRangeException, str(text ++ " (Parameter '" ++ param ++ "')"));
 }

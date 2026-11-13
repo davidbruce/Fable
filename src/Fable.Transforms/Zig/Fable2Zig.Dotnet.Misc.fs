@@ -371,6 +371,87 @@ let call
     | "System.Random", "Next", [ rnd; min; max ] -> rt "fable_rt.randomNextRange($0, $1, $2)" [ rnd; min; max ] tI32
     | "System.Random", "NextDouble", [ rnd ] -> pure' "fable_rt.randomNextDouble($0)" [ rnd ] tF64
     | "System.Random", "NextBytes", [ rnd; buffer ] -> pure' "fable_rt.randomNextBytes($0, $1)" [ rnd; buffer ] tVoid
+    // ---- F#'s nullness operators (a value of a type without null here is never null) ----
+    | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] -> pure' "fable_rt.isNullValue($0)" [ x ] tBool
+    | "Microsoft.FSharp.Core.Operators", ("NonNull" | "NonNullQuickPattern"), [ x ] ->
+        rt "fable_rt.nonNullValue($0)" [ x ] (mapType ctx r t)
+    | "Microsoft.FSharp.Core.Operators", "NullArgCheck", [ name; x ] ->
+        rt "fable_rt.nullArgCheck($0, $1)" [ name; x ] (mapType ctx r t)
+    | "Microsoft.FSharp.Core.Operators.Unchecked", "NonNull", [ x ] -> lw ctx x
+    // `match x with Null -> ... | NonNull y -> ...`: the choice of the two
+    | "Microsoft.FSharp.Core.Operators", "NullMatchPattern", [ x ] ->
+        match t with
+        | Fable.DeclaredType(choice, genArgs) ->
+            let v = AST.makeTypedIdent x.Type "nullable"
+
+            let test =
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = "IsNull"
+                            Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    Fable.CallInfo.Create(args = [ Fable.IdentExpr v ], genArgs = [ x.Type ]),
+                    Fable.Boolean,
+                    r
+                )
+
+            let case tag value =
+                Fable.Value(Fable.NewUnion([ value ], tag, choice, genArgs), r)
+
+            lw
+                ctx
+                (Fable.Let(
+                    v,
+                    x,
+                    Fable.IfThenElse(
+                        test,
+                        case 0 (Fable.Value(Fable.UnitConstant, None)),
+                        case 1 (Fable.IdentExpr v),
+                        r
+                    )
+                ))
+        | _ -> fail r "internal: the null pattern of %A" t
+    // the same of `Nullable<T>`, an option
+    | "Microsoft.FSharp.Core.Operators", "WithNullV", [ x ] ->
+        dotnetCall
+            ctx
+            r
+            "System.Nullable`1"
+            ".ctor"
+            { info with
+                ThisArg = None
+                Args = [ x ]
+            }
+            t
+    | "Microsoft.FSharp.Core.Operators", "NullV", [] ->
+        dotnetCall
+            ctx
+            r
+            "System.Nullable`1"
+            ".ctor"
+            { info with
+                ThisArg = None
+                Args = []
+            }
+            t
+    | "Microsoft.FSharp.Core.Operators", "NonNullV", [ x ] ->
+        dotnetCall
+            ctx
+            r
+            "System.Nullable`1"
+            "get_Value"
+            { info with
+                ThisArg = None
+                Args = [ x ]
+            }
+            t
+    | "Microsoft.FSharp.Core.Operators", "IsNullV", [ x ] ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> ETest(xs.Head, "None", typeOf xs.Head))
     // ---- `Nullable<T>`: an option ----
     | "System.Nullable`1", ".ctor", [] -> ECon(mapType ctx r t, "None", [], None)
     | "System.Nullable`1", ".ctor", [ x ] ->
