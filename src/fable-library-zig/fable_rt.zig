@@ -3603,6 +3603,32 @@ pub const Shower = struct {
                 return b.record(x, depth);
             },
             .@"struct" => |s| {
+                // a sequence (Seq.fs): `seq [a; b; c; d; ...]`, which walks it, as .NET does
+                if (comptime @hasField(T, "fable_seq")) {
+                    var items: [4]*Layout = undefined;
+                    var n: usize = 0;
+                    var more = false;
+                    const walk = x.fable_seq.code(x.fable_seq.env, {}) catch {
+                        drop(take());
+                        return b.word("seq [...]");
+                    };
+                    defer drop(walk);
+                    while (true) {
+                        const next = walk.next.code(walk.next.env, {}) catch {
+                            drop(take());
+                            break;
+                        };
+                        const item = next orelse break;
+                        defer drop(item);
+                        if (n == 4) {
+                            more = true;
+                            break;
+                        }
+                        items[n] = b.show(item, .bracket_if_tuple, depth - 1);
+                        n += 1;
+                    }
+                    return showSeq(b, items[0..n], more);
+                }
                 if (!s.is_tuple) return b.record(&x, depth);
                 var items: [s.field_names.len]*Layout = undefined;
                 inline for (s.field_names, 0..) |field, i| items[i] = b.show(@field(x, field), .bracket_if_tuple, depth - 1);

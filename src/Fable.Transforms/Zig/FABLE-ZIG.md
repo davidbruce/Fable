@@ -286,6 +286,16 @@ library function declares its type parameters, with FSharp.Core's names, in that
 (`fold<'State, 'T>`). A library function is named as FSharp.Core compiles it, with a small
 first letter (`mapIndexed` for `List.mapi`).
 
+`Seq.fs` is F#'s `seq`: a sequence is a record around a function that starts a walk, and a
+walk is a record around the function that gives the next item or `None`. Nothing is computed
+before it is asked for: `Seq.take 2` of a sequence with side effects runs them twice, and
+infinite sequences work. `seq { }`, list and array comprehensions and ranges (`1 .. 10`,
+`0 .. 2 .. 10`, `'a' .. 'z'`, of `int`, `int64`, `float` and `char`) are what F# makes of them:
+calls of `Seq.delay`, `Seq.collect`, `Seq.append`, ... A list, an array or a collection given
+where a sequence is expected is walked as one; a sequence given to a function that takes a list
+is the list of what it gives. `for x in s` over a sequence asks it for each item in turn.
+`%A` walks a sequence for its first four items (`seq [1; 2; 3; 4; ...]`), as .NET does.
+
 So far: `List.fs` (the `List` module, sorting included: a merge sort, stable as F#'s),
 `Option.fs`, `Result.fs`, `Map.fs` and `Set.fs`. `Map` and `Set` are balanced trees ordered
 by `compare`, as in FSharp.Core; a program's `Map<'K, 'V>` is the library's `MapTree_2`, and

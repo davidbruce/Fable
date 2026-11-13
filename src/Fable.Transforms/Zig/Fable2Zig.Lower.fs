@@ -708,6 +708,9 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, _) when dotnetExceptions.ContainsKey ent.FullName -> tExn
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
+    // a sequence: the record of the library's Seq.fs
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.IEnumerable`1" ->
+        TEnt(seqEnt ctx, [ mapType ctx r item ])
     // (an entry of a map, as a `for ... in` loop over the map gives it: a pair here)
     | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Collections.Generic.KeyValuePair`2" ->
         TTuple [ mapType ctx r k; mapType ctx r v ]
@@ -911,6 +914,68 @@ and importAlias (ctx: Ctx) (path: string) =
 
         ctx.State.Imports[path] <- alias
         alias
+
+/// F#'s `seq`: the record of the library's Seq.fs, around the function that starts a walk.
+and seqEnt (ctx: Ctx) : Ent =
+    match ctx.State.Ents.TryGetValue "$seq" with
+    | true, e -> e
+    | _ ->
+        let e =
+            {
+                Name = libraryTarget ctx "Seq" "SeqOf_1"
+                Ref =
+                    {
+                        FullName = "Fable.Library.Zig.Seq.SeqOf`1"
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KRecord
+                TypeParams = [ "T" ]
+                Cases = [ "", [ "fable_seq", TFn([ tVoid ], TEnt(walkEnt ctx, [ TGen "T" ])) ] ]
+                MutableFields = []
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        ctx.State.Ents["$seq"] <- e
+        e
+
+/// A walk of a sequence (Seq.fs): the record of the function that gives the next item.
+and walkEnt (ctx: Ctx) : Ent =
+    match ctx.State.Ents.TryGetValue "$walk" with
+    | true, e -> e
+    | _ ->
+        let e =
+            {
+                Name = libraryTarget ctx "Seq" "Walk_1"
+                Ref =
+                    {
+                        FullName = "Fable.Library.Zig.Seq.Walk`1"
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KRecord
+                TypeParams = [ "T" ]
+                Cases = [ "", [ "next", TFn([ tVoid ], TOpt(TGen "T")) ] ]
+                MutableFields = []
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        ctx.State.Ents["$walk"] <- e
+        e
+
+/// A function of the part of the library written in F#: `m_Seq.toList`, or `toList` inside
+/// Seq.fs itself.
+and libraryTarget (ctx: Ctx) (file: string) (fn: string) : string =
+    if System.IO.Path.GetFileNameWithoutExtension(ctx.Com.CurrentFile) = file then
+        fn
+    else
+        importAlias ctx (Fable.Transforms.AST.getLibPath ctx.Com file) + "." + fn
 
 /// F#'s `Map` and `Set`: the trees of the part of the runtime library written in F#
 /// (`Map.fs`, `Set.fs`).
@@ -1529,6 +1594,12 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
         )
     | "Microsoft.FSharp.Core.ExtraTopLevelOperators" when name = "CreateSet" -> Some("Set", "ofList")
     | "Microsoft.FSharp.Collections.ListModule" when name = "OfSeq" -> Some("List", "ofSeq")
+    | "Microsoft.FSharp.Collections.SeqModule" when
+        has
+            "Empty Singleton Delay OfList OfArray Append Map MapIndexed Filter Where Choose Collect Concat Initialize InitializeInfinite Unfold Take Truncate Skip TakeWhile SkipWhile Zip Indexed Pairwise Iterate IterateIndexed Fold ToList ToArray Length IsEmpty TryHead Head TryLast Last TryItem Item TryFind Find TryPick Pick Exists ForAll Contains Reduce Reverse Sort SortBy SortDescending Distinct Max Min MaxBy MinBy GroupBy CountBy Cache"
+        ->
+        Some("Seq", small name)
+    | "Microsoft.FSharp.Core.Operators" when name = "CreateSequence" -> Some("Seq", "createSequence")
     | "Microsoft.FSharp.Collections.FSharpSet`1" ->
         match name with
         | "Add"
@@ -1573,6 +1644,19 @@ let private implements (com: Compiler) (t: Fable.Type) (ifaceFullName: string) :
             )
         | _ -> None
     | _ -> None
+
+/// The entity of `seq<'T>`.
+let private seqEntRef: Fable.EntityRef =
+    {
+        FullName = "System.Collections.Generic.IEnumerable`1"
+        Path = Fable.CoreAssemblyName "System.Runtime"
+    }
+
+/// Is this F#'s `seq<'T>`?
+let private isSeqType (t: Fable.Type) : bool =
+    match t with
+    | Fable.DeclaredType(ent, [ _ ]) -> ent.FullName = "System.Collections.Generic.IEnumerable`1"
+    | _ -> false
 
 /// Is this the type of an interface?
 let private isInterfaceType (com: Compiler) (t: Fable.Type) : bool =
@@ -1910,6 +1994,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | "string" -> TPrim "u16"
             | _ -> itemOf source
 
+        // (a sequence's walk is a call; the source is named so that the walk starts once)
+
         let cur = ctx.State.NewVar("item", itemTy, VLocal, false)
         ctx.Enumerators[enumerator.Name] <- cur
 
@@ -1928,6 +2014,35 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                             cur,
                             EGet(EVar restV, PCase("Cons", "Head"), itemTy),
                             ESeq(EAssign(restV, EGet(EVar restV, PCase("Cons", "Tail"), listTy)), lwStmt ctx loopBody)
+                        )
+                    )
+                )
+            | "seq" ->
+                // a sequence: start a walk, and ask it for each item until it has none
+                let walkTy = TEnt(walkEnt ctx, [ itemTy ])
+                let nextTy = TFn([ tVoid ], TOpt itemTy)
+                let walk = ctx.State.NewVar("walk", walkTy, VLocal, false)
+                let go = ctx.State.NewVar("go", tBool, VLocal, true)
+                let next = ctx.State.NewVar("next", TOpt itemTy, VLocal, false)
+
+                ELet(
+                    walk,
+                    ECallClo(EGet(source, PField "fable_seq", TFn([ tVoid ], walkTy)), [ EUnit ], walkTy),
+                    ELet(
+                        go,
+                        ELit("true", tBool),
+                        EWhile(
+                            EVar go,
+                            ELet(
+                                next,
+                                ECallClo(EGet(EVar walk, PField "next", nextTy), [ EUnit ], TOpt itemTy),
+                                EIf(
+                                    ETest(EVar next, "None", TOpt itemTy),
+                                    EAssign(go, ELit("false", tBool)),
+                                    ELet(cur, EGet(EVar next, PSome, itemTy), lwStmt ctx loopBody),
+                                    tVoid
+                                )
+                            )
                         )
                     )
                 )
@@ -2248,6 +2363,24 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     | Some(f, fty) -> ECallClo(EGet(xs.Head, PField f, fty), [ EUnit ], mapType ctx r t)
                     | None -> fail r "the Zig target cannot find the member %s of this interface" info.Name
             )
+
+    // a collection given where a sequence is expected: a sequence that walks it
+    | Fable.TypeCast(x, Fable.DeclaredType(seqRef, [ item ])) when
+        seqRef.FullName = "System.Collections.Generic.IEnumerable`1"
+        && not (isSeqType x.Type)
+        ->
+        let itemTy = mapType ctx e.Range item
+        let seqTy = TEnt(seqEnt ctx, [ itemTy ])
+
+        match x.Type with
+        | Fable.Array(_, Fable.MutableArray)
+        | Fable.Array(_, Fable.ImmutableArray) ->
+            bindArgs ctx [ lw ctx x ] (fun xs -> ECall(libraryTarget ctx "Seq" "ofArray", [ itemTy ], xs, seqTy))
+        | _ ->
+            match forInSource ctx x with
+            | Some(listExpr, "list") ->
+                bindArgs ctx [ listExpr ] (fun xs -> ECall(libraryTarget ctx "Seq" "ofList", [ itemTy ], xs, seqTy))
+            | _ -> fail e.Range "the Zig target cannot use a value of this type as a sequence yet (%A)" x.Type
 
     // a value given where an interface is expected: each member, a function value that
     // holds the object
@@ -2643,6 +2776,7 @@ and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
         | Fable.Option(_, true) -> fail r "the Zig target cannot write a voption with %%A yet"
         | Fable.Tuple(ts, false) -> List.iter go ts
         | Fable.AnonymousRecordType(_, genArgs, _) -> List.iter go genArgs
+        | Fable.DeclaredType(ent, [ inner ]) when ent.FullName = "System.Collections.Generic.IEnumerable`1" -> go inner
         | Fable.DeclaredType(ent, [ inner ]) when ent.FullName = "System.Lazy`1" -> go inner
         | Fable.Tuple(_, true) -> fail r "the Zig target cannot write a struct tuple with %%A yet"
         | Fable.LambdaType _
@@ -3083,6 +3217,11 @@ and dotnetCall
     let tChar = TPrim "u16"
     let tF64 = TPrim "f64"
 
+    let zigTypeOf (ty: Ty) =
+        match ty with
+        | TPrim name -> name
+        | _ -> fail r "internal: not a number type"
+
     let zigTypeName (ty: Ty) =
         match ty with
         | TPrim name -> name
@@ -3138,6 +3277,66 @@ and dotnetCall
         mapType ctx r x.Type = mapType ctx r t
         ->
         lw ctx x
+    // ---- ranges: `a .. b`, `a .. step .. b` ----
+    | "Microsoft.FSharp.Core.Operators", ("op_Range" | "op_RangeStep"), _ ->
+        let lo, step, hi =
+            match args with
+            | [ a; b ] -> a, None, b
+            | [ a; s; b ] -> a, Some s, b
+            | _ -> fail r "internal: a range"
+
+        let one (lit: string) =
+            match step with
+            | Some s -> lw ctx s
+            | None -> ELit(lit, mapType ctx r lo.Type)
+
+        let fn, irs =
+            match lo.Type with
+            | Fable.Number(Int32, _) -> "rangeInt", [ lw ctx lo; one "1"; lw ctx hi ]
+            | Fable.Number(Int64, _) -> "rangeInt64", [ lw ctx lo; one "1"; lw ctx hi ]
+            | Fable.Number(Float64, _) -> "rangeFloat", [ lw ctx lo; one "1.0"; lw ctx hi ]
+            | Fable.Char when step.IsNone -> "rangeChar", [ lw ctx lo; lw ctx hi ]
+            | other -> fail r "the Zig target does not support a range of this type yet (%A)" other
+
+        bindArgs ctx irs (fun xs -> ECall(libraryTarget ctx "Seq" fn, [], xs, mapType ctx r t))
+    | "Microsoft.FSharp.Collections.SeqModule", ("Sum" | "Average" | "SumBy" | "AverageBy"), _ ->
+        let item =
+            match t with
+            | _ when name.EndsWith "By" -> t
+            | _ -> t
+
+        let seqArg = List.last args
+
+        let listIr =
+            match seqArg with
+            | Fable.TypeCast(inner, _) when (listItem inner.Type).IsSome -> lw ctx inner
+            | _ ->
+                let itemTy =
+                    match seqArg.Type with
+                    | Fable.DeclaredType(_, [ i ]) -> mapType ctx r i
+                    | _ -> mapType ctx r item
+
+                bindArgs
+                    ctx
+                    [ lw ctx seqArg ]
+                    (fun xs ->
+                        ECall(libraryTarget ctx "Seq" "toList", [ itemTy ], xs, TEnt(listEnt ctx.State, [ itemTy ]))
+                    )
+
+        let ty = mapType ctx r t
+
+        match name, args with
+        | "Sum", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.listSum($0)", xs, ty))
+        | "Average", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> ERt("fable_rt.listAverage($0)", xs, ty))
+        | "SumBy", [ f; _ ] ->
+            bindArgs ctx [ lw ctx f; listIr ] (fun xs -> ERt($"fable_rt.listSumBy(%s{zigTypeOf ty}, $0, $1)", xs, ty))
+        | "AverageBy", [ f; _ ] ->
+            bindArgs
+                ctx
+                [ lw ctx f; listIr ]
+                (fun xs -> ERt($"fable_rt.listAverageBy(%s{zigTypeOf ty}, $0, $1)", xs, ty))
+        | _ -> fail r "internal: a sum"
+
     // ---- the entry of a map ----
     | "System.Collections.Generic.KeyValuePair`2", ("get_Key" | "get_Value"), [ kv ] ->
         bindArgs
@@ -3728,6 +3927,7 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
     | Fable.DeclaredType(ent, _) when ent.FullName = "System.Collections.Generic.ICollection`1" ->
         Some(lw ctx inner, "list")
     | Fable.String -> Some(lw ctx inner, "string")
+    | t when isSeqType t -> Some(lw ctx inner, "seq")
     | Fable.Array(_, Fable.ResizeArray) ->
         Some(
             bindArgs
@@ -3788,6 +3988,68 @@ and libraryCall
     =
     let found = Dictionary<string, Fable.Type>()
 
+    // `Seq.collect` and `Seq.concat` are generic in the type of the collections too
+    // (`'Collection :> seq<'U>`): the library's take sequences, so a function that gives a list
+    // gives the sequence of it.
+    let info, args =
+        match file, fn, info.GenericArgs, args with
+        | "Seq", "collect", [ t; _; u ], [ mapping; source ] when
+            (match mapping.Type with
+             | Fable.LambdaType(_, ret) -> not (isSeqType ret)
+             | _ -> false)
+            ->
+            let x: Fable.Ident =
+                {
+                    Name = "collected"
+                    Type = t
+                    IsMutable = false
+                    IsThisArgument = false
+                    IsCompilerGenerated = true
+                    Range = None
+                    IsInlineIfLambda = false
+                }
+
+            let seqU = Fable.DeclaredType(seqEntRef, [ u ])
+
+            let wrapped =
+                Fable.Lambda(
+                    x,
+                    Fable.TypeCast(
+                        Fable.CurriedApply(
+                            mapping,
+                            [ Fable.IdentExpr x ],
+                            (match mapping.Type with
+                             | Fable.LambdaType(_, ret) -> ret
+                             | _ -> Fable.Any),
+                            None
+                        ),
+                        seqU
+                    ),
+                    None
+                )
+
+            { info with
+                GenericArgs = [ t; u ]
+                SignatureArgTypes = []
+                MemberRef = None
+            },
+            [ wrapped; source ]
+        | "Seq", "collect", [ t; _; u ], _ ->
+            { info with
+                GenericArgs = [ t; u ]
+                SignatureArgTypes = []
+                MemberRef = None
+            },
+            args
+        | "Seq", "concat", [ _; t ], _ ->
+            { info with
+                GenericArgs = [ t ]
+                SignatureArgTypes = []
+                MemberRef = None
+            },
+            args
+        | _ -> info, args
+
     // (where FSharp.Core takes a sequence and is given a list, the library takes the list; an
     // empty value whose item type F# left open, `obj` on .NET, gets `unit`: nothing can depend
     // on it)
@@ -3795,6 +4057,7 @@ and libraryCall
         args
         |> List.map (fun arg ->
             match arg with
+            | _ when file = "Seq" -> arg
             | Fable.Value(Fable.NewOption(None, Fable.Any, isStruct), r) ->
                 Fable.Value(Fable.NewOption(None, Fable.Unit, isStruct), r)
             | Fable.Value(Fable.NewList(None, Fable.Any), r) -> Fable.Value(Fable.NewList(None, Fable.Unit), r)
@@ -3915,6 +4178,21 @@ and libraryCall
     // holds)
     let lowerArg (arg: Fable.Expr) : Expr =
         match arg with
+        | _ when file = "Seq" -> lw ctx arg
+        // (a sequence given to a function that takes a list: the list of what it gives)
+        | Fable.TypeCast(inner, _)
+        | inner when isSeqType inner.Type && isSeqType arg.Type ->
+            match inner.Type with
+            | Fable.DeclaredType(_, [ item ]) ->
+                let itemTy = mapType ctx r item
+
+                bindArgs
+                    ctx
+                    [ lw ctx inner ]
+                    (fun xs ->
+                        ECall(libraryTarget ctx "Seq" "toList", [ itemTy ], xs, TEnt(listEnt ctx.State, [ itemTy ]))
+                    )
+            | _ -> lw ctx arg
         | Fable.TypeCast(inner, Fable.DeclaredType(seq, _)) when
             seq.FullName = "System.Collections.Generic.IEnumerable`1"
             && (listItem inner.Type).IsNone
