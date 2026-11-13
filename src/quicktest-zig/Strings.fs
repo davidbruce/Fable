@@ -333,6 +333,53 @@ let messages () : int =
     + same "plain" caught
     + check (rethrown = 12)
 
+type ShowBox<'T> = { Item: 'T }
+
+type ShowBranch =
+    | Tip of uint16 voption
+    | Branch of ShowBranch * struct (int * string) * ShowBranch
+
+let showShapes () : int =
+    let f = fun (x: int) -> x + 1
+    let vo1: int voption = ValueSome 42
+    let vo2: int voption = ValueNone
+    let st = struct (1, "a")
+    let nested = Branch(Tip(ValueSome 16us), struct (7, "ok"), Tip ValueNone)
+    let boxV: ShowBox<int voption> = { Item = ValueSome 9 }
+
+    let anon =
+        {|
+            S = struct (16us, 'a')
+            V = ValueSome 'z'
+        |}
+
+    let m = Map.ofList [ (ValueSome 1, struct (2, "b")) ]
+
+    same "ValueSome 42" (sprintf "%A" vo1)
+    + same "ValueNone" (sprintf "%A" vo2)
+    + same "ValueSome (1, 2)" (sprintf "%A" (ValueSome(1, 2)))
+    + same "ValueSome struct (1, 2)" (sprintf "%A" (ValueSome(struct (1, 2))))
+    + same "Some (ValueSome 5)" (sprintf "%A" (Some(ValueSome 5)))
+    + same "ValueSome ValueNone" (sprintf "%A" (ValueSome(ValueNone: int voption)))
+    + same "Some struct (1, 2)" (sprintf "%A" (Some(struct (1, 2))))
+    + same "struct (1, \"a\")" (sprintf "%A" st)
+    + same "[struct (1, 2); struct (3, 4)]" (sprintf "%A" [ struct (1, 2); struct (3, 4) ])
+    + same "(1, struct (2, 3))" (sprintf "%A" (1, struct (2, 3)))
+    + same "struct (1, (2, 3))" (sprintf "%A" (struct (1, (2, 3))))
+    + same "16us" (sprintf "%A" 16us)
+    + same "(16us, 'a')" (sprintf "%A" (16us, 'a'))
+    + same "{ Item = ValueSome 9 }" (sprintf "%A" boxV)
+    + same "Branch (Tip (ValueSome 16us), struct (7, \"ok\"), Tip ValueNone)" (sprintf "%A" nested)
+    + same "{ S = struct (16us, 'a')\n  V = ValueSome 'z' }" (sprintf "%A" anon)
+    + same "map [(ValueSome 1, struct (2, \"b\"))]" (sprintf "%A" m)
+    + same "42" (string vo1)
+    + same "ValueNone" (string vo2)
+    + same "(1, a)" (string st)
+    + same "[(1, 2)]" (string [ struct (1, 2) ])
+    + same "(42, Some(7))" (string (struct (vo1, Some 7)))
+    + same "7|(1, 2)" $"{ValueSome 7}|{struct (1, 2)}"
+    + check ((sprintf "%A" f).StartsWith("<fun"))
+
 let run () : int =
     let before = liveCells ()
 
@@ -342,6 +389,7 @@ let run () : int =
         + inData ()
         + formatting ()
         + conversions ()
+        + showShapes ()
         + messages ()
 
     printfn "strings: %d failed, %s, %5.2f|%-4d|" failed ("héllo " + "😀") 3.14159 42

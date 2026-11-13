@@ -1250,3 +1250,41 @@ let ``test String slices clamp the bounds like .NET`` () =
     s.[2..1] |> equal ""
     let lower, upper = -1, 1
     s.[lower..upper] |> equal "ab"
+
+type private ShowBox<'T> = { BoxItem: 'T }
+
+type private ShowTree =
+    | Leaf of uint16 voption
+    | Fork of ShowTree * struct (int * string) * ShowTree
+
+[<Fact>]
+let ``test %A and ToString for voption, struct tuple, uint16, and functions`` () =
+    sprintf "%A" (ValueSome 42) |> equal "ValueSome 42"
+    sprintf "%A" (ValueNone: int voption) |> equal "ValueNone"
+    sprintf "%A" (ValueSome(1, 2)) |> equal "ValueSome (1, 2)"
+    sprintf "%A" (ValueSome(struct (1, 2))) |> equal "ValueSome struct (1, 2)"
+    sprintf "%A" (Some(ValueSome 5)) |> equal "Some (ValueSome 5)"
+    sprintf "%A" (ValueSome(ValueNone: int voption)) |> equal "ValueSome ValueNone"
+    sprintf "%A" (struct (1, "a")) |> equal "struct (1, \"a\")"
+    sprintf "%A" [ struct (1, 2); struct (3, 4) ] |> equal "[struct (1, 2); struct (3, 4)]"
+    sprintf "%A" (1, struct (2, 3)) |> equal "(1, struct (2, 3))"
+    sprintf "%A" (struct (1, (2, 3))) |> equal "struct (1, (2, 3))"
+    sprintf "%A" 16us |> equal "16us"
+    sprintf "%A" (16us, 'a') |> equal "(16us, 'a')"
+    sprintf "%A" { BoxItem = ValueSome 9 } |> equal "{ BoxItem = ValueSome 9 }"
+    sprintf "%A" (Fork(Leaf(ValueSome 16us), struct (7, "ok"), Leaf ValueNone))
+    |> equal "Fork (Leaf (ValueSome 16us), struct (7, \"ok\"), Leaf ValueNone)"
+    sprintf "%A" {| A = ValueSome 3; B = struct (1, 2) |}
+    |> equal "{ A = ValueSome 3\n  B = struct (1, 2) }"
+    sprintf "%A" (Map.ofList [ (ValueSome 1, struct (2, "b")) ])
+    |> equal "map [(ValueSome 1, struct (2, \"b\"))]"
+    (sprintf "%A" (fun (x: int) -> x + 1)).StartsWith("<fun") |> equal true
+#if FABLE_COMPILER_ZIG
+    sprintf "%A" (fun (x: int) -> x + 1) |> equal "<fun>"
+#endif
+    string (ValueSome 42) |> equal "42"
+    string (ValueNone: int voption) |> equal "ValueNone"
+    string (struct (1, "a")) |> equal "(1, a)"
+    string (struct (ValueSome 42, Some 7)) |> equal "(42, Some(7))"
+    $"{ValueSome 7}|{struct (1, 2)}" |> equal "7|(1, 2)"
+    sprintf "%O" (ValueSome 42) |> equal "42"

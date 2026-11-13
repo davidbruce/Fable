@@ -612,23 +612,28 @@ let call
             }
             t
     | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] ->
+        let shapeCall fn shapeFn strict =
+            match showShapeOf ctx r strict x.Type with
+            | Some shape -> pure' $"%s{shapeFn}(%s{shape}, $0)" [ x ] tStr
+            | None -> pure' $"%s{fn}($0)" [ x ] tStr
+
         match x.Type with
         // (the text of a null string is the empty string)
         | Fable.String when neverNull x -> lw ctx x
         | Fable.String -> pure' "fable_rt.strConcat($0, null)" [ x ] tStr
         // (a record or a union is written by its `ToString`, which is `%A`)
+        | Fable.AnonymousRecordType _ -> shapeCall "fable_rt.anyText" "fable_rt.anyTextShape" true
         | Fable.DeclaredType(entRef, _) when
             (match ctx.Com.TryGetEntity entRef with
              | Some ent -> ent.IsFSharpRecord || ent.IsFSharpUnion
              | None -> false)
             ->
-            checkShowable ctx r x.Type
-            pure' "fable_rt.anyText($0)" [ x ] tStr
+            shapeCall "fable_rt.anyText" "fable_rt.anyTextShape" true
         | Fable.Option _
         | Fable.Tuple _
-        | Fable.List _ -> pure' "fable_rt.toText($0)" [ x ] tStr
+        | Fable.List _ -> shapeCall "fable_rt.toText" "fable_rt.toTextShape" false
         | Fable.DeclaredType(ent, _) when ent.FullName = mapName || ent.FullName = setName ->
-            pure' "fable_rt.toText($0)" [ x ] tStr
+            shapeCall "fable_rt.toText" "fable_rt.toTextShape" false
         // (an object: its class's ToString, or .NET's name of its class)
         | Fable.DeclaredType _ when (objOfType ctx r x.Type).IsSome -> rt "fable_rt.objText($0)" [ x ] tStr
         | Fable.Char ->

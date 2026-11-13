@@ -884,9 +884,14 @@ pub fn Lazy(comptime T: type) type {
         },
 
         pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
+            return fable_show_shape(b, x, .{}, .{ .kind = .auto }, depth);
+        }
+
+        pub fn fable_show_shape(b: *Shower, x: *Self, comptime shape: TypeShape, node: ShowNode, depth: i32) *Layout {
+            const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
             return switch (x.state) {
                 // (.NET writes the value's ToString)
-                .value => |v| showPlain(b, v, depth),
+                .value => |v| showPlainShape(b, v, shape, child, depth),
                 else => b.word("Value is not created."),
             };
         }
@@ -1042,9 +1047,14 @@ pub fn ResizeArray(comptime T: type) type {
         }
 
         pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
+            return fable_show_shape(b, x, .{}, .{ .kind = .auto }, depth);
+        }
+
+        pub fn fable_show_shape(b: *Shower, x: *Self, comptime shape: TypeShape, node: ShowNode, depth: i32) *Layout {
+            const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
             var items: [4]*Layout = undefined;
             const n = @min(x.items.len, 4);
-            for (x.items[0..n], 0..) |item, i| items[i] = b.show(item, .bracket_if_tuple, depth - 1);
+            for (x.items[0..n], 0..) |item, i| items[i] = b.showShape(item, shape, child, .bracket_if_tuple, depth - 1);
             return showSeq(b, items[0..n], x.items.len > 4);
         }
     };
@@ -1197,16 +1207,21 @@ pub fn raToList(r: anytype) List(rItem(@TypeOf(r))) {
 
 /// The text `string x` and `{x}` give for a key or a value: unquoted, as .NET's ToString.
 fn showPlain(b: *Shower, x: anytype, depth: i32) *Layout {
+    return showPlainShape(b, x, .{}, ShowNode.auto, depth);
+}
+
+fn showPlainShape(b: *Shower, x: anytype, comptime shape: TypeShape, node_idx: u16, depth: i32) *Layout {
     const T = @TypeOf(x);
     if (T == String) return b.leaf(false, b.arena.dupe(u16, unitsOf(x)) catch @panic("fable: out of memory"), false);
-    if (T == u16) return b.leaf(false, b.arena.dupe(u16, &.{x}) catch @panic("fable: out of memory"), false);
+    const node: ShowNode = if (node_idx < shape.nodes.len) shape.nodes[node_idx] else .{};
+    if (T == u16 and node.kind != .u16_num) return b.leaf(false, b.arena.dupe(u16, &.{x}) catch @panic("fable: out of memory"), false);
     switch (@typeInfo(T)) {
         .int, .float, .bool => {
             var scratch: [scratch_len]u8 align(2) = undefined;
             const piece = pieceOf(.{}, x, &scratch);
             return b.ascii(false, piece.ascii, false);
         },
-        else => return b.show(x, .bracket_if_tuple, depth),
+        else => return b.showShape(x, shape, node_idx, .bracket_if_tuple, depth),
     }
 }
 
@@ -1237,6 +1252,12 @@ pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type
         }
 
         pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
+            return fable_show_shape(b, x, .{}, .{ .kind = .auto }, depth);
+        }
+
+        pub fn fable_show_shape(b: *Shower, x: *Self, comptime shape: TypeShape, node: ShowNode, depth: i32) *Layout {
+            const k_idx: u16 = if (node.kind == .map or node.kind == .seq) node.a else ShowNode.auto;
+            const v_idx: u16 = if (node.kind == .map) node.b else ShowNode.auto;
             var items: [4]*Layout = undefined;
             var n: usize = 0;
             var more = false;
@@ -1247,9 +1268,9 @@ pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type
                     break;
                 }
                 items[n] = if (is_set)
-                    b.show(kv.key, .bracket_if_tuple, depth - 1)
+                    b.showShape(kv.key, shape, k_idx, .bracket_if_tuple, depth - 1)
                 else
-                    b.tight(b.tight(b.ascii(false, "[", true), b.join(b.tight(showPlain(b, kv.key, depth - 1), b.ascii(true, ",", false)), showPlain(b, kv.value, depth - 1), .unbreakable)), b.ascii(true, "]", false));
+                    b.tight(b.tight(b.ascii(false, "[", true), b.join(b.tight(showPlainShape(b, kv.key, shape, k_idx, depth - 1), b.ascii(true, ",", false)), showPlainShape(b, kv.value, shape, v_idx, depth - 1), .unbreakable)), b.ascii(true, "]", false));
                 n += 1;
             }
             return showSeq(b, items[0..n], more);
@@ -3505,6 +3526,32 @@ pub fn strCollect(f: anytype, s: String) Raised!String {
     return b.finish();
 }
 
+/// Comptime type-shape metadata for `%A` and `ToString` when Zig erases F# distinctions
+/// (`option` vs `voption`, tuple vs `struct tuple`, `char` vs `uint16`).
+pub const ShowNode = struct {
+    pub const auto: u16 = 0xFFFF;
+    pub const Kind = enum {
+        auto,
+        u16_num,
+        opt,
+        vopt,
+        tuple,
+        struct_tuple,
+        seq,
+        map,
+        record,
+        @"union",
+    };
+    kind: Kind = .auto,
+    a: u16 = auto,
+    b: u16 = 0,
+};
+
+pub const TypeShape = struct {
+    nodes: []const ShowNode = &.{},
+    refs: []const u16 = &.{},
+};
+
 /// How a value is turned into text: an F# format specifier (`%5d`, `%.2f`, `%s`, ...), or
 /// what `string x` and `$"{x}"` do (kind 'P').
 pub const Spec = struct {
@@ -3517,6 +3564,7 @@ pub const Spec = struct {
     space: bool = false,
     /// a .NET format (`N2`), for a hole of an interpolated string that has one
     net: []const u8 = "",
+    shape: TypeShape = .{},
 };
 
 pub fn Arg(comptime T: type, comptime spec: Spec) type {
@@ -3879,7 +3927,7 @@ pub fn format(parts: anytype) String {
             pieces[i] = .{ .units = comptime std.unicode.utf8ToUtf16LeStringLiteral(part) };
         } else if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "fable_spec"))) {
             if (comptime T.fable_spec.kind == 'A') {
-                written[i] = anyText(part.value);
+                written[i] = anyTextShape(T.fable_spec.shape, part.value);
                 pieces[i] = .{ .units = unitsOf(written[i]) };
             } else if (comptime T.fable_spec.kind == 'T') {
                 // (`%O` and `{x}` of a value whose type is a type parameter: its `ToString`)
@@ -4457,8 +4505,12 @@ pub const Shower = struct {
         return all;
     }
 
-    /// `Case`, `Case x` or `Case (x, y)`: a union case, `Some`, or an F# exception.
+    /// `Case`, `Case x` or `Case (x, y)`: a union case, `Some`, `ValueSome`, or an F# exception.
     pub fn case(b: *Shower, name: []const u8, payload: anytype, prec: Prec, depth: i32) *Layout {
+        return b.caseShape(name, payload, .{}, &.{}, prec, depth);
+    }
+
+    pub fn caseShape(b: *Shower, name: []const u8, payload: anytype, comptime shape: TypeShape, field_refs: []const u16, prec: Prec, depth: i32) *Layout {
         const P = @TypeOf(payload);
         if (P == void) return b.word(name);
         const fields = if (@typeInfo(P) == .pointer) payload else &payload;
@@ -4472,7 +4524,8 @@ pub const Shower = struct {
         comptime var i = 0;
         inline for (names) |field| {
             if (comptime !isCount(field)) {
-                items[i] = b.show(@field(fields, field), if (n == 1) .bracket_if_tuple_or_not_atomic else .bracket_if_tuple, depth - 1);
+                const child_idx = if (i < field_refs.len) field_refs[i] else ShowNode.auto;
+                items[i] = b.showShape(@field(fields, field), shape, child_idx, if (n == 1) .bracket_if_tuple_or_not_atomic else .bracket_if_tuple, depth - 1);
                 i += 1;
             }
         }
@@ -4482,16 +4535,20 @@ pub const Shower = struct {
     }
 
     /// A two-dimensional array: `[[a; b]` and every further row on a line of its own, `]`.
-    pub fn array2D(b: *Shower, items: anytype, shape: [2]usize, depth: i32) *Layout {
+    pub fn array2D(b: *Shower, items: anytype, arr_shape: [2]usize, depth: i32) *Layout {
+        return b.array2DShape(items, arr_shape, .{}, ShowNode.auto, depth);
+    }
+
+    pub fn array2DShape(b: *Shower, items: anytype, arr_shape: [2]usize, comptime shape: TypeShape, child_idx: u16, depth: i32) *Layout {
         var all: ?*Layout = null;
-        for (0..shape[0]) |i| {
+        for (0..arr_shape[0]) |i| {
             var row: std.ArrayList(*Layout) = .empty;
-            for (items[i * shape[1] ..][0..shape[1]]) |item| {
+            for (items[i * arr_shape[1] ..][0..arr_shape[1]]) |item| {
                 if (row.items.len == print_length) {
                     row.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
                     break;
                 }
-                row.append(b.arena, b.show(item, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
+                row.append(b.arena, b.showShape(item, shape, child_idx, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
             }
             const inner = if (row.items.len == 0) b.word("[]") else b.tight(b.tight(b.ascii(false, "[", true), b.separated(row.items, ";")), b.ascii(true, "]", false));
             all = if (all) |above| b.join(above, inner, .{ .broken = 0 }) else inner;
@@ -4502,10 +4559,17 @@ pub const Shower = struct {
 
     /// `{ A = 1` and every further field on a line of its own.
     pub fn record(b: *Shower, fields: anytype, depth: i32) *Layout {
+        return b.recordShape(fields, .{}, &.{}, depth);
+    }
+
+    pub fn recordShape(b: *Shower, fields: anytype, comptime shape: TypeShape, field_refs: []const u16, depth: i32) *Layout {
         var all: ?*Layout = null;
+        comptime var fi: usize = 0;
         inline for (@typeInfo(@TypeOf(fields.*)).@"struct".field_names) |field| {
             if (comptime !isCount(field)) {
-                const value = b.show(@field(fields, field), .bracket_if_tuple, depth - 1);
+                const child_idx = if (fi < field_refs.len) field_refs[fi] else ShowNode.auto;
+                fi += 1;
+                const value = b.showShape(@field(fields, field), shape, child_idx, .bracket_if_tuple, depth - 1);
                 const item = b.join(b.tight(b.word(field), b.word("=")), value, .{ .breakable = 1 });
                 all = if (all) |above| b.join(above, item, .{ .broken = 0 }) else item;
             }
@@ -4589,8 +4653,12 @@ pub const Shower = struct {
         return b.leaf(false, text, false);
     }
 
-    /// The layout of a value. A `u16` is taken to be a char.
+    /// The layout of a value. A `u16` is taken to be a char unless `node` marks it `.u16_num`.
     pub fn show(b: *Shower, x: anytype, prec: Prec, depth: i32) *Layout {
+        return b.showShape(x, .{}, ShowNode.auto, prec, depth);
+    }
+
+    pub fn showShape(b: *Shower, x: anytype, comptime shape: TypeShape, node_idx: u16, prec: Prec, depth: i32) *Layout {
         const T = @TypeOf(x);
         if (depth <= 0) return b.word("...");
         if (T == String) return if (x) |p| b.quoted(p.units()) else b.word("null");
@@ -4609,16 +4677,24 @@ pub const Shower = struct {
         if (T == Exn) return x.type.show(b, x, prec, depth);
         if (T == Obj) return b.word(x.type.name);
         if (comptime isFunc(T)) return b.word("<fun>");
+        const node: ShowNode = if (node_idx < shape.nodes.len) shape.nodes[node_idx] else .{};
         switch (@typeInfo(T)) {
             .void => return b.word("()"),
             .bool => return b.word(if (x) "true" else "false"),
-            .int => return if (T == u16) b.char(x) else b.number(x),
+            .int => return if (T == u16 and node.kind != .u16_num) b.char(x) else b.number(x),
             .float => return b.number(x),
-            .optional => return if (x) |v| b.case("Some", .{v}, prec, depth) else b.word("None"),
+            .optional => {
+                const is_vopt = node.kind == .vopt;
+                const child: u16 = if (is_vopt or node.kind == .opt) node.a else ShowNode.auto;
+                if (x) |v| return b.caseShape(if (is_vopt) "ValueSome" else "Some", .{v}, shape, &.{child}, prec, depth);
+                return b.word(if (is_vopt) "ValueNone" else "None");
+            },
             .pointer => |ptr| {
+                if (comptime @hasDecl(ptr.child, "fable_show_shape")) return ptr.child.fable_show_shape(b, x, shape, node, depth);
                 if (comptime @hasDecl(ptr.child, "fable_identity")) return ptr.child.fable_show(b, x, depth);
                 if (comptime @hasDecl(ptr.child, "fable_array")) {
-                    if (x.shape) |shape| return b.array2D(x.items, shape, depth);
+                    const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
+                    if (x.shape) |arr_shape| return b.array2DShape(x.items, arr_shape, shape, child, depth);
                     if (x.items.len == 0) return b.word("[||]");
                     var items: std.ArrayList(*Layout) = .empty;
                     for (x.items) |item| {
@@ -4626,7 +4702,7 @@ pub const Shower = struct {
                             items.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
                             break;
                         }
-                        items.append(b.arena, b.show(item, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
+                        items.append(b.arena, b.showShape(item, shape, child, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
                     }
                     return b.tight(b.tight(b.ascii(false, "[|", true), b.separated(items.items, ";")), b.ascii(true, "|]", false));
                 }
@@ -4639,11 +4715,13 @@ pub const Shower = struct {
                 b.path[b.on_path] = addr;
                 b.on_path += 1;
                 defer b.on_path -= 1;
-                return b.record(x, depth);
+                const field_refs: []const u16 = if (node.kind == .record) shape.refs[node.a..][0..node.b] else &.{};
+                return b.recordShape(x, shape, field_refs, depth);
             },
             .@"struct" => |s| {
                 // a sequence (Seq.fs): `seq [a; b; c; d; ...]`, which walks it, as .NET does
                 if (comptime @hasField(T, "fable_seq")) {
+                    const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
                     var items: [4]*Layout = undefined;
                     var n: usize = 0;
                     var more = false;
@@ -4664,20 +4742,31 @@ pub const Shower = struct {
                             more = true;
                             break;
                         }
-                        items[n] = b.show(item, .bracket_if_tuple, depth - 1);
+                        items[n] = b.showShape(item, shape, child, .bracket_if_tuple, depth - 1);
                         n += 1;
                     }
                     return showSeq(b, items[0..n], more);
                 }
-                if (!s.is_tuple) return b.record(&x, depth);
+                if (!s.is_tuple) {
+                    const field_refs: []const u16 = if (node.kind == .record) shape.refs[node.a..][0..node.b] else &.{};
+                    return b.recordShape(&x, shape, field_refs, depth);
+                }
+                const is_struct = node.kind == .struct_tuple;
+                const field_refs: []const u16 = if (is_struct or node.kind == .tuple) shape.refs[node.a..][0..node.b] else &.{};
                 var items: [s.field_names.len]*Layout = undefined;
-                inline for (s.field_names, 0..) |field, i| items[i] = b.show(@field(x, field), .bracket_if_tuple, depth - 1);
-                return b.bracket(b.separated(&items, ","));
+                inline for (s.field_names, 0..) |field, i| {
+                    const child_idx = if (i < field_refs.len) field_refs[i] else ShowNode.auto;
+                    items[i] = b.showShape(@field(x, field), shape, child_idx, .bracket_if_tuple, depth - 1);
+                }
+                const tup = b.bracket(b.separated(&items, ","));
+                return if (is_struct) b.tight(b.word("struct"), tup) else tup;
             },
             .@"union" => {
                 if (comptime isCollection(T)) {
                     // `map [(1, "a"); ...]`, `set [1; 2]`: nine entries, then `...`
                     const name = if (T.fable_collection == .map) "map" else "set";
+                    const k_idx: u16 = if (node.kind == .map or node.kind == .seq) node.a else ShowNode.auto;
+                    const v_idx: u16 = if (node.kind == .map) node.b else ShowNode.auto;
                     var items: std.ArrayList(*Layout) = .empty;
                     var w = TreeWalk(T).init(x);
                     while (w.next()) |n| {
@@ -4685,10 +4774,13 @@ pub const Shower = struct {
                             items.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
                             break;
                         }
-                        const item = if (comptime T.fable_collection == .map)
-                            b.show(.{ n.key, n.value }, .bracket_if_tuple, depth - 1)
-                        else
-                            b.show(n.key, .bracket_if_tuple, depth - 1);
+                        const item = if (comptime T.fable_collection == .map) blk: {
+                            const pair_items: [2]*Layout = .{
+                                b.showShape(n.key, shape, k_idx, .bracket_if_tuple, depth - 1),
+                                b.showShape(n.value, shape, v_idx, .bracket_if_tuple, depth - 1),
+                            };
+                            break :blk b.bracket(b.separated(&pair_items, ","));
+                        } else b.showShape(n.key, shape, k_idx, .bracket_if_tuple, depth - 1);
                         items.append(b.arena, item) catch @panic("fable: out of memory");
                     }
                     const list = if (items.items.len == 0)
@@ -4699,6 +4791,7 @@ pub const Shower = struct {
                     return if (@backingInt(prec) <= @backingInt(Prec.bracket_if_tuple_or_not_atomic)) b.bracket(whole) else whole;
                 }
                 if (comptime @hasDecl(T, "fable_list")) {
+                    const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
                     if (x == .Empty) return b.word("[]");
                     var items: std.ArrayList(*Layout) = .empty;
                     var rest = x;
@@ -4707,12 +4800,25 @@ pub const Shower = struct {
                             items.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
                             break;
                         }
-                        items.append(b.arena, b.show(rest.Cons.Head, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
+                        items.append(b.arena, b.showShape(rest.Cons.Head, shape, child, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
                     }
                     return b.tight(b.tight(b.ascii(false, "[", true), b.separated(items.items, ";")), b.ascii(true, "]", false));
                 }
                 switch (x) {
-                    inline else => |payload, tag| return b.case(@tagName(tag), payload, prec, depth),
+                    inline else => |payload, tag| {
+                        const tag_idx = comptime blk: {
+                            for (@typeInfo(T).@"union".field_names, 0..) |name, idx| {
+                                if (std.mem.eql(u8, name, @tagName(tag))) break :blk idx;
+                            }
+                            unreachable;
+                        };
+                        const field_refs: []const u16 = if (node.kind == .@"union" and tag_idx < node.b) blk: {
+                            const case_idx = shape.refs[node.a + tag_idx];
+                            const cn = if (case_idx < shape.nodes.len) shape.nodes[case_idx] else ShowNode{};
+                            break :blk if (cn.kind == .record) shape.refs[cn.a..][0..cn.b] else &.{};
+                        } else &.{};
+                        return b.caseShape(@tagName(tag), payload, shape, field_refs, prec, depth);
+                    },
                 }
             },
             else => @compileError("fable: a value of type " ++ @typeName(T) ++ " cannot be written with %A"),
@@ -4811,11 +4917,20 @@ pub fn writeObj(out: *TextBuilder, o: Obj) void {
 
 /// `%A`: the value as F# would write it.
 pub fn anyText(x: anytype) String {
+    return anyTextAt(.{}, ShowNode.auto, x);
+}
+
+pub fn anyTextShape(comptime shape: TypeShape, x: anytype) String {
+    const start: u16 = if (shape.nodes.len != 0) 0 else ShowNode.auto;
+    return anyTextAt(shape, start, x);
+}
+
+fn anyTextAt(comptime shape: TypeShape, node_idx: u16, x: anytype) String {
     if (@TypeOf(x) == String and x == null) return str("<null>");
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var b: Shower = .{ .arena = arena.allocator() };
-    const layout = b.show(x, .bracket_if_tuple, print_depth);
+    const layout = b.showShape(x, shape, node_idx, .bracket_if_tuple, print_depth);
     _ = b.fit(0, layout);
     var out: TextBuilder = .{};
     var column: i32 = 0;
@@ -4831,6 +4946,10 @@ pub fn anyText(x: anytype) String {
 /// `Some(1)`, `(1, a)`, `[1; 2; 3; ... ]` (three items), `map [(1, a)]`; a record or a union as
 /// `%A`; None (null on .NET) as nothing.
 pub fn writeNet(out: *TextBuilder, x: anytype) void {
+    writeNetShape(out, x, .{}, ShowNode.auto);
+}
+
+fn writeNetShape(out: *TextBuilder, x: anytype, comptime shape: TypeShape, node_idx: u16) void {
     const T = @TypeOf(x);
     if (T == String) return out.add(unitsOf(x));
     if (comptime isBigInt(T)) {
@@ -4842,7 +4961,14 @@ pub fn writeNet(out: *TextBuilder, x: anytype) void {
         var buf: [40]u8 = undefined;
         return out.addAscii(decAscii(x, &buf));
     }
-    if (T == u16) return out.addOne(x);
+    const node: ShowNode = if (node_idx < shape.nodes.len) shape.nodes[node_idx] else .{};
+    if (T == u16) {
+        if (node.kind == .u16_num) {
+            var scratch: [scratch_len]u8 align(2) = undefined;
+            return out.addAscii(pieceOf(.{}, x, &scratch).ascii);
+        }
+        return out.addOne(x);
+    }
     if (T == Obj) return writeObj(out, x);
     // (`Append(chars)`: the chars; `Append(builder)`: what it holds)
     if (comptime T == Array(u16)) return out.add(x.items);
@@ -4860,27 +4986,40 @@ pub fn writeNet(out: *TextBuilder, x: anytype) void {
             var scratch: [scratch_len]u8 align(2) = undefined;
             out.addAscii(pieceOf(.{}, x, &scratch).ascii);
         },
-        .optional => if (x) |v| {
-            out.addAscii("Some(");
-            writeNet(out, v);
-            out.addOne(')');
+        .optional => {
+            const is_vopt = node.kind == .vopt;
+            const child: u16 = if (is_vopt or node.kind == .opt) node.a else ShowNode.auto;
+            if (x) |v| {
+                if (is_vopt) {
+                    writeNetShape(out, v, shape, child);
+                } else {
+                    out.addAscii("Some(");
+                    writeNetShape(out, v, shape, child);
+                    out.addOne(')');
+                }
+            } else if (is_vopt) {
+                out.addAscii("ValueNone");
+            }
         },
         .@"struct" => |st| {
             if (st.is_tuple) {
+                const field_refs: []const u16 = if (node.kind == .struct_tuple or node.kind == .tuple) shape.refs[node.a..][0..node.b] else &.{};
                 out.addOne('(');
                 inline for (st.field_names, 0..) |name, i| {
                     if (i != 0) out.addAscii(", ");
-                    writeNet(out, @field(x, name));
+                    const child_idx = if (i < field_refs.len) field_refs[i] else ShowNode.auto;
+                    writeNetShape(out, @field(x, name), shape, child_idx);
                 }
                 out.addOne(')');
             } else {
-                const text = anyText(x);
+                const text = anyTextAt(shape, node_idx, x);
                 defer drop(text);
                 out.add(unitsOf(text));
             }
         },
         .@"union" => {
             if (comptime @hasDecl(T, "fable_list")) {
+                const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
                 out.addOne('[');
                 var rest = x;
                 var n: usize = 0;
@@ -4890,17 +5029,19 @@ pub fn writeNet(out: *TextBuilder, x: anytype) void {
                         break;
                     }
                     if (n != 0) out.addAscii("; ");
-                    writeNet(out, rest.Cons.Head);
+                    writeNetShape(out, rest.Cons.Head, shape, child);
                     n += 1;
                 }
                 out.addOne(']');
                 return;
             }
             if (comptime isCollection(T)) {
+                const k_idx: u16 = if (node.kind == .map or node.kind == .seq) node.a else ShowNode.auto;
+                const v_idx: u16 = if (node.kind == .map) node.b else ShowNode.auto;
                 out.addAscii(if (T.fable_collection == .map) "map [" else "set [");
                 var w = TreeWalk(T).init(x);
                 var n: usize = 0;
-                while (w.next()) |node| {
+                while (w.next()) |node_kv| {
                     if (n == 3) {
                         out.addAscii("; ... ");
                         break;
@@ -4908,22 +5049,22 @@ pub fn writeNet(out: *TextBuilder, x: anytype) void {
                     if (n != 0) out.addAscii("; ");
                     if (comptime T.fable_collection == .map) {
                         out.addOne('(');
-                        writeNet(out, node.key);
+                        writeNetShape(out, node_kv.key, shape, k_idx);
                         out.addAscii(", ");
-                        writeNet(out, node.value);
+                        writeNetShape(out, node_kv.value, shape, v_idx);
                         out.addOne(')');
-                    } else writeNet(out, node.key);
+                    } else writeNetShape(out, node_kv.key, shape, k_idx);
                     n += 1;
                 }
                 out.addOne(']');
                 return;
             }
-            const text = anyText(x);
+            const text = anyTextAt(shape, node_idx, x);
             defer drop(text);
             out.add(unitsOf(text));
         },
         else => {
-            const text = anyText(x);
+            const text = anyTextAt(shape, node_idx, x);
             defer drop(text);
             out.add(unitsOf(text));
         },
@@ -4932,8 +5073,13 @@ pub fn writeNet(out: *TextBuilder, x: anytype) void {
 
 /// `string x` and `x.ToString()` of an option, a tuple, a list, a map, a set.
 pub fn toText(x: anytype) String {
+    return toTextShape(.{}, x);
+}
+
+pub fn toTextShape(comptime shape: TypeShape, x: anytype) String {
     var out: TextBuilder = .{};
-    writeNet(&out, x);
+    const start: u16 = if (shape.nodes.len != 0) 0 else ShowNode.auto;
+    writeNetShape(&out, x, shape, start);
     return out.finish();
 }
 
@@ -6904,4 +7050,46 @@ test "Random(seed) gives .NET's numbers" {
     defer drop(r3);
     try std.testing.expectEqual(@as(i32, 766440938), try randomNextRange(r3, -2000000000, 2000000000));
     try std.testing.expectEqual(@as(i32, 1419354884), randomNext(r3));
+}
+
+test "TypeShape formats voption, struct tuple, u16_num, and recursive unions" {
+    const vopt_int: TypeShape = .{ .nodes = &.{.{ .kind = .vopt, .a = ShowNode.auto }} };
+    try expectText("ValueSome 42", anyTextShape(vopt_int, @as(?i32, 42)));
+    try expectText("ValueNone", anyTextShape(vopt_int, @as(?i32, null)));
+    try expectText("42", toTextShape(vopt_int, @as(?i32, 42)));
+    try expectText("ValueNone", toTextShape(vopt_int, @as(?i32, null)));
+
+    const vopt_st_num: TypeShape = .{
+        .nodes = &.{
+            .{ .kind = .vopt, .a = 1 },
+            .{ .kind = .struct_tuple, .a = 0, .b = 2 },
+            .{ .kind = .u16_num },
+        },
+        .refs = &.{ ShowNode.auto, 2 },
+    };
+    const p1: ?struct { i32, c_ushort } = .{ 7, 16 };
+    try expectText("ValueSome struct (7, 16us)", anyTextShape(vopt_st_num, p1));
+    try expectText("(7, 16)", toTextShape(vopt_st_num, p1));
+
+    const Tree = union(enum) {
+        Leaf: struct { Value: ?c_ushort },
+        Pair: struct { Left: struct { ?i32, bool }, Right: void },
+    };
+    const tree_shape: TypeShape = .{
+        .nodes = &.{
+            .{ .kind = .@"union", .a = 0, .b = 2 },
+            .{ .kind = .record, .a = 2, .b = 1 },
+            .{ .kind = .vopt, .a = 3 },
+            .{ .kind = .u16_num },
+            .{ .kind = .record, .a = 3, .b = 2 },
+            .{ .kind = .struct_tuple, .a = 5, .b = 2 },
+        },
+        .refs = &.{ 1, 4, 2, 5, ShowNode.auto, ShowNode.auto, ShowNode.auto },
+    };
+    const t1: Tree = .{ .Leaf = .{ .Value = 65 } };
+    const t2: Tree = .{ .Pair = .{ .Left = .{ 9, true }, .Right = {} } };
+    const t3: Tree = .{ .Leaf = .{ .Value = null } };
+    try expectText("Leaf (ValueSome 65us)", anyTextShape(tree_shape, t1));
+    try expectText("Leaf ValueNone", anyTextShape(tree_shape, t3));
+    try expectText("Pair (struct (Some 9, true), ())", anyTextShape(tree_shape, t2));
 }

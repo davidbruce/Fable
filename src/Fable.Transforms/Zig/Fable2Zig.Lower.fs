@@ -154,6 +154,15 @@ let interfaceMembers (ent: Fable.Entity) : (string * Fable.Type list * Fable.Typ
     )
     |> List.ofSeq
 
+/// Substitute type parameters in a Fable AST type using `subst`.
+let rec substFableType (subst: Map<string, Fable.Type>) (t: Fable.Type) : Fable.Type =
+    if subst.IsEmpty then
+        t
+    else
+        match t with
+        | Fable.GenericParam(n, _, _) when subst.ContainsKey n -> subst[n]
+        | _ -> t.MapGenerics(substFableType subst)
+
 /// The members of an interface and of the interfaces it inherits, each with the full name of
 /// the interface that declares it (type arguments of an inherited generic interface are put in).
 let rec allInterfaceMembers
@@ -162,10 +171,7 @@ let rec allInterfaceMembers
     (subst: Map<string, Fable.Type>)
     : (string * string * Fable.Type list * Fable.Type) list
     =
-    let rec sub (t: Fable.Type) =
-        match t with
-        | Fable.GenericParam(n, _, _) when subst.ContainsKey n -> subst[n]
-        | _ -> t.MapGenerics sub
+    let sub = substFableType subst
 
     let own =
         interfaceMembers ent
@@ -4918,51 +4924,294 @@ and toStringCall (x: Fable.Expr) : Fable.Expr =
 /// a struct tuple is a tuple, and a function
 /// value has no name here: a type that mentions one of them is refused, so that what is
 /// written is never different from .NET's.
-and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
-    let seen = HashSet<string>()
+and showShapeOf (ctx: Ctx) (r: SourceLocation option) (strict: bool) (root: Fable.Type) : string option =
+    let substFor (ent: Fable.Entity) (genArgs: Fable.Type list) =
+        if ent.GenericParameters.Length = genArgs.Length && not genArgs.IsEmpty then
+            List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) genArgs
+            |> Map.ofList
+        else
+            Map.empty
 
-    let rec go (t: Fable.Type) =
+    let rec typeKey (t: Fable.Type) : string =
+        match t with
+        | Fable.Number(k, _) -> $"N(%A{k})"
+        | Fable.Boolean -> "B"
+        | Fable.Char -> "C"
+        | Fable.String -> "S"
+        | Fable.Unit -> "U"
+        | Fable.GenericParam(n, _, _) -> $"'%s{n}"
+        | Fable.Option(i, s) ->
+            (if s then
+                 "VO("
+             else
+                 "O(")
+            + typeKey i
+            + ")"
+        | Fable.Array(i, k) -> $"A(%A{k}," + typeKey i + ")"
+        | Fable.List i -> "L(" + typeKey i + ")"
+        | Fable.Tuple(ts, s) ->
+            (if s then
+                 "ST("
+             else
+                 "T(")
+            + (ts |> List.map typeKey |> String.concat ",")
+            + ")"
+        | Fable.AnonymousRecordType(ns, gs, _) ->
+            "AR("
+            + (ns |> String.concat ";")
+            + "|"
+            + (gs |> List.map typeKey |> String.concat ",")
+            + ")"
+        | Fable.LambdaType _
+        | Fable.DelegateType _ -> "FN"
+        | Fable.DeclaredType(ent, gs) -> ent.FullName + "<" + (gs |> List.map typeKey |> String.concat ",") + ">"
+        | _ -> "X"
+
+    let checkedSeen = HashSet<string>()
+
+    let rec check (t: Fable.Type) =
         match t with
         | Fable.Number _
         | Fable.Boolean
         | Fable.Char
         | Fable.String
         | Fable.Unit
-        | Fable.GenericParam _ -> ()
-        | Fable.Option(inner, false)
-        | Fable.Array(inner, _)
-        | Fable.List inner -> go inner
-        | Fable.Option(_, true) -> fail r "the Zig target cannot write a voption with %%A yet"
-        | Fable.Tuple(ts, false) -> List.iter go ts
-        | Fable.AnonymousRecordType(_, genArgs, _) -> List.iter go genArgs
-        | Fable.DeclaredType(ent, [ inner ]) when ent.FullName = "System.Collections.Generic.IEnumerable`1" -> go inner
-        | Fable.DeclaredType(ent, [ inner ]) when ent.FullName = "System.Lazy`1" -> go inner
-        | Fable.Tuple(_, true) -> fail r "the Zig target cannot write a struct tuple with %%A yet"
+        | Fable.GenericParam _
         | Fable.LambdaType _
-        | Fable.DelegateType _ -> fail r "the Zig target cannot write a function value with %%A yet"
+        | Fable.DelegateType _ -> ()
+        | Fable.Option(inner, _)
+        | Fable.Array(inner, _)
+        | Fable.List inner -> check inner
+        | Fable.Tuple(ts, _) -> List.iter check ts
+        | Fable.AnonymousRecordType(_, genArgs, _) -> List.iter check genArgs
+        | Fable.DeclaredType(ent, [ inner ]) when ent.FullName = "System.Collections.Generic.IEnumerable`1" ->
+            check inner
+        | Fable.DeclaredType(ent, [ inner ]) when ent.FullName = "System.Lazy`1" -> check inner
         | Fable.DeclaredType(entRef, genArgs) ->
-            List.iter go genArgs
+            List.iter check genArgs
+            let key = typeKey t
 
             if
                 not (dotnetExceptions.ContainsKey entRef.FullName)
                 && entRef.FullName <> mapName
                 && entRef.FullName <> setName
-                && entRef.FullName <> "System.Collections.Generic.Dictionary`2"
+                && not (isDictionaryName entRef.FullName)
                 && entRef.FullName <> "System.Collections.Generic.HashSet`1"
-                && seen.Add entRef.FullName
+                && checkedSeen.Add key
             then
                 match ctx.Com.TryGetEntity entRef with
                 | Some ent when ent.IsFSharpUnion ->
+                    let sub = substFor ent genArgs
+
                     for case in ent.UnionCases do
                         for field in case.UnionCaseFields do
-                            go field.FieldType
+                            check (substFableType sub field.FieldType)
                 | Some ent when ent.IsFSharpRecord || ent.IsFSharpExceptionDeclaration ->
-                    for field in (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic)) do
-                        go field.FieldType
-                | _ -> fail r "the Zig target cannot write a value of the type %s with %%A yet" entRef.FullName
-        | other -> fail r "the Zig target cannot write a value of this type with %%A yet (%A)" other
+                    let sub = substFor ent genArgs
 
-    go t
+                    for field in (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic)) do
+                        check (substFableType sub field.FieldType)
+                | _ when strict ->
+                    fail r "the Zig target cannot write a value of the type %s with %%A yet" entRef.FullName
+                | _ -> ()
+        | other when strict -> fail r "the Zig target cannot write a value of this type with %%A yet (%A)" other
+        | _ -> ()
+
+    check root
+
+    // (`needsShape` computes reachability of voption / struct tuple / uint16, keeping
+    // shapes empty when comptime defaults already match .NET)
+    let needsShape (start: Fable.Type) : bool =
+        let visited = HashSet<string>()
+
+        let rec go (t: Fable.Type) =
+            match t with
+            | Fable.Option(_, true)
+            | Fable.Tuple(_, true)
+            | Fable.Number(UInt16, _) -> true
+            | Fable.Option(inner, false)
+            | Fable.Array(inner, _)
+            | Fable.List inner -> go inner
+            | Fable.Tuple(ts, false) -> List.exists go ts
+            | Fable.AnonymousRecordType(_, genArgs, _) -> List.exists go genArgs
+            | Fable.DeclaredType(ent, [ inner ]) when
+                ent.FullName = "System.Collections.Generic.IEnumerable`1"
+                || ent.FullName = "System.Lazy`1"
+                || ent.FullName = setName
+                || ent.FullName = "System.Collections.Generic.HashSet`1"
+                ->
+                go inner
+            | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = mapName || isDictionaryName ent.FullName ->
+                go k || go v
+            | Fable.DeclaredType(entRef, genArgs) when not (dotnetExceptions.ContainsKey entRef.FullName) ->
+                if List.exists go genArgs then
+                    true
+                else
+                    let key = typeKey t
+
+                    if not (visited.Add key) then
+                        false
+                    else
+                        match ctx.Com.TryGetEntity entRef with
+                        | Some ent when ent.IsFSharpUnion ->
+                            let sub = substFor ent genArgs
+
+                            ent.UnionCases
+                            |> List.exists (fun c ->
+                                c.UnionCaseFields |> List.exists (fun f -> go (substFableType sub f.FieldType))
+                            )
+                        | Some ent when ent.IsFSharpRecord || ent.IsFSharpExceptionDeclaration ->
+                            let sub = substFor ent genArgs
+
+                            ent.FSharpFields
+                            |> List.filter (fun f -> not f.IsStatic)
+                            |> List.exists (fun f -> go (substFableType sub f.FieldType))
+                        | _ -> false
+            | _ -> false
+
+        go start
+
+    if not (needsShape root) then
+        None
+    else
+        let autoIdx = 0xFFFFus
+        let nodes = ResizeArray<string>()
+        let refs = ResizeArray<uint16>()
+        let memo = Dictionary<string, uint16>()
+
+        let addNode s =
+            let idx = uint16 nodes.Count
+            nodes.Add s
+            idx
+
+        let addRefs (rs: uint16 list) =
+            let start = uint16 refs.Count
+            refs.AddRange rs
+            start
+
+        let rec build (t: Fable.Type) : uint16 =
+            if not (needsShape t) then
+                autoIdx
+            else
+                match t with
+                | Fable.Number(UInt16, _) -> addNode ".{ .kind = .u16_num }"
+                | Fable.Option(inner, isStruct) ->
+                    let idx = addNode ""
+                    let child = build inner
+
+                    let kind =
+                        if isStruct then
+                            ".vopt"
+                        else
+                            ".opt"
+
+                    nodes[int idx] <- $".{{ .kind = %s{kind}, .a = %d{child} }}"
+                    idx
+                | Fable.Tuple(ts, isStruct) ->
+                    let idx = addNode ""
+                    let rs = ts |> List.map build
+                    let start = addRefs rs
+
+                    let kind =
+                        if isStruct then
+                            ".struct_tuple"
+                        else
+                            ".tuple"
+
+                    nodes[int idx] <- $".{{ .kind = %s{kind}, .a = %d{start}, .b = %d{rs.Length} }}"
+                    idx
+                | Fable.Array(inner, _)
+                | Fable.List inner ->
+                    let idx = addNode ""
+                    let child = build inner
+                    nodes[int idx] <- $".{{ .kind = .seq, .a = %d{child} }}"
+                    idx
+                | Fable.AnonymousRecordType(_, genArgs, _) ->
+                    let idx = addNode ""
+                    let rs = genArgs |> List.map build
+                    let start = addRefs rs
+                    nodes[int idx] <- $".{{ .kind = .record, .a = %d{start}, .b = %d{rs.Length} }}"
+                    idx
+                | Fable.DeclaredType(ent, [ inner ]) when
+                    ent.FullName = "System.Collections.Generic.IEnumerable`1"
+                    || ent.FullName = "System.Lazy`1"
+                    || ent.FullName = setName
+                    || ent.FullName = "System.Collections.Generic.HashSet`1"
+                    ->
+                    let idx = addNode ""
+                    let child = build inner
+                    nodes[int idx] <- $".{{ .kind = .seq, .a = %d{child} }}"
+                    idx
+                | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = mapName || isDictionaryName ent.FullName ->
+                    let idx = addNode ""
+                    let kIdx = build k
+                    let vIdx = build v
+                    nodes[int idx] <- $".{{ .kind = .map, .a = %d{kIdx}, .b = %d{vIdx} }}"
+                    idx
+                | Fable.DeclaredType(entRef, genArgs) ->
+                    let key = typeKey t
+
+                    match memo.TryGetValue key with
+                    | true, existing -> existing
+                    | _ ->
+                        match ctx.Com.TryGetEntity entRef with
+                        | Some ent when ent.IsFSharpUnion ->
+                            let sub = substFor ent genArgs
+                            let idx = addNode ""
+                            memo[key] <- idx
+
+                            let caseRefs =
+                                ent.UnionCases
+                                |> List.map (fun c ->
+                                    let fieldRefs =
+                                        c.UnionCaseFields |> List.map (fun f -> build (substFableType sub f.FieldType))
+
+                                    if List.forall ((=) autoIdx) fieldRefs then
+                                        autoIdx
+                                    else
+                                        let start = addRefs fieldRefs
+                                        addNode $".{{ .kind = .record, .a = %d{start}, .b = %d{fieldRefs.Length} }}"
+                                )
+
+                            let start = addRefs caseRefs
+                            nodes[int idx] <- $".{{ .kind = .@\"union\", .a = %d{start}, .b = %d{caseRefs.Length} }}"
+                            idx
+                        | Some ent when ent.IsFSharpRecord || ent.IsFSharpExceptionDeclaration ->
+                            let sub = substFor ent genArgs
+                            let idx = addNode ""
+                            memo[key] <- idx
+
+                            let fieldRefs =
+                                ent.FSharpFields
+                                |> List.filter (fun f -> not f.IsStatic)
+                                |> List.map (fun f -> build (substFableType sub f.FieldType))
+
+                            let start = addRefs fieldRefs
+                            nodes[int idx] <- $".{{ .kind = .record, .a = %d{start}, .b = %d{fieldRefs.Length} }}"
+                            idx
+                        | _ -> autoIdx
+                | _ -> autoIdx
+
+        ignore (build root)
+        let nodesLit = nodes |> String.concat ", "
+
+        if refs.Count = 0 then
+            Some $".{{ .nodes = &.{{ %s{nodesLit} }} }}"
+        else
+            let refsLit =
+                refs
+                |> Seq.map (fun i ->
+                    if i = autoIdx then
+                        "0xFFFF"
+                    else
+                        $"%d{i}"
+                )
+                |> String.concat ", "
+
+            Some $".{{ .nodes = &.{{ %s{nodesLit} }}, .refs = &.{{ %s{refsLit} }} }}"
+
+/// Check that a value of type `t` can be written with `%A`.
+and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit = ignore (showShapeOf ctx r true t)
 
 /// Argument `i` of a macro, with its type: a number that is written out in the program has
 /// no type of its own in Zig, and how it is formatted depends on the type it has in F#.
@@ -5081,12 +5330,9 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
 
                 if kind = 'A' then
                     // (F# ignores a width, flags and a precision on %A)
-                    match value.Type with
-                    // (a number of 16 bits without a sign and a char are the same type in Zig; at
-                    // the top the compiler can tell them apart, inside a value it cannot)
-                    | t ->
-                        checkShowable ctx r t
-                        $"fable_rt.arg(.{{ .kind = 'A' }}, %s{typedArg ctx r value i})"
+                    match showShapeOf ctx r true value.Type with
+                    | Some shape -> $"fable_rt.arg(.{{ .kind = 'A', .shape = %s{shape} }}, %s{typedArg ctx r value i})"
+                    | None -> $"fable_rt.arg(.{{ .kind = 'A' }}, %s{typedArg ctx r value i})"
                 else
 
                     let fields =
