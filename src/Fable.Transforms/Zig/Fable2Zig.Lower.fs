@@ -1186,6 +1186,10 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "TimeSpan" "TimeSpanOf", [])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.DateTime" ->
         TEnt(libRecordEnt ctx "DateTime" "DateTimeOf", [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.DateOnly" ->
+        TEnt(libRecordEnt ctx "DateOnly" "DateOnlyOf", [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.TimeOnly" ->
+        TEnt(libRecordEnt ctx "DateOnly" "TimeOnlyOf", [])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
@@ -1867,6 +1871,8 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                 ]
             | "TimeSpanOf" -> [ "ticks", TPrim "i64" ]
             | "DateTimeOf" -> [ "ticks", TPrim "i64"; "kind", TPrim "i32" ]
+            | "DateOnlyOf" -> [ "dayNumber", TPrim "i32" ]
+            | "TimeOnlyOf" -> [ "timeTicks", TPrim "i64" ]
             | "GuidOf" -> [ "a", TPrim "u32"; "b", tI32; "c", tI32; "rest", TPrim "u64" ]
             | "UriOf" ->
                 [
@@ -5652,6 +5658,8 @@ and showShapeOf (ctx: Ctx) (r: SourceLocation option) (strict: bool) (root: Fabl
                 && entRef.FullName <> "System.Guid"
                 && entRef.FullName <> "System.TimeSpan"
                 && entRef.FullName <> "System.DateTime"
+                && entRef.FullName <> "System.DateOnly"
+                && entRef.FullName <> "System.TimeOnly"
                 && checkedSeen.Add key
             then
                 match ctx.Com.TryGetEntity entRef with
@@ -5933,6 +5941,8 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                             || ent.FullName = "System.Guid"
                             || ent.FullName = "System.TimeSpan"
                             || ent.FullName = "System.DateTime"
+                            || ent.FullName = "System.DateOnly"
+                            || ent.FullName = "System.TimeOnly"
                         | _ -> false
                     )
 

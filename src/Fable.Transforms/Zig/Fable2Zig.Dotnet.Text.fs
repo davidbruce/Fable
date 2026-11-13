@@ -507,6 +507,22 @@ let call
                 )
 
             ECon(mapType ctx r t, "", defaults, None)
+        | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.DateOnly" || entRef.FullName = "System.TimeOnly" ->
+            libraryCall
+                ctx
+                r
+                "DateOnly"
+                (if entRef.FullName = "System.DateOnly" then
+                     "minValue"
+                 else
+                     "timeMinValue")
+                { info with
+                    ThisArg = None
+                    Args = []
+                    GenericArgs = []
+                }
+                [ Fable.Value(Fable.UnitConstant, None) ]
+                t
         | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.DateTime" ->
             libraryCall
                 ctx
@@ -834,6 +850,22 @@ let call
                 r
                 "Uri"
                 "toString"
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                [ x ]
+                t
+        | Fable.DeclaredType(e, []) when e.FullName = "System.DateOnly" || e.FullName = "System.TimeOnly" ->
+            libraryCall
+                ctx
+                r
+                "DateOnly"
+                (if e.FullName = "System.DateOnly" then
+                     "toString"
+                 else
+                     "timeToString")
                 { info with
                     ThisArg = None
                     GenericArgs = []

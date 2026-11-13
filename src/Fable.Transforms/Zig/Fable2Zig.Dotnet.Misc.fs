@@ -535,6 +535,109 @@ let call
                 Args = args
             }
             t
+    // ---- `System.DateOnly` and `System.TimeOnly`: the library's DateOnly.fs ----
+    | ("System.DateOnly" | "System.TimeOnly" as typ), name, args ->
+        let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]
+        let isDate = typ = "System.DateOnly"
+
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "DateOnly"
+                fn
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                xs
+                t
+
+        // (TimeOnly's functions are named `time...` where DateOnly has the same name)
+        let timeName (n: string) =
+            "time" + n.Substring(0, 1).ToUpperInvariant() + n.Substring 1
+
+        let fn (n: string) =
+            if isDate then
+                n
+            else
+                timeName n
+
+        let lowerFirst (n: string) =
+            n.Substring(0, 1).ToLowerInvariant() + n.Substring 1
+
+        let isTypeArg (fullName: string) (x: Fable.Expr) =
+            match x.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = fullName
+            | _ -> false
+
+        let kindArg (x: Fable.Expr) =
+            Fable.TypeCast(x, Fable.Number(Int32, Fable.NumberInfo.Empty))
+
+        let int32Const (v: int) =
+            Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 v, Fable.NumberInfo.Empty), None)
+
+        match name, args with
+        | ".ctor", [] -> call (fn "minValue") unitArg
+        | ".ctor", [ y; m; d ] when isDate -> call "create" [ y; m; d ]
+        | ".ctor", [ ticks ] when not isDate -> call "timeOfTicks" [ ticks ]
+        | ".ctor", [ h; m ] -> call "time2" [ h; m ]
+        | ".ctor", [ h; m; s ] -> call "time3" [ h; m; s ]
+        | ".ctor", [ h; m; s; ms ] -> call "time4" [ h; m; s; ms ]
+        | ".ctor", [ h; m; s; ms; us ] -> call "time5" [ h; m; s; ms; us ]
+        | ("get_MinValue" | "get_MaxValue"), [] -> call (fn (lowerFirst (name.Substring 4))) unitArg
+        | "FromDayNumber", [ n ] -> call "fromDayNumber" [ n ]
+        | "FromDateTime", [ d ] -> call (fn "fromDateTime") [ d ]
+        | "FromTimeSpan", [ s ] -> call "timeFromTimeSpan" [ s ]
+        | "get_Ticks", [ x ] -> call "timeTicks" [ x ]
+        | getter, [ x ] when getter.StartsWith("get_", System.StringComparison.Ordinal) ->
+            call (lowerFirst (getter.Substring 4)) [ x ]
+        | ("AddDays" | "AddMonths" | "AddYears"), [ d; v ] when isDate -> call (lowerFirst name) [ d; v ]
+        | ("Add" | "AddHours" | "AddMinutes"), [ x; v ] when not isDate -> call (timeName (lowerFirst name)) [ x; v ]
+        | ("Add" | "AddHours" | "AddMinutes"), [ x; v; _ ] when not isDate ->
+            // (the days wrapped, an out argument: not given)
+            call (timeName (lowerFirst name)) [ x; v ]
+        | "op_Subtraction", [ a; b ] when not isDate -> call "timeSubtract" [ a; b ]
+        | "IsBetween", [ x; a; b ] -> call "isBetween" [ x; a; b ]
+        | "ToTimeSpan", [ x ] -> call "toTimeSpan" [ x ]
+        | "ToDateTime", [ d; tm ] -> call "toDateTime" [ d; tm; int32Const 0 ]
+        | "ToDateTime", [ d; tm; k ] -> call "toDateTime" [ d; tm; kindArg k ]
+        | ("Compare" | "CompareTo"), [ a; b ] ->
+            call
+                (if isDate then
+                     "compare"
+                 else
+                     "timeCompare")
+                [ a; b ]
+        | "ToString", [ x ] -> call (fn "toString") [ x ]
+        | "ToString", x :: format :: _ when format.Type = Fable.String -> call (fn "toStringFormat") [ x; format ]
+        | "ToString", [ x; _ ] -> call (fn "toString") [ x ]
+        | ("op_Equality" | "op_Inequality" | "op_LessThan" | "op_LessThanOrEqual" | "op_GreaterThan" | "op_GreaterThanOrEqual"),
+          [ a; b ] when isTypeArg typ b ->
+            let op =
+                match name with
+                | "op_Equality" -> "=="
+                | "op_Inequality" -> "!="
+                | "op_LessThan" -> "<"
+                | "op_LessThanOrEqual" -> "<="
+                | "op_GreaterThan" -> ">"
+                | _ -> ">="
+
+            EPrim(
+                op,
+                [
+                    call
+                        (if isDate then
+                             "compare"
+                         else
+                             "timeCompare")
+                        [ a; b ]
+                    ELit("0", tI32)
+                ],
+                tBool
+            )
+        | _ -> fail r "the Zig target does not support %s.%s with these arguments yet" (typ.Substring 7) name
     // ---- `System.DateTime`: the library's DateTime.fs ----
     | "System.DateTime", name, args ->
         let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]

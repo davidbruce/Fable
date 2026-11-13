@@ -476,7 +476,7 @@ let private formatError () =
     raise (System.FormatException "Input string was not in a correct format.")
 
 /// The custom format specifiers (`yyyy-MM-dd HH:mm`, quotes, `\\` and `%`)
-let private formatCustom (d: DateTimeOf) (format: string) : string =
+let formatCustom (d: DateTimeOf) (format: string) : string =
     let sb = System.Text.StringBuilder()
     let y, mo, dd = datePart d.ticks
     let h = hour d
