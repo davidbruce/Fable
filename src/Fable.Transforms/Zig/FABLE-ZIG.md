@@ -478,6 +478,13 @@ group's count with the cells before every allocation of such a cell (slow; for t
 every build, a group whose count says it is dead is checked against its cells' counts before
 any of them is freed, so a wrong report is a panic with a message, not freed memory in use.
 
+The prototype's tests (`poc/cycles` in the experiments repository: deterministic cases, a
+randomized test that compares the heap with a reachability oracle after every operation, and
+mutants of the collector) pass against `fable_sgc.zig`: the randomized test at 5000 seeds in
+ReleaseSafe, and 26 of the 28 mutants caught. The two that are not, removing the barrier on a
+release or on a store during a check in steps, are the two the prototype's tests never caught
+either.
+
 **From F#.** `Fable.Core.Zig.Collector` has `collect`, `step` (a bounded amount of work, for
 idle time), `pause`/`resume` and the tuning (`setPace`, `setFreeBudget`, ...);
 `Fable.Core.Zig.Counters` shows what the runtime did. Under .NET they do nothing and return
