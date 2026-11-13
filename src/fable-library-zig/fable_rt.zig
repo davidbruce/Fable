@@ -5029,6 +5029,7 @@ pub const Shower = struct {
                 const suffix = switch (T) {
                     i8 => "y",
                     u8 => "uy",
+                    c_ushort => "us",
                     i16 => "s",
                     i32 => "",
                     u32 => "u",
@@ -6215,7 +6216,7 @@ fn netIntName(comptime T: type) []const u8 {
         i8 => "a signed byte",
         u8 => "an unsigned byte",
         i16 => "an Int16",
-        u16 => "a UInt16",
+        u16, c_ushort => "a UInt16",
         i32 => "an Int32",
         u32 => "a UInt32",
         i64 => "an Int64",

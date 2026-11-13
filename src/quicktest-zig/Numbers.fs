@@ -311,6 +311,10 @@ let run () : int =
             (System.String.Format("{0:0.00}|{1:#,##0}|{2,8:0.0}|{3:000}", 3.14159, 1234567, 2.25, 7)
              + "|"
              + System.String.Format("{0:0.00}|{1:0.0;(0.0)}", 1.005m, -2.345m))
+        // uint16 is not a char
+        + same
+            "5us|[1us; 2us]|(3us, 'c')|65535|7"
+            (sprintf "%A|%A|%A|%d|%d" 5us [ 1us; 2us ] (3us, 'c') (0us - 1us) (uint16 'a' % 10us))
         // `open Checked`
         + same
             "Overflow: Arithmetic operation resulted in an overflow."

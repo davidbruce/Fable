@@ -240,7 +240,21 @@ let rec ex (em: Em) (e: Expr) : string =
     | ELit(s, _) -> s
     | EUnit -> "{}"
     | EPrim(op, xs, t) ->
-        let a = xs |> List.map (ex em)
+        // (an operation of literals only would be computed by Zig without bounds, as
+        // comptime_int: the first is given its type, so that it wraps as on .NET)
+        let a =
+            match xs with
+            | ELit(s, (TPrim p as ty)) :: rest when
+                (intBits ty > 0 || isFloatTy ty)
+                && rest
+                   |> List.forall (
+                       function
+                       | ELit _ -> true
+                       | _ -> false
+                   )
+                ->
+                $"@as(%s{p}, %s{s})" :: (rest |> List.map (ex em))
+            | _ -> xs |> List.map (ex em)
 
         let argT =
             match xs with

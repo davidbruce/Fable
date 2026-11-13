@@ -872,7 +872,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         | Int8 -> TPrim "i8"
         | UInt8 -> TPrim "u8"
         | Int16 -> TPrim "i16"
-        | UInt16 -> TPrim "u16"
+        // (Zig's u16 is a char here: a uint16 is a type of its own of the same size)
+        | UInt16 -> TPrim "c_ushort"
         | Int32 -> TPrim "i32"
         | UInt32 -> TPrim "u32"
         | Int64 -> TPrim "i64"
@@ -1577,7 +1578,7 @@ let private numberLit (r: SourceLocation option) (v: Fable.NumberValue) : string
     | Fable.NumberValue.Int8 x -> string<sbyte> x, TPrim "i8"
     | Fable.NumberValue.UInt8 x -> string<byte> x, TPrim "u8"
     | Fable.NumberValue.Int16 x -> string<int16> x, TPrim "i16"
-    | Fable.NumberValue.UInt16 x -> string<uint16> x, TPrim "u16"
+    | Fable.NumberValue.UInt16 x -> string<uint16> x, TPrim "c_ushort"
     | Fable.NumberValue.Int32 x -> string<int> x, tI32
     | Fable.NumberValue.UInt32 x -> string<uint32> x, TPrim "u32"
     | Fable.NumberValue.Int64 x -> string<int64> x, TPrim "i64"
@@ -4029,8 +4030,8 @@ and toStringCall (x: Fable.Expr) : Fable.Expr =
 
     Fable.Call(callee, Fable.CallInfo.Create(thisArg = x), Fable.String, x.Range)
 
-/// Can `%A` write a value of this type as F# does? Two pairs of F# types are one type in Zig
-/// (`uint16` and `char`, `option` and `voption`), a struct tuple is a tuple, and a function
+/// Can `%A` write a value of this type as F# does? `option` and `voption` are one type in Zig,
+/// a struct tuple is a tuple, and a function
 /// value has no name here: a type that mentions one of them is refused, so that what is
 /// written is never different from .NET's.
 and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
@@ -4038,7 +4039,6 @@ and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
 
     let rec go (t: Fable.Type) =
         match t with
-        | Fable.Number(UInt16, _) -> fail r "the Zig target cannot write a uint16 inside a value with %%A yet"
         | Fable.Number _
         | Fable.Boolean
         | Fable.Char
@@ -4197,7 +4197,6 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                     match value.Type with
                     // (a number of 16 bits without a sign and a char are the same type in Zig; at
                     // the top the compiler can tell them apart, inside a value it cannot)
-                    | Fable.Number(UInt16, _) -> $"fable_rt.arg(.{{ .kind = 'd' }}, @as(u16, $%d{i})), \"us\""
                     | t ->
                         checkShowable ctx r t
                         $"fable_rt.arg(.{{ .kind = 'A' }}, %s{typedArg ctx r value i})"

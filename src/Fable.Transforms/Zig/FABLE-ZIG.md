@@ -709,10 +709,11 @@ ToString: `Some(1)`, `(1, a)`, `[1; 2; 3; ... ]`. Comparisons that say how compa
 
 Not yet, each of them a compile error and not a different text:
 
-- `%A` of a type that mentions a `uint16`, a `voption`, a struct tuple or a function. (The
-  first three are the same Zig type as `char`, `option` and a tuple. In the message of an F#
-  exception, where nothing can be refused, they are written as those.)
-- A width or flags on `%A`; a custom .NET format (`{x:0.00}`); `String.Format` of a format that is not a literal.
+- `%A` of a type that mentions a `voption`, a struct tuple or a function. (The first two are
+  the same Zig type as `option` and a tuple. In the message of an F# exception, where nothing
+  can be refused, they are written as those.) A `uint16` is Zig's `c_ushort`, a type apart
+  from `char` (`u16`), so `%A` writes `5us`.
+- `String.Format` of a format that is not a literal.
 - Comparison by a culture: `CompareTo`, `String.Compare` without `Ordinal`, and the
   `CurrentCulture` and `InvariantCulture` kinds of `StringComparison`.
 

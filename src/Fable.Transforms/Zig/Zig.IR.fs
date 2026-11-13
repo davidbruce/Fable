@@ -91,6 +91,8 @@ let isFloatTy (t: Ty) =
 let intBits (t: Ty) =
     match t with
     | TPrim("isize" | "usize") -> 64
+    // (F#'s uint16: a type of its own, so that it is not taken for a char)
+    | TPrim "c_ushort" -> 16
     | TPrim s when s.Length > 1 && (s[0] = 'i' || s[0] = 'u') && System.Char.IsDigit s[1] -> int (s.Substring 1)
     | _ -> 0
 
