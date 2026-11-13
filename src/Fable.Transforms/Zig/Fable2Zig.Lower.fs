@@ -708,6 +708,10 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, _) when dotnetExceptions.ContainsKey ent.FullName -> tExn
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
+    // an async computation: the record of the library's Async.fs; the builder has no state
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsync`1" ->
+        TEnt(libRecordEnt ctx "Async" "AsyncOf_1", [ mapType ctx r item ])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsyncBuilder" -> tVoid
     // a sequence: the record of the library's Seq.fs
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.IEnumerable`1" ->
         TEnt(seqEnt ctx, [ mapType ctx r item ])
@@ -940,6 +944,45 @@ and seqEnt (ctx: Ctx) : Ent =
             }
 
         ctx.State.Ents["$seq"] <- e
+        e
+
+/// A record of the library's (`AsyncOf_1` of Async.fs, `Cont_1`): what a program sees of it
+/// is its type; its fields are the library's own business.
+and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
+    let key = $"$lib:%s{file}.%s{name}"
+
+    match ctx.State.Ents.TryGetValue key with
+    | true, e -> e
+    | _ ->
+        let contTy () =
+            TEnt(libRecordEnt ctx "Async" "Cont_1", [ TGen "T" ])
+
+        let fields =
+            match name with
+            | "AsyncOf_1" -> [ "fable_async", TFn([ contTy () ], tVoid) ]
+            | "Cont_1" -> [ "ok", TFn([ TGen "T" ], tVoid); "fail", TFn([ tExn ], tVoid) ]
+            | _ -> []
+
+        let e =
+            {
+                Name = libraryTarget ctx file name
+                Ref =
+                    {
+                        FullName = $"Fable.Library.Zig.%s{file}.%s{name.Replace('_', '`')}"
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KRecord
+                TypeParams = [ "T" ]
+                Cases = [ "", fields ]
+                MutableFields = []
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        ctx.State.Ents[key] <- e
         e
 
 /// A walk of a sequence (Seq.fs): the record of the function that gives the next item.
@@ -1600,6 +1643,20 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
         ->
         Some("Seq", small name)
     | "Microsoft.FSharp.Core.Operators" when name = "CreateSequence" -> Some("Seq", "createSequence")
+    | "Microsoft.FSharp.Control.FSharpAsyncBuilder" when
+        has "Return ReturnFrom Zero Delay Bind Combine TryWith TryFinally While For"
+        ->
+        Some("Async", "builder" + name)
+    | "Microsoft.FSharp.Control.FSharpAsync" ->
+        match name with
+        | "RunSynchronously" -> Some("Async", "runSynchronously")
+        | "StartImmediate" -> Some("Async", "startImmediate")
+        | "Start" -> Some("Async", "startAsync")
+        | "Sleep" -> Some("Async", "sleep")
+        | "Ignore" -> Some("Async", "ignoreAsync")
+        | "Catch" -> Some("Async", "catch")
+        | "Parallel" -> Some("Async", "parallelAll")
+        | _ -> None
     | "Microsoft.FSharp.Collections.FSharpSet`1" ->
         match name with
         | "Add"
@@ -3337,6 +3394,9 @@ and dotnetCall
                 (fun xs -> ERt($"fable_rt.listAverageBy(%s{zigTypeOf ty}, $0, $1)", xs, ty))
         | _ -> fail r "internal: a sum"
 
+    // ---- async: `async` is the builder, which has no state ----
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators", "DefaultAsyncBuilder", _ -> EUnit
+
     // ---- the entry of a map ----
     | "System.Collections.Generic.KeyValuePair`2", ("get_Key" | "get_Value"), [ kv ] ->
         bindArgs
@@ -4050,6 +4110,21 @@ and libraryCall
             args
         | _ -> info, args
 
+    let args =
+        args
+        |> List.filter (fun a ->
+            match a.Type with
+            | Fable.DeclaredType(ent, _) -> ent.FullName <> "Microsoft.FSharp.Control.FSharpAsyncBuilder"
+            | _ -> true
+        )
+
+    // (the optional timeout and cancellation of `Async.RunSynchronously` and `Start` are not
+    // taken)
+    let args =
+        match file, fn with
+        | "Async", ("runSynchronously" | "startImmediate" | "startAsync") -> List.truncate 1 args
+        | _ -> args
+
     // (where FSharp.Core takes a sequence and is given a list, the library takes the list; an
     // empty value whose item type F# left open, `obj` on .NET, gets `unit`: nothing can depend
     // on it)
@@ -4057,7 +4132,7 @@ and libraryCall
         args
         |> List.map (fun arg ->
             match arg with
-            | _ when file = "Seq" -> arg
+            | _ when file = "Seq" || file = "Async" -> arg
             | Fable.Value(Fable.NewOption(None, Fable.Any, isStruct), r) ->
                 Fable.Value(Fable.NewOption(None, Fable.Unit, isStruct), r)
             | Fable.Value(Fable.NewList(None, Fable.Any), r) -> Fable.Value(Fable.NewList(None, Fable.Unit), r)
@@ -4178,7 +4253,7 @@ and libraryCall
     // holds)
     let lowerArg (arg: Fable.Expr) : Expr =
         match arg with
-        | _ when file = "Seq" -> lw ctx arg
+        | _ when file = "Seq" || file = "Async" -> lw ctx arg
         // (a sequence given to a function that takes a list: the list of what it gives)
         | Fable.TypeCast(inner, _)
         | inner when isSeqType inner.Type && isSeqType arg.Type ->

@@ -1292,8 +1292,22 @@ let emitFunction
             )
             |> String.concat "\n"
 
+        // (a function lifted out of a generic one has its type parameters, and may not use
+        // them all)
+        let signature = $"%s{sigParams} %s{retType fn}"
+
+        let discards =
+            typeParams
+            |> List.filter (fun g ->
+                let name = genName g
+                not (bodyText.Contains name || signature.Contains name)
+            )
+            |> List.map (fun g -> $"    _ = %s{genName g};\n")
+            |> String.concat ""
+
         out
             .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{comptimeParams}) type {{")
+            .Append(discards)
             .AppendLine("    return struct {")
             .AppendLine($"        pub fn call(%s{sigParams}) %s{retType fn} {{")
             .Append(indented unused)

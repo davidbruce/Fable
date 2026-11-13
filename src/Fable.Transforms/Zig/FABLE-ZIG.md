@@ -296,6 +296,14 @@ where a sequence is expected is walked as one; a sequence given to a function th
 is the list of what it gives. `for x in s` over a sequence asks it for each item in turn.
 `%A` walks a sequence for its first four items (`seq [1; 2; 3; 4; ...]`), as .NET does.
 
+`Async.fs` is F#'s `async`: a computation is a function given a record of what to do with its
+result and with an exception (continuations). There is one thread and nothing waits:
+`Async.Sleep` returns at once and `Async.Parallel` runs the computations one after the other,
+in order; what a computation gives and raises, and the order of its effects, are .NET's. The
+builder (`async`) has no state; its members, `RunSynchronously`, `StartImmediate`, `Start`,
+`Catch`, `Ignore` and `Parallel` are the library's. A builder of the program's own is a class
+like any other. Not yet: `task`, cancellation, `Async.FromContinuations`, `use!`.
+
 So far: `List.fs` (the `List` module, sorting included: a merge sort, stable as F#'s),
 `Option.fs`, `Result.fs`, `Map.fs` and `Set.fs`. `Map` and `Set` are balanced trees ordered
 by `compare`, as in FSharp.Core; a program's `Map<'K, 'V>` is the library's `MapTree_2`, and

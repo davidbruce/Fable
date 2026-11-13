@@ -1241,7 +1241,15 @@ and private pcNode (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
         // given up before it leaves
         // (inside a `try`, the handler and what follows it may still use the value raised)
         let x', consumed, _ = rewriteFlat p env x true env.RaiseKeep
-        wrapDrops (raiseEdgeDrops p env (Set.difference env.Owned consumed)) (ERaise(x', ty))
+        let drops = raiseEdgeDrops p env (Set.difference env.Owned consumed)
+
+        match x', drops with
+        | EVar _, _
+        | _, [] -> wrapDrops drops (ERaise(x', ty))
+        | _ ->
+            // (the exception is taken first: it may be borrowed from what is given up)
+            let raised = p.State.NewVar("raised", typeOf x', VLocal, false)
+            ELet(raised, x', wrapDrops drops (ERaise(EVar raised, ty)))
     | ETry(body, exV, handler, ty) ->
         let hl = Set.remove exV.Id (live handler L)
         let Lb = Set.union L hl

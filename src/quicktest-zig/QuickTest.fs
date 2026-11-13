@@ -353,3 +353,4 @@ let main _ =
     + Features.run ()
     + Classes.run ()
     + Sequences.run ()
+    + Computations.run ()
