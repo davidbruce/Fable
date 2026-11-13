@@ -94,3 +94,43 @@ let rec sumChecked (limit: int) (xs: IntList) : int =
     match xs with
     | Nil -> 0
     | Cons(h, t) -> addChecked limit h (sumChecked limit t)
+
+/// (a type with members that another file uses)
+type Money =
+    {
+        Units: int
+        Cents: int
+    }
+
+    member m.Total = m.Units * 100 + m.Cents
+    member m.Add(other: Money) = Money.OfCents(m.Total + other.Total)
+
+    static member OfCents(cents: int) =
+        {
+            Units = cents / 100
+            Cents = cents % 100
+        }
+
+    static member (+)(a: Money, b: Money) = a.Add b
+
+    override m.ToString() =
+        string m.Units + "." + (string m.Cents).PadLeft(2, '0')
+
+/// (a generic type with members that another file uses)
+type Tagged<'T> =
+    {
+        Mark: string
+        Item: 'T
+    }
+
+    member t.With(item: 'U) =
+        {
+            Mark = t.Mark
+            Item = item
+        }
+
+    static member Of(item: 'T) =
+        {
+            Mark = "of"
+            Item = item
+        }

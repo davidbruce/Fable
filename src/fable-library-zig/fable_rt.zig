@@ -1155,8 +1155,10 @@ pub const Str = extern struct {
     }
 };
 
-/// F#'s `string`: a pointer to the text, or null as on .NET.
-pub const String = ?*const Str;
+/// F#'s `string`: a pointer to the text, or null as on .NET. (The pointer is not to a
+/// constant: the count behind it changes. A literal is constant data all the same, and is
+/// never written: its count says so.)
+pub const String = ?*Str;
 
 /// The code units of a string. A null string has none.
 pub inline fn unitsOf(s: String) []const u16 {
@@ -1176,13 +1178,13 @@ pub inline fn str(comptime utf8: []const u8) String {
         const u = std.unicode.utf8ToUtf16LeStringLiteral(utf8);
         break :blk LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len }, .units = u.* };
     };
-    return &static.header;
+    return @constCast(&static.header);
 }
 
 /// A string literal that is not well-formed text (F# allows a surrogate on its own).
 pub inline fn strOf(comptime u: []const u16) String {
     const static = comptime LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len }, .units = u[0..u.len].* };
-    return &static.header;
+    return @constCast(&static.header);
 }
 
 fn strWords(len: usize) usize {
@@ -1210,14 +1212,14 @@ fn strFrom(u: []const u16) String {
 inline fn strRetain(s: String) void {
     const p = s orelse return;
     if (p.rc == Str.literal) return;
-    @constCast(p).rc += 1;
+    p.rc += 1;
     if (track) thread.stats.dups += 1;
 }
 
 inline fn strRelease(s: String) void {
     const p = s orelse return;
     if (p.rc == Str.literal) return;
-    const m = @constCast(p);
+    const m = p;
     if (m.rc != 1) {
         m.rc -= 1;
         if (track) thread.stats.decs += 1;

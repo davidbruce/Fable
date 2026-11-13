@@ -878,7 +878,14 @@ let private tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
                         Target = importAlias ctx imp.Path + "." + imp.Selector
                         Captures = []
                         OuterTypeArgs = []
-                        TypeParams = m.GenericParameters |> List.map (fun g -> g.Name)
+                        TypeParams =
+                            // (those of the type it is a member of, then its own)
+                            (match m.DeclaringEntity |> Option.bind ctx.Com.TryGetEntity with
+                             | Some ent when not ent.IsFSharpModule ->
+                                 ent.GenericParameters |> List.map (fun g -> g.Name)
+                             | _ -> [])
+                            @ (m.GenericParameters |> List.map (fun g -> g.Name))
+                            |> List.distinct
                         ArgTypes = argTypes
                         Ret = m.ReturnParameter.Type
                     }
@@ -1586,15 +1593,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.Call(callee, info, t, r) ->
         let ty = mapType ctx r t
 
-        if info.ThisArg.IsSome then
-            fail r "the Zig target does not support method calls yet"
-
-        let args = info.Args |> List.map (lw ctx)
+        // (a member of a type is a function whose first argument is the object)
+        let allArgs = Option.toList info.ThisArg @ info.Args
+        let args = allArgs |> List.map (lw ctx)
 
         match tryCallable ctx callee, callee with
         | Some c, _ ->
             let typeArgs, _ =
-                typeArgsOf ctx r c (Some info.GenericArgs) (info.Args |> List.map (fun a -> a.Type)) (Some t)
+                typeArgsOf ctx r c (Some info.GenericArgs) (allArgs |> List.map (fun a -> a.Type)) (Some t)
 
             bindArgs ctx args (fun xs -> ECall(c.Target, typeArgs, c.Captures @ xs, ty))
         | None, Fable.Import(imp, _, _) ->
@@ -1747,6 +1753,38 @@ and withParameter (ctx: Ctx) (message: Expr) (parameter: Fable.Expr) : Expr =
         [ message; lw ctx parameter ]
         (fun xs -> EEmit("fable_rt.format(.{ $0, \" (Parameter '\", $1, \"')\" })", xs, tStr))
 
+/// The function that is the `ToString` a record or a union declares for itself, if it does.
+and ownToString (ctx: Ctx) (t: Fable.Type) : string option =
+    match t with
+    | Fable.DeclaredType(entRef, _) ->
+        match ctx.Com.TryGetEntity entRef with
+        | Some ent when
+            (ent.IsFSharpRecord || ent.IsFSharpUnion)
+            && ent.MembersFunctionsAndValues
+               |> Seq.exists (fun m -> m.CompiledName = "ToString" && m.IsOverrideOrExplicitInterfaceImplementation)
+            ->
+            match FSharp2Fable.Util.entityIdent ctx.Com entRef with
+            | Fable.IdentExpr id -> Some(id.Name + "__ToString")
+            | Fable.Import(imp, _, _) -> Some(importAlias ctx imp.Path + "." + imp.Selector + "__ToString")
+            | _ -> None
+        | _ -> None
+    | _ -> None
+
+/// `x.ToString()`, as an expression of Fable's.
+and toStringCall (x: Fable.Expr) : Fable.Expr =
+    let callee =
+        Fable.Import(
+            {
+                Selector = "ToString"
+                Path = Replacements.DotnetPrefix + "System.Object"
+                Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+            },
+            Fable.Any,
+            None
+        )
+
+    Fable.Call(callee, Fable.CallInfo.Create(thisArg = x), Fable.String, x.Range)
+
 /// Can `%A` write a value of this type as F# does? Two pairs of F# types are one type in Zig
 /// (`uint16` and `char`, `option` and `voption`), a struct tuple is a tuple, and a function
 /// value has no name here: a type that mentions one of them is refused, so that what is
@@ -1816,6 +1854,7 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
             args.Length
 
     let mutable next = 0
+    let values = Array.ofList args
 
     let texts =
         parts
@@ -1828,7 +1867,12 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
             | Spec(flags, width, precision, letter, net) ->
                 let i = next
                 next <- next + 1
-                let value = args[i]
+
+                // (`{x}` and `%O` of a value whose type has a `ToString` of its own)
+                if (letter = 'P' || letter = 'O') && (ownToString ctx args[i].Type).IsSome then
+                    values[i] <- toStringCall args[i]
+
+                let value = values[i]
 
                 let isWhole =
                     match value.Type with
@@ -1922,7 +1966,7 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
     (match texts with
      | [] -> ".{}"
      | _ -> texts |> String.concat ", " |> sprintf ".{ %s }"),
-    args
+    List.ofArray values
 
 /// printf and its relatives: text is built from the format's parts and printed, returned or
 /// raised.
@@ -2426,7 +2470,9 @@ and dotnetCall
                 (values |> Seq.map (lw ctx) |> List.ofSeq)
                 (fun xs -> EEmit($"fable_rt.format(.{{ %s{texts} }})", xs, tStr))
     // `string x`
-    | "Microsoft.FSharp.Core.Operators", "ToString", [ x ] ->
+    | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when (ownToString ctx x.Type).IsSome ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> ECall((ownToString ctx x.Type).Value, [], xs @ [ EUnit ], tStr))
+    | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] ->
         match x.Type with
         // (the text of a null string is the empty string)
         | Fable.String when neverNull x -> lw ctx x
@@ -2593,6 +2639,8 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
     let report (r: SourceLocation option) (msg: string) =
         com.AddLog(msg, Severity.Error, ?range = r, fileName = com.CurrentFile)
 
+    let attached = List<Fable.MemberDecl>()
+
     let rec membersOf (decls: Fable.Declaration list) : Fable.MemberDecl list =
         decls
         |> List.collect (fun d ->
@@ -2607,11 +2655,24 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 | Some ent when ent.IsFSharpRecord || ent.IsFSharpUnion ->
                     try
                         entOf (newCtx c.Name) None c.Entity |> ignore
-
-                        if not c.AttachedMembers.IsEmpty then
-                            report None $"the Zig target does not support members of types yet (%s{c.Name})"
                     with ZigError(msg, r) ->
                         report r msg
+
+                    // What a type overrides is a function like its other members. So far only
+                    // `ToString` is called where .NET would call it.
+                    attached.AddRange(
+                        c.AttachedMembers
+                        |> List.choose (fun m ->
+                            if m.Name = "ToString" then
+                                Some { m with Name = c.Name + "__ToString" }
+                            else
+                                report
+                                    m.Body.Range
+                                    $"the Zig target does not support this kind of member yet (%s{c.Name}.%s{m.Name})"
+
+                                None
+                        )
+                    )
                 | Some ent when ent.IsFSharpExceptionDeclaration ->
                     try
                         tryExnEnt (newCtx c.Name) None c.Entity |> ignore
@@ -2623,11 +2684,21 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
         )
 
     let decls = membersOf file.Declarations
+    let decls = decls @ List.ofSeq attached
 
     // (for work on the target: what Fable hands over for a file)
     if System.Environment.GetEnvironmentVariable "FABLE_ZIG_DUMP" = "1" then
         for d in file.Declarations do
             eprintfn "DUMP %A" d
+
+    /// the type parameters of a function: those of the type it is a member of, then its own
+    let typeParamsOf (info: Fable.MemberFunctionOrValue) : string list =
+        let ofType =
+            match info.DeclaringEntity |> Option.bind com.TryGetEntity with
+            | Some ent when not ent.IsFSharpModule -> ent.GenericParameters |> List.map (fun g -> g.Name)
+            | _ -> []
+
+        ofType @ (info.GenericParameters |> List.map (fun g -> g.Name)) |> List.distinct
 
     // What the file declares is known before any body is lowered: bodies call each other.
     for d in decls do
@@ -2639,18 +2710,13 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             if info.IsValue then
                 members[d.Name] <- MConst(mapType (newCtx d.Name) d.Body.Range d.Body.Type)
             else
-                members[d.Name] <-
-                    MFunction(
-                        info.GenericParameters |> List.map (fun g -> g.Name),
-                        d.Args |> List.map (fun a -> a.Type),
-                        d.Body.Type
-                    )
+                members[d.Name] <- MFunction(typeParamsOf info, d.Args |> List.map (fun a -> a.Type), d.Body.Type)
         with ZigError(msg, r) ->
             report r msg
 
     for d in decls do
         let info = com.GetMember d.MemberRef
-        let typeParams = info.GenericParameters |> List.map (fun g -> g.Name)
+        let typeParams = typeParamsOf info
         let ctx = { newCtx d.Name with TypeParams = typeParams }
 
         try

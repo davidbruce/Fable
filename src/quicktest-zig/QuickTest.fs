@@ -343,3 +343,4 @@ let main _ =
     + Strings.run ()
     + Text.run ()
     + Arrays.run ()
+    + Members.run ()

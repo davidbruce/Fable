@@ -54,9 +54,16 @@ Types that are plain values, also when another file declares them:
 
 with construction, copy-and-update, field access, pattern matching and structural equality.
 A record, union, tuple or option that holds a recursive union is still a plain value; the
-references inside it are counted. Not yet: members on types, ordering comparison of anything
+references inside it are counted. Not yet: ordering comparison of anything
 but numbers, chars, booleans and strings, module-level values that are not literals, and the functions of the `List` module (literals, `::`,
 patterns, `IsEmpty`, `Head` and `Tail` work).
+
+Members on records and unions are functions whose first argument is the object: properties,
+methods (also curried, also used as function values), static members, the operators a type
+declares for itself (`static member (+)`), and members of generic types, in the file that
+declares the type or in another. A `ToString` that a type overrides is called where .NET
+calls it: by `x.ToString()`, `string x`, `{x}` and `%O` (`%A` does not use it, as on .NET).
+Not yet: other overrides and interface implementations, classes, object expressions.
 
 `[<Emit("...")>]` is supported for Zig text, with `$0`, `$1`, ... standing for the arguments.
 
