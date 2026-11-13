@@ -69,7 +69,6 @@ module Functions =
         test 0
         log
 
-#if !FABLE_COMPILER_ZIG // (object expressions of IDisposable are not supported by the Zig target yet)
     let recWithUse () =
         let mutable log = ""
         let disp(n) =
@@ -81,7 +80,6 @@ module Functions =
           if n < 4 then test (n+1) else 0
         test 0 |> ignore
         log
-#endif
 
 open Functions
 
@@ -187,11 +185,9 @@ let ``test Tailcall optimization doesnt cause endless loops`` () =
 let ``test Recursive functions containing finally work`` () =
     recWithFinally () |> equal "abcdeEDCBA"
 
-#if !FABLE_COMPILER_ZIG // (object expressions of IDisposable are not supported by the Zig target yet)
 [<Fact>]
 let ``test Recursive functions containing use work`` () =
     recWithUse () |> equal "abcdeEDCBA"
-#endif
 
 [<Fact>]
 let ``test Function arguments can be optimized`` () =

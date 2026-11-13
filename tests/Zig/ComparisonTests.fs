@@ -632,16 +632,13 @@ let ``test nullArg works`` () =
     |> equal false
 
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: struct types with val fields, object expressions of IDisposable, culture comparison)
 [<Fact>]
 let ``test using function disposes the resource when action finishes`` () =
     let mutable disposed = false
     let resource = { new IDisposable with member _.Dispose() = disposed <- true }
     using resource (fun _resource -> ())
     equal true disposed
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: object expressions of IDisposable)
 [<Fact>]
 let ``test using function disposes the resource when action fails`` () =
     let mutable disposed = false
@@ -651,7 +648,6 @@ let ``test using function disposes the resource when action fails`` () =
     with
     | _ -> () // ignore
     equal true disposed
-#endif
 
 [<Fact>]
 let ``test isNull with primitives works`` () =
@@ -741,7 +737,7 @@ let ``Equals with primitives works`` () =
     (1.m).Equals(1.m) |> equal true
     ("1").Equals("1") |> equal true
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: struct types with val fields, object expressions of IDisposable, culture comparison)
+#if !FABLE_COMPILER_ZIG // (comparison by a culture is not supported by the Zig target yet)
 [<Fact>]
 let ``CompareTo with primitives works`` () =
     (true).CompareTo(true) |> equal 0

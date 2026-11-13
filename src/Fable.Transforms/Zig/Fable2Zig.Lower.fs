@@ -1117,6 +1117,33 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(listEnt ctx.State, [ mapType ctx r item ])
     | Fable.DeclaredType(ent, genArgs) when ent.FullName = mapName || ent.FullName = setName ->
         TEnt(treeEnt ctx (ent.FullName = mapName), genArgs |> List.map (mapTypeArg ctx r))
+    // (an interface of .NET's, `IDisposable`: a struct of function values as the program's own
+    // interfaces are, of the runtime's type for its member names, so that it is one type in
+    // every file)
+    | Fable.DeclaredType(ent, genArgs) when
+        (match ent.Path with
+         | Fable.SourcePath _ -> false
+         | _ -> true)
+        && (
+            match ctx.Com.TryGetEntity ent with
+            | Some e -> e.IsInterface
+            | None -> false
+        )
+        ->
+        let e = ctx.Com.GetEntity ent
+
+        let subst =
+            List.zip (e.GenericParameters |> List.map (fun g -> g.Name)) genArgs
+            |> Map.ofList
+
+        let members =
+            allInterfaceMembers ctx.Com e subst |> List.sortBy (fun (_, n, _, _) -> n)
+
+        TEnt(
+            anonEnt ctx.State (members |> List.map (fun (_, n, _, _) -> n) |> Array.ofList),
+            members
+            |> List.map (fun (_, _, args, ret) -> TFn(args |> List.map (mapType ctx r), mapType ctx r ret))
+        )
     | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapTypeArg ctx r))
     | Fable.Any -> tAny
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
@@ -3826,6 +3853,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     // `x :? IDisposable` where the type of x is known (what `use` asks): true if the type
     // implements the interface
+    // (a value of the interface itself: it is one)
+    | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _) as ifaceType), _) when
+        isInterfaceType ctx.Com ifaceType
+        && (
+            match inner.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = ifaceRef.FullName
+            | _ -> false
+        )
+        ->
+        ESeq(lwStmt ctx inner, ELit("true", tBool))
     | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _) as ifaceType), _) when
         isInterfaceType ctx.Com ifaceType
         && (implements ctx.Com inner.Type ifaceRef.FullName).IsSome

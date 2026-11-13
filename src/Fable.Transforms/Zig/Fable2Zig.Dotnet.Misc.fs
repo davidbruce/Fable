@@ -34,6 +34,72 @@ let call
     let contents = contents r
 
     match entity, name, args with
+    // a member of a .NET interface called on a value of that interface: its function in the
+    // struct of function values (`d.Dispose()` of an `IDisposable`)
+    | _, _, this :: rest when
+        info.ThisArg.IsSome
+        && this.Type =
+            (match this.Type with
+             | Fable.DeclaredType(e, _) when
+                 (match e.Path with
+                  | Fable.SourcePath _ -> false
+                  | _ -> true)
+                 && (
+                     match ctx.Com.TryGetEntity e with
+                     | Some ent -> ent.IsInterface && ent.FullName = entity
+                     | None -> false
+                 )
+                 ->
+                 this.Type
+             | _ -> Fable.Unit)
+        ->
+        bindArgs
+            ctx
+            (lw ctx this :: (rest |> List.map (lw ctx)))
+            (fun xs ->
+                match caseFields (typeOf xs.Head) "" |> List.tryFind (fun (f, _) -> f = name) with
+                | Some(f, fty) ->
+                    let args =
+                        if xs.Tail.IsEmpty then
+                            [ EUnit ]
+                        else
+                            xs.Tail
+
+                    ECallClo(EGet(xs.Head, PField f, fty), args, mapType ctx r t)
+                | None -> fail r "the Zig target cannot find the member %s of %s" name entity
+            )
+    // (a value boxed and unboxed to its own type, as `use` does with an interface value)
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxGeneric" | "UnboxFast"), [ Unboxed inner ] when
+        inner.Type <> Fable.Any && mapType ctx r inner.Type = mapType ctx r t
+        ->
+        lw ctx inner
+    // `using resource f`: `f resource`, then `resource.Dispose()`, also when it raises
+    | "Microsoft.FSharp.Core.Operators", "Using", [ resource; f ] ->
+        let rid = AST.makeTypedIdent resource.Type "resource"
+
+        let dispose =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "Dispose"
+                        Path = Replacements.DotnetPrefix + "System.IDisposable"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(thisArg = Fable.IdentExpr rid),
+                Fable.Unit,
+                r
+            )
+
+        lw
+            ctx
+            (Fable.Let(
+                rid,
+                resource,
+                Fable.TryCatch(Fable.CurriedApply(f, [ Fable.IdentExpr rid ], t, r), None, Some dispose, r)
+            ))
     // ---- enums: numbers of their underlying type ----
     | "System.Enum", "HasFlag", [ v; Uncast flag ] -> pure' "(($0 & $1) == $1)" [ v; flag ] tBool
     | "Microsoft.FSharp.Core.LanguagePrimitives", ("EnumOfValue" | "EnumToValue"), [ x ] ->

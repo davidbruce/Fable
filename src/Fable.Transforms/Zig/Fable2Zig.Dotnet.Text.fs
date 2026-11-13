@@ -105,6 +105,11 @@ let call
 
         let listIr =
             match inner.Type with
+            | Fable.Array(item, Fable.ResizeArray) ->
+                bindArgs
+                    ctx
+                    [ lw ctx inner ]
+                    (fun xs -> EEmit("fable_rt.raToList($0)", xs, TEnt(listEnt ctx.State, [ mapType ctx r item ])))
             | Fable.Array(item, _) ->
                 bindArgs
                     ctx
