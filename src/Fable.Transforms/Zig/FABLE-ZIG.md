@@ -325,7 +325,9 @@ what an array, a ref cell or any generic cell with assignable fields holds as as
 `[| ... |]`, indexing, slices (`a.[1..3]`, lenient at both ends as in F#), `for x in a`,
 `.Length`, and of the `Array` module: `length`, `isEmpty`, `empty`, `get`, `set`,
 `zeroCreate`, `create`, `init`, `copy`, `append`, `rev`, `sub`, `fill`, `ofList`, `toList`,
-`contains`, `map`, `mapi`, `iter`, `iteri`, `fold`, `filter`, `exists`, `forall`.
+`contains`, `map`, `mapi`, `iter`, `iteri`, `fold`, `filter`, `exists`, `forall` in the
+runtime, and the rest of the module (sorting, `sortInPlace`, `max`, `groupBy`, `zip`, `take`,
+`chunkBySize`, `blit`, ...) in F# in the library (`Array.fs`).
 
 Not yet: `Array.zeroCreate n` for items that have no null here (records, unions, functions:
 only the empty array can be made that way; use `Array.create` or `Array.init`), arrays of

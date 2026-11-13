@@ -1645,6 +1645,21 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
         )
     | "Microsoft.FSharp.Core.ExtraTopLevelOperators" when name = "CreateSet" -> Some("Set", "ofList")
     | "Microsoft.FSharp.Collections.ListModule" when name = "OfSeq" -> Some("List", "ofSeq")
+    | "Microsoft.FSharp.Collections.ArrayModule" when
+        has
+            "Singleton Replicate Head TryHead Last TryLast Item TryItem ExactlyOne TryFindIndex FindIndex TryFind Find
+             TryFindBack TryPick Pick Choose Collect Concat FoldBack Reduce Scan Max Min MaxBy MinBy SortWith Sort SortBy
+             SortDescending SortByDescending SortInPlaceWith SortInPlace SortInPlaceBy Distinct DistinctBy GroupBy
+             CountBy Indexed Zip Unzip Map2 Iterate2 Fold2 Exists2 ForAll2 Partition Take Truncate Skip TakeWhile
+             SkipWhile SplitAt ChunkBySize Windowed Pairwise AllPairs Except CopyTo"
+        ->
+        Some(
+            "Array",
+            (if name = "CopyTo" then
+                 "blit"
+             else
+                 small name)
+        )
     | "Microsoft.FSharp.Collections.SeqModule" when
         has
             "Empty Singleton Delay OfList OfArray Append Map MapIndexed Filter Where Choose Collect Concat Initialize InitializeInfinite Unfold Take Truncate Skip TakeWhile SkipWhile Zip Indexed Pairwise Iterate IterateIndexed Fold ToList ToArray Length IsEmpty TryHead Head TryLast Last TryItem Item TryFind Find TryPick Pick Exists ForAll Contains Reduce Reverse Sort SortBy SortDescending Distinct Max Min MaxBy MinBy GroupBy CountBy Cache"

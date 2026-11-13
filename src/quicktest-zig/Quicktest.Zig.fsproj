@@ -28,6 +28,7 @@
     <Compile Include="Sequences.fs" />
     <Compile Include="Computations.fs" />
     <Compile Include="Strings2.fs" />
+    <Compile Include="Arrays2.fs" />
     <Compile Include="QuickTest.fs" />
   </ItemGroup>
   <ItemGroup>
