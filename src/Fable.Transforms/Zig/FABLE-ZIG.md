@@ -628,9 +628,14 @@ is not supported.
 
 A `string` is what it is on .NET: immutable UTF-16, or null. `s.Length` and `s.[i]` count and
 give code units, so an emoji has length 2 here as there, and nothing a program computes from
-a string differs. In memory it is a pointer to a header (count and length, 8 bytes) that the
-units follow. A literal is static data of the program: its count is a fixed mark, so that
-making, copying and dropping one costs nothing and it is never freed.
+a string differs. In memory it is a pointer to a header (count, length and room, 12 bytes)
+that the units follow. A literal is static data of the program: its count is a fixed mark, so
+that making, copying and dropping one costs nothing and it is never freed.
+
+`a + b` gives `a` up to the append (ownership decides it, as for any owned argument): when
+nothing else refers to `a`, it grows in place and its room doubles, so `s <- s + x` in a loop
+costs what a `StringBuilder` would. A string that something else still refers to is never
+changed: it is copied, as before.
 
 ```zig
 pub fn greet(name: fable_rt.String) fable_rt.String {

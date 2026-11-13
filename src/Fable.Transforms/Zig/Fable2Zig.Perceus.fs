@@ -19,6 +19,10 @@ type private P =
 /// Remove `let x = <pure> in body` when x is unused, and what follows a `raise`.
 /// If evaluating `e` always ends in a raise: `e`, with `ty` as the type that is expected where
 /// it stands. What comes after it can never run, and Zig refuses code that cannot.
+/// A call into the runtime that takes its first argument over (the others it borrows).
+let private ownsFirst (macro: string) =
+    macro.StartsWith("fable_rt.strAppend(", System.StringComparison.Ordinal)
+
 let rec private asRaise (ty: Ty) (e: Expr) : Expr option =
     match e with
     | ERaise(x, _) -> Some(ERaise(x, ty))
@@ -562,6 +566,9 @@ let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
             | EClosure(_, _, xs, _)
             | EExnNew(_, xs)
             | ECon(_, _, xs, _) -> List.iter (go true) xs
+            | EEmit(m, x :: rest, _) when ownsFirst m ->
+                go true x
+                List.iter (go false) rest
             | _ -> List.iter (go false) (flatKids e)
 
         go owning e
@@ -1080,6 +1087,7 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
                 match e with
                 | ECall(f, _, xs, _) -> modesOf p f xs |> List.map (fun m -> m = MOwned)
                 | ECallClo(_, xs, _) -> false :: (xs |> List.map (fun _ -> true))
+                | EEmit(m, _ :: rest, _) when ownsFirst m -> true :: (rest |> List.map (fun _ -> false))
                 | EClosure(_, _, xs, _)
                 | EExnNew(_, xs)
                 | ECon(_, _, xs, _) -> xs |> List.map (fun _ -> true)

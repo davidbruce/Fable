@@ -5531,7 +5531,9 @@ and dotnetCall
             | _ -> [ x ]
 
         match parts a @ parts b with
-        | [ a; b ] -> bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EEmit("fable_rt.strConcat($0, $1)", xs, tStr))
+        // (the left string is given up to the append, which grows it in place when nothing
+        // else refers to it: `s <- s + x` in a loop is not quadratic)
+        | [ a; b ] -> bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EEmit("fable_rt.strAppend($0, $1)", xs, tStr))
         | many ->
             // (literal text among the parts is written into the result directly)
             let values = List<Fable.Expr>()

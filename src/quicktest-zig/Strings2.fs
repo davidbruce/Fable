@@ -51,8 +51,26 @@ let run () : int =
     let built = sb.ToString() + "|" + string sb.Length
     sb.Clear().Append("z") |> ignore
 
+    // appending: a string grows in place only when nothing else refers to it
+    let mutable grown = ""
+
+    for _ in 1..100000 do
+        grown <- grown + "x"
+
+    let mutable step = "a"
+    let mutable kept = []
+
+    for _ in 1..3 do
+        kept <- step :: kept
+        step <- step + "b"
+
+    let twice = step + step
+
     let failed =
         same
+            "100000|[\"abb\"; \"ab\"; \"a\"]|abbb|abbbabbb"
+            (string grown.Length + "|" + sprintf "%A" kept + "|" + step + "|" + twice)
+        + same
             "[|\"a\"; \"b\"; \"\"; \"c\"|]|[|\"a\"; \" b\"; \"c\"|]|[|\"a\"; \"b\"; \"c\"|]|[|\"a\"; \"b\"|]"
             (sprintf
                 "%A|%A|%A|%A"

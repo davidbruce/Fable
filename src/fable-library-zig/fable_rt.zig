@@ -3298,6 +3298,8 @@ pub const Str = extern struct {
     /// the number of references, or `literal` for a string that is static data
     rc: u32,
     len: u32,
+    /// the units there is room for (more than `len` in a string that is appended to)
+    cap: u32,
 
     pub const literal: u32 = std.math.maxInt(u32);
 
@@ -3329,14 +3331,14 @@ pub inline fn str(comptime utf8: []const u8) String {
         // many times: the compiler's guard against endless loops is not for this)
         @setEvalBranchQuota(std.math.maxInt(u32));
         const u = std.unicode.utf8ToUtf16LeStringLiteral(utf8);
-        break :blk LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len }, .units = u.* };
+        break :blk LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len, .cap = u.len }, .units = u.* };
     };
     return @constCast(&static.header);
 }
 
 /// A string literal that is not well-formed text (F# allows a surrogate on its own).
 pub inline fn strOf(comptime u: []const u16) String {
-    const static = comptime LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len }, .units = u[0..u.len].* };
+    const static = comptime LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len, .cap = u.len }, .units = u[0..u.len].* };
     return @constCast(&static.header);
 }
 
@@ -3348,7 +3350,7 @@ fn strWords(len: usize) usize {
 fn strNew(len: usize) struct { *Str, []u16 } {
     const words = allocator.alloc(u32, strWords(len)) catch @panic("fable: out of memory");
     const s: *Str = @ptrCast(words.ptr);
-    s.* = .{ .rc = 1, .len = @intCast(len) };
+    s.* = .{ .rc = 1, .len = @intCast(len), .cap = @intCast(len) };
     if (track) thread.stats.allocs += 1;
     const first: [*]u16 = @ptrCast(@as([*]Str, @ptrCast(s)) + 1);
     return .{ s, first[0..len] };
@@ -3380,7 +3382,7 @@ inline fn strRelease(s: String) void {
     }
     if (track) thread.stats.frees += 1;
     const words: [*]u32 = @ptrCast(@alignCast(m));
-    allocator.free(words[0..strWords(m.len)]);
+    allocator.free(words[0..strWords(m.cap)]);
 }
 
 /// Text that grows: what the functions below build a string of unknown length in.
@@ -3695,6 +3697,32 @@ pub fn strConcat(a: String, b: String) String {
     const s, const u = strNew(x.len + y.len);
     @memcpy(u[0..x.len], x);
     @memcpy(u[x.len..], y);
+    return s;
+}
+
+/// `a + b` where the caller gives `a` up: a string nothing else refers to grows in place, its
+/// room doubling, so that appending in a loop is not quadratic.
+pub fn strAppend(a: String, b: String) String {
+    const p = a orelse return strConcat(a, b);
+    const y = unitsOf(b);
+    if (y.len == 0) return a;
+    if (p.rc != 1 or b == a) {
+        const r = strConcat(a, b);
+        strRelease(a);
+        return r;
+    }
+    const need = @as(usize, p.len) + y.len;
+    var s = p;
+    if (need > p.cap) {
+        const cap = @max(need, @as(usize, p.cap) * 2);
+        const old: [*]u32 = @ptrCast(@alignCast(p));
+        const words = allocator.realloc(old[0..strWords(p.cap)], strWords(cap)) catch @panic("fable: out of memory");
+        s = @ptrCast(words.ptr);
+        s.cap = @intCast(cap);
+    }
+    const first: [*]u16 = @ptrCast(@as([*]Str, @ptrCast(s)) + 1);
+    @memcpy(first[s.len..need], y);
+    s.len = @intCast(need);
     return s;
 }
 
