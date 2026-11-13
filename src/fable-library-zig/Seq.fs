@@ -87,6 +87,121 @@ let append<'T> (source1: SeqOf<'T>) (source2: SeqOf<'T>) : SeqOf<'T> =
         walker next
     )
 
+// ---- what `seq { }` is made of besides `for` and `yield` ----
+
+/// `while guard () do yield! source` in a sequence expression: `source` is walked anew each
+/// time round
+let enumerateWhile<'T> (guard: unit -> bool) (source: SeqOf<'T>) : SeqOf<'T> =
+    make (fun () ->
+        let mutable current: Walk<'T> option = None
+
+        let rec next () =
+            match current with
+            | Some w ->
+                match w.next () with
+                | Some x -> Some x
+                | None ->
+                    current <- None
+                    next ()
+            | None ->
+                if guard () then
+                    current <- Some(walk source)
+                    next ()
+                else
+                    None
+
+        walker next
+    )
+
+/// `try yield! source finally compensation ()`: the compensation runs once, when the walk ends
+/// or raises. (A walk that is left before its end does not run it yet: the library's walks
+/// have no way to be stopped.)
+let enumerateThenFinally<'T> (source: SeqOf<'T>) (compensation: unit -> unit) : SeqOf<'T> =
+    make (fun () ->
+        let mutable finished = false
+
+        let finish () =
+            if not finished then
+                finished <- true
+                compensation ()
+
+        let mutable current: Walk<'T> option = None
+
+        walker
+        <| fun () ->
+            if finished then
+                None
+            else
+                let r =
+                    try
+                        let w =
+                            match current with
+                            | Some w -> w
+                            | None ->
+                                let w = walk source
+                                current <- Some w
+                                w
+
+                        w.next ()
+                    with _ ->
+                        finish ()
+                        reraise ()
+
+                match r with
+                | Some x -> Some x
+                | None ->
+                    finish ()
+                    None
+    )
+
+/// `try yield! source with e -> yield! handler e` (F#'s `filter` says whether the handler takes
+/// the exception: 1 if it does)
+let enumerateTryWith<'T> (source: SeqOf<'T>) (filter: exn -> int) (handler: exn -> SeqOf<'T>) : SeqOf<'T> =
+    make (fun () ->
+        let mutable current: Walk<'T> option = None
+        let mutable handled = false
+
+        let rec next () =
+            match current with
+            | None when not handled ->
+                let w =
+                    try
+                        Choice1Of2(walk source)
+                    with e ->
+                        Choice2Of2 e
+
+                match w with
+                | Choice1Of2 w -> current <- Some w
+                | Choice2Of2 e ->
+                    if filter e = 1 then
+                        handled <- true
+                        current <- Some(walk (handler e))
+                    else
+                        raise e
+
+                next ()
+            | None -> None
+            | Some w when handled -> w.next ()
+            | Some w ->
+                let r =
+                    try
+                        Choice1Of2(w.next ())
+                    with e ->
+                        Choice2Of2 e
+
+                match r with
+                | Choice1Of2 x -> x
+                | Choice2Of2 e ->
+                    if filter e = 1 then
+                        handled <- true
+                        current <- Some(walk (handler e))
+                        next ()
+                    else
+                        raise e
+
+        walker next
+    )
+
 let map<'T, 'U> (mapping: 'T -> 'U) (source: SeqOf<'T>) : SeqOf<'U> =
     make (fun () ->
         let w = walk source

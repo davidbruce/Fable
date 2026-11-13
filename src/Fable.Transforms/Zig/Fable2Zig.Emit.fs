@@ -309,7 +309,8 @@ let rec ex (em: Em) (e: Expr) : string =
                 | [ xe; ye ] when typeOf xe <> typeOf ye ->
                     let rec placeholder (t: Ty) =
                         match t with
-                        | TPrim "void" -> true
+                        | TPrim "void"
+                        | TOpt(TPrim "fable_rt.Obj") -> true
                         | TOpt t -> placeholder t
                         | TEnt(_, args) -> args |> List.exists placeholder
                         | _ -> false

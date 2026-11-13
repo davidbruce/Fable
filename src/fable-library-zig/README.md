@@ -49,6 +49,8 @@ to compile, rather than doing something else. The known exceptions:
   calling thread; `Async.Sleep` and `Task.Delay` do not wait, `Async.Parallel` runs in turn.
 - A weak reference sees its target gone at the target's last use, not at a later collection.
 - A loop over a `Dictionary` walks a snapshot of it.
+- `try ... finally` and `use` inside `seq { }` run their finalizer when the sequence is walked to
+  its end or raises, not yet when a walk is left early (`Seq.head`, `Seq.take`, ...).
 - `%A` of a type that contains a `voption`, a struct tuple or a function is refused.
 - Comparison by a culture (`String.Compare` without `StringComparison.Ordinal`) is refused;
   `StackTrace` is not supported.

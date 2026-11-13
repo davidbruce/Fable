@@ -41,5 +41,9 @@
     <Compile Include="RecordTypeTests.fs" />
     <Compile Include="TupleTypeTests.fs" />
     <Compile Include="UnionTypeTests.fs" />
+    <Compile Include="AnonRecordsTests.fs" />
+    <Compile Include="SeqExpressionTests.fs" />
+    <Compile Include="LoopsTests.fs" />
+    <Compile Include="PatternMatchTests.fs" />
   </ItemGroup>
 </Project>

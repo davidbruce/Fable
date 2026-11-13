@@ -4871,6 +4871,13 @@ pub fn format(parts: anytype) String {
             if (comptime T.fable_spec.kind == 'A') {
                 written[i] = anyText(part.value);
                 pieces[i] = .{ .units = unitsOf(written[i]) };
+            } else if (comptime T.fable_spec.kind == 'T') {
+                // (`%O` and `{x}` of a value whose type is a type parameter: its `ToString`)
+                written[i] = genericText(part.value) catch blk: {
+                    drop(take());
+                    break :blk str("");
+                };
+                pieces[i] = .{ .units = unitsOf(written[i]) };
             } else {
                 pieces[i] = pieceOf(T.fable_spec, part.value, &scratch[i]);
             }

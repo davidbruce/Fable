@@ -908,11 +908,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     // (`Tuple<'T>`, which F# does not write as a tuple)
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Tuple`1" || ent.FullName = "System.ValueTuple`1" ->
         TTuple [ mapType ctx r t ]
-    // (`None` and `[]` whose type F# leaves as `obj`: they hold nothing, so any item type is
-    // theirs)
-    | Fable.Option(Fable.Any, _) -> TOpt tVoid
-    | Fable.List Fable.Any -> TEnt(listEnt ctx.State, [ tVoid ])
-    | Fable.Array(Fable.Any, kind) -> mapType ctx r (Fable.Array(Fable.Unit, kind))
+    // (`None` and `[]` whose item type F# leaves as `obj` are of `obj` here too)
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
@@ -979,11 +975,10 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Any -> tAny
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
 
-/// A type argument: `obj` stands for the item type of something empty (an `obj` value cannot be
-/// made here), so any type is right for it.
+/// A type argument (`obj`, as for the item type of something empty, is `obj` here too).
 and mapTypeArg (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
-    | Fable.Any -> tVoid
+    | Fable.Any -> tAny
     | _ -> mapType ctx r t
 
 /// The record or union behind an entity reference. Immutable, non-recursive records and
@@ -2225,6 +2220,13 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
     | "Microsoft.FSharp.Collections.SetModule" when name = "IntersectMany" -> Some("Set", "intersectMany")
     | "Microsoft.FSharp.Collections.ArrayModule" when name = "OfSeq" -> Some("Seq", "toArray")
     | "Microsoft.FSharp.Collections.SeqModule" when name = "Tail" -> Some("Seq", "tail")
+    // (what `while`, `try ... finally` and `try ... with` in `seq { }` are)
+    | "Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers" when
+        name = "EnumerateWhile"
+        || name = "EnumerateThenFinally"
+        || name = "EnumerateTryWith"
+        ->
+        Some("Seq", small name)
     | "Microsoft.FSharp.Core.OptionModule"
     | "Microsoft.FSharp.Core.ValueOption" when
         has
@@ -3262,11 +3264,18 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ERaise(
             failure,
             match t with
-            | Fable.Any -> tVoid
+            | Fable.Any -> tAny
             | _ -> mapType ctx r t
         )
 
     // a function with several arguments that is used one argument at a time
+    // (F#'s own `raise` of an exception value, as a `with` that does not match passes it on)
+    | Fable.Extended(Fable.Throw(Some x, t), _) ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx e.Range t))
+    | Fable.Extended(Fable.Throw(None, t), r) ->
+        match ctx.CaughtExn with
+        | Some exV -> ERaise(EVar exV, mapType ctx r t)
+        | None -> fail r "`reraise ()` is only possible inside a `with` handler"
     | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
 
     // `match w.TryGetTarget() with | true, x -> ...` where x's type has no default value (null on
@@ -4592,6 +4601,9 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                     | ('u' | 'x' | 'X' | 'o'), Fable.Number _ when isWhole -> letter
                     | ('f' | 'F' | 'e' | 'E' | 'g' | 'G'), Fable.Number((Float32 | Float64 | Decimal), _) -> letter
                     | 'M', Fable.Number(Decimal, _) -> 'M'
+                    // (a value whose type is a type parameter: its `ToString`, known when the
+                    // Zig is compiled)
+                    | ('P' | 'O' | 's'), Fable.GenericParam _ -> 'T'
                     | 'A', _ -> 'A'
                     | _, (Fable.String | Fable.Char | Fable.Boolean | Fable.Number _) ->
                         fail r "the Zig target does not support the format %%%c for this type of value yet" letter
@@ -6586,6 +6598,59 @@ and dotnetCall
         else
             dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
 
+    // `use x = resource` in `seq { }`: what follows, then `x.Dispose()`
+    | "Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers", "EnumerateUsing", [ resource; body ] ->
+        let rid = AST.makeTypedIdent resource.Type "resource"
+
+        let dispose =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "Dispose"
+                        Path = Replacements.DotnetPrefix + "System.IDisposable"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(thisArg = Fable.IdentExpr rid),
+                Fable.Unit,
+                r
+            )
+
+        let unitArg = AST.makeTypedIdent Fable.Unit "unitVar"
+
+        let thenFinally =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "EnumerateThenFinally"
+                        Path =
+                            Replacements.DotnetPrefix
+                            + "Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                { info with
+                    Args =
+                        [
+                            Fable.CurriedApply(body, [ Fable.IdentExpr rid ], t, r)
+                            Fable.Lambda(unitArg, dispose, None)
+                        ]
+                    GenericArgs =
+                        (match t with
+                         | Fable.DeclaredType(_, [ item ]) -> [ item ]
+                         | _ -> [])
+                    SignatureArgTypes = []
+                    MemberRef = None
+                },
+                t,
+                r
+            )
+
+        lw ctx (Fable.Let(rid, resource, thenFinally))
     // ---- tuples: `Tuple(a, b)`, `Tuple.Create`, struct tuples, and the conversions between
     // them (a tuple is a Zig tuple, struct or not) ----
     | ("System.Tuple`1" | "System.Tuple`2" | "System.Tuple`3" | "System.Tuple`4" | "System.Tuple`5" | "System.Tuple`6" | "System.Tuple`7" | "System.ValueTuple`1" | "System.ValueTuple`2" | "System.ValueTuple`3" | "System.ValueTuple`4" | "System.ValueTuple`5" | "System.ValueTuple`6" | "System.ValueTuple`7"),
@@ -7108,7 +7173,7 @@ and libraryCall
     let emptyItem =
         match info.GenericArgs with
         | [ only ] when only <> Fable.Any -> only
-        | _ -> Fable.Unit
+        | _ -> Fable.Any
 
     let args =
         args
@@ -7117,7 +7182,6 @@ and libraryCall
             | _ when file = "Seq" || file = "Async" || file = "Task" -> arg
             | Fable.Value(Fable.NewOption(None, Fable.Any, isStruct), r) ->
                 Fable.Value(Fable.NewOption(None, emptyItem, isStruct), r)
-            | Fable.Value(Fable.NewList(None, Fable.Any), r) -> Fable.Value(Fable.NewList(None, Fable.Unit), r)
             | Uncast inner when
                 (match arg.Type with
                  | Fable.DeclaredType(seq, _) -> seq.FullName = "System.Collections.Generic.IEnumerable`1"
@@ -7214,7 +7278,7 @@ and libraryCall
         |> Seq.sortWith (fun a b -> System.String.CompareOrdinal(a.Key, b.Key))
         |> Seq.map (fun kv ->
             match kv.Value with
-            | Fable.Any -> tVoid
+            | Fable.Any -> tAny
             | other -> mapType ctx r other
         )
         |> List.ofSeq
