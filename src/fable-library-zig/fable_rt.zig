@@ -5419,14 +5419,20 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
         pub const info: ExnType = .{
             .name = name,
             .destroy = destroy,
-            .message = if (Payload == Described) message else if (is_match_failure) matchMessage else null,
+            .message = if (Payload == Described) message else if (is_match_failure) matchMessage else if (@hasField(Payload, "fable_message")) classMessage else null,
             .parent = parent,
             .show = show,
-            .eql = if (Payload == Described) null else payloadEql,
-            .hash = if (Payload == Described) null else payloadHash,
+            // (an object of a class compares by reference, as on .NET)
+            .eql = if (Payload == Described or @hasField(Payload, "fable_message")) null else payloadEql,
+            .hash = if (Payload == Described or @hasField(Payload, "fable_message")) null else payloadHash,
             .set_inner = setInner,
             .inner = innerOf,
         };
+
+        /// (a class deriving from System.Exception: the message its base constructor was given)
+        pub fn classMessage(e: Exn) String {
+            return dup(of(e).fable_message);
+        }
 
         pub fn matchMessage(_: Exn) String {
             return str("The match cases were incomplete");

@@ -1049,6 +1049,16 @@ let isClassEntity (ent: Fable.Entity) =
         || ent.IsValueType
     )
 
+/// A class that derives from `System.Exception` (`inherit exn(message)`): an exception here,
+/// whose payload is its message and its fields
+let isExceptionClass (ent: Fable.Entity) =
+    isClassEntity ent
+    && (
+        match ent.BaseType with
+        | Some bt -> bt.Entity.FullName = "System.Exception"
+        | None -> false
+    )
+
 /// .NET's name of a type: `Probe+Circle` for a class in module `Probe`.
 let rec dotnetTypeName (com: Compiler) (ent: Fable.Entity) : string =
     match ent.DeclaringEntity with
@@ -1465,8 +1475,9 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
             match entRef.Path with
             | Fable.SourcePath _ ->
                 match ctx.Com.TryGetEntity entRef with
-                // (a struct is a value, not an object)
-                | Some ent when isClassEntity ent && not ent.IsValueType ->
+                // (a struct is a value, not an object; a class deriving from System.Exception is
+                // an exception)
+                | Some ent when isClassEntity ent && not ent.IsValueType && not (isExceptionClass ent) ->
                     let derives =
                         match ent.BaseType with
                         | Some bt -> bt.Entity.FullName <> "System.Object"
@@ -1639,7 +1650,7 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
         Some(dotnetExnEntIn ctx.State entRef.FullName)
     | _ ->
         match ctx.Com.TryGetEntity entRef with
-        | Some ent when ent.IsFSharpExceptionDeclaration ->
+        | Some ent when ent.IsFSharpExceptionDeclaration || isExceptionClass ent ->
             let name, isLocal =
                 match FSharp2Fable.Util.entityIdent ctx.Com entRef with
                 | Fable.IdentExpr id -> id.Name, true
@@ -1666,11 +1677,18 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
             ctx.State.Ents[entRef.FullName] <- e
 
             try
+                let fields =
+                    (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                    |> List.map (fun f -> f.Name, mapType ctx r (FableTransforms.uncurryType f.FieldType))
+
+                // (a class: its message first, which its base constructor was given)
                 e.Cases <-
                     [
                         "",
-                        (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
-                        |> List.map (fun f -> f.Name, mapType ctx r (FableTransforms.uncurryType f.FieldType))
+                        if isExceptionClass ent then
+                            ("fable_message", tStr) :: fields
+                        else
+                            fields
                     ]
             with _ ->
                 ctx.State.Ents.Remove entRef.FullName |> ignore
@@ -4767,6 +4785,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | None -> applyValue ctx r Map.empty (lw ctx applied) applied.Type args t
 
     // `record.Field <- value`
+    // (a property of an interface: by calling its setter, a field of its struct)
+    | Fable.Set(x, Fable.FieldSet name, _, value, r) when isInterfaceType ctx.Com x.Type ->
+        bindArgs
+            ctx
+            [ lw ctx x; lw ctx value ]
+            (fun xs ->
+                match caseFields (typeOf xs[0]) "" |> List.tryFind (fun (f, _) -> f = "set_" + name) with
+                | Some(f, fty) -> ECallClo(EGet(xs[0], PField f, fty), [ xs[1] ], tVoid)
+                | None -> fail r "the Zig target cannot find the setter of %s of this interface" name
+            )
     | Fable.Set(x, Fable.FieldSet name, t, value, r) ->
         bindArgs
             ctx
@@ -7165,6 +7193,46 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                      | None -> false)
                     ->
                     ()
+                // a class deriving from System.Exception: its constructor makes the exception,
+                // of the message given to the base constructor and its fields
+                | Some ent when isExceptionClass ent ->
+                    try
+                        tryExnEnt (newCtx c.Name) None c.Entity |> ignore
+
+                        let message =
+                            match c.BaseCall with
+                            | Some(Fable.Call(_, info, _, _)) ->
+                                match info.Args with
+                                | msg :: _ when msg.Type = Fable.String -> msg
+                                | _ ->
+                                    Fable.Value(
+                                        Fable.StringConstant $"Exception of type '%s{ent.FullName}' was thrown.",
+                                        None
+                                    )
+                            | _ ->
+                                Fable.Value(
+                                    Fable.StringConstant $"Exception of type '%s{ent.FullName}' was thrown.",
+                                    None
+                                )
+
+                        let fields =
+                            (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                            |> List.map (fun f -> f.Name)
+
+                        match c.Constructor with
+                        | Some ctor ->
+                            let finish (values: Fable.Expr list) =
+                                Fable.Value(Fable.NewRecord(message :: values, c.Entity, []), None)
+
+                            attached.Add { ctor with Body = constructorBodyWith fields finish ctor.Body }
+                        | None -> report None $"the Zig target needs a primary constructor of %s{c.Name}"
+
+                        for m in c.AttachedMembers do
+                            report
+                                m.Body.Range
+                                $"the Zig target does not support this kind of member of an exception class yet (%s{c.Name}.%s{m.Name})"
+                    with ZigError(msg, r) ->
+                        report r msg
                 | Some ent when
                     not (ent.IsFSharpExceptionDeclaration || ent.IsFSharpModule)
                     && (try
