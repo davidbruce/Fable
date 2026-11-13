@@ -4133,7 +4133,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             match forInSource ctx x with
             | Some(listExpr, "list") ->
                 bindArgs ctx [ listExpr ] (fun xs -> ECall(libraryTarget ctx "Seq" "ofList", [ itemTy ], xs, seqTy))
-            | _ -> fail e.Range "the Zig target cannot use a value of this type as a sequence yet (%A)" x.Type
+            | _ ->
+                match x.Type with
+                // (a value of a type parameter constrained to a sequence: what it is, Zig knows
+                // when it instantiates the function)
+                | Fable.GenericParam _ ->
+                    let seqModule =
+                        if System.IO.Path.GetFileNameWithoutExtension(ctx.Com.CurrentFile) = "Seq" then
+                            "@This()"
+                        else
+                            importAlias ctx (Fable.Transforms.AST.getLibPath ctx.Com "Seq")
+
+                    ctx.State.UsesRuntime <- true
+                    bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.flexSeq($R, $0, %s{seqModule})", xs, seqTy))
+                | _ -> fail e.Range "the Zig target cannot use a value of this type as a sequence yet (%A)" x.Type
 
     // an interface given where an interface it inherits is expected: the members that one has
     | Fable.TypeCast(x, (Fable.DeclaredType _ as ifaceType)) when

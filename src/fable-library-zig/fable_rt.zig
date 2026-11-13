@@ -5395,6 +5395,24 @@ pub fn uncaught() void {
 
 pub const Use = enum { plain, keep, give };
 
+/// A value of a type parameter constrained to a sequence (`#seq<'T>`, a flexible type) given
+/// where a sequence `S` is expected. Its type is known when Zig instantiates the function: the
+/// sequence itself, or the library's sequence over the array or list it is (`m` is the
+/// library's Seq module). The value is borrowed.
+pub fn flexSeq(comptime S: type, x: anytype, comptime m: type) Raised!S {
+    const T = @TypeOf(x);
+    if (comptime T == S) return dup(x);
+    if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) {
+        const I = @typeInfo(T).pointer.child.fable_array;
+        return across(m.ofArray(I).call, m.@"ofArray$sig", .{.keep}, .{x});
+    }
+    if (comptime @typeInfo(T) == .@"union" and @hasDecl(T, "fable_list")) {
+        const I = @FieldType(@typeInfo(@FieldType(T, "Cons")).pointer.child, "Head");
+        return across(m.ofList(I).call, m.@"ofList$sig", .{.keep}, .{x});
+    }
+    @compileError("fable: " ++ @typeName(T) ++ " is not a sequence the Zig target can walk yet");
+}
+
 pub inline fn across(
     comptime f: anytype,
     comptime sig: anytype,

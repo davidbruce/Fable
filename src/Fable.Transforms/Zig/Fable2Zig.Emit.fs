@@ -1265,6 +1265,28 @@ let emitFunction
             + bodyText
         | _ -> bodyText
 
+    // (the runtime's `cell` is inlined, so the work Zig does at compile time for each counts
+    // against the function's quota of backward branches: a literal of many cells, a 9 by 9
+    // list of lists, runs out of it)
+    let bodyText =
+        let cells =
+            let mutable n = 0
+            let mutable i = bodyText.IndexOf("fable_rt.cell(", System.StringComparison.Ordinal)
+
+            while i >= 0 do
+                n <- n + 1
+                i <- bodyText.IndexOf("fable_rt.cell(", i + 1, System.StringComparison.Ordinal)
+
+            n
+
+        if cells > 32 then
+            "    @setEvalBranchQuota("
+            + string (max 10000 (cells * 200))
+            + ");\n"
+            + bodyText
+        else
+            bodyText
+
     let sigParams =
         ps
         |> List.map (fun (s, _, p) -> $"%s{s}: %s{zigType p.Ty}")
