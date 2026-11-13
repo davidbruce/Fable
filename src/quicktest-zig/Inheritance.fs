@@ -82,6 +82,27 @@ type Labelled(name: string, label: string) =
 
 let size (a: IArea) = a.Size()
 
+type IBase =
+    abstract A: unit -> int
+
+type IDerived =
+    inherit IBase
+    abstract B: unit -> int
+
+type Both() =
+    interface IDerived with
+        member _.A() = 1
+        member _.B() = 2
+
+let viaDerived (x: IDerived) = x.A() + x.B()
+let viaBase (x: IBase) = x.A()
+
+let both =
+    { new IDerived with
+        member _.A() = 10
+        member _.B() = 20
+    }
+
 let total (shapes: Shape list) =
     shapes |> List.sumBy (fun s -> s.Area())
 
@@ -142,6 +163,12 @@ let run () : int =
         + check (tree = 4.0)
         + check (t.Count = 3)
         + same "Inheritance+Circle" (string (Circle 1.0))
+        + check (
+            viaDerived (Both()) = 3
+            && viaBase (Both()) = 1
+            && viaBase (Both() :> IDerived) = 1
+            && viaDerived both + viaBase both = 40
+        )
         + same
             "named abc|named xy|3|2"
             (string (Named "abc")

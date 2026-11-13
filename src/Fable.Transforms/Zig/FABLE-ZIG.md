@@ -89,7 +89,8 @@ most derived implementations. `base.M()` calls the parent's implementation direc
 walks the chain of classes; `:?>` raises `InvalidCastException` with .NET's message. A class's
 `ToString` override is in its type too, so `string x` finds it whatever the static type; without
 one the text is .NET's name of the class (`Probe+Circle`). An interface that a base class
-implements works on objects of derived classes. Objects are equal only to themselves, as on
+implements works on objects of derived classes. An interface that inherits interfaces has their
+members too, and is given where one of them is expected by taking those members. Objects are equal only to themselves, as on
 .NET.
 
 An interface value is a struct of function values, one per member (a property is a function of
@@ -103,8 +104,7 @@ member when a value is made an interface. `use` works with a class that implemen
 
 Not yet: generic classes that take part in inheritance, overloaded virtual members, object
 expressions that derive from a class, secondary constructors of derived classes, `this` in a
-constructor or an object expression, interfaces that inherit interfaces, generic interface
-members, type tests against interfaces at run time, `%A` of an object using its `ToString`, and
+constructor or an object expression, generic interface members, type tests against interfaces at run time, `%A` of an object using its `ToString`, and
 overrides of `Equals` and `GetHashCode`.
 
 A module-level value that is not a literal is computed when the program starts: every file

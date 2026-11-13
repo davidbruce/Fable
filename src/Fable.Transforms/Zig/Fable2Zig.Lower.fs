@@ -138,6 +138,39 @@ let private interfaceMembers (ent: Fable.Entity) : (string * Fable.Type list * F
     )
     |> List.ofSeq
 
+/// The members of an interface and of the interfaces it inherits, each with the full name of
+/// the interface that declares it (type arguments of an inherited generic interface are put in).
+let rec private allInterfaceMembers
+    (com: Compiler)
+    (ent: Fable.Entity)
+    (subst: Map<string, Fable.Type>)
+    : (string * string * Fable.Type list * Fable.Type) list
+    =
+    let rec sub (t: Fable.Type) =
+        match t with
+        | Fable.GenericParam(n, _, _) when subst.ContainsKey n -> subst[n]
+        | _ -> t.MapGenerics sub
+
+    let own =
+        interfaceMembers ent
+        |> List.map (fun (n, args, ret) -> ent.FullName, n, List.map sub args, sub ret)
+
+    let inherited =
+        ent.DeclaredInterfaces
+        |> Seq.toList
+        |> List.collect (fun d ->
+            match com.TryGetEntity d.Entity with
+            | Some b ->
+                let m =
+                    List.zip (b.GenericParameters |> List.map (fun g -> g.Name)) (d.GenericArgs |> List.map sub)
+                    |> Map.ofList
+
+                allInterfaceMembers com b m
+            | None -> []
+        )
+
+    own @ inherited |> List.distinctBy (fun (_, n, _, _) -> n)
+
 /// Does a record or union contain itself, directly or through other records and unions?
 /// With `throughUnions = false` the search stops at unions.
 let private reachesSelf (com: Compiler) (throughUnions: bool) (start: Fable.Entity) : bool =
@@ -1022,8 +1055,8 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 if ent.IsInterface then
                     [
                         "",
-                        interfaceMembers ent
-                        |> List.map (fun (name, args, ret) ->
+                        allInterfaceMembers ctx.Com ent Map.empty
+                        |> List.map (fun (_, name, args, ret) ->
                             name, TFn(args |> List.map (mapType ctx r), mapType ctx r ret)
                         )
                     ]
@@ -2309,6 +2342,40 @@ let private classPrefix
     =
     classPrefixWith ctx.Com (objInfo ctx r) (fun c -> (entOf ctx r c).Name) classRef iface
 
+/// The function that implements member `name` of interface `iface` for a class: the class's
+/// own, or the one of the nearest class above it that has one. (A member is implemented under
+/// the name of the interface written in `interface X with`, which may inherit `iface`.)
+let private interfaceImpl
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (classRef: Fable.EntityRef)
+    (iface: string)
+    (name: string)
+    : string
+    =
+    let classes =
+        match objInfo ctx r classRef with
+        | Some o -> ancestors o |> List.map (fun k -> k.Ref, k.Prefix)
+        | None -> [ classRef, (entOf ctx r classRef).Name ]
+
+    let found =
+        classes
+        |> List.tryPick (fun (ref, prefix) ->
+            match ctx.Com.TryGetEntity ref with
+            | Some ent ->
+                ent.MembersFunctionsAndValues
+                |> Seq.tryFind (fun m ->
+                    m.IsOverrideOrExplicitInterfaceImplementation
+                    && m.CompiledName.EndsWith("." + name, System.StringComparison.Ordinal)
+                )
+                |> Option.map (fun m -> implName prefix m.CompiledName)
+            | None -> None
+        )
+
+    match found with
+    | Some f -> f
+    | None -> implName (classPrefix ctx r classRef (Some iface)) (iface + "." + name)
+
 /// What the file emits for a class that takes part in inheritance that it declares.
 let private objDecl (com: Compiler) (r: SourceLocation option) (o: ObjInfo) (dotnetName: string) : ObjDecl =
     let classes = ancestors o |> List.rev
@@ -3247,8 +3314,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         match inner.Type with
         | Fable.DeclaredType(typeRef, genArgs) ->
-            let target =
-                implName (classPrefix ctx r typeRef (Some iface)) (iface + "." + imp.Selector)
+            let target = interfaceImpl ctx r typeRef iface imp.Selector
 
             let args =
                 match info.Args |> List.filter (fun a -> not (isUnit a.Type)) with
@@ -3333,6 +3399,24 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 bindArgs ctx [ listExpr ] (fun xs -> ECall(libraryTarget ctx "Seq" "ofList", [ itemTy ], xs, seqTy))
             | _ -> fail e.Range "the Zig target cannot use a value of this type as a sequence yet (%A)" x.Type
 
+    // an interface given where an interface it inherits is expected: the members that one has
+    | Fable.TypeCast(x, (Fable.DeclaredType _ as ifaceType)) when
+        isInterfaceType ctx.Com ifaceType
+        && isInterfaceType ctx.Com x.Type
+        && mapType ctx e.Range ifaceType <> mapType ctx e.Range x.Type
+        ->
+        let ifaceTy = mapType ctx e.Range ifaceType
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                let members =
+                    caseFields ifaceTy "" |> List.map (fun (f, fty) -> EGet(xs.Head, PField f, fty))
+
+                ECon(ifaceTy, "", members, None)
+            )
+
     // a value given where an interface is expected: each member, a function value that
     // holds the object
     | Fable.TypeCast(x, (Fable.DeclaredType(ifaceRef, _) as ifaceType)) when
@@ -3346,6 +3430,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 classPrefix ctx e.Range classRef (Some ifaceRef.FullName), genArgs |> List.map (mapType ctx e.Range)
             | other -> fail e.Range "the Zig target cannot make an interface of a value of this type yet (%A)" other
 
+        let classRef =
+            match x.Type with
+            | Fable.DeclaredType(classRef, _) -> classRef
+            | _ -> fail e.Range "internal: not a declared type"
+
         bindArgs
             ctx
             [ lw ctx x ]
@@ -3353,7 +3442,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 let members =
                     caseFields ifaceTy ""
                     |> List.map (fun (f, fty) ->
-                        EClosure(implName typeName (ifaceRef.FullName + "." + f), typeArgs, [ xs.Head ], fty)
+                        EClosure(interfaceImpl ctx e.Range classRef ifaceRef.FullName f, typeArgs, [ xs.Head ], fty)
                     )
 
                 ECon(ifaceTy, "", members, None)
