@@ -166,27 +166,31 @@ let tryCall (com: ICompiler) (ctx: Context) r t (info: CallInfo) (thisArg: Expr 
 /// A static field of .NET (`Decimal.MaxValue`): kept as a call of its getter, which the
 /// lowering resolves.
 let tryField (com: ICompiler) (returnTyp: Type) (ownerTyp: Type) (fieldName: string) : Expr option =
-    let owner =
-        match ownerTyp with
-        | Number(Decimal, _) -> Some "System.Decimal"
-        | DeclaredType(ent, _) -> Some ent.FullName
-        | _ -> None
+    match ownerTyp, fieldName with
+    | String, "Empty" -> Some(Value(StringConstant "", None))
+    | _ ->
 
-    owner
-    |> Option.map (fun owner ->
-        let callee =
-            Import(
-                {
-                    Selector = "get_" + fieldName
-                    Path = DotnetPrefix + owner
-                    Kind = LibraryImport(LibraryImportInfo.Create(isInstanceMember = false))
-                },
-                Any,
-                None
-            )
+        let owner =
+            match ownerTyp with
+            | Number(Decimal, _) -> Some "System.Decimal"
+            | DeclaredType(ent, _) -> Some ent.FullName
+            | _ -> None
 
-        Call(callee, makeCallInfo None [] [], returnTyp, None)
-    )
+        owner
+        |> Option.map (fun owner ->
+            let callee =
+                Import(
+                    {
+                        Selector = "get_" + fieldName
+                        Path = DotnetPrefix + owner
+                        Kind = LibraryImport(LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Any,
+                    None
+                )
+
+            Call(callee, makeCallInfo None [] [], returnTyp, None)
+        )
 
 let tryBaseConstructor
     (com: ICompiler)

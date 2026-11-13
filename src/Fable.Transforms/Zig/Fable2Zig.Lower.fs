@@ -2011,6 +2011,54 @@ let private (|PrintfCall|_|) (e: Fable.Expr) : (string * string * Fable.Expr lis
         | _ -> None
     | _ -> None
 
+/// `kprintf cont fmt args` as `cont (sprintf fmt args)`.
+let private kprintf
+    (imp: Fable.ImportInfo)
+    (info: Fable.CallInfo)
+    (args: Fable.Expr list)
+    (t: Fable.Type)
+    (r: SourceLocation option)
+    : Fable.Expr
+    =
+    let cont, fmtArg =
+        match info.Args with
+        | [ cont; fmtArg ] -> Some cont, fmtArg
+        | [ fmtArg ] -> None, fmtArg
+        | _ -> raise (ZigError("the Zig target does not support this kind of printf yet", r))
+
+    let toString =
+        Fable.Call(
+            Fable.Import(
+                { imp with
+                    Selector = "PrintFormatToString"
+                    Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.ExtraTopLevelOperators"
+                },
+                Fable.Any,
+                None
+            ),
+            { info with Args = [ fmtArg ] },
+            Fable.String,
+            r
+        )
+
+    let text =
+        if args.IsEmpty then
+            toString
+        else
+            Fable.CurriedApply(toString, args, Fable.String, r)
+
+    match cont with
+    | Some cont -> Fable.CurriedApply(cont, [ text ], t, r)
+    | None -> text
+
+/// Is this a culture or a format provider given to a .NET method (`CultureInfo.InvariantCulture`)?
+let private isCulture (x: Fable.Expr) =
+    match x.Type with
+    | Fable.DeclaredType(e, _) ->
+        e.FullName = "System.Globalization.CultureInfo"
+        || e.FullName = "System.IFormatProvider"
+    | _ -> false
+
 /// (for the names of the values of a printf that is used as a function)
 let mutable private printfValues = 0
 
@@ -3318,6 +3366,18 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 )
 
     // printf, sprintf, failwithf and interpolated strings: the format is taken apart here
+    // `Printf.kprintf cont fmt a b` and `ksprintf`: `cont (sprintf fmt a b)` (`Printf.sprintf`
+    // is `ksprintf id`)
+    | Fable.CurriedApply(Fable.Call(Fable.Import(imp, _, _), info, _, _), args, t, r) when
+        imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.PrintfModule"
+        && (imp.Selector = "PrintFormatThen" || imp.Selector = "PrintFormatToStringThen")
+        ->
+        lw ctx (kprintf imp info args t r)
+    | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
+        imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.PrintfModule"
+        && (imp.Selector = "PrintFormatThen" || imp.Selector = "PrintFormatToStringThen")
+        ->
+        lw ctx (kprintf imp info [] t r)
     | Fable.CurriedApply(Fable.CurriedApply(PrintfCall(selector, fmt, []), first, _, _), rest, t, r) ->
         formatted ctx r selector fmt (first @ rest) t
     // A printf that is not given all its values where it stands (`List.iter (printfn "%d") xs`)
@@ -3496,6 +3556,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.Array(_, Fable.MutableArray)
         | Fable.Array(_, Fable.ImmutableArray) ->
             bindArgs ctx [ lw ctx x ] (fun xs -> ECall(libraryTarget ctx "Seq" "ofArray", [ itemTy ], xs, seqTy))
+        // (a string: its chars)
+        | Fable.String ->
+            let chars = TEnt(arrayEnt ctx.State, [ TPrim "u16" ])
+            ctx.State.UsesRuntime <- true
+
+            bindArgs
+                ctx
+                [ lw ctx x ]
+                (fun xs ->
+                    bindArgs
+                        ctx
+                        [ ERt("fable_rt.strToChars($0)", xs, chars) ]
+                        (fun cs -> ECall(libraryTarget ctx "Seq" "ofArray", [ itemTy ], cs, seqTy))
+                )
         | _ ->
             match forInSource ctx x with
             | Some(listExpr, "list") ->
@@ -4681,8 +4755,10 @@ and dotnetCall
         | TPrim name -> name
         | _ -> fail r "internal: not a number type"
 
+    // (an enum's value is not a number argument: `IndexOf(c, StringComparison.Ordinal)`)
     let isInt (x: Fable.Expr) =
         match x.Type with
+        | Fable.Number(Int32, Fable.NumberInfo.IsEnum _) -> false
         | Fable.Number(Int32, _) -> true
         | _ -> false
 
@@ -5324,7 +5400,7 @@ and dotnetCall
     | "System.Text.StringBuilder", ".ctor", [] -> pure' "fable_rt.sbNew(null)" [] (mapType ctx r t)
     | "System.Text.StringBuilder", ".ctor", [ init ] when init.Type = Fable.String ->
         pure' "fable_rt.sbNew($0)" [ init ] (mapType ctx r t)
-    | "System.Text.StringBuilder", ("Append" | "AppendLine"), sb :: rest ->
+    | "System.Text.StringBuilder", ("Append" | "AppendLine"), sb :: rest when rest.Length <= 1 ->
         let f =
             if name = "Append" then
                 "sbAppend"
@@ -5350,32 +5426,41 @@ and dotnetCall
 
     // ---- Split, Join, Format ----
     | "System.String", "Split", s0 :: rest ->
-        let options =
-            match List.tryLast rest with
-            | Some o when rest.Length >= 2 -> Some o
-            | _ -> None
+        // (separators, then a count of parts (a number), then options (an enum))
+        let isEnum (x: Fable.Expr) =
+            match x.Type with
+            | Fable.Number(_, Fable.NumberInfo.IsEnum _) -> true
+            | _ -> false
 
-        let sepArg =
+        let sepArg, more =
             match rest with
-            | [] -> None
-            | x :: _ -> Some x
+            | [] -> None, []
+            | x :: more -> Some x, more
 
-        let opts = options |> Option.map (lw ctx) |> Option.defaultValue (ELit("0", tI32))
+        let count =
+            match more with
+            | c :: _ when not (isEnum c) -> lw ctx c
+            | _ -> ELit("2147483647", tI32)
+
+        let opts =
+            match more |> List.tryFind isEnum with
+            | Some o -> lw ctx o
+            | None -> ELit("0", tI32)
 
         let call macro (xs: Fable.Expr list) =
             ctx.State.UsesRuntime <- true
 
             bindArgs
                 ctx
-                (s0 :: xs |> List.map (lw ctx) |> fun l -> l @ [ opts ])
+                (s0 :: xs |> List.map (lw ctx) |> fun l -> l @ [ count; opts ])
                 (fun irs -> ERt(macro, irs, mapType ctx r t))
 
         match sepArg |> Option.map (fun a -> a, a.Type) with
-        | None -> call "fable_rt.strSplitChars($0, &.{}, @intCast($1))" []
-        | Some(c, Fable.Char) -> call "fable_rt.strSplitChars($0, &.{ $1 }, @intCast($2))" [ c ]
-        | Some(a, Fable.Array(Fable.Char, _)) -> call "fable_rt.strSplitChars($0, $1.items, @intCast($2))" [ a ]
-        | Some(sep, Fable.String) -> call "fable_rt.strSplitString($0, $1, @intCast($2))" [ sep ]
-        | Some(a, Fable.Array(Fable.String, _)) -> call "fable_rt.strSplitStrings($0, $1.items, @intCast($2))" [ a ]
+        | None -> call "fable_rt.strSplitChars($0, &.{}, $1, @intCast($2))" []
+        | Some(c, Fable.Char) -> call "fable_rt.strSplitChars($0, &.{ $1 }, $2, @intCast($3))" [ c ]
+        | Some(a, Fable.Array(Fable.Char, _)) -> call "fable_rt.strSplitChars($0, $1.items, $2, @intCast($3))" [ a ]
+        | Some(sep, Fable.String) -> call "fable_rt.strSplitString($0, $1, $2, @intCast($3))" [ sep ]
+        | Some(a, Fable.Array(Fable.String, _)) -> call "fable_rt.strSplitStrings($0, $1.items, $2, @intCast($3))" [ a ]
         | _ -> fail r "the Zig target does not support this String.Split yet"
     | "System.String", "Join", [ sep; items ]
     | "Microsoft.FSharp.Core.StringModule", "Concat", [ sep; items ] when sep.Type = Fable.String ->
@@ -5406,6 +5491,139 @@ and dotnetCall
         bindArgs ctx [ lw ctx sep; listIr ] (fun xs -> EEmit("fable_rt.joinList($0, $1)", xs, tStr))
     | "System.String", "Format", (Fable.Value(Fable.StringConstant fmt, _)) :: values ->
         compositeFormat ctx r fmt values t
+    // (a culture changes nothing here: formatting is the invariant culture's)
+    | "System.String", "Format", culture :: (Fable.Value(Fable.StringConstant fmt, _)) :: values when isCulture culture ->
+        compositeFormat ctx r fmt values t
+    | "System.Text.StringBuilder", "AppendFormat", sb :: rest ->
+        let rest =
+            match rest with
+            | culture :: more when isCulture culture -> more
+            | _ -> rest
+
+        match rest with
+        | (Fable.Value(Fable.StringConstant fmt, _)) :: values ->
+            bindArgs
+                ctx
+                [ lw ctx sb; compositeFormat ctx r fmt values Fable.String ]
+                (fun xs -> EEmit("fable_rt.sbAppend($0, $1)", xs, mapType ctx r t))
+        | _ -> fail r "the Zig target needs the format of AppendFormat to be a literal"
+    | _, "ToString", [ x; culture ] when isCulture culture ->
+        dotnetCall
+            ctx
+            r
+            "Microsoft.FSharp.Core.Operators"
+            "ToString"
+            { info with
+                Args = [ x ]
+                ThisArg = None
+            }
+            t
+    | "System.String", "LastIndexOf", [ s; x; start ] when x.Type = Fable.Char && isInt start ->
+        rt "fable_rt.strLastIndexOfCharFrom($0, $1, $2)" [ s; x; start ] tI32
+    | "System.String", "LastIndexOf", [ s; x; start ] when x.Type = Fable.String && isInt start ->
+        rt "fable_rt.strLastIndexOfFrom($0, $1, $2)" [ s; x; start ] tI32
+    | "System.String", "LastIndexOf", [ s; x; Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 4, _), _) ] when
+        x.Type = Fable.String
+        ->
+        rt "fable_rt.strLastIndexOf($0, $1)" [ s; x ] tI32
+    | "System.String",
+      "LastIndexOf",
+      [ s; x; start; Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 4, _), _) ] when x.Type = Fable.String ->
+        rt "fable_rt.strLastIndexOfFrom($0, $1, $2)" [ s; x; start ] tI32
+    | "System.String", "IndexOf", [ s; x; start; Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 4, _), _) ] when
+        x.Type = Fable.String
+        ->
+        rt "fable_rt.strIndexOf($0, $1, $2)" [ s; x; start ] tI32
+    | "System.String", "IndexOfAny", [ s; Uncast chars ] ->
+        rt "fable_rt.strIndexOfAny($0, $1, 0, null)" [ s; chars ] tI32
+    | "System.String", "IndexOfAny", [ s; Uncast chars; start ] ->
+        rt "fable_rt.strIndexOfAny($0, $1, $2, null)" [ s; chars; start ] tI32
+    | "System.String", "IndexOfAny", [ s; Uncast chars; start; count ] ->
+        rt "fable_rt.strIndexOfAny($0, $1, $2, $3)" [ s; chars; start; count ] tI32
+    | "System.String", ("Trim" | "TrimStart" | "TrimEnd"), [ s; Uncast chars ] when
+        (match chars.Type with
+         | Fable.Array(Fable.Char, _) -> true
+         | _ -> false)
+        ->
+        let ends =
+            match name with
+            | "Trim" -> "true, true"
+            | "TrimStart" -> "true, false"
+            | _ -> "false, true"
+
+        rt $"fable_rt.strTrimAny($0, %s{ends}, $1)" [ s; chars ] tStr
+    | "System.String", ("Trim" | "TrimStart" | "TrimEnd"), s :: chars when
+        chars.Length > 1 && chars |> List.forall (fun c -> c.Type = Fable.Char)
+        ->
+        let arr =
+            Fable.Value(Fable.NewArray(Fable.ArrayValues chars, Fable.Char, Fable.MutableArray), r)
+
+        dotnetCall
+            ctx
+            r
+            entity
+            name
+            { info with
+                Args = [ arr ]
+                ThisArg = Some s
+            }
+            t
+    | "System.String", "ToCharArray", [ s; start; n ] ->
+        rt "fable_rt.strToCharsRange($0, $1, $2)" [ s; start; n ] (mapType ctx r t)
+    | "System.String", ".ctor", [ Uncast chars; start; n ] when
+        (match chars.Type with
+         | Fable.Array(Fable.Char, _) -> true
+         | _ -> false)
+        ->
+        rt "fable_rt.strOfCharsRange($0, $1, $2)" [ chars; start; n ] tStr
+    | "System.String", "Join", [ sep; Uncast values; start; n ] when
+        (match values.Type with
+         | Fable.Array(Fable.String, _) -> true
+         | _ -> false)
+        ->
+        rt "fable_rt.strJoinRange($0, $1, $2, $3)" [ sep; values; start; n ] tStr
+    | "System.String",
+      "Compare",
+      [ a; ia; b; ib; n; Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 kind, _), _) ] when
+        kind = 4 || kind = 5
+        ->
+        rt
+            (if kind = 5 then
+                 "fable_rt.strCompareRange($0, $1, $2, $3, $4, true)"
+             else
+                 "fable_rt.strCompareRange($0, $1, $2, $3, $4, false)")
+            [ a; ia; b; ib; n ]
+            tI32
+    // (`String.Concat` of a sequence, a list or an array of strings: their join)
+    | "System.String", "Concat", [ Uncast values ] when values.Type <> Fable.String ->
+        dotnetCall
+            ctx
+            r
+            "System.String"
+            "Join"
+            { info with
+                Args = [ Fable.Value(Fable.StringConstant "", None); values ]
+                ThisArg = None
+            }
+            t
+    | "Microsoft.FSharp.Core.Operators.OperatorIntrinsics", "GetStringSlice", [ s; lo; hi ] ->
+        rt "fable_rt.strSliceRange($0, $1, $2)" [ s; lo; hi ] tStr
+    | "System.Environment", "get_NewLine", [] -> pure' "fable_rt.newLine()" [] tStr
+    | "System.Uri", "EscapeDataString", [ s ] -> rt "fable_rt.uriEscape($0, false)" [ s ] tStr
+    | "System.Uri", "EscapeUriString", [ s ] -> rt "fable_rt.uriEscape($0, true)" [ s ] tStr
+    | "System.Uri", "UnescapeDataString", [ s ] -> rt "fable_rt.uriUnescape($0)" [ s ] tStr
+    | "System.Text.StringBuilder", ("get_Chars" | "get_Item"), [ sb; i ] ->
+        rt "fable_rt.sbCharAt($0, $1)" [ sb; i ] (TPrim "u16")
+    | "System.Text.StringBuilder", ("set_Chars" | "set_Item"), [ sb; i; c ] ->
+        rt "fable_rt.sbSetChar($0, $1, $2)" [ sb; i; c ] tVoid
+    | "System.Text.StringBuilder", "ToString", [ sb; start; n ] ->
+        rt "fable_rt.sbToStringRange($0, $1, $2)" [ sb; start; n ] tStr
+    | "System.Text.StringBuilder", "Replace", [ sb; a; b ] when a.Type = Fable.Char ->
+        pure' "fable_rt.sbReplaceChar($0, $1, $2)" [ sb; a; b ] (mapType ctx r t)
+    | "System.Text.StringBuilder", "Append", [ sb; c; n ] when c.Type = Fable.Char && isInt n ->
+        rt "fable_rt.sbAppendRepeat($0, $1, $2)" [ sb; c; n ] (mapType ctx r t)
+    | "System.Text.StringBuilder", "Replace", [ sb; a; b ] when a.Type = Fable.String ->
+        rt "fable_rt.sbReplace($0, $1, $2)" [ sb; a; b ] (mapType ctx r t)
     | "System.String", "ToCharArray", [ s0 ] -> rt "fable_rt.strToChars($0)" [ s0 ] (mapType ctx r t)
     | "System.String", ".ctor", [ chars ] when
         (match chars.Type with
@@ -5446,7 +5664,9 @@ and dotnetCall
             | "Equals" -> pure' "fable_rt.strEql($0, $1)" [ a; b ] tBool
             | "StartsWith" -> rt "fable_rt.strStartsWith($0, $1)" [ a; b ] tBool
             | "EndsWith" -> rt "fable_rt.strEndsWith($0, $1)" [ a; b ] tBool
+            | "IndexOf" when b.Type = Fable.Char -> rt "fable_rt.strIndexOfChar($0, $1, 0)" [ a; b ] tI32
             | "IndexOf" -> rt "fable_rt.strIndexOf($0, $1, 0)" [ a; b ] tI32
+            | "Contains" when b.Type = Fable.Char -> rt "fable_rt.strContainsChar($0, $1)" [ a; b ] tBool
             | "Contains" -> rt "fable_rt.strContains($0, $1)" [ a; b ] tBool
             | _ -> pure' "fable_rt.strCompare($0, $1)" [ a; b ] tI32
         | 5 ->
@@ -6094,6 +6314,9 @@ and dotnetCall
         pure' (zig.Replace("$0", "@as($R, $0)")) [ x ] (mapType ctx r x.Type)
     | ("Microsoft.FSharp.Core.Operators" | "System.Math"), ("Atan2" | "Atan2"), [ y; x ] ->
         pure' "std.math.atan2(@as(f64, $0), @as(f64, $1))" [ y; x ] tF64
+    // `char "a"` and `Char.Parse "a"`: a string of exactly one char
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), "ToChar", [ x ]
+    | "System.Char", "Parse", [ x ] when x.Type = Fable.String -> rt "fable_rt.strToChar($0)" [ x ] (TPrim "u16")
     // text to numbers: F#'s conversions read `0x`, `0o`, `0b` and `_`; .NET's `Parse` does not
     | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when
         name.StartsWith("To", System.StringComparison.Ordinal) && x.Type = Fable.String

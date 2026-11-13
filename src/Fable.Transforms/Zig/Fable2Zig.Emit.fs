@@ -998,8 +998,11 @@ and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
 
 /// Zig rejects a parameter that is never used.
 let ensureUsed (names: string list) (body: string) =
+    // (a name inside a string literal is not a use of it)
+    let code = Regex.Replace(body, "\"(?:[^\"\\\\]|\\\\.)*\"", "\"\"")
+
     names
-    |> List.filter (fun n -> not (Regex.IsMatch(body, $@"(?<![\w.])%s{Regex.Escape n}\b")))
+    |> List.filter (fun n -> not (Regex.IsMatch(code, $@"(?<![\w.])%s{Regex.Escape n}\b")))
     |> List.map (fun n -> $"    _ = %s{n};\n")
     |> String.concat ""
 

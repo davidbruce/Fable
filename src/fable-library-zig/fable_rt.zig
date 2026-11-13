@@ -5423,6 +5423,9 @@ fn writeNet(out: *TextBuilder, x: anytype) void {
     }
     if (T == u16) return out.addOne(x);
     if (T == Obj) return out.addAscii(x.type.name);
+    // (`Append(chars)`: the chars; `Append(builder)`: what it holds)
+    if (comptime T == Array(u16)) return out.add(x.items);
+    if (comptime T == StringBuilder) return out.add(x.units.items);
     if (T == Exn) {
         const m = exnMessage(x);
         defer drop(m);
@@ -5606,12 +5609,16 @@ fn splitDone(parts: *std.ArrayList(String)) Array(String) {
 
 /// `s.Split(chars, options)`: by any of the chars (white space if there are none). `options`
 /// is .NET's StringSplitOptions: 1 removes empty parts, 2 trims each part.
-pub fn strSplitChars(s: String, chars: []const u16, options: i32) Raised!Array(String) {
+pub fn strSplitChars(s: String, chars: []const u16, count: i32, options: i32) Raised!Array(String) {
     const p = s orelse return nullRef();
     const u = p.units();
     var parts: std.ArrayList(String) = .empty;
+    if (count < 0) return raise(ArgumentOutOfRangeException, str("Count cannot be less than zero. (Parameter 'count')"));
+    if (count == 0) return splitDone(&parts);
     var start: usize = 0;
     for (u, 0..) |c, i| {
+        // (`count` parts at most: the last is the rest of the string)
+        if (parts.items.len + 1 == count) break;
         const sep = if (chars.len == 0) unicode.isWhiteSpace(c) else std.mem.indexOfScalar(u16, chars, c) != null;
         if (sep) {
             splitPush(&parts, u[start..i], options & 1 != 0, options & 2 != 0);
@@ -5623,13 +5630,16 @@ pub fn strSplitChars(s: String, chars: []const u16, options: i32) Raised!Array(S
 }
 
 /// `s.Split(separators, options)` by strings (the first that matches at each place).
-pub fn strSplitStrings(s: String, separators: []const String, options: i32) Raised!Array(String) {
+pub fn strSplitStrings(s: String, separators: []const String, count: i32, options: i32) Raised!Array(String) {
     const p = s orelse return nullRef();
     const u = p.units();
     var parts: std.ArrayList(String) = .empty;
+    if (count < 0) return raise(ArgumentOutOfRangeException, str("Count cannot be less than zero. (Parameter 'count')"));
+    if (count == 0) return splitDone(&parts);
     var start: usize = 0;
     var i: usize = 0;
     outer: while (i < u.len) {
+        if (parts.items.len + 1 == count) break;
         for (separators) |sepStr| {
             const sep = unitsOf(sepStr);
             if (sep.len != 0 and std.mem.startsWith(u16, u[i..], sep)) {
@@ -5645,8 +5655,15 @@ pub fn strSplitStrings(s: String, separators: []const String, options: i32) Rais
     return splitDone(&parts);
 }
 
-pub fn strSplitString(s: String, separator: String, options: i32) Raised!Array(String) {
-    return strSplitStrings(s, &.{separator}, options);
+pub fn strSplitString(s: String, separator: String, count: i32, options: i32) Raised!Array(String) {
+    return strSplitStrings(s, &.{separator}, count, options);
+}
+
+/// `char s` and `Char.Parse s`: a string of exactly one char
+pub fn strToChar(s: String) Raised!u16 {
+    const p = s orelse return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
+    if (p.len != 1) return raise(FormatException, str("String must be exactly one character long."));
+    return p.units()[0];
 }
 
 /// `s.ToCharArray()`
@@ -5661,6 +5678,254 @@ pub fn strToChars(s: String) Raised!Array(u16) {
 /// `String(chars)`
 pub fn strOfChars(a: Array(u16)) String {
     return strFrom(a.items);
+}
+
+// ---- more of System.String and StringBuilder ----
+
+const last_range = "Index was out of range. Must be non-negative and less than the size of the collection.";
+
+/// `s.LastIndexOf(c, start)`: the last at or before `start`
+pub fn strLastIndexOfCharFrom(s: String, c: u16, start: i32) Raised!i32 {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    if (u.len == 0) return -1;
+    if (start < 0 or start >= u.len) return argRange("startIndex", last_range);
+    const at = std.mem.lastIndexOfScalar(u16, u[0 .. @as(usize, @intCast(start)) + 1], c) orelse return -1;
+    return @intCast(at);
+}
+
+/// `s.LastIndexOf(value, start)`: the last that ends at or before `start`
+pub fn strLastIndexOfFrom(s: String, value: String, start: i32) Raised!i32 {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    const u = p.units();
+    if (v.len == 0) return @min(start + 1, @as(i32, @intCast(u.len)));
+    if (u.len == 0) return -1;
+    if (start < 0 or start >= u.len) return argRange("startIndex", last_range);
+    const at = std.mem.lastIndexOf(u16, u[0 .. @as(usize, @intCast(start)) + 1], v.units()) orelse return -1;
+    return @intCast(at);
+}
+
+/// `s.IndexOfAny(chars, start, count)`
+pub fn strIndexOfAny(s: String, chars: Array(u16), start: i32, count: ?i32) Raised!i32 {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    if (start < 0 or start > u.len) return argRange("startIndex", index_range);
+    const n = count orelse @as(i32, @intCast(u.len)) - start;
+    if (n < 0 or start + n > u.len) return argRange("count", "Count must be positive and count must refer to a location within the string/array/collection.");
+    for (u[@intCast(start)..][0..@intCast(n)], 0..) |c, i| {
+        if (std.mem.indexOfScalar(u16, chars.items, c) != null) return start + @as(i32, @intCast(i));
+    }
+    return -1;
+}
+
+/// `s.Trim(chars)`, `TrimStart(chars)`, `TrimEnd(chars)`: no chars is white space
+pub fn strTrimAny(s: String, comptime start: bool, comptime end: bool, chars: Array(u16)) Raised!String {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    const set = chars.items;
+    var from: usize = 0;
+    var to: usize = u.len;
+    const trimmed_ = struct {
+        fn is(c: u16, cs: []const u16) bool {
+            return if (cs.len == 0) unicode.isWhiteSpace(c) else std.mem.indexOfScalar(u16, cs, c) != null;
+        }
+    };
+    if (start) {
+        while (from < to and trimmed_.is(u[from], set)) from += 1;
+    }
+    if (end) {
+        while (to > from and trimmed_.is(u[to - 1], set)) to -= 1;
+    }
+    return strSlice(s, from, to - from);
+}
+
+/// `s.ToCharArray(start, length)`
+pub fn strToCharsRange(s: String, start: i32, n: i32) Raised!Array(u16) {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    if (start < 0 or n < 0 or start + n > u.len) return argRange("startIndex", index_range);
+    const items = allocator.alloc(u16, @intCast(n)) catch @panic("fable: out of memory");
+    @memcpy(items, u[@intCast(start)..][0..@intCast(n)]);
+    return arrayFrom(Array(u16), items);
+}
+
+/// `String(chars, start, length)`
+pub fn strOfCharsRange(chars: Array(u16), start: i32, n: i32) Raised!String {
+    if (start < 0 or n < 0 or start + n > chars.items.len) return argRange("startIndex", index_range);
+    return strFrom(chars.items[@intCast(start)..][0..@intCast(n)]);
+}
+
+/// `String.Join(separator, values, start, count)`
+pub fn strJoinRange(sep: String, values: Array(String), start: i32, n: i32) Raised!String {
+    if (start < 0 or n < 0 or start + n > values.items.len) return argRange("startIndex", index_range);
+    var b: TextBuilder = .{};
+    for (values.items[@intCast(start)..][0..@intCast(n)], 0..) |v, i| {
+        if (i > 0) b.add(unitsOf(sep));
+        b.add(unitsOf(v));
+    }
+    return b.finish();
+}
+
+/// `String.Compare(a, ia, b, ib, length, comparison)`: by code unit (and case), as .NET's
+/// ordinal comparisons, which give the difference of the first units that differ
+pub fn strCompareRange(a: String, ia: i32, b: String, ib: i32, length: i32, ignore_case: bool) Raised!i32 {
+    const x = unitsOf(a);
+    const y = unitsOf(b);
+    if (ia < 0 or ib < 0 or length < 0) return argRange("length", "Value must be positive.");
+    const xs = x[@min(@as(usize, @intCast(ia)), x.len)..];
+    const ys = y[@min(@as(usize, @intCast(ib)), y.len)..];
+    const nx = @min(xs.len, @as(usize, @intCast(length)));
+    const ny = @min(ys.len, @as(usize, @intCast(length)));
+    for (xs[0..@min(nx, ny)], ys[0..@min(nx, ny)]) |c0, d0| {
+        const c = if (ignore_case) unicode.toUpper(c0) else c0;
+        const d = if (ignore_case) unicode.toUpper(d0) else d0;
+        if (c != d) return @as(i32, c) - @as(i32, d);
+    }
+    return @as(i32, @intCast(nx)) - @as(i32, @intCast(ny));
+}
+
+/// `s.[lo..hi]`: what of it is inside the string
+pub fn strSliceRange(s: String, lo: ?i32, hi: ?i32) Raised!String {
+    const p = s orelse return nullRef();
+    const len: i32 = @intCast(p.len);
+    const from: i32 = @max(lo orelse 0, 0);
+    const to: i32 = @min(hi orelse len - 1, len - 1);
+    if (to < from) return str("");
+    return strSlice(s, @intCast(from), @intCast(to - from + 1));
+}
+
+/// `Environment.NewLine`
+pub fn newLine() String {
+    return if (builtin.os.tag == .windows) str("\r\n") else str("\n");
+}
+
+fn isUnreserved(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
+}
+
+/// `Uri.EscapeDataString s` (`uri`: `EscapeUriString`, which keeps what a URI uses as syntax)
+pub fn uriEscape(s: String, comptime uri: bool) Raised!String {
+    const p = s orelse return argNull("stringToEscape");
+    var utf8: std.ArrayList(u8) = .empty;
+    defer utf8.deinit(allocator);
+    var it = std.unicode.Utf16LeIterator.init(p.units());
+    while (it.nextCodepoint() catch null) |cp| {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &buf) catch 0;
+        utf8.appendSlice(allocator, buf[0..n]) catch @panic("fable: out of memory");
+    }
+    var b: TextBuilder = .{};
+    for (utf8.items) |c| {
+        const keep = isUnreserved(c) or (uri and std.mem.indexOfScalar(u8, ":/?#[]@!$&'()*+,;=", c) != null);
+        if (keep) {
+            b.addOne(c);
+        } else {
+            var hex: [3]u8 = undefined;
+            _ = std.fmt.bufPrint(&hex, "%{X:0>2}", .{c}) catch unreachable;
+            b.addAscii(&hex);
+        }
+    }
+    return b.finish();
+}
+
+/// `Uri.UnescapeDataString s`: %XX sequences of UTF-8 decoded; anything else kept
+pub fn uriUnescape(s: String) Raised!String {
+    const p = s orelse return argNull("stringToUnescape");
+    const u = p.units();
+    var b: TextBuilder = .{};
+    var i: usize = 0;
+    while (i < u.len) {
+        if (u[i] == '%') {
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(allocator);
+            var j = i;
+            while (j + 2 < u.len + 0 and u[j] == '%' and j + 2 < u.len + 1) {
+                if (j + 2 >= u.len) break;
+                const hi = std.fmt.charToDigit(@intCast(@min(u[j + 1], 127)), 16) catch break;
+                const lo = std.fmt.charToDigit(@intCast(@min(u[j + 2], 127)), 16) catch break;
+                bytes.append(allocator, hi * 16 + lo) catch @panic("fable: out of memory");
+                j += 3;
+            }
+            if (bytes.items.len == 0) {
+                b.addOne(u[i]);
+                i += 1;
+                continue;
+            }
+            if (std.unicode.utf8ValidateSlice(bytes.items)) {
+                var view = std.unicode.Utf8View.initUnchecked(bytes.items).iterator();
+                while (view.nextCodepoint()) |cp| {
+                    if (cp >= 0x10000) {
+                        const v = cp - 0x10000;
+                        b.addOne(@intCast(0xD800 + (v >> 10)));
+                        b.addOne(@intCast(0xDC00 + (v & 0x3FF)));
+                    } else b.addOne(@intCast(cp));
+                }
+            } else {
+                for (u[i..j]) |c| b.addOne(c);
+            }
+            i = j;
+        } else {
+            b.addOne(u[i]);
+            i += 1;
+        }
+    }
+    return b.finish();
+}
+
+/// `sb.[i]` / `sb.Chars(i)`
+pub fn sbCharAt(sb: StringBuilder, i: i32) Raised!u16 {
+    if (i < 0 or i >= sb.units.items.len) return raise(IndexOutOfRangeException, str("Index was outside the bounds of the array."));
+    return sb.units.items[@intCast(i)];
+}
+
+/// `sb.[i] <- c`
+pub fn sbSetChar(sb: StringBuilder, i: i32, c: u16) Raised!void {
+    if (i < 0 or i >= sb.units.items.len) return raise(ArgumentOutOfRangeException, str("Index was out of range. Must be non-negative and less than the size of the collection. (Parameter 'index')"));
+    sb.units.items[@intCast(i)] = c;
+}
+
+/// `sb.ToString(start, length)`
+pub fn sbToStringRange(sb: StringBuilder, start: i32, n: i32) Raised!String {
+    const u = sb.units.items;
+    if (start < 0 or n < 0 or start + n > u.len) return argRange("startIndex", index_range);
+    return strFrom(u[@intCast(start)..][0..@intCast(n)]);
+}
+
+/// `sb.Append(c, count)`
+pub fn sbAppendRepeat(sb: StringBuilder, c: u16, n: i32) Raised!StringBuilder {
+    if (n < 0) return argRange("repeatCount", "Count cannot be less than zero.");
+    sb.units.appendNTimes(allocator, c, @intCast(n)) catch @panic("fable: out of memory");
+    return dup(sb);
+}
+
+/// `sb.Replace(oldChar, newChar)`
+pub fn sbReplaceChar(sb: StringBuilder, old: u16, new_: u16) StringBuilder {
+    for (sb.units.items) |*c| {
+        if (c.* == old) c.* = new_;
+    }
+    return dup(sb);
+}
+
+/// `sb.Replace(old, new)`
+pub fn sbReplace(sb: StringBuilder, old: String, new_: String) Raised!StringBuilder {
+    const o = unitsOf(old);
+    if (o.len == 0) return raise(ArgumentException, str("String cannot be of zero length. (Parameter 'oldValue')"));
+    var out: std.ArrayList(u16) = .empty;
+    const u = sb.units.items;
+    var i: usize = 0;
+    while (i < u.len) {
+        if (i + o.len <= u.len and std.mem.eql(u16, u[i..][0..o.len], o)) {
+            out.appendSlice(allocator, unitsOf(new_)) catch @panic("fable: out of memory");
+            i += o.len;
+        } else {
+            out.append(allocator, u[i]) catch @panic("fable: out of memory");
+            i += 1;
+        }
+    }
+    sb.units.deinit(allocator);
+    sb.units = out;
+    return dup(sb);
 }
 
 fn foldUnits(a: []const u16, b: []const u16) bool {
@@ -7642,10 +7907,10 @@ test ".NET's ToString, Split, StringBuilder, categories" {
     try expectText("Some(1)|(1, a)|[1; 2; 3; ... ]|[a]", format(.{
         toText(@as(?i32, 1)), "|", toText(@as(struct { i32, String }, .{ 1, str("a") })), "|", toText(listOf(i32, &.{ 1, 2, 3, 4 })), "|", toText(listOf(String, &.{str("a")})),
     }));
-    try expectAny("[|\"a\"; \"b\"; \"\"; \"c\"|]", try strSplitChars(str("a,b,,c"), &.{','}, 0));
-    try expectAny("[|\"a\"; \"b\"|]", try strSplitChars(str("a,,b"), &.{','}, 1));
-    try expectAny("[|\"a\"; \"b\"; \"c\"|]", try strSplitString(str("a--b--c"), str("--"), 0));
-    try expectAny("[|\"a\"; \"b\"; \"c\"|]", try strSplitChars(str("a b\tc"), &.{}, 0));
+    try expectAny("[|\"a\"; \"b\"; \"\"; \"c\"|]", try strSplitChars(str("a,b,,c"), &.{','}, std.math.maxInt(i32), 0));
+    try expectAny("[|\"a\"; \"b\"|]", try strSplitChars(str("a,,b"), &.{','}, std.math.maxInt(i32), 1));
+    try expectAny("[|\"a\"; \"b\"; \"c\"|]", try strSplitString(str("a--b--c"), str("--"), std.math.maxInt(i32), 0));
+    try expectAny("[|\"a\"; \"b\"; \"c\"|]", try strSplitChars(str("a b\tc"), &.{}, std.math.maxInt(i32), 0));
     const sb = sbNew(str(""));
     drop(sbAppend(sb, str("a")));
     drop(sbAppend(sb, @as(i32, 1)));
