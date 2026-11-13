@@ -54,9 +54,10 @@ Types that are plain values, also when another file declares them:
 
 with construction, copy-and-update, field access, pattern matching and structural equality.
 A record, union, tuple or option that holds a recursive union is still a plain value; the
-references inside it are counted. Not yet: ordering comparison of anything
-but numbers, chars, booleans and strings, and the functions of the `List` module (literals, `::`,
-patterns, `IsEmpty`, `Head` and `Tail` work).
+references inside it are counted. `compare`, `<`, `max`, `min` and `hash` work on every
+value as F# defines them: records and tuples field by field, unions by case then field,
+`None` first, lists item by item, arrays by length then item; `fable_rt.compare` and
+`fable_rt.hash` walk the Zig types. `Result` is a union of the runtime library.
 
 Members on records and unions are functions whose first argument is the object: properties,
 methods (also curried, also used as function values), static members, the operators a type
@@ -239,6 +240,10 @@ from the signature of the FSharp.Core function and given in the order of the nam
 library function declares its type parameters, with FSharp.Core's names, in that order
 (`fold<'State, 'T>`). A library function is named as FSharp.Core compiles it, with a small
 first letter (`mapIndexed` for `List.mapi`).
+
+So far: `List.fs` (the `List` module, sorting included: a merge sort, stable as F#'s),
+`Option.fs` and `Result.fs`. An empty value whose item type F# left open (`Option.isNone
+None`, where .NET has `obj`) is given `unit`.
 
 ## Arrays
 

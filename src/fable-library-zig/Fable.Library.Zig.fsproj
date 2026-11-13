@@ -9,6 +9,8 @@
   <ItemGroup>
     <Compile Include="Global.fs" />
     <Compile Include="List.fs" />
+    <Compile Include="Option.fs" />
+    <Compile Include="Result.fs" />
   </ItemGroup>
 
   <ItemGroup>

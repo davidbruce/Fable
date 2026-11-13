@@ -19,6 +19,7 @@
     <Compile Include="Members.fs" />
     <Compile Include="Values.fs" />
     <Compile Include="Lists.fs" />
+    <Compile Include="Order.fs" />
     <Compile Include="QuickTest.fs" />
   </ItemGroup>
   <ItemGroup>

@@ -346,3 +346,4 @@ let main _ =
     + Members.run ()
     + Values.run ()
     + Lists.run ()
+    + Order.run ()

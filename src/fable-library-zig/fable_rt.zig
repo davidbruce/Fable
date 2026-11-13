@@ -437,6 +437,14 @@ pub fn Ref(comptime T: type) type {
     };
 }
 
+/// F#'s `Result`.
+pub fn Result(comptime T: type, comptime E: type) type {
+    return union(enum) {
+        Ok: struct { ResultValue: T },
+        Error: struct { ErrorValue: E },
+    };
+}
+
 /// F#'s list.
 pub fn List(comptime T: type) type {
     return union(enum) {
@@ -1282,17 +1290,164 @@ pub fn strCompare(a: String, b: String) i32 {
     return @as(i32, @intCast(x.len)) - @as(i32, @intCast(y.len));
 }
 
-/// F#'s `compare` for numbers, chars, booleans and strings: negative, zero or positive.
+/// F#'s `compare`: negative, zero or positive. Numbers, chars and booleans by value (on a
+/// float, not-a-number comes first); strings by code unit; records and tuples field by field;
+/// unions by case, then by field; an option with None first; lists item by item, the shorter
+/// first when one starts the other; arrays by length, then item by item.
 pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
     const T = @TypeOf(a);
     if (T == String) return strCompare(a, b);
     if (T == bool) return @as(i32, @intFromBool(a)) - @as(i32, @intFromBool(b));
-    if (a < b) return -1;
-    if (a > b) return 1;
-    if (a == b) return 0;
-    // (not a number: it comes before every number, and equals itself)
-    if (a == a) return 1;
-    return if (b == b) -1 else 0;
+    if (T == void) return 0;
+    if (T == Exn) @compileError("fable: exceptions cannot be compared");
+    if (comptime isFunc(T)) @compileError("fable: function values cannot be compared");
+    switch (@typeInfo(T)) {
+        .int, .float, .comptime_int, .comptime_float => {
+            if (a < b) return -1;
+            if (a > b) return 1;
+            if (a == b) return 0;
+            // (not a number: it comes before every number, and equals itself)
+            if (a == a) return 1;
+            return if (b == b) -1 else 0;
+        },
+        .optional => {
+            const x = a orelse return if (b == null) 0 else -1;
+            const y = b orelse return 1;
+            return compare(x, y);
+        },
+        .pointer => |p| {
+            if (comptime p.size == .slice) {
+                if (a.len != b.len) return if (a.len < b.len) -1 else 1;
+                for (a, b) |x, y| {
+                    const c = compare(x, y);
+                    if (c != 0) return c;
+                }
+                return 0;
+            }
+            // a cell: a reference record, an array, or what a case of a recursive union holds
+            if (a == b) return 0;
+            inline for (@typeInfo(p.child).@"struct".field_names) |name| {
+                if (comptime !isCount(name)) {
+                    const c = compare(@field(a, name), @field(b, name));
+                    if (c != 0) return c;
+                }
+            }
+            return 0;
+        },
+        .@"struct" => |st| {
+            inline for (st.field_names) |name| {
+                const c = compare(@field(a, name), @field(b, name));
+                if (c != 0) return c;
+            }
+            return 0;
+        },
+        .@"union" => {
+            if (comptime @hasDecl(T, "fable_list")) {
+                var x = a;
+                var y = b;
+                while (true) {
+                    if (x == .Empty) return if (y == .Empty) 0 else -1;
+                    if (y == .Empty) return 1;
+                    if (x.Cons == y.Cons) return 0;
+                    const c = compare(x.Cons.Head, y.Cons.Head);
+                    if (c != 0) return c;
+                    x = x.Cons.Tail;
+                    y = y.Cons.Tail;
+                }
+            }
+            const ta = @backingInt(std.meta.activeTag(a));
+            const tb = @backingInt(std.meta.activeTag(b));
+            if (ta != tb) return if (ta < tb) -1 else 1;
+            switch (a) {
+                inline else => |pa, tag| return compare(pa, @field(b, @tagName(tag))),
+            }
+        },
+        else => @compileError("fable: values of type " ++ @typeName(T) ++ " cannot be compared"),
+    }
+}
+
+/// `compare a b` where one of them may be a number that is written out.
+pub inline fn compareOf(a: anytype, b: anytype) i32 {
+    const T = @TypeOf(a, b);
+    return compare(@as(T, a), @as(T, b));
+}
+
+/// `max a b` and `min a b`: a reference of its own to the one that is chosen. (With a
+/// not-a-number among two floats the result is not a number, as on .NET.)
+pub fn maxOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    if (comptime @typeInfo(@TypeOf(a)) == .float) {
+        if (a != a) return a;
+        if (b != b) return b;
+    }
+    return dup(if (compare(a, b) < 0) b else a);
+}
+
+pub fn minOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    if (comptime @typeInfo(@TypeOf(a)) == .float) {
+        if (a != a) return a;
+        if (b != b) return b;
+    }
+    return dup(if (compare(a, b) > 0) b else a);
+}
+
+/// F#'s `hash`: equal values have equal hashes. A number is its own hash, as on .NET; the
+/// hash of anything else is this library's.
+pub fn hash(x: anytype) i32 {
+    const T = @TypeOf(x);
+    if (T == String) {
+        var h: u32 = 5381;
+        for (unitsOf(x)) |c| h = (h *% 33) ^ c;
+        return @bitCast(h);
+    }
+    if (T == Exn) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
+    if (comptime isFunc(T)) @compileError("fable: function values cannot be hashed");
+    switch (@typeInfo(T)) {
+        .void => return 0,
+        .bool => return @intFromBool(x),
+        .int => |info| {
+            if (info.bits <= 32) return if (info.signedness == .signed) @as(i32, x) else @bitCast(@as(u32, x));
+            // (as .NET folds a 64-bit number)
+            const wide: u64 = @bitCast(@as(i64, @intCast(x)));
+            return @bitCast(@as(u32, @truncate(wide)) ^ @as(u32, @truncate(wide >> 32)));
+        },
+        .float => {
+            const wide: u64 = @bitCast(@as(f64, if (x == 0) 0 else x));
+            return @bitCast(@as(u32, @truncate(wide)) ^ @as(u32, @truncate(wide >> 32)));
+        },
+        .optional => return if (x) |v| hashWith(1, hash(v)) else 0,
+        .pointer => |p| {
+            var h: i32 = 17;
+            if (comptime p.size == .slice) {
+                for (x) |item| h = hashWith(h, hash(item));
+                return h;
+            }
+            inline for (@typeInfo(p.child).@"struct".field_names) |name| {
+                if (comptime !isCount(name)) h = hashWith(h, hash(@field(x, name)));
+            }
+            return h;
+        },
+        .@"struct" => |st| {
+            var h: i32 = 17;
+            inline for (st.field_names) |name| h = hashWith(h, hash(@field(x, name)));
+            return h;
+        },
+        .@"union" => {
+            if (comptime @hasDecl(T, "fable_list")) {
+                var h: i32 = 17;
+                var rest = x;
+                while (rest == .Cons) : (rest = rest.Cons.Tail) h = hashWith(h, hash(rest.Cons.Head));
+                return h;
+            }
+            switch (x) {
+                inline else => |payload, tag| return hashWith(@backingInt(tag), hash(payload)),
+            }
+        },
+        else => @compileError("fable: values of type " ++ @typeName(T) ++ " cannot be hashed"),
+    }
+}
+
+fn hashWith(h: i32, next: i32) i32 {
+    return (h *% 31) +% next;
 }
 
 // ---- what .NET raises for a string that is null or an argument that is out of range ----
@@ -3543,6 +3698,11 @@ test "floats are written as .NET writes them" {
 }
 
 test "compare gives what .NET gives" {
+    const P = struct { Name: String, Age: i32 };
+    try std.testing.expectEqual(@as(i32, -1), compare(P{ .Name = str("a"), .Age = 2 }, P{ .Name = str("a"), .Age = 3 }));
+    try std.testing.expectEqual(@as(i32, 1), compare(@as(?i32, 1), @as(?i32, null)));
+    try std.testing.expectEqual(@as(i32, -1), compare(@as(struct { i32, i32 }, .{ 1, 2 }), @as(struct { i32, i32 }, .{ 1, 3 })));
+    try std.testing.expect(hash(P{ .Name = str("a"), .Age = 2 }) == hash(P{ .Name = str("a"), .Age = 2 }) and hash(@as(i32, -7)) == -7);
     try std.testing.expectEqual(@as(i32, -1), compare(str("abc"), str("abd")));
     try std.testing.expectEqual(@as(i32, 1), compare(str("b"), str("abc")));
     try std.testing.expectEqual(@as(i32, 32), compare(str("a"), str("A")));

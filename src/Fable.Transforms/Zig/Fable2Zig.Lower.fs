@@ -414,6 +414,36 @@ let private dotnetExnEntIn (state: FileState) (fullName: string) : Ent =
         e
 
 /// F#'s `ref` cell: a generic reference record that the runtime library declares.
+let private resultName = "Microsoft.FSharp.Core.FSharpResult`2"
+
+/// F#'s `Result`: a union of the runtime library.
+let private resultEnt (state: FileState) : Ent =
+    match state.Ents.TryGetValue resultName with
+    | true, e -> e
+    | _ ->
+        let e =
+            {
+                Name = "fable_rt.Result"
+                Ref =
+                    {
+                        FullName = resultName
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KValueUnion
+                TypeParams = [ "T"; "TError" ]
+                Cases = [ "Ok", [ "ResultValue", TGen "T" ]; "Error", [ "ErrorValue", TGen "TError" ] ]
+                MutableFields = []
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        state.Ents[resultName] <- e
+        state.UsesRuntime <- true
+        e
+
 /// F#'s array: a cell of the runtime library whose items can be assigned.
 let private arrayEnt (state: FileState) : Ent =
     match state.Ents.TryGetValue "$array" with
@@ -521,6 +551,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
 and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent =
     match ctx.State.Ents.TryGetValue entRef.FullName with
     | true, e -> e
+    | _ when entRef.FullName = resultName -> resultEnt ctx.State
     | _ ->
         let ent =
             match ctx.Com.TryGetEntity entRef with
@@ -1166,9 +1197,21 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
             "Length Head Tail TryHead Last TryLast TryItem Item Singleton Reverse Append Concat Map MapIndexed Map2
              Iterate IterateIndexed Fold FoldBack Reduce Filter Choose Collect Exists ForAll Contains TryFind Find
              TryFindIndex FindIndex TryPick Pick Initialize Replicate Zip Unzip Take Truncate Skip TakeWhile SkipWhile
-             Partition Indexed Pairwise Distinct ExactlyOne OfArray ToArray"
+             Partition Indexed Pairwise Distinct ExactlyOne OfArray ToArray SortWith Sort SortBy SortDescending
+             SortByDescending Max Min MaxBy MinBy DistinctBy GroupBy CountBy Except Scan SplitAt ChunkBySize
+             Windowed Iterate2 ForAll2 Exists2 Fold2 Map3 Zip3 Head Permute AllPairs TryExactlyOne Where Get
+             Cons Empty IsEmpty Transpose InsertAt RemoveAt UpdateAt"
         ->
         Some("List", small name)
+    | "Microsoft.FSharp.Core.OptionModule" when
+        has
+            "Map Bind DefaultValue DefaultWith IsSome IsNone GetValue Iterate Filter Exists ForAll Fold OrElse
+             OrElseWith ToList ToArray Count Contains Flatten Map2"
+        ->
+        Some("Option", small name)
+    | "Microsoft.FSharp.Core.FSharpOption`1" when name = "get_IsSome" -> Some("Option", "isSome")
+    | "Microsoft.FSharp.Core.FSharpOption`1" when name = "get_IsNone" -> Some("Option", "isNone")
+    | "Microsoft.FSharp.Core.ResultModule" when has "Map Bind MapError" -> Some("Result", small name)
     | "Microsoft.FSharp.Collections.FSharpList`1" when name = "get_Item" -> Some("List", "getItem")
     | "Microsoft.FSharp.Collections.FSharpList`1" when name = "get_Length" -> Some("List", "length")
     | "Microsoft.FSharp.Core.Operators" when name = "op_Append" -> Some("List", "append")
@@ -2613,16 +2656,15 @@ and dotnetCall
             bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.format(.{{ %s{typedArg ctx r x 0} }})", xs, tStr))
         | other -> fail r "the Zig target cannot turn a value of this type into text yet (%A)" other
     // ---- comparison of what is not a number: by `compare` ----
+    | "Microsoft.FSharp.Core.Operators", "Max", [ a; b ] ->
+        pure' "fable_rt.maxOf(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
+    | "Microsoft.FSharp.Core.Operators", "Min", [ a; b ] ->
+        pure' "fable_rt.minOf(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
+    | "Microsoft.FSharp.Core.Operators", "Hash", [ x ] ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.hash(%s{typedArg ctx r x 0})", xs, tI32))
     | "Microsoft.FSharp.Core.Operators",
       ("op_LessThan" | "op_GreaterThan" | "op_LessThanOrEqual" | "op_GreaterThanOrEqual" | "Compare"),
-      [ a; b ] when
-        (match a.Type with
-         | Fable.String
-         | Fable.Number _
-         | Fable.Char
-         | Fable.Boolean -> true
-         | _ -> false)
-        ->
+      [ a; b ] ->
         let op =
             match name with
             | "op_LessThan" -> Some "lt"
@@ -2635,7 +2677,7 @@ and dotnetCall
             ctx
             [ lw ctx a; lw ctx b ]
             (fun xs ->
-                let order = EEmit("fable_rt.compare($0, $1)", xs, tI32)
+                let order = EEmit("fable_rt.compareOf($0, $1)", xs, tI32)
 
                 match op with
                 | Some op -> EPrim(op, [ order; ELit("0", tI32) ], tBool)
@@ -2740,11 +2782,16 @@ and libraryCall
     =
     let found = Dictionary<string, Fable.Type>()
 
-    // (where FSharp.Core takes a sequence and is given a list, the library takes the list)
+    // (where FSharp.Core takes a sequence and is given a list, the library takes the list; an
+    // empty value whose item type F# left open, `obj` on .NET, gets `unit`: nothing can depend
+    // on it)
     let args =
         args
         |> List.map (fun arg ->
             match arg with
+            | Fable.Value(Fable.NewOption(None, Fable.Any, isStruct), r) ->
+                Fable.Value(Fable.NewOption(None, Fable.Unit, isStruct), r)
+            | Fable.Value(Fable.NewList(None, Fable.Any), r) -> Fable.Value(Fable.NewList(None, Fable.Unit), r)
             | Uncast inner when
                 (match arg.Type, inner.Type with
                  | Fable.DeclaredType(seq, _), Fable.List _ ->
@@ -2777,7 +2824,11 @@ and libraryCall
     let typeArgs =
         found
         |> Seq.sortWith (fun a b -> System.String.CompareOrdinal(a.Key, b.Key))
-        |> Seq.map (fun kv -> mapType ctx r kv.Value)
+        |> Seq.map (fun kv ->
+            match kv.Value with
+            | Fable.Any -> tVoid
+            | other -> mapType ctx r other
+        )
         |> List.ofSeq
 
     // (inside the library file itself the function is one of the file's own)

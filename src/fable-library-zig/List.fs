@@ -370,3 +370,226 @@ let exactlyOne<'T> (list: 'T list) : 'T =
 let ofArray<'T> (array: 'T[]) : 'T list = Array.toList array
 
 let toArray<'T> (list: 'T list) : 'T[] = Array.ofList list
+
+// ---- order ----
+
+/// A merge sort: equal items keep their order, as `List.sortWith` promises.
+let sortWith<'T> (comparer: 'T -> 'T -> int) (list: 'T list) : 'T list =
+    let rec merge (a: 'T list) (b: 'T list) : 'T list =
+        match a, b with
+        | [], rest -> rest
+        | rest, [] -> rest
+        | x :: restA, y :: restB ->
+            if comparer x y <= 0 then
+                x :: merge restA b
+            else
+                y :: merge a restB
+
+    let rec pairs (lists: 'T list list) : 'T list list =
+        match lists with
+        | a :: b :: rest -> merge a b :: pairs rest
+        | _ -> lists
+
+    let rec all (lists: 'T list list) : 'T list =
+        match lists with
+        | [] -> []
+        | [ one ] -> one
+        | _ -> all (pairs lists)
+
+    all (map (fun x -> [ x ]) list)
+
+let sort<'T when 'T: comparison> (list: 'T list) : 'T list = sortWith (fun a b -> compare a b) list
+
+let sortBy<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (list: 'T list) : 'T list =
+    sortWith (fun a b -> compare (projection a) (projection b)) list
+
+let sortDescending<'T when 'T: comparison> (list: 'T list) : 'T list = sortWith (fun a b -> compare b a) list
+
+let sortByDescending<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (list: 'T list) : 'T list =
+    sortWith (fun a b -> compare (projection b) (projection a)) list
+
+let private emptySequence () =
+    invalidArg "list" "The input sequence was empty."
+
+let max<'T when 'T: comparison> (list: 'T list) : 'T =
+    match list with
+    | [] -> emptySequence ()
+    | first :: rest ->
+        fold
+            (fun best x ->
+                if compare x best > 0 then
+                    x
+                else
+                    best
+            )
+            first
+            rest
+
+let min<'T when 'T: comparison> (list: 'T list) : 'T =
+    match list with
+    | [] -> emptySequence ()
+    | first :: rest ->
+        fold
+            (fun best x ->
+                if compare x best < 0 then
+                    x
+                else
+                    best
+            )
+            first
+            rest
+
+let maxBy<'T, 'U when 'U: comparison> (projection: 'T -> 'U) (list: 'T list) : 'T =
+    match list with
+    | [] -> emptySequence ()
+    | first :: rest ->
+        fold
+            (fun best x ->
+                if compare (projection x) (projection best) > 0 then
+                    x
+                else
+                    best
+            )
+            first
+            rest
+
+let minBy<'T, 'U when 'U: comparison> (projection: 'T -> 'U) (list: 'T list) : 'T =
+    match list with
+    | [] -> emptySequence ()
+    | first :: rest ->
+        fold
+            (fun best x ->
+                if compare (projection x) (projection best) < 0 then
+                    x
+                else
+                    best
+            )
+            first
+            rest
+
+// ---- by key ----
+
+let distinctBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (list: 'T list) : 'T list =
+    let rec go (seen: 'Key list) (list: 'T list) : 'T list =
+        match list with
+        | [] -> []
+        | x :: rest ->
+            let key = projection x
+
+            if contains key seen then
+                go seen rest
+            else
+                x :: go (key :: seen) rest
+
+    go [] list
+
+/// The groups in the order their keys first appear, the items of each in their order.
+let groupBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (list: 'T list) : ('Key * 'T list) list =
+    let keys = distinct (map projection list)
+    map (fun key -> (key, filter (fun x -> projection x = key) list)) keys
+
+let countBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (list: 'T list) : ('Key * int) list =
+    map (fun (key: 'Key, items: 'T list) -> (key, length items)) (groupBy projection list)
+
+let except<'T when 'T: equality> (itemsToExclude: 'T list) (list: 'T list) : 'T list =
+    distinct (filter (fun x -> not (contains x itemsToExclude)) list)
+
+// ---- more shapes ----
+
+let scan<'State, 'T> (folder: 'State -> 'T -> 'State) (state: 'State) (list: 'T list) : 'State list =
+    let rec go (state: 'State) (list: 'T list) : 'State list =
+        match list with
+        | [] -> []
+        | x :: rest ->
+            let next = folder state x
+            next :: go next rest
+
+    state :: go state list
+
+let splitAt<'T> (index: int) (list: 'T list) : 'T list * 'T list =
+    if index < 0 then
+        invalidArg "index" "The input must be non-negative."
+
+    take index list, skip index list
+
+let chunkBySize<'T> (chunkSize: int) (list: 'T list) : 'T list list =
+    if chunkSize <= 0 then
+        invalidArg "chunkSize" ("The input must be positive.\nchunkSize = " + string chunkSize)
+
+    let rec go (list: 'T list) : 'T list list =
+        match list with
+        | [] -> []
+        | _ ->
+            truncate chunkSize list
+            :: go (
+                skip
+                    (if length list < chunkSize then
+                         length list
+                     else
+                         chunkSize)
+                    list
+            )
+
+    go list
+
+let windowed<'T> (windowSize: int) (list: 'T list) : 'T list list =
+    if windowSize <= 0 then
+        invalidArg "windowSize" ("The input must be positive.\nwindowSize = " + string windowSize)
+
+    let rec go (list: 'T list) : 'T list list =
+        if length list < windowSize then
+            []
+        else
+            truncate windowSize list :: go (tail list)
+
+    go list
+
+let rec iterate2<'T1, 'T2> (action: 'T1 -> 'T2 -> unit) (list1: 'T1 list) (list2: 'T2 list) : unit =
+    match list1, list2 with
+    | x :: restA, y :: restB ->
+        action x y
+        iterate2 action restA restB
+    | [], [] -> ()
+    | [], rest -> differentLengths "list1" "list2" (length rest)
+    | rest, [] -> differentLengths "list2" "list1" (length rest)
+
+let rec forAll2<'T1, 'T2> (predicate: 'T1 -> 'T2 -> bool) (list1: 'T1 list) (list2: 'T2 list) : bool =
+    match list1, list2 with
+    | x :: restA, y :: restB -> predicate x y && forAll2 predicate restA restB
+    | [], [] -> true
+    | [], rest -> differentLengths "list1" "list2" (length rest)
+    | rest, [] -> differentLengths "list2" "list1" (length rest)
+
+let rec exists2<'T1, 'T2> (predicate: 'T1 -> 'T2 -> bool) (list1: 'T1 list) (list2: 'T2 list) : bool =
+    match list1, list2 with
+    | x :: restA, y :: restB -> predicate x y || exists2 predicate restA restB
+    | [], [] -> false
+    | [], rest -> differentLengths "list1" "list2" (length rest)
+    | rest, [] -> differentLengths "list2" "list1" (length rest)
+
+let rec fold2<'State, 'T1, 'T2>
+    (folder: 'State -> 'T1 -> 'T2 -> 'State)
+    (state: 'State)
+    (list1: 'T1 list)
+    (list2: 'T2 list)
+    : 'State
+    =
+    match list1, list2 with
+    | x :: restA, y :: restB -> fold2 folder (folder state x y) restA restB
+    | [], [] -> state
+    | [], rest -> differentLengths "list1" "list2" (length rest)
+    | rest, [] -> differentLengths "list2" "list1" (length rest)
+
+let allPairs<'T1, 'T2> (list1: 'T1 list) (list2: 'T2 list) : ('T1 * 'T2) list =
+    collect (fun x -> map (fun y -> (x, y)) list2) list1
+
+let tryExactlyOne<'T> (list: 'T list) : 'T option =
+    match list with
+    | [ x ] -> Some x
+    | _ -> None
+
+let where<'T> (predicate: 'T -> bool) (list: 'T list) : 'T list = filter predicate list
+
+let get<'T> (list: 'T list) (index: int) : 'T = item index list
+
+let cons<'T> (head: 'T) (tail: 'T list) : 'T list = head :: tail
