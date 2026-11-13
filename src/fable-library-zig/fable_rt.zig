@@ -486,6 +486,7 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
         }
         return true;
     }
+    if (comptime isBigInt(T)) return a.value.eql(b.value);
     // (.NET's mutable collections are equal only to themselves)
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity")) return a == b;
     // (an array is equal to another with equal items, as F#'s `=` has it)
@@ -1769,6 +1770,167 @@ pub fn spanSlice(s: anytype, start: i32, length: ?i32) Raised!@TypeOf(s) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// bigint: F#'s arbitrary-precision integer, a counted cell of Zig's big integer
+// ---------------------------------------------------------------------------------------------
+
+const Big = std.math.big.int.Managed;
+
+pub const BigInt = *struct {
+    pub const fable_bigint = {};
+    @"$rc": u32 = 1,
+    value: Big,
+
+    pub fn fable_free(c: anytype) void {
+        c.value.deinit();
+    }
+};
+
+fn isBigInt(comptime T: type) bool {
+    return T == BigInt;
+}
+
+fn bigOom(_: anyerror) noreturn {
+    @panic("fable: out of memory");
+}
+
+fn bigEmpty() Big {
+    return Big.init(allocator) catch |e| bigOom(e);
+}
+
+fn bigFrom(m: Big) BigInt {
+    const c = allocator.create(@typeInfo(BigInt).pointer.child) catch @panic("fable: out of memory");
+    c.* = .{ .value = m };
+    if (track) thread.stats.allocs += 1;
+    return c;
+}
+
+/// `bigint x` of a whole number
+pub fn bigOf(x: anytype) BigInt {
+    var m = bigEmpty();
+    switch (@typeInfo(@TypeOf(x))) {
+        .float => {
+            _ = m.setFloat(@trunc(x), .trunc) catch |e| bigOom(e);
+        },
+        else => m.set(x) catch |e| bigOom(e),
+    }
+    return bigFrom(m);
+}
+
+/// `123456789012345678901234567890I`
+pub fn bigLit(comptime digits: []const u8) BigInt {
+    var m = bigEmpty();
+    m.setString(10, digits) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+pub fn bigAdd(a: BigInt, b: BigInt) BigInt {
+    var m = bigEmpty();
+    m.add(&a.value, &b.value) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+pub fn bigSub(a: BigInt, b: BigInt) BigInt {
+    var m = bigEmpty();
+    m.sub(&a.value, &b.value) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+pub fn bigMul(a: BigInt, b: BigInt) BigInt {
+    var m = bigEmpty();
+    m.mul(&a.value, &b.value) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+/// `a / b` (`quotient`) and `a % b`: truncated, as .NET
+pub fn bigDivRem(a: BigInt, b: BigInt, comptime quotient: bool) Raised!BigInt {
+    if (b.value.eqlZero()) return raise(DivideByZeroException, str("Attempted to divide by zero."));
+    var q = bigEmpty();
+    var r = bigEmpty();
+    Big.divTrunc(&q, &r, &a.value, &b.value) catch |e| bigOom(e);
+    if (quotient) {
+        r.deinit();
+        return bigFrom(q);
+    }
+    q.deinit();
+    return bigFrom(r);
+}
+
+pub fn bigNeg(a: BigInt) BigInt {
+    var m = a.value.clone() catch |e| bigOom(e);
+    m.negate();
+    return bigFrom(m);
+}
+
+pub fn bigAbs(a: BigInt) BigInt {
+    var m = a.value.clone() catch |e| bigOom(e);
+    m.abs();
+    return bigFrom(m);
+}
+
+/// `BigInteger.Pow(a, n)` and `pown a n`
+pub fn bigPow(a: BigInt, n: i32) Raised!BigInt {
+    if (n < 0) return raise(ArgumentOutOfRangeException, str("The number must be greater than or equal to zero. (Parameter 'exponent')"));
+    var m = bigEmpty();
+    m.pow(&a.value, @intCast(n)) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+pub fn bigCompare(a: BigInt, b: BigInt) i32 {
+    return switch (a.value.order(b.value)) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+}
+
+pub fn bigSign(a: BigInt) i32 {
+    if (a.value.eqlZero()) return 0;
+    return if (a.value.isPositive()) 1 else -1;
+}
+
+/// `int x` of a bigint: a value that does not fit raises, as on .NET
+pub fn bigToInt(comptime T: type, a: BigInt) Raised!T {
+    return a.value.toInt(T) catch raise(OverflowException, str("Value was either too large or too small for " ++ netIntName(T) ++ "."));
+}
+
+pub fn bigToFloat(comptime T: type, a: BigInt) T {
+    return a.value.toFloat(T, .nearest_even)[0];
+}
+
+fn bigDigits(a: BigInt) []u8 {
+    return a.value.toString(allocator, 10, .lower) catch |e| bigOom(e);
+}
+
+/// `string x` of a bigint: its digits
+pub fn bigText(a: BigInt) String {
+    const d = bigDigits(a);
+    defer allocator.free(d);
+    const s, const u = strNew(d.len);
+    for (d, u) |c, *o| o.* = c;
+    return s;
+}
+
+/// `BigInteger.Parse s`
+pub fn bigParse(s: String) Raised!BigInt {
+    const u = trimmed(s);
+    var buf = allocator.alloc(u8, u.len) catch @panic("fable: out of memory");
+    defer allocator.free(buf);
+    var n: usize = 0;
+    for (u, 0..) |c, i| {
+        const ok = (c >= '0' and c <= '9') or (i == 0 and (c == '-' or c == '+'));
+        if (!ok) return raise(FormatException, str("The value could not be parsed."));
+        if (c != '+') {
+            buf[n] = @intCast(c);
+            n += 1;
+        }
+    }
+    if (n == 0 or (n == 1 and buf[0] == '-')) return raise(FormatException, str("The value could not be parsed."));
+    var m = bigEmpty();
+    m.setString(10, buf[0..n]) catch return raise(FormatException, str("The value could not be parsed."));
+    return bigFrom(m);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Weak references
 //
 // `WeakReference<'T>` points at a cell without keeping it alive. It holds a handle, shared by
@@ -2385,6 +2547,7 @@ pub fn strCompare(a: String, b: String) i32 {
 pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
     const T = @TypeOf(a);
     if (T == String) return strCompare(a, b);
+    if (comptime isBigInt(T)) return bigCompare(a, b);
     if (T == bool) return @as(i32, @intFromBool(a)) - @as(i32, @intFromBool(b));
     if (T == void) return 0;
     if (T == Exn) @compileError("fable: exceptions cannot be compared");
@@ -2483,6 +2646,11 @@ pub fn minOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
 /// hash of anything else is this library's.
 pub fn hash(x: anytype) i32 {
     const T = @TypeOf(x);
+    if (comptime isBigInt(T)) {
+        const t = bigText(x);
+        defer drop(t);
+        return hash(t);
+    }
     if (T == String) {
         var h: u32 = 5381;
         for (unitsOf(x)) |c| h = (h *% 33) ^ c;
@@ -3325,7 +3493,14 @@ pub fn format(parts: anytype) String {
     inline for (names, 0..) |name, i| {
         const part = @field(parts, name);
         const T = @TypeOf(part);
-        if (comptime isLiteralText(T)) {
+        if (comptime isBigInt(T)) {
+            written[i] = bigText(part);
+            pieces[i] = .{ .units = unitsOf(written[i]) };
+        } else if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "fable_spec") and isBigInt(@FieldType(T, "value")))) {
+            written[i] = bigText(part.value);
+            pieces[i] = .{ .units = unitsOf(written[i]) };
+            if (T.fable_spec.width > pieces[i].len()) pad[i] = T.fable_spec.width - pieces[i].len();
+        } else if (comptime isLiteralText(T)) {
             pieces[i] = .{ .units = comptime std.unicode.utf8ToUtf16LeStringLiteral(part) };
         } else if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "fable_spec"))) {
             if (comptime T.fable_spec.kind == 'A') {
@@ -3756,6 +3931,11 @@ pub const Shower = struct {
         const T = @TypeOf(x);
         if (depth <= 0) return b.word("...");
         if (T == String) return if (x) |p| b.quoted(p.units()) else b.word("null");
+        if (comptime isBigInt(T)) {
+            const d = bigDigits(x);
+            defer allocator.free(d);
+            return b.word(d);
+        }
         if (T == Exn) return x.type.show(b, x, prec, depth);
         if (comptime isFunc(T)) return b.word("<fun>");
         switch (@typeInfo(T)) {
@@ -3971,6 +4151,11 @@ pub fn anyText(x: anytype) String {
 fn writeNet(out: *TextBuilder, x: anytype) void {
     const T = @TypeOf(x);
     if (T == String) return out.add(unitsOf(x));
+    if (comptime isBigInt(T)) {
+        const d = bigDigits(x);
+        defer allocator.free(d);
+        return out.addAscii(d);
+    }
     if (T == u16) return out.addOne(x);
     if (T == Exn) {
         const m = exnMessage(x);
@@ -4892,13 +5077,25 @@ pub fn parseBool(s: String) Raised!bool {
     return raise(FormatException, format(.{ "String '", s, "' was not recognized as a valid Boolean." }));
 }
 
+/// `a + b` of a running total: `a` is owned (a bigint total is replaced), `b` borrowed
 fn addOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    if (comptime isBigInt(@TypeOf(a))) {
+        const r = bigAdd(a, b);
+        drop(a);
+        return r;
+    }
     return if (comptime @typeInfo(@TypeOf(a)) == .float) a + b else a +% b;
+}
+
+/// the zero a sum starts from
+fn zeroOf(comptime T: type) T {
+    if (comptime isBigInt(T)) return bigOf(@as(i32, 0));
+    return 0;
 }
 
 /// `List.sum xs`
 pub fn listSum(xs: anytype) @FieldType(@typeInfo(@FieldType(@TypeOf(xs), "Cons")).pointer.child, "Head") {
-    var total: @TypeOf(xs.Cons.Head) = 0;
+    var total = zeroOf(@TypeOf(xs.Cons.Head));
     var rest = xs;
     while (rest == .Cons) : (rest = rest.Cons.Tail) total = addOf(total, rest.Cons.Head);
     return total;
@@ -4906,9 +5103,16 @@ pub fn listSum(xs: anytype) @FieldType(@typeInfo(@FieldType(@TypeOf(xs), "Cons")
 
 /// `List.sumBy f xs`
 pub fn listSumBy(comptime R: type, f: anytype, xs: anytype) Raised!R {
-    var total: R = 0;
+    var total = zeroOf(R);
     var rest = xs;
-    while (rest == .Cons) : (rest = rest.Cons.Tail) total = addOf(total, try f.code(f.env, dup(rest.Cons.Head)));
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        const v = f.code(f.env, dup(rest.Cons.Head)) catch |e| {
+            drop(total);
+            return e;
+        };
+        total = addOf(total, v);
+        drop(v);
+    }
     return total;
 }
 
@@ -4944,7 +5148,7 @@ pub fn listAverageBy(comptime R: type, f: anytype, xs: anytype) Raised!R {
 
 /// `Array.sum a`
 pub fn arraySum(a: anytype) ItemOf(@TypeOf(a)) {
-    var total: ItemOf(@TypeOf(a)) = 0;
+    var total = zeroOf(ItemOf(@TypeOf(a)));
     for (a.items) |x| total = addOf(total, x);
     return total;
 }
@@ -5992,6 +6196,43 @@ test "weak references see their target go" {
     drop(w2);
     try std.testing.expectEqual(@as(usize, 0), thread.weak.count());
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "bigint does what .NET does" {
+    const before = thread.stats;
+    const a = bigLit("123456789012345678901234567890");
+    defer drop(a);
+    const sq = bigMul(a, a);
+    defer drop(sq);
+    try expectText("15241578753238836750495351562536198787501905199875019052100", bigText(sq));
+    const seven = bigOf(@as(i32, 7));
+    defer drop(seven);
+    const q = try bigDivRem(a, seven, true);
+    defer drop(q);
+    try expectText("17636684144620811271604938270", bigText(q));
+    const na = bigNeg(a);
+    defer drop(na);
+    const nq = try bigDivRem(na, seven, true);
+    defer drop(nq);
+    try expectText("-17636684144620811271604938270", bigText(nq));
+    const two = bigOf(@as(i32, 2));
+    defer drop(two);
+    const p = try bigPow(two, 100);
+    defer drop(p);
+    try expectText("1267650600228229401496703205376", bigText(p));
+    const zero = bigOf(@as(i32, 0));
+    defer drop(zero);
+    try expectRaised(DivideByZeroException, "Attempted to divide by zero.", bigDivRem(a, zero, true));
+    try expectRaised(OverflowException, "Value was either too large or too small for an Int32.", bigToInt(i32, a));
+    try expectRaised(FormatException, "The value could not be parsed.", bigParse(str("12x")));
+    const parsed = try bigParse(str(" -123 "));
+    defer drop(parsed);
+    try expectText("-123", bigText(parsed));
+    try std.testing.expect(compare(a, seven) == 1 and eql(a, a) and !eql(a, seven));
+    try std.testing.expectEqual(@as(i32, 42), try bigToInt(i32, bigOf(@as(i32, 42))));
+    try std.testing.expectEqual(@as(f64, 1.2345678901234568e29), bigToFloat(f64, a));
+    try expectText("a=123456789012345678901234567890", format(.{ "a=", a }));
+    _ = before;
 }
 
 test "conv follows .NET" {

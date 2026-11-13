@@ -722,7 +722,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         | Float16 -> TPrim "f16"
         | Float32 -> TPrim "f32"
         | Float64 -> TPrim "f64"
-        | BigInt -> fail r "the Zig target does not support bigint yet"
+        | BigInt -> TPrim "fable_rt.BigInt"
         | Decimal -> fail r "the Zig target does not support decimal yet"
     | Fable.String -> tStr
     // (a unit argument stays, as `void`: a function value has one shape whatever its type
@@ -2123,6 +2123,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                      "false"),
                 tBool
             )
+        | Fable.NumberConstant(Fable.NumberValue.BigInt x, _) ->
+            ctx.State.UsesRuntime <- true
+            EEmit("fable_rt.bigLit(\"" + string x + "\")", [], TPrim "fable_rt.BigInt")
         | Fable.NumberConstant(v, _) -> ELit(numberLit r v)
         | Fable.CharConstant c -> ELit(string<int>(int c), TPrim "u16")
         | Fable.StringConstant text -> ELit(stringLiteral text, tStr)
@@ -3767,6 +3770,13 @@ and dotnetCall
         | Fable.Number(Int32, _) -> true
         | _ -> false
 
+    let tBig = TPrim "fable_rt.BigInt"
+
+    let isBig (x: Fable.Expr) =
+        match x.Type with
+        | Fable.Number(BigInt, _) -> true
+        | _ -> false
+
     match entity, name, args with
     // ref cells: `ref x`, `!r` and `r.Value`, `r := x` and `r.Value <- x`, `incr`, `decr`
     | "Microsoft.FSharp.Core.Operators", "Ref", [ x ] ->
@@ -4723,6 +4733,83 @@ and dotnetCall
         bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 0, mapType ctx r t))
     | "Microsoft.FSharp.Core.Operators", "Snd", [ x ] ->
         bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 1, mapType ctx r t))
+    // ---- bigint: a counted cell of the runtime (`fable_rt.BigInt`) ----
+    | "Microsoft.FSharp.Core.NumericLiterals.NumericLiteralI", ("FromZero" | "FromOne"), ([] | [ _ ]) ->
+        pure'
+            (if name = "FromZero" then
+                 "fable_rt.bigOf(@as(i32, 0))"
+             else
+                 "fable_rt.bigOf(@as(i32, 1))")
+            []
+            tBig
+    | "Microsoft.FSharp.Core.NumericLiterals.NumericLiteralI", ("FromInt32" | "FromInt64"), [ x ] ->
+        pure' $"fable_rt.bigOf(%s{typedArg ctx r x 0})" [ x ] tBig
+    | "Microsoft.FSharp.Core.NumericLiterals.NumericLiteralI", "FromString", [ x ] ->
+        rt "fable_rt.bigParse($0)" [ x ] tBig
+    | "System.Numerics.BigInteger", ".ctor", [ x ] when not (isBig x) ->
+        pure' $"fable_rt.bigOf(%s{typedArg ctx r x 0})" [ x ] tBig
+    | "System.Numerics.BigInteger", "get_Zero", [] -> pure' "fable_rt.bigOf(@as(i32, 0))" [] tBig
+    | "System.Numerics.BigInteger", "get_One", [] -> pure' "fable_rt.bigOf(@as(i32, 1))" [] tBig
+    | "System.Numerics.BigInteger", "get_MinusOne", [] -> pure' "fable_rt.bigOf(@as(i32, -1))" [] tBig
+    | "System.Numerics.BigInteger", "Parse", [ x ] -> rt "fable_rt.bigParse($0)" [ x ] tBig
+    | "System.Numerics.BigInteger", "Pow", [ x; n ]
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked"), "PowInteger", [ x; n ] when
+        isBig x
+        ->
+        rt "fable_rt.bigPow($0, $1)" [ x; n ] tBig
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked" | "System.Numerics.BigInteger"),
+      ("op_Addition" | "op_Subtraction" | "op_Multiply" | "Add" | "Subtract" | "Multiply"),
+      [ a; b ] when isBig a ->
+        let f =
+            match name with
+            | "op_Addition"
+            | "Add" -> "bigAdd"
+            | "op_Subtraction"
+            | "Subtract" -> "bigSub"
+            | _ -> "bigMul"
+
+        pure' $"fable_rt.%s{f}($0, $1)" [ a; b ] tBig
+    | ("Microsoft.FSharp.Core.Operators" | "System.Numerics.BigInteger"),
+      ("op_Division" | "op_Modulus" | "Divide" | "Remainder"),
+      [ a; b ] when isBig a ->
+        let quotient =
+            if name = "op_Division" || name = "Divide" then
+                "true"
+            else
+                "false"
+
+        rt ("fable_rt.bigDivRem($0, $1, " + quotient + ")") [ a; b ] tBig
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked" | "System.Numerics.BigInteger"),
+      ("op_UnaryNegation" | "Negate"),
+      [ a ] when isBig a -> pure' "fable_rt.bigNeg($0)" [ a ] tBig
+    | ("Microsoft.FSharp.Core.Operators" | "System.Numerics.BigInteger"), "op_UnaryPlus", [ a ] when isBig a -> lw ctx a
+    | ("Microsoft.FSharp.Core.Operators" | "System.Numerics.BigInteger" | "System.Math"), "Abs", [ a ] when isBig a ->
+        pure' "fable_rt.bigAbs($0)" [ a ] tBig
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Sign", [ a ] when isBig a ->
+        pure' "fable_rt.bigSign($0)" [ a ] tI32
+    | "System.Numerics.BigInteger", "get_Sign", [ a ] -> pure' "fable_rt.bigSign($0)" [ a ] tI32
+    | "System.Numerics.BigInteger", "get_IsZero", [ a ] -> pure' "(fable_rt.bigSign($0) == 0)" [ a ] tBool
+    | "System.Numerics.BigInteger", "Compare", [ a; b ] -> pure' "fable_rt.bigCompare($0, $1)" [ a; b ] tI32
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked" | "System.Numerics.BigInteger"),
+      _,
+      [ x ] when
+        isBig x
+        && (name.StartsWith("To", System.StringComparison.Ordinal) || name = "op_Explicit")
+        && name <> "ToString"
+        ->
+        let ty = mapType ctx r t
+
+        if isFloatTy ty then
+            pure' $"fable_rt.bigToFloat(%s{zigTypeOf ty}, $0)" [ x ] ty
+        elif intBits ty > 0 then
+            rt $"fable_rt.bigToInt(%s{zigTypeOf ty}, $0)" [ x ] ty
+        elif ty = tBig then
+            lw ctx x
+        else
+            fail r "the Zig target cannot convert a bigint to %A yet" t
+    | ("Microsoft.FSharp.Core.Operators" | "System.Numerics.BigInteger"), ("ToBigInt" | "op_Implicit"), [ x ] ->
+        pure' $"fable_rt.bigOf(%s{typedArg ctx r x 0})" [ x ] tBig
+
     // ---- `open Checked`: whole-number arithmetic and conversions that raise on overflow ----
     | "Microsoft.FSharp.Core.Operators.Checked", ("op_Addition" | "op_Subtraction" | "op_Multiply"), [ a; b ] ->
         let ty = mapType ctx r a.Type

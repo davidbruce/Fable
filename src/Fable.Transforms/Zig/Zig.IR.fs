@@ -106,6 +106,7 @@ let rec isManaged (t: Ty) =
     // (a function value may own an environment)
     | TFn _ -> true
     | TPrim "fable_rt.Exn"
+    | TPrim "fable_rt.BigInt"
     | TPrim "fable_rt.String" -> true
     | _ -> false
 
@@ -118,6 +119,7 @@ let rec isManagedDecl (t: Ty) =
     | TTuple ts -> List.exists isManagedDecl ts
     | TFn _ -> true
     | TPrim "fable_rt.Exn"
+    | TPrim "fable_rt.BigInt"
     | TPrim "fable_rt.String" -> true
     | _ -> false
 

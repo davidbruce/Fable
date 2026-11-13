@@ -159,6 +159,46 @@ let run () : int =
             "Argument: The input sequence was empty. (Parameter 'source')"
             (raised (fun () -> string (List.average ([]: float list))))
         + check (Array.sum [| 1; 2; 3 |] = 6 && Array.average [| 1.0; 3.0 |] = 2.0)
+        // bigint
+        + same
+            "15241578753238836750495351562536198787501905199875019052100|17636684144620811271604938270|0|-17636684144620811271604938270|1267650600228229401496703205376"
+            (let a = 123456789012345678901234567890I in
+
+             string (a * a)
+             + "|"
+             + string (a / 7I)
+             + "|"
+             + string (a % 7I)
+             + "|"
+             + string (-a / 7I)
+             + "|"
+             + string (bigint.Pow(2I, 100)))
+        + same
+            "1TrueTrue4242|1.2345678901234568E+29"
+            (let a = 123456789012345678901234567890I in
+
+             string (compare a 1I)
+             + string (a = a + 0I)
+             + string (abs -a = a)
+             + string (bigint 42)
+             + string (int 42I)
+             + "|"
+             + string (float a))
+        + same "Arithmetic: Attempted to divide by zero." (raised (fun () -> string (5I / 0I)))
+        + same
+            "Overflow: Value was either too large or too small for an Int32."
+            (raised (fun () -> string (int 123456789012345678901I)))
+        + same "Format: The value could not be parsed." (raised (fun () -> string (bigint.Parse "12x")))
+        + same
+            "-123|265252859812191058636308480000000|[1; 2]|6"
+            (string (bigint.Parse " -123 ")
+             + "|"
+             + string (Seq.fold (fun acc (n: int) -> acc * bigint n) 1I [ 1..30 ])
+             + "|"
+             + sprintf "%A" [ 1I; 2I ]
+             + "|"
+             + string (List.sum [ 1I; 2I; 3I ]))
+        + check (hash 5I = hash 5I && max 3I 4I = 4I && 2I < 3I && sign -4I = -1)
         // `open Checked`
         + same
             "Overflow: Arithmetic operation resulted in an overflow."

@@ -312,6 +312,12 @@ builder's intermediate calls no usable type (they are F#'s resumable code); a pa
 lowering gives each the type its arguments say. `Task.FromResult`, `Task.Delay` (which does not
 wait), `Task.WhenAll`, `IsCompleted` and `IsFaulted` work.
 
+`bigint` is a counted cell of the runtime holding Zig's `std.math.big.int.Managed`: literals,
+arithmetic (division truncates, by zero raises), `pown`/`BigInteger.Pow`, `abs`, `sign`,
+conversions (a value that does not fit raises `OverflowException` with .NET's message),
+`BigInteger.Parse`, comparison, equality, hashing, `string`, `%A`, `List.sum`. A bigint is
+never part of a cycle.
+
 `open Checked`: `+`, `-`, `*`, unary `-` of whole numbers and the conversions raise
 `OverflowException` where the result does not fit, as on .NET.
 
