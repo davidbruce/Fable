@@ -259,7 +259,12 @@ library function declares its type parameters, with FSharp.Core's names, in that
 first letter (`mapIndexed` for `List.mapi`).
 
 So far: `List.fs` (the `List` module, sorting included: a merge sort, stable as F#'s),
-`Option.fs` and `Result.fs`. An empty value whose item type F# left open (`Option.isNone
+`Option.fs`, `Result.fs`, `Map.fs` and `Set.fs`. `Map` and `Set` are balanced trees ordered
+by `compare`, as in FSharp.Core; a program's `Map<'K, 'V>` is the library's `MapTree_2`, and
+the members of a map (`m.[k]`, `m.Add`, `m.Count`, ...) are library functions that take the
+map first. Their trees carry `fable_collection`, so that the runtime compares, hashes and
+writes them by what they hold (`map [(1, "a")]`, nine entries then `...`, as F#), not by the
+shape of the tree. `Map.keys` and `Map.values` give lists. An empty value whose item type F# left open (`Option.isNone
 None`, where .NET has `obj`) is given `unit`.
 
 ## Arrays

@@ -11,6 +11,8 @@
     <Compile Include="List.fs" />
     <Compile Include="Option.fs" />
     <Compile Include="Result.fs" />
+    <Compile Include="Map.fs" />
+    <Compile Include="Set.fs" />
   </ItemGroup>
 
   <ItemGroup>

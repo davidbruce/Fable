@@ -415,6 +415,8 @@ let private dotnetExnEntIn (state: FileState) (fullName: string) : Ent =
 
 /// F#'s `ref` cell: a generic reference record that the runtime library declares.
 let private resultName = "Microsoft.FSharp.Core.FSharpResult`2"
+let private mapName = "Microsoft.FSharp.Collections.FSharpMap`2"
+let private setName = "Microsoft.FSharp.Collections.FSharpSet`1"
 
 /// F#'s `Result`: a union of the runtime library.
 let private resultEnt (state: FileState) : Ent =
@@ -540,6 +542,11 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, _) when dotnetExceptions.ContainsKey ent.FullName -> tExn
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
+    // (what `Map.keys` and `Map.values` give: a list here, which is what they hold, in order)
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.ICollection`1" ->
+        TEnt(listEnt ctx.State, [ mapType ctx r item ])
+    | Fable.DeclaredType(ent, genArgs) when ent.FullName = mapName || ent.FullName = setName ->
+        TEnt(treeEnt ctx (ent.FullName = mapName), genArgs |> List.map (mapType ctx r))
     | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapType ctx r))
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
 
@@ -707,6 +714,73 @@ and importAlias (ctx: Ctx) (path: string) =
 
         ctx.State.Imports[path] <- alias
         alias
+
+/// F#'s `Map` and `Set`: the trees of the part of the runtime library written in F#
+/// (`Map.fs`, `Set.fs`).
+and treeEnt (ctx: Ctx) (isMap: bool) : Ent =
+    let key =
+        if isMap then
+            "$map"
+        else
+            "$set"
+
+    match ctx.State.Ents.TryGetValue key with
+    | true, e -> e
+    | _ ->
+        // (the names Fable gives the declarations of the library's files)
+        let file, typeName =
+            if isMap then
+                "Map", "MapTree_2"
+            else
+                "Set", "SetTree_1"
+
+        let pre =
+            if isMap then
+                "Map"
+            else
+                "Set"
+
+        let e =
+            {
+                Name = importAlias ctx (Fable.Transforms.AST.getLibPath ctx.Com file) + "." + typeName
+                Ref =
+                    {
+                        FullName = $"Fable.Library.Zig.%s{file}.%s{typeName.Replace('_', '`')}"
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KHeapUnion
+                TypeParams =
+                    if isMap then
+                        [ "Key"; "Value" ]
+                    else
+                        [ "T" ]
+                Cases = []
+                MutableFields = []
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        let self = TEnt(e, e.TypeParams |> List.map TGen)
+
+        e.Cases <-
+            [
+                pre + "Empty", []
+                pre + "Node",
+                [
+                    "key", TGen e.TypeParams.Head
+                    if isMap then
+                        "value", TGen "Value"
+                    "left", self
+                    "right", self
+                    "height", tI32
+                ]
+            ]
+
+        ctx.State.Ents[key] <- e
+        e
 
 let private isUnit (t: Fable.Type) =
     match t with
@@ -1179,6 +1253,13 @@ let rec private (|Uncast|) (e: Fable.Expr) : Fable.Expr =
     | Fable.TypeCast(Uncast inner, _) -> inner
     | _ -> e
 
+/// The item type of what is a list here: a list, or a collection that `Map.keys` gives.
+let private listItem (t: Fable.Type) : Fable.Type option =
+    match t with
+    | Fable.List item -> Some item
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.ICollection`1" -> Some item
+    | _ -> None
+
 /// The functions of FSharp.Core that the part of the runtime library written in F# has: the
 /// file, and the name there (the name FSharp.Core compiles the function to).
 let private libraryFunction (entity: string) (name: string) : (string * string) option =
@@ -1212,6 +1293,59 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
     | "Microsoft.FSharp.Core.FSharpOption`1" when name = "get_IsSome" -> Some("Option", "isSome")
     | "Microsoft.FSharp.Core.FSharpOption`1" when name = "get_IsNone" -> Some("Option", "isNone")
     | "Microsoft.FSharp.Core.ResultModule" when has "Map Bind MapError" -> Some("Result", small name)
+    | "Microsoft.FSharp.Collections.MapModule" when
+        has
+            "Empty IsEmpty Add Find TryFind ContainsKey Remove Change Iterate Fold FoldBack ToList ToArray OfList OfArray
+             OfSeq Count Exists ForAll Filter Partition Map TryPick Pick TryFindKey FindKey Keys Values MinKeyValue
+             MaxKeyValue"
+        ->
+        Some(
+            "Map",
+            (if name = "OfSeq" then
+                 "ofList"
+             else
+                 small name)
+        )
+    | "Microsoft.FSharp.Collections.FSharpMap`2" ->
+        match name with
+        | "get_Item" -> Some("Map", "getItem")
+        | "Add"
+        | "Remove"
+        | "ContainsKey"
+        | "TryFind"
+        | "Change" -> Some("Map", "member" + name)
+        | "get_Count" -> Some("Map", "memberCount")
+        | "get_IsEmpty" -> Some("Map", "memberIsEmpty")
+        | _ -> None
+    | "Microsoft.FSharp.Collections.SetModule" when
+        has
+            "Empty IsEmpty Add Singleton Contains Remove Iterate Fold FoldBack ToList ToArray OfList OfArray OfSeq Count
+             Exists ForAll Filter Partition Map Union UnionMany Intersect Difference IsSubset IsSuperset IsProperSubset
+             IsProperSuperset MinElement MaxElement"
+        ->
+        Some(
+            "Set",
+            (if name = "OfSeq" then
+                 "ofList"
+             else
+                 small name)
+        )
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators" when name = "CreateSet" -> Some("Set", "ofList")
+    | "Microsoft.FSharp.Collections.ListModule" when name = "OfSeq" -> Some("List", "ofSeq")
+    | "Microsoft.FSharp.Collections.FSharpSet`1" ->
+        match name with
+        | "Add"
+        | "Remove"
+        | "Contains" -> Some("Set", "member" + name)
+        | "get_Count"
+        | "get_IsEmpty"
+        | "get_MinimumElement"
+        | "get_MaximumElement" -> Some("Set", "member" + name.Substring 4)
+        | "IsSubsetOf"
+        | "IsSupersetOf" -> Some("Set", "member" + name)
+        | "op_Addition" -> Some("Set", "opAddition")
+        | "op_Subtraction" -> Some("Set", "opSubtraction")
+        | _ -> None
     | "Microsoft.FSharp.Collections.FSharpList`1" when name = "get_Item" -> Some("List", "getItem")
     | "Microsoft.FSharp.Collections.FSharpList`1" when name = "get_Length" -> Some("List", "length")
     | "Microsoft.FSharp.Core.Operators" when name = "op_Append" -> Some("List", "append")
@@ -1903,6 +2037,7 @@ and typeArgsOf
 
 and dotnetExnEnt (ctx: Ctx) (fullName: string) : Ent = dotnetExnEntIn ctx.State fullName
 
+
 and failureEnt (ctx: Ctx) : Ent = dotnetExnEnt ctx "System.Exception"
 
 /// Raise a .NET exception of the given class with the given message.
@@ -1975,7 +2110,12 @@ and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
         | Fable.DeclaredType(entRef, genArgs) ->
             List.iter go genArgs
 
-            if not (dotnetExceptions.ContainsKey entRef.FullName) && seen.Add entRef.FullName then
+            if
+                not (dotnetExceptions.ContainsKey entRef.FullName)
+                && entRef.FullName <> mapName
+                && entRef.FullName <> setName
+                && seen.Add entRef.FullName
+            then
                 match ctx.Com.TryGetEntity entRef with
                 | Some ent when ent.IsFSharpUnion ->
                     for case in ent.UnionCases do
@@ -2602,6 +2742,34 @@ and dotnetCall
     | "System.String", "Concat", parts when not parts.IsEmpty && parts |> List.forall (fun x -> x.Type = Fable.String) ->
         let holes = parts |> List.mapi (fun i _ -> $"$%d{i}") |> String.concat ", "
         pure' $"fable_rt.format(.{{ %s{holes} }})" parts tStr
+    | "Microsoft.FSharp.Core.Operators", ("op_Addition" | "op_Subtraction"), [ a; _ ] when
+        (match a.Type with
+         | Fable.DeclaredType(ent, _) -> ent.FullName = setName
+         | _ -> false)
+        ->
+        let fn =
+            if name = "op_Addition" then
+                "opAddition"
+            else
+                "opSubtraction"
+
+        let item =
+            match a.Type with
+            | Fable.DeclaredType(_, [ item ]) -> item
+            | _ -> Fable.Any
+
+        libraryCall
+            ctx
+            r
+            "Set"
+            fn
+            { info with
+                GenericArgs = [ item ]
+                MemberRef = None
+                SignatureArgTypes = []
+            }
+            args
+            t
     // `a + b + c`: one new string, whatever the number of parts
     | "Microsoft.FSharp.Core.Operators", "op_Addition", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
         let rec parts (x: Fable.Expr) : Fable.Expr list =
@@ -2912,33 +3080,95 @@ and libraryCall
                 Fable.Value(Fable.NewOption(None, Fable.Unit, isStruct), r)
             | Fable.Value(Fable.NewList(None, Fable.Any), r) -> Fable.Value(Fable.NewList(None, Fable.Unit), r)
             | Uncast inner when
-                (match arg.Type, inner.Type with
-                 | Fable.DeclaredType(seq, _), Fable.List _ ->
-                     seq.FullName = "System.Collections.Generic.IEnumerable`1"
+                (match arg.Type with
+                 | Fable.DeclaredType(seq, _) -> seq.FullName = "System.Collections.Generic.IEnumerable`1"
                  | _ -> false)
+                && (listItem inner.Type).IsSome
                 ->
                 inner
             | _ -> arg
         )
 
-    if info.SignatureArgTypes.Length = args.Length then
+    // (an instance member: the object's type has the type parameters of its type)
+    let calledMember = info.MemberRef |> Option.bind ctx.Com.TryGetMember
+
+    let ownerParams =
+        match info.MemberRef with
+        | Some(Fable.MemberRef(entRef, _)) ->
+            match ctx.Com.TryGetEntity entRef with
+            | Some ent when not ent.IsFSharpModule -> ent.GenericParameters |> List.map (fun g -> g.Name)
+            | _ -> []
+        | _ -> []
+
+    match info.ThisArg, info.MemberRef with
+    | Some this, Some(Fable.MemberRef(entRef, _)) when not ownerParams.IsEmpty ->
+        unify
+            found
+            (Fable.DeclaredType(entRef, ownerParams |> List.map (fun n -> Fable.GenericParam(n, false, []))))
+            this.Type
+    | _ -> ()
+
+    let sigArgs =
+        match info.ThisArg with
+        | Some _ when info.SignatureArgTypes.Length + 1 = args.Length -> args.Tail
+        | _ -> args
+
+    if info.SignatureArgTypes.Length = sigArgs.Length then
         List.iter2
             (fun (pattern: Fable.Type) (arg: Fable.Expr) ->
                 match pattern, arg.Type with
-                | Fable.DeclaredType(seq, [ item ]), Fable.List actual when
+                | Fable.DeclaredType(seq, [ item ]), actual when
                     seq.FullName = "System.Collections.Generic.IEnumerable`1"
+                    && (listItem actual).IsSome
                     ->
-                    unify found item actual
+                    unify found item (listItem actual).Value
                 | _ -> unify found pattern arg.Type
             )
             info.SignatureArgTypes
-            args
+            sigArgs
+
+    // what no argument tells (`Map.empty`) is in the call's own type arguments
+    let allParams =
+        ownerParams
+        @ (
+            match calledMember with
+            | Some m -> m.GenericParameters |> List.map (fun g -> g.Name)
+            | None -> []
+        )
+
+    if allParams.Length = info.GenericArgs.Length then
+        for (n, ty) in List.zip allParams info.GenericArgs do
+            if not (found.ContainsKey n) then
+                found[n] <- ty
+
+    // (a member of a generic type that is not generic itself: the type arguments of the
+    // call are those of the object's type, in their order)
+    match info.ThisArg with
+    | Some this when
+        found.Count <> info.GenericArgs.Length
+        && (
+            match this.Type with
+            | Fable.DeclaredType(_, targs) -> targs.Length = info.GenericArgs.Length
+            | _ -> false
+        )
+        ->
+        found.Clear()
+        info.GenericArgs |> List.iteri (fun i ty -> found[$"%03d{i}"] <- ty)
+    | _ -> ()
 
     if found.Count <> info.GenericArgs.Length then
-        // (a type parameter that no argument mentions: only one of them can be told)
+        // (no argument tells: the call's own type arguments, in their order, which is the
+        // order of their names in FSharp.Core and in the library)
         match info.GenericArgs with
-        | [ only ] when found.Count = 0 -> found["T"] <- only
-        | _ -> fail r "the Zig target cannot tell the type arguments of this call of %s yet" fn
+        | given when found.Count = 0 -> given |> List.iteri (fun i ty -> found[$"%03d{i}"] <- ty)
+        | _ ->
+            fail
+                r
+                "the Zig target cannot tell the type arguments of this call of %s yet (%A from %A of %A)"
+                fn
+                (List.ofSeq found.Keys)
+                allParams
+                info.GenericArgs
 
     let typeArgs =
         found

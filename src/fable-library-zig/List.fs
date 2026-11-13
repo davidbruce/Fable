@@ -593,3 +593,6 @@ let where<'T> (predicate: 'T -> bool) (list: 'T list) : 'T list = filter predica
 let get<'T> (list: 'T list) (index: int) : 'T = item index list
 
 let cons<'T> (head: 'T) (tail: 'T list) : 'T list = head :: tail
+
+/// `List.ofSeq` of what is a list here already (a list, `Map.keys`, ...).
+let ofSeq<'T> (source: 'T list) : 'T list = source

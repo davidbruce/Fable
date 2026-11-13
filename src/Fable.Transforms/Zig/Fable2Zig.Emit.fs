@@ -1598,6 +1598,15 @@ let emitFile (state: FileState) : string =
             | Some verdict -> out.AppendLine($"%s{ind}    pub const fable_cyclic = %s{verdict};") |> ignore
             | None -> ()
 
+            // (the trees of `Map` and `Set`: the runtime compares and writes them by what they
+            // hold, not by their shape)
+            match e.Ref.FullName with
+            | "Fable.Library.Zig.Map.MapTree`2" ->
+                out.AppendLine($"%s{ind}    pub const fable_collection = .map;") |> ignore
+            | "Fable.Library.Zig.Set.SetTree`1" ->
+                out.AppendLine($"%s{ind}    pub const fable_collection = .set;") |> ignore
+            | _ -> ()
+
             for (c, fs) in e.Cases do
                 if fs.IsEmpty then
                     out.AppendLine($"%s{ind}    %s{fieldIdent c},") |> ignore

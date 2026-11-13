@@ -106,10 +106,11 @@ let tryCall (com: ICompiler) (ctx: Context) r t (info: CallInfo) (thisArg: Expr 
             if
                 thisArg.IsNone
                 && info.CompiledName.StartsWith("op_", System.StringComparison.Ordinal)
+                // (a type of the program's own source, not of a .NET assembly)
                 && args
                    |> List.exists (fun a ->
                        match a.Type with
-                       | DeclaredType _ -> true
+                       | DeclaredType({ Path = SourcePath _ }, _) -> true
                        | _ -> false
                    )
             then

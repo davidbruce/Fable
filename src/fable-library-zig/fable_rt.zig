@@ -336,9 +336,98 @@ fn dropRecord(comptime P: type, x: P) void {
     }
 }
 
+// ---- `Map` and `Set`: trees (Map.fs, Set.fs) that are compared by what they hold ----
+
+fn isCollection(comptime T: type) bool {
+    return @typeInfo(T) == .@"union" and @hasDecl(T, "fable_collection");
+}
+
+/// The entries of a map or a set, in order: the cells of its tree from left to right.
+fn TreeWalk(comptime T: type) type {
+    const Node = @typeInfo(@typeInfo(T).@"union".field_types[1]).pointer.child;
+    return struct {
+        stack: [64]*Node = undefined,
+        len: usize = 0,
+
+        fn init(tree: T) @This() {
+            var w: @This() = .{};
+            w.pushLeft(tree);
+            return w;
+        }
+
+        fn pushLeft(w: *@This(), tree: T) void {
+            var t = tree;
+            while (true) {
+                switch (t) {
+                    inline else => |p| {
+                        if (@TypeOf(p) == void) return;
+                        w.stack[w.len] = p;
+                        w.len += 1;
+                        t = p.left;
+                    },
+                }
+            }
+        }
+
+        fn next(w: *@This()) ?*Node {
+            if (w.len == 0) return null;
+            w.len -= 1;
+            const n = w.stack[w.len];
+            w.pushLeft(n.right);
+            return n;
+        }
+    };
+}
+
+/// An entry as F# sees it: the item of a set, the `(key, value)` of a map.
+fn entryEql(a: anytype, b: @TypeOf(a)) bool {
+    if (comptime @hasField(@TypeOf(a.*), "value")) return eql(a.key, b.key) and eql(a.value, b.value);
+    return eql(a.key, b.key);
+}
+
+fn entryCompare(a: anytype, b: @TypeOf(a)) i32 {
+    const c = compare(a.key, b.key);
+    if (c != 0) return c;
+    if (comptime @hasField(@TypeOf(a.*), "value")) return compare(a.value, b.value);
+    return 0;
+}
+
+fn treeEql(a: anytype, b: @TypeOf(a)) bool {
+    var x = TreeWalk(@TypeOf(a)).init(a);
+    var y = TreeWalk(@TypeOf(a)).init(b);
+    while (true) {
+        const p = x.next();
+        const q = y.next();
+        if (p == null or q == null) return p == null and q == null;
+        if (!entryEql(p.?, q.?)) return false;
+    }
+}
+
+fn treeCompare(a: anytype, b: @TypeOf(a)) i32 {
+    var x = TreeWalk(@TypeOf(a)).init(a);
+    var y = TreeWalk(@TypeOf(a)).init(b);
+    while (true) {
+        const p = x.next() orelse return if (y.next() == null) 0 else -1;
+        const q = y.next() orelse return 1;
+        const c = entryCompare(p, q);
+        if (c != 0) return c;
+    }
+}
+
+fn treeHash(x: anytype) i32 {
+    var w = TreeWalk(@TypeOf(x)).init(x);
+    var h: i32 = 17;
+    while (w.next()) |n| {
+        h = hashWith(h, hash(n.key));
+        if (comptime @hasField(@TypeOf(n.*), "value")) h = hashWith(h, hash(n.value));
+    }
+    return h;
+}
+
 /// Structural equality, as F#'s `=` on records, unions, tuples and options.
 pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     const T = @TypeOf(a);
+    if (comptime isCollection(T)) return treeEql(a, b);
     if (comptime isSlice(T)) {
         if (a.len != b.len) return false;
         for (a, b) |x, y| {
@@ -1342,6 +1431,7 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
             return 0;
         },
         .@"union" => {
+            if (comptime isCollection(T)) return treeCompare(a, b);
             if (comptime @hasDecl(T, "fable_list")) {
                 var x = a;
                 var y = b;
@@ -1432,6 +1522,7 @@ pub fn hash(x: anytype) i32 {
             return h;
         },
         .@"union" => {
+            if (comptime isCollection(T)) return treeHash(x);
             if (comptime @hasDecl(T, "fable_list")) {
                 var h: i32 = 17;
                 var rest = x;
@@ -2704,6 +2795,29 @@ pub const Shower = struct {
                 return b.bracket(b.separated(&items, ","));
             },
             .@"union" => {
+                if (comptime isCollection(T)) {
+                    // `map [(1, "a"); ...]`, `set [1; 2]`: nine entries, then `...`
+                    const name = if (T.fable_collection == .map) "map" else "set";
+                    var items: std.ArrayList(*Layout) = .empty;
+                    var w = TreeWalk(T).init(x);
+                    while (w.next()) |n| {
+                        if (items.items.len == 9) {
+                            items.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+                            break;
+                        }
+                        const item = if (comptime T.fable_collection == .map)
+                            b.show(.{ n.key, n.value }, .bracket_if_tuple, depth - 1)
+                        else
+                            b.show(n.key, .bracket_if_tuple, depth - 1);
+                        items.append(b.arena, item) catch @panic("fable: out of memory");
+                    }
+                    const list = if (items.items.len == 0)
+                        b.word("[]")
+                    else
+                        b.tight(b.tight(b.ascii(false, "[", true), b.separated(items.items, ";")), b.ascii(true, "]", false));
+                    const whole = b.join(b.word(name), list, .{ .breakable = 2 });
+                    return if (@backingInt(prec) <= @backingInt(Prec.bracket_if_tuple_or_not_atomic)) b.bracket(whole) else whole;
+                }
                 if (comptime @hasDecl(T, "fable_list")) {
                     if (x == .Empty) return b.word("[]");
                     var items: std.ArrayList(*Layout) = .empty;
