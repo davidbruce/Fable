@@ -229,3 +229,19 @@ let memberIsSubsetOf<'T when 'T: comparison> (set: SetTree<'T>) (other: SetTree<
 let memberIsSupersetOf<'T when 'T: comparison> (set: SetTree<'T>) (other: SetTree<'T>) : bool = isSuperset set other
 let opAddition<'T when 'T: comparison> (set1: SetTree<'T>) (set2: SetTree<'T>) : SetTree<'T> = union set1 set2
 let opSubtraction<'T when 'T: comparison> (set1: SetTree<'T>) (set2: SetTree<'T>) : SetTree<'T> = difference set1 set2
+
+let memberIsProperSubsetOf<'T when 'T: comparison> (set: SetTree<'T>) (other: SetTree<'T>) : bool =
+    isProperSubset set other
+
+let memberIsProperSupersetOf<'T when 'T: comparison> (set: SetTree<'T>) (other: SetTree<'T>) : bool =
+    isProperSuperset set other
+
+/// `Set.intersectMany sets`: what all of them hold (FSharp.Core raises for no set)
+let intersectMany<'T when 'T: comparison> (sets: SetTree<'T> list) : SetTree<'T> =
+    match sets with
+    | [] -> invalidArg "sets" "The input sequence was empty."
+    | first :: rest -> List.fold intersect first rest
+
+/// `Set.toSeq set`: its elements, in order
+let toSeq<'T when 'T: comparison> (set: SetTree<'T>) : Fable.Library.Zig.Seq.SeqOf<'T> =
+    Fable.Library.Zig.Seq.ofList (toList set)

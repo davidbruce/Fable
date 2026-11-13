@@ -31,5 +31,7 @@
     <Compile Include="ResultTests.fs" />
     <Compile Include="ListTests.fs" />
     <Compile Include="ArrayTests.fs" />
+    <Compile Include="MapTests.fs" />
+    <Compile Include="SetTests.fs" />
   </ItemGroup>
 </Project>

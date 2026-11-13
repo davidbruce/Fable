@@ -2075,6 +2075,9 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
     | "Microsoft.FSharp.Collections.FSharpList`1" when name = "Cons" -> Some("List", "cons")
     | "Microsoft.FSharp.Collections.ListModule" when name = "ToSeq" -> Some("Seq", "ofList")
     | "Microsoft.FSharp.Collections.ArrayModule" when name = "ToSeq" -> Some("Seq", "ofArray")
+    | "Microsoft.FSharp.Collections.MapModule" when name = "ToSeq" -> Some("Map", "toSeq")
+    | "Microsoft.FSharp.Collections.SetModule" when name = "ToSeq" -> Some("Set", "toSeq")
+    | "Microsoft.FSharp.Collections.SetModule" when name = "IntersectMany" -> Some("Set", "intersectMany")
     | "Microsoft.FSharp.Collections.ArrayModule" when name = "OfSeq" -> Some("Seq", "toArray")
     | "Microsoft.FSharp.Collections.SeqModule" when name = "Tail" -> Some("Seq", "tail")
     | "Microsoft.FSharp.Core.OptionModule"
@@ -2123,6 +2126,8 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
         | "Change" -> Some("Map", "member" + name)
         | "get_Count" -> Some("Map", "memberCount")
         | "get_IsEmpty" -> Some("Map", "memberIsEmpty")
+        // `Map [ (k, v); ... ]`
+        | ".ctor" -> Some("Map", "ofList")
         | _ -> None
     | "Microsoft.FSharp.Collections.SetModule" when
         has
@@ -2179,6 +2184,7 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
         | _ -> None
     | "Microsoft.FSharp.Collections.FSharpSet`1" ->
         match name with
+        | ".ctor" -> Some("Set", "ofList")
         | "Add"
         | "Remove"
         | "Contains" -> Some("Set", "member" + name)
@@ -2187,7 +2193,9 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
         | "get_MinimumElement"
         | "get_MaximumElement" -> Some("Set", "member" + name.Substring 4)
         | "IsSubsetOf"
-        | "IsSupersetOf" -> Some("Set", "member" + name)
+        | "IsSupersetOf"
+        | "IsProperSubsetOf"
+        | "IsProperSupersetOf" -> Some("Set", "member" + name)
         | "op_Addition" -> Some("Set", "opAddition")
         | "op_Subtraction" -> Some("Set", "opSubtraction")
         | _ -> None
@@ -5032,6 +5040,10 @@ and dotnetCall
     | "Microsoft.FSharp.Core.ExtraTopLevelOperators", "DefaultAsyncBuilder", _ -> EUnit
 
     // ---- the entry of a map ----
+    // (an entry is a pair here: making one is making the pair, and `KeyValue(k, v)` is the pair)
+    | "System.Collections.Generic.KeyValuePair`2", ".ctor", [ k; v ] ->
+        lw ctx (Fable.Value(Fable.NewTuple([ k; v ], false), r))
+    | "Microsoft.FSharp.Core.Operators", "KeyValuePattern", [ kv ] -> lw ctx kv
     | "System.Collections.Generic.KeyValuePair`2", ("get_Key" | "get_Value"), [ kv ] ->
         bindArgs
             ctx

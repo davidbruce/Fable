@@ -332,3 +332,7 @@ let memberChange<'Key, 'Value when 'Key: comparison>
     : MapTree<'Key, 'Value>
     =
     change key f table
+
+/// `Map.toSeq table`: its entries, in the order of the keys
+let toSeq<'Key, 'T when 'Key: comparison> (table: MapTree<'Key, 'T>) : Fable.Library.Zig.Seq.SeqOf<'Key * 'T> =
+    Fable.Library.Zig.Seq.ofList (toList table)
