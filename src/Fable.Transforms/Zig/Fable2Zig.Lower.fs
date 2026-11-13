@@ -733,6 +733,24 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Lazy`1" -> TEnt(lazyEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.WeakReference`1" ->
         TEnt(netEnt ctx.State "Weak", [ mapType ctx r t ])
+    // a byref: a pointer (`inref` to what cannot be assigned)
+    | Fable.DeclaredType(ent, [ t; kind ]) when ent.FullName = "Microsoft.FSharp.Core.byref`2" ->
+        let isIn =
+            match kind with
+            | Fable.DeclaredType(k, _) -> k.FullName.EndsWith(".In", System.StringComparison.Ordinal)
+            | _ -> false
+
+        TPtr(mapType ctx r t, isIn)
+    // a span: a slice of what it views
+    | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Span`1" || ent.FullName = "System.ReadOnlySpan`1" ->
+        let item = mapType ctx r t
+
+        if isManaged item then
+            fail
+                r
+                "the Zig target does not support spans of values that are counted (strings, records with references, ...) yet"
+
+        TSlice(item, ent.FullName = "System.ReadOnlySpan`1")
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Text.StringBuilder" ->
         TEnt(netEnt ctx.State "StringBuilder", [])
     | Fable.Array(t, _) -> TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
@@ -1788,6 +1806,19 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
     | "Microsoft.FSharp.Core.Operators" when name = "op_Append" -> Some("List", "append")
     | _ -> None
 
+/// The type a byref points at; any other type as it is.
+let private unByref (t: Fable.Type) : Fable.Type =
+    match t with
+    | Fable.DeclaredType(ent, [ inner; _ ]) when ent.FullName = "Microsoft.FSharp.Core.byref`2" -> inner
+    | _ -> t
+
+/// A read of what a byref points at, typed as that: `string s.[i]`, `%d` of it.
+let private readByref (e: Fable.Expr) : Fable.Expr =
+    match e.Type with
+    | Fable.DeclaredType(ent, [ inner; _ ]) when ent.FullName = "Microsoft.FSharp.Core.byref`2" ->
+        Fable.TypeCast(e, inner)
+    | _ -> e
+
 /// The expression under the casts and unboxing that F# puts around `x` in `use x = ...`.
 let rec private (|Unboxed|) (e: Fable.Expr) : Fable.Expr =
     match e with
@@ -2073,6 +2104,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     | Fable.IdentExpr id ->
         match ctx.Vars.TryGetValue id.Name with
+        | true, ({ Ty = TPtr(t, _) } as v) -> EDeref(EVar v, t)
         | true, v -> EVar v
         | _ ->
             match ctx.Members.TryGetValue id.Name with
@@ -2314,6 +2346,29 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ctx.Boxed.Add id.Name |> ignore
         ELet(v, rhs, lw ctx body)
 
+    // a byref variable bound to a place: the pointer to it
+    | Fable.Let(id, value, body) when
+        (match id.Type with
+         | Fable.DeclaredType(ent, _) -> ent.FullName = "Microsoft.FSharp.Core.byref`2"
+         | _ -> false)
+        ->
+        let ty = mapType ctx id.Range id.Type
+        let v = ctx.State.NewVar(id.Name, ty, VLocal, false)
+        ctx.Vars[id.Name] <- v
+
+        let place =
+            bindArgs
+                ctx
+                [ lw ctx value ]
+                (fun xs ->
+                    match xs.Head with
+                    | EDeref(p, _) -> p
+                    | EVar x -> EAddr(EVar x, not x.FMutable)
+                    | _ -> fail id.Range "the Zig target cannot take the address of this yet"
+                )
+
+        ELet(v, place, lw ctx body)
+
     | Fable.Let(id, value, body) ->
         let rhs = lw ctx value
         let ty = mapType ctx id.Range id.Type
@@ -2354,7 +2409,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | UnaryMinus -> bindArgs ctx [ ir ] (fun xs -> EPrim("neg", xs, ty))
             | UnaryNot -> bindArgs ctx [ ir ] (fun xs -> EPrim("not", xs, ty))
             | UnaryNotBitwise -> bindArgs ctx [ ir ] (fun xs -> EPrim("bnot", xs, ty))
-            | UnaryAddressOf -> fail r "the Zig target does not support address-of yet"
+            | UnaryAddressOf ->
+                match ir with
+                // (a byref passed on is the pointer it is)
+                | EDeref(p, _) -> p
+                | EVar v -> EAddr(EVar v, not v.FMutable)
+                | _ -> fail r "the Zig target can only take the address of a variable (`&x`)"
         | Fable.Binary(op, a, b) ->
             let name =
                 match op with
@@ -2770,7 +2830,39 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             let typeArgs, _ =
                 typeArgsOf ctx r c (Some info.GenericArgs) (allArgs |> List.map (fun a -> a.Type)) (Some t)
 
-            bindArgs ctx args (fun xs -> ECall(c.Target, typeArgs, c.Captures @ xs, ty))
+            // (F# gives a value, not its address, where an `inref` is expected)
+            let isByref (t: Fable.Type) =
+                match t with
+                | Fable.DeclaredType(ent, _) -> ent.FullName = "Microsoft.FSharp.Core.byref`2"
+                | _ -> false
+
+            let wantsAddress =
+                if c.ArgTypes.Length = allArgs.Length then
+                    List.map2
+                        (fun (p: Fable.Type) (a: Fable.Expr) -> isByref p && not (isByref a.Type))
+                        c.ArgTypes
+                        allArgs
+                else
+                    allArgs |> List.map (fun _ -> false)
+
+            bindArgs
+                ctx
+                args
+                (fun xs ->
+                    let xs =
+                        List.map2
+                            (fun x want ->
+                                match x, want with
+                                | EVar v, true -> EAddr(EVar v, true)
+                                | EAddr _, _
+                                | _, false -> x
+                                | _ -> fail r "the Zig target can only give a variable where an inref is expected"
+                            )
+                            xs
+                            wantsAddress
+
+                    ECall(c.Target, typeArgs, c.Captures @ xs, ty)
+                )
         | None, Fable.Import(imp, _, _) ->
             fail r "the Zig target does not support this library call yet (%s from %s)" imp.Selector imp.Path
         // a function value: all its arguments at once
@@ -2829,6 +2921,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, r) ->
         match ctx.Vars.TryGetValue id.Name, ctx.Members.TryGetValue id.Name with
+        | (true, ({ Ty = TPtr(t, _) } as v)), _ ->
+            bindArgs ctx [ lw ctx value ] (fun xs -> EStore(EDeref(EVar v, t), xs.Head))
         | (true, v), _ -> EAssign(v, lw ctx value)
         // (a module-level value: what it held is given up once the new value is in place)
         | _, (true, MValue ty) ->
@@ -3057,7 +3151,7 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
             args.Length
 
     let mutable next = 0
-    let values = Array.ofList args
+    let values = args |> List.map readByref |> Array.ofList
 
     let texts =
         parts
@@ -3775,8 +3869,7 @@ and dotnetCall
     // ---- .NET's mutable collections ----
     | "System.Collections.Generic.List`1", ".ctor", ([] | [ _ ]) when
         (match args with
-         | [ Uncast x ] -> (listItem x.Type).IsSome
-         | [ n ] -> isInt n
+         | [ (Uncast inner as x) ] -> (listItem inner.Type).IsSome || isInt x
          | _ -> true)
         ->
         let ty = mapType ctx r t
@@ -3861,6 +3954,39 @@ and dotnetCall
     | ("Microsoft.FSharp.Control.LazyExtensions" | "System.Lazy`1"), ("Force" | "get_Value"), l :: _ ->
         rt "fable_rt.lazyForce($0)" [ l ] (mapType ctx r t)
     | "System.Lazy`1", "get_IsValueCreated", [ l ] -> pure' "fable_rt.lazyIsCreated($0)" [ l ] tBool
+
+    // ---- spans: slices of the arrays they view ----
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), ".ctor", [ a ] when
+        (match a.Type with
+         | Fable.Array _ -> true
+         | _ -> false)
+        ->
+        pure' "$0.items" [ a ] (mapType ctx r t)
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), ".ctor", [ a; start; n ] ->
+        rt "fable_rt.spanSlice($0.items, $1, $2)" [ a; start; n ] (mapType ctx r t)
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "get_Length", [ sp ] ->
+        pure' "@as(i32, @intCast($0.len))" [ sp ] tI32
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "get_Item", [ sp; i ] ->
+        // (the item's place: a byref, which is read here, or kept by a byref variable)
+        let item =
+            match mapType ctx r t with
+            | TPtr(item, _) -> item
+            | other -> other
+
+        let ptr =
+            rt "fable_rt.spanRef($0, $1)" [ sp; i ] (TPtr(item, entity = "System.ReadOnlySpan`1"))
+
+        bindArgs ctx [ ptr ] (fun xs -> EDeref(xs.Head, item))
+    | "System.Span`1", "set_Item", [ sp; i; x ] -> rt "fable_rt.spanSet($0, $1, $2)" [ sp; i; x ] tVoid
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "Slice", [ sp; start ] ->
+        rt "fable_rt.spanSlice($0, $1, null)" [ sp; start ] (mapType ctx r t)
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "Slice", [ sp; start; n ] ->
+        rt "fable_rt.spanSlice($0, $1, $2)" [ sp; start; n ] (mapType ctx r t)
+    | "System.Span`1", "op_Implicit", [ sp ] -> lw ctx sp
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "ToArray", [ sp ] ->
+        pure' "fable_rt.arrayOf($R, .{})" [] (mapType ctx r t) |> ignore
+        fail r "the Zig target does not support Span.ToArray yet"
+    | "System.Span`1", "Fill", [ sp; x ] -> pure' "@memset($0, $1)" [ sp; x ] tVoid
 
     // ---- weak references ----
     | "System.WeakReference`1", ".ctor", [ target ] -> pure' "fable_rt.weakNew($R, $0)" [ target ] (mapType ctx r t)
@@ -4202,6 +4328,17 @@ and dotnetCall
     // `string x`
     | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when (ownToString ctx x.Type).IsSome ->
         bindArgs ctx [ lw ctx x ] (fun xs -> ECall((ownToString ctx x.Type).Value, [], xs @ [ EUnit ], tStr))
+    | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when x.Type <> unByref x.Type ->
+        dotnetCall
+            ctx
+            r
+            entity
+            name
+            { info with
+                Args = [ readByref x ]
+                ThisArg = None
+            }
+            t
     | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] ->
         match x.Type with
         // (the text of a null string is the empty string)

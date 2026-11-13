@@ -578,6 +578,9 @@ let rec ex (em: Em) (e: Expr) : string =
             $"(%s{ex em x} %s{op} null)"
         | _ -> $"(%s{ex em x} == .%s{fieldIdent c})"
     | EDup(x, _) -> dupCode (ex em x)
+    // (`&x` and what a byref points at)
+    | EAddr(x, _) -> "&" + ex em x
+    | EDeref(x, _) -> ex em x + ".*"
     | EIf(c, t, f, _) when isFlat c && isFlat t && isFlat f -> simpleIf em c t f
     | _ -> fail None "internal: this expression is not part of the Zig target yet"
 
@@ -1183,7 +1186,22 @@ let emitFunction
             Out = StringBuilder()
             Names = Dictionary()
             Used = HashSet(rootNames)
-            Mutated = Set.union (assignedIn fn.Body) (storedInto fn.Body)
+            Mutated =
+                // (a variable whose address is taken to be assigned through is a `var` too)
+                let addressed = HashSet<int>()
+
+                exists
+                    (fun x ->
+                        match x with
+                        | EAddr(EVar v, false) -> addressed.Add v.Id |> ignore
+                        | _ -> ()
+
+                        false
+                    )
+                    fn.Body
+                |> ignore
+
+                Set.unionMany [ assignedIn fn.Body; storedInto fn.Body; Set.ofSeq addressed ]
             Loop = loop
             Self = fn
             Fns = fns

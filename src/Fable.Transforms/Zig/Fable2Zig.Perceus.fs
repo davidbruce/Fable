@@ -1403,6 +1403,15 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
                     |> List.map (fun r -> r.Id)
 
                 { env with Owners = env.Owners.Add(v.Id, srcs) }, true
+            // A span views what it was made of (an array's items, another span): what it was
+            // made of stays alive while it is in use.
+            | _ when
+                (match v.Ty with
+                 | TSlice _ -> true
+                 | _ -> false)
+                ->
+                let srcs = fv rhs |> Set.toList
+                { env with Owners = env.Owners.Add(v.Id, srcs) }, true
             | _ -> env, false
 
         let rhs', consumed, env2 = rewriteFlat p env1 rhs (isManaged v.Ty && not isAlias) Lb

@@ -19,12 +19,14 @@ open Replacements.Util
 let DotnetPrefix = "dotnet:"
 
 /// Numbers, booleans and chars: what Zig's own operators work on.
-let private isNative (t: Type) =
+let rec private isNative (t: Type) =
     match t with
     | Number((BigInt | Decimal), _) -> false
     | Number _
     | Boolean
     | Char -> true
+    // (a byref of a number is read as the number)
+    | DeclaredType(ent, [ inner; _ ]) when ent.FullName = "Microsoft.FSharp.Core.byref`2" -> isNative inner
     | _ -> false
 
 /// The .NET name of a native number type, and its zero.

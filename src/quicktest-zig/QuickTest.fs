@@ -358,3 +358,4 @@ let main _ =
     + Arrays2.run ()
     + Weak.run ()
     + Resources.run ()
+    + Pointers.run ()

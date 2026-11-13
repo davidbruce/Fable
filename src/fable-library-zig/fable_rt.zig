@@ -1744,6 +1744,31 @@ pub fn arenaLeave(a: Arena) void {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Spans: `Span<'T>` and `ReadOnlySpan<'T>` are Zig slices of what they view (an array's items)
+// ---------------------------------------------------------------------------------------------
+
+/// `s.[i]`: where the item is (F# reads it, or assigns through it)
+pub inline fn spanRef(s: anytype, i: i32) Raised!@TypeOf(&s[0]) {
+    if (i < 0 or i >= s.len) return indexOutside();
+    return &s[@intCast(i)];
+}
+
+/// `s.[i] <- x`
+pub inline fn spanSet(s: anytype, i: i32, x: @typeInfo(@TypeOf(s)).pointer.child) Raised!void {
+    if (i < 0 or i >= s.len) return indexOutside();
+    s[@intCast(i)] = x;
+}
+
+/// `s.Slice(start)` and `s.Slice(start, length)`
+pub fn spanSlice(s: anytype, start: i32, length: ?i32) Raised!@TypeOf(s) {
+    const n = length orelse @as(i32, @intCast(s.len)) - start;
+    if (start < 0 or n < 0 or start > s.len or n > @as(i32, @intCast(s.len)) - start) {
+        return raise(ArgumentOutOfRangeException, str("Specified argument was out of the range of valid values."));
+    }
+    return s[@intCast(start)..][0..@intCast(n)];
+}
+
+// ---------------------------------------------------------------------------------------------
 // Weak references
 //
 // `WeakReference<'T>` points at a cell without keeping it alive. It holds a handle, shared by

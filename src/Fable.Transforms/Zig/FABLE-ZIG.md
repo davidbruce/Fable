@@ -374,6 +374,24 @@ still alive when it ends is a panic in builds that count.
 Not yet: generic resources, `IResource` on classes, hooks that raise (what they raise is
 given up), and a stack arena shared between threads.
 
+## Byrefs and spans
+
+A `byref`, `inref` or `outref` is a pointer (`*T`, `*const T` for an `inref`); `&x` is the
+address of a variable (a `let mutable` whose address is taken is a Zig `var`), a byref passed
+on is the pointer it is, and where F# gives a value for an `inref` its address is taken.
+Reading a byref reads what it points at; assigning to it, or to a field through it, assigns
+there.
+
+`Span<'T>` and `ReadOnlySpan<'T>` are slices (`[]T`, `[]const T`) of the array they view, and
+the array stays alive while a span made of it is in use (the ownership pass takes the span for
+an alias of it). `s.[i]` is the item's place, with .NET's `IndexOutOfRangeException` outside;
+`Slice`, `Length`, `Fill` and the conversion to `ReadOnlySpan` work. Spans of values that are
+counted are not supported yet (an assignment through one could not tell the collector), nor
+`stackalloc`, `Span.ToArray` and spans of strings.
+
+(A fix in the shared `FableTransforms.fs`: `let t = r`, where `r` is a byref, copies the value
+it points at, so Fable no longer inlines `t`; that was wrong for every target.)
+
 ## Weak references
 
 `WeakReference<'T>` of a reference type (a class, a record with mutable fields, an array, ...)
