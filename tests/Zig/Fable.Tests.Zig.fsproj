@@ -26,12 +26,12 @@
     <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="../Js/Main/Globs/*.fs" />
+    <Compile Include="Globs/GlobTest.fs" />
     <Compile Include="Util.fs" />
     <Compile Include="Misc/Util2.fs" />
     <Compile Include="Misc/Util3.fs" />
     <Compile Include="Misc/Aether.fs" />
-    <Compile Include="../../tests_external/Util3.fs" />
+    <Compile Include="External/Util3.fs" />
     <Compile Include="MiscTestsHelper.fs" />
     <Compile Include="OptionTests.fs" />
     <Compile Include="ResultTests.fs" />
