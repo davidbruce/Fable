@@ -1,0 +1,386 @@
+/// .NET's members: arrays, 2D arrays, .NET's mutable collections, lazy, spans, weak references. The lowering (`Lower.dotnetCall`) asks here in the place these
+/// cases had among its own.
+module Fable.Transforms.Zig.DotnetCollections
+
+open System.Collections.Generic
+open Fable
+open Fable.AST
+open Fable.Transforms
+open Fable.Transforms.Zig.IR
+open Fable.Transforms.Zig.Lower
+open Fable.Transforms.Zig.DotnetHelpers
+
+/// The lowered call, or null when the member is not one of this file's.
+let call
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (entity: string)
+    (name: string)
+    (info: Fable.CallInfo)
+    (t: Fable.Type)
+    : Expr
+    =
+    // (the object of a property or method comes first)
+    let args =
+        match info.ThisArg with
+        | Some this -> this :: info.Args
+        | None -> info.Args
+
+    let rt = rt ctx
+    let pure' = pure' ctx
+    let zigTypeName = zigTypeName r
+    let decLit = decLit ctx
+    let contents = contents r
+
+    match entity, name, args with
+    // ---- arrays ----
+    // ---- two-dimensional arrays: arrays that know their rows and columns ----
+    | "Microsoft.FSharp.Collections.Array2DModule", "ZeroCreate", [ rows; cols ] ->
+        rt "fable_rt.array2DZero($R, $0, $1)" [ rows; cols ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "Create", [ rows; cols; x ] ->
+        rt "fable_rt.array2DCreate($R, $0, $1, $2)" [ rows; cols; x ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "Initialize", [ rows; cols; f ] ->
+        rt "fable_rt.array2DInit($R, $0, $1, $2)" [ rows; cols; f ] (mapType ctx r t)
+    | ("Microsoft.FSharp.Collections.Array2DModule" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
+      ("Get" | "GetArray2D"),
+      [ a; i; j ] -> rt "fable_rt.array2DGet($0, $1, $2)" [ a; i; j ] (mapType ctx r t)
+    | ("Microsoft.FSharp.Collections.Array2DModule" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
+      ("Set" | "SetArray2D"),
+      [ a; i; j; v ] -> rt "fable_rt.array2DSet($0, $1, $2, $3)" [ a; i; j; v ] tVoid
+    | "Microsoft.FSharp.Collections.Array2DModule", ("Length1" | "Length2"), [ a ] ->
+        pure'
+            $"""fable_rt.array2DLength($0, %s{if name = "Length1" then
+                                                  "0"
+                                              else
+                                                  "1"})"""
+            [ a ]
+            tI32
+    | "Microsoft.FSharp.Collections.Array2DModule", ("Base1" | "Base2"), [ a ] -> ESeq(lwStmt ctx a, ELit("0", tI32))
+    | "System.Array", "GetLength", [ a; d ] -> rt "fable_rt.arrayGetLength($0, $1)" [ a; d ] tI32
+    | "Microsoft.FSharp.Collections.Array2DModule", ("Copy" | "Rebase"), [ a ] ->
+        pure' "fable_rt.array2DCopy($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "CopyTo", [ src; si; sj; dst; ti; tj; n1; n2 ] ->
+        rt "fable_rt.array2DBlit($0, $1, $2, $3, $4, $5, $6, $7)" [ src; si; sj; dst; ti; tj; n1; n2 ] tVoid
+    | "Microsoft.FSharp.Core.Operators.OperatorIntrinsics", "GetArraySlice2D", [ a; lo1; hi1; lo2; hi2 ] ->
+        pure' "fable_rt.array2DSlice($0, $1, $2, $3, $4)" [ a; lo1; hi1; lo2; hi2 ] (mapType ctx r t)
+    // `array2D rows`: rows given as a list or an array of lists or arrays
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators", "CreateArray2D", [ Uncast rows ] when
+        (match rows.Type with
+         | Fable.List(Fable.List _ | Fable.Array _)
+         | Fable.Array((Fable.List _ | Fable.Array _), _) -> true
+         | _ -> false)
+        ->
+        rt "fable_rt.array2DOfRows($R, $0)" [ rows ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "Map", [ f; a ] ->
+        rt "fable_rt.array2DMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "MapIndexed", [ f; a ] ->
+        rt "fable_rt.array2DMapi($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.Array2DModule", "Iterate", [ f; a ] ->
+        rt "fable_rt.array2DIter($0, $1)" [ f; a ] tVoid
+    | "Microsoft.FSharp.Collections.Array2DModule", "IterateIndexed", [ f; a ] ->
+        rt "fable_rt.array2DIteri($0, $1)" [ f; a ] tVoid
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetArray", [ a; i ]
+    | "Microsoft.FSharp.Collections.ArrayModule", "Get", [ a; i ] ->
+        // (where the item is a function that is applied at once, Fable gives the read the type
+        // of the application: the type of the array is the one to go by)
+        let itemTy =
+            match a.Type with
+            | Fable.Array(item, _) -> item
+            | _ -> t
+
+        rt "fable_rt.arrayGet($0, $1)" [ a; i ] (mapType ctx r itemTy)
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "SetArray", [ a; i; x ]
+    | "Microsoft.FSharp.Collections.ArrayModule", "Set", [ a; i; x ] ->
+        rt "fable_rt.arraySet($0, $1, $2)" [ a; i; x ] tVoid
+    | "System.Array", "get_Length", [ a ]
+    | "Microsoft.FSharp.Collections.ArrayModule", "Length", [ a ] -> pure' "fable_rt.arrayLen($0)" [ a ] tI32
+    | "Microsoft.FSharp.Collections.ArrayModule", "IsEmpty", [ a ] -> pure' "(fable_rt.arrayLen($0) == 0)" [ a ] tBool
+    | "Microsoft.FSharp.Collections.ArrayModule", "Empty", [] -> pure' "fable_rt.arrayOf($R, .{})" [] (mapType ctx r t)
+    | "Microsoft.FSharp.Core.Operators.OperatorIntrinsics", "GetArraySlice", [ a; lo; hi ] ->
+        pure' "fable_rt.arraySlice($0, $1, $2)" [ a; lo; hi ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "ZeroCreate", [ n ] ->
+        rt "fable_rt.arrayZero($R, $0)" [ n ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Create", [ n; x ] ->
+        rt "fable_rt.arrayCreate($R, $0, $1)" [ n; x ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Initialize", [ n; f ] ->
+        rt "fable_rt.arrayInit($R, $0, $1)" [ n; f ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Copy", [ a ] ->
+        pure' "fable_rt.arrayCopy($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Append", [ a; b ] ->
+        pure' "fable_rt.arrayAppend($0, $1)" [ a; b ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Reverse", [ a ] ->
+        pure' "fable_rt.arrayRev($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "GetSubArray", [ a; start; n ] ->
+        rt "fable_rt.arraySub($0, $1, $2)" [ a; start; n ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Fill", [ a; start; n; x ] ->
+        rt "fable_rt.arrayFill($0, $1, $2, $3)" [ a; start; n; x ] tVoid
+    | "Microsoft.FSharp.Collections.ArrayModule", "OfList", [ xs ] ->
+        pure' "fable_rt.arrayOfList($R, $0)" [ xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "ToList", [ a ] ->
+        pure' "fable_rt.arrayToList($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Contains", [ x; a ] ->
+        pure' "fable_rt.arrayContains(@as(fable_rt.ItemOf(@TypeOf($1)), $0), $1)" [ x; a ] tBool
+    | "Microsoft.FSharp.Collections.ArrayModule", "Map", [ f; a ] ->
+        rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "MapIndexed", [ f; a ] ->
+        rt "fable_rt.arrayMapi($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Iterate", [ f; a ] -> rt "fable_rt.arrayIter($0, $1)" [ f; a ] tVoid
+    | "Microsoft.FSharp.Collections.ArrayModule", "IterateIndexed", [ f; a ] ->
+        rt "fable_rt.arrayIteri($0, $1)" [ f; a ] tVoid
+    | "Microsoft.FSharp.Collections.ArrayModule", "Fold", [ f; state; a ] ->
+        rt "fable_rt.arrayFold($0, @as($R, $1), $2)" [ f; state; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Filter", [ f; a ] ->
+        rt "fable_rt.arrayFilter($0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Exists", [ f; a ] -> rt "fable_rt.arrayExists($0, $1)" [ f; a ] tBool
+    | "Microsoft.FSharp.Collections.ArrayModule", "ForAll", [ f; a ] -> rt "fable_rt.arrayForall($0, $1)" [ f; a ] tBool
+
+    // ---- .NET's mutable collections ----
+    | "System.Collections.Generic.List`1", ".ctor", ([] | [ _ ]) when
+        (match args with
+         | [ (Uncast inner as x) ] -> (listItem inner.Type).IsSome || isInt x
+         | _ -> true)
+        ->
+        let ty = mapType ctx r t
+
+        match args with
+        | [ Uncast x ] when (listItem x.Type).IsSome -> pure' "fable_rt.raOfList($R, $0)" [ x ] ty
+        | [ n ] -> bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.raNew($R)" [] ty)
+        | _ -> pure' "fable_rt.raNew($R)" [] ty
+    // (from any other sequence)
+    | "System.Collections.Generic.List`1", ".ctor", [ items ] when not (isInt items) ->
+        libraryCall ctx r "ResizeArray" "ofSeq" info args t
+    | "System.Collections.Generic.List`1", _, r0 :: rest ->
+        match name, rest with
+        | "Add", [ x ] -> pure' "fable_rt.raAdd($0, $1)" [ r0; x ] tVoid
+        | "AddRange", [ Uncast xs ] when (listItem xs.Type).IsSome ->
+            pure' "fable_rt.raAddList($0, $1)" [ r0; xs ] tVoid
+        | "get_Item", [ i ] -> rt "fable_rt.raGet($0, $1)" [ r0; i ] (mapType ctx r t)
+        | "set_Item", [ i; x ] -> rt "fable_rt.raSet($0, $1, $2)" [ r0; i; x ] tVoid
+        | "get_Count", [] -> pure' "fable_rt.raCount($0)" [ r0 ] tI32
+        | "Insert", [ i; x ] -> rt "fable_rt.raInsert($0, $1, $2)" [ r0; i; x ] tVoid
+        | "RemoveAt", [ i ] -> rt "fable_rt.raRemoveAt($0, $1)" [ r0; i ] tVoid
+        | "Remove", [ x ] -> pure' "fable_rt.raRemove($0, $1)" [ r0; x ] tBool
+        | "Contains", [ x ] -> pure' "fable_rt.raContains($0, $1)" [ r0; x ] tBool
+        | "IndexOf", [ x ] -> pure' "fable_rt.raIndexOf($0, $1)" [ r0; x ] tI32
+        | "Clear", [] -> pure' "fable_rt.raClear($0)" [ r0 ] tVoid
+        | "Reverse", [] -> pure' "fable_rt.raReverse($0)" [ r0 ] tVoid
+        | "Sort", [] -> pure' "fable_rt.raSort($0)" [ r0 ] tVoid
+        | "ToArray", [] -> pure' "fable_rt.raToArray($0)" [ r0 ] (mapType ctx r t)
+        // (`Find` gives `default(T)` when nothing matches: the library's `tryFind`, and the
+        // default where the type has one)
+        | ("Find" | "FindLast"), [ _ ] ->
+            if not (hasDefault t) then
+                fail
+                    r
+                    "the Zig target does not support ResizeArray.%s of items whose default is null on .NET; use a function of the List or Seq module"
+                    name
+
+            let found =
+                libraryCall ctx r "ResizeArray" ("try" + name) info args (Fable.Option(t, false))
+
+            bindArgs ctx [ found ] (fun xs -> EEmit("fable_rt.orDefault($R, $0)", xs, mapType ctx r t))
+        | "IndexOf", [ _; _ ] -> libraryCall ctx r "ResizeArray" "indexOfFrom" info args t
+        | "IndexOf", [ _; _; _ ] -> libraryCall ctx r "ResizeArray" "indexOfRange" info args t
+        | "BinarySearch", [ _ ] -> libraryCall ctx r "ResizeArray" "binarySearch" info args t
+        | ("FindAll" | "FindIndex" | "FindLastIndex" | "Exists" | "TrueForAll" | "ForEach" | "RemoveAll" | "RemoveRange" | "GetRange" | "InsertRange"),
+          _
+        | "AddRange", [ _ ] ->
+            let fn = name.Substring(0, 1).ToLowerInvariant() + name.Substring(1)
+            libraryCall ctx r "ResizeArray" fn info args t
+        | _ -> fail r "the Zig target does not support ResizeArray.%s yet" name
+    // (F#'s `dict` and `readOnlyDict`: dictionaries that cannot be changed)
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators", ("CreateDictionary" | "CreateReadOnlyDictionary"), [ pairs ] ->
+        match forInSource ctx pairs with
+        | Some(listIr, "list") ->
+            bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.dictOfList($R, $0, true)", xs, mapType ctx r t))
+        | Some(seqIr, "seq") ->
+            let itemTy = itemOf seqIr
+
+            bindArgs
+                ctx
+                [ seqIr ]
+                (fun xs ->
+                    bindArgs
+                        ctx
+                        [
+                            ECall(
+                                libraryTarget ctx "Seq" "toList",
+                                [ itemTy ],
+                                xs,
+                                TEnt(listEnt ctx.State, [ itemTy ])
+                            )
+                        ]
+                        (fun ls -> EEmit("fable_rt.dictOfList($R, $0, true)", ls, mapType ctx r t))
+                )
+        | _ -> fail r "the Zig target does not support dict of this kind of sequence yet"
+    // `Dictionary(other)`: a copy of another dictionary or of a map
+    | "System.Collections.Generic.Dictionary`2", ".ctor", [ Uncast source ] when
+        (match source.Type with
+         | Fable.DeclaredType(ent, _) -> isDictionaryName ent.FullName || ent.FullName = mapName
+         | _ -> false)
+        ->
+        match forInSource ctx source with
+        | Some(listIr, "list") ->
+            bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.dictOfList($R, $0, false)", xs, mapType ctx r t))
+        | _ -> fail r "the Zig target cannot copy this into a Dictionary yet"
+    | ("System.Collections.Generic.IDictionary`2" | "System.Collections.Generic.IReadOnlyDictionary`2"), _, _ ->
+        dotnetCall ctx r "System.Collections.Generic.Dictionary`2" name info t
+    // (what a dictionary is as a collection of its entries)
+    | ("System.Collections.Generic.ICollection`1" | "System.Collections.Generic.IReadOnlyCollection`1"),
+      ("get_Count" | "Clear"),
+      [ d ] when
+        (match d.Type with
+         | Fable.DeclaredType(ent, _) -> isDictionaryName ent.FullName
+         | _ -> false)
+        ->
+        if name = "Clear" then
+            rt "fable_rt.htClear($0)" [ d ] tVoid
+        else
+            pure' "fable_rt.htCount($0)" [ d ] tI32
+    | ("System.Collections.Generic.Dictionary`2.KeyCollection" | "System.Collections.Generic.Dictionary`2.ValueCollection"),
+      "get_Count",
+      [ xs ] -> pure' "fable_rt.listCount($0)" [ xs ] tI32
+    | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"), ".ctor", [] ->
+        pure' "fable_rt.htNew($R)" [] (mapType ctx r t)
+    | "System.Collections.Generic.HashSet`1", ".ctor", [ Uncast xs ] when (listItem xs.Type).IsSome ->
+        pure' "fable_rt.setOfList($R, $0)" [ xs ] (mapType ctx r t)
+    // (a capacity: nothing to do here)
+    | "System.Collections.Generic.HashSet`1", ".ctor", [ n ] when isInt n ->
+        bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.htNew($R)" [] (mapType ctx r t))
+    | "System.Collections.Generic.HashSet`1", ".ctor", [ _ ] -> libraryCall ctx r "HashSet" "ofSeq" info args t
+    | "System.Collections.Generic.Dictionary`2", _, d :: rest ->
+        match name, rest with
+        | "Add", [ k; v ] -> rt "fable_rt.dictAdd($0, $1, $2)" [ d; k; v ] tVoid
+        | "set_Item", [ k; v ] -> rt "fable_rt.dictSet($0, $1, $2)" [ d; k; v ] tVoid
+        | "get_Item", [ k ] -> rt "fable_rt.dictGet($0, $1)" [ d; k ] (mapType ctx r t)
+        | "ContainsKey", [ k ] -> pure' "fable_rt.dictContainsKey($0, $1)" [ d; k ] tBool
+        | "ContainsValue", [ v ] -> pure' "fable_rt.dictContainsValue($0, $1)" [ d; v ] tBool
+        | "Remove", [ k ] -> rt "fable_rt.htRemove($0, $1)" [ d; k ] tBool
+        | "get_Count", [] -> pure' "fable_rt.htCount($0)" [ d ] tI32
+        | "Clear", [] -> rt "fable_rt.htClear($0)" [ d ] tVoid
+        | "get_Keys", [] -> pure' "fable_rt.dictKeys($0)" [ d ] (mapType ctx r t)
+        | "get_Values", [] -> pure' "fable_rt.dictValues($0)" [ d ] (mapType ctx r t)
+        | "TryGetValue", [ k; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+            ctx.Vars.ContainsKey out.Name
+            ->
+            let outVar = ctx.Vars[out.Name]
+            let tmp = ctx.State.NewVar("found", TOpt outVar.Ty, VLocal, false)
+            ctx.State.UsesRuntime <- true
+
+            bindArgs
+                ctx
+                [ lw ctx d; lw ctx k ]
+                (fun xs ->
+                    ELet(
+                        tmp,
+                        EEmit("fable_rt.dictTryGet($0, $1)", xs, TOpt outVar.Ty),
+                        EIf(
+                            EPrim("not", [ ETest(EVar tmp, "None", TOpt outVar.Ty) ], tBool),
+                            ESeq(EAssign(outVar, EGet(EVar tmp, PSome, outVar.Ty)), ELit("true", tBool)),
+                            ELit("false", tBool),
+                            tBool
+                        )
+                    )
+                )
+        | _ -> fail r "the Zig target does not support Dictionary.%s yet" name
+    | "System.Collections.Generic.HashSet`1", _, h :: rest ->
+        match name, rest with
+        | "Add", [ x ] -> pure' "fable_rt.setAdd($0, $1)" [ h; x ] tBool
+        | "Contains", [ x ] -> pure' "fable_rt.dictContainsKey($0, $1)" [ h; x ] tBool
+        | "Remove", [ x ] -> rt "fable_rt.htRemove($0, $1)" [ h; x ] tBool
+        | "get_Count", [] -> pure' "fable_rt.htCount($0)" [ h ] tI32
+        | "Clear", [] -> rt "fable_rt.htClear($0)" [ h ] tVoid
+        | "UnionWith", [ Uncast xs ] when (listItem xs.Type).IsSome ->
+            pure' "fable_rt.setUnionList($0, $1)" [ h; xs ] tVoid
+        | "CopyTo", [ _ ] ->
+            libraryCall
+                ctx
+                r
+                "HashSet"
+                "copyTo"
+                { info with SignatureArgTypes = [] }
+                (args
+                 @ [
+                     Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 0, Fable.NumberInfo.Empty), None)
+                 ])
+                t
+        | "CopyTo", [ _; _; _ ] -> libraryCall ctx r "HashSet" "copyToCount" info args t
+        | ("UnionWith" | "IntersectWith" | "ExceptWith" | "SymmetricExceptWith" | "Overlaps" | "SetEquals" | "IsSubsetOf" | "IsSupersetOf" | "IsProperSubsetOf" | "IsProperSupersetOf" | "CopyTo"),
+          _ ->
+            let fn = name.Substring(0, 1).ToLowerInvariant() + name.Substring(1)
+            libraryCall ctx r "HashSet" fn info args t
+        | _ -> fail r "the Zig target does not support HashSet.%s yet" name
+
+    // ---- lazy ----
+    | "Microsoft.FSharp.Control.LazyExtensions", "Create", [ f ] ->
+        pure' "fable_rt.lazyNew($R, $0)" [ f ] (mapType ctx r t)
+    | "Microsoft.FSharp.Control.LazyExtensions", "CreateFromValue", [ v ] ->
+        pure' "fable_rt.lazyOf($R, $0)" [ v ] (mapType ctx r t)
+    | ("Microsoft.FSharp.Control.LazyExtensions" | "System.Lazy`1"), ("Force" | "get_Value"), l :: _ ->
+        rt "fable_rt.lazyForce($0)" [ l ] (mapType ctx r t)
+    | "System.Lazy`1", "get_IsValueCreated", [ l ] -> pure' "fable_rt.lazyIsCreated($0)" [ l ] tBool
+
+    // ---- spans: slices of the arrays they view ----
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), ".ctor", [ a ] when
+        (match a.Type with
+         | Fable.Array _ -> true
+         | _ -> false)
+        ->
+        pure' "$0.items" [ a ] (mapType ctx r t)
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), ".ctor", [ a; start; n ] ->
+        rt "fable_rt.spanSlice($0.items, $1, $2)" [ a; start; n ] (mapType ctx r t)
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "get_Length", [ sp ] ->
+        pure' "@as(i32, @intCast($0.len))" [ sp ] tI32
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "get_Item", [ sp; i ] ->
+        // (the item's place: a byref, which is read here, or kept by a byref variable)
+        let item =
+            match mapType ctx r t with
+            | TPtr(item, _) -> item
+            | other -> other
+
+        let ptr =
+            rt "fable_rt.spanRef($0, $1)" [ sp; i ] (TPtr(item, entity = "System.ReadOnlySpan`1"))
+
+        bindArgs ctx [ ptr ] (fun xs -> EDeref(xs.Head, item))
+    | "System.Span`1", "set_Item", [ sp; i; x ] -> rt "fable_rt.spanSet($0, $1, $2)" [ sp; i; x ] tVoid
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "Slice", [ sp; start ] ->
+        rt "fable_rt.spanSlice($0, $1, null)" [ sp; start ] (mapType ctx r t)
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "Slice", [ sp; start; n ] ->
+        rt "fable_rt.spanSlice($0, $1, $2)" [ sp; start; n ] (mapType ctx r t)
+    | "System.Span`1", "op_Implicit", [ sp ] -> lw ctx sp
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "ToArray", [ sp ] ->
+        pure' "fable_rt.arrayOf($R, .{})" [] (mapType ctx r t) |> ignore
+        fail r "the Zig target does not support Span.ToArray yet"
+    | "System.Span`1", "Fill", [ sp; x ] -> pure' "@memset($0, $1)" [ sp; x ] tVoid
+
+    // ---- weak references ----
+    | "System.WeakReference`1", ".ctor", [ target ] -> pure' "fable_rt.weakNew($R, $0)" [ target ] (mapType ctx r t)
+    | "System.WeakReference`1", "SetTarget", [ w; target ] -> pure' "fable_rt.weakSet($0, $1)" [ w; target ] tVoid
+    | "System.WeakReference`1",
+      "TryGetTarget",
+      [ w; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+        ctx.Vars.ContainsKey out.Name
+        ->
+        let outVar = ctx.Vars[out.Name]
+        let tmp = ctx.State.NewVar("target", TOpt outVar.Ty, VLocal, false)
+        ctx.State.UsesRuntime <- true
+
+        bindArgs
+            ctx
+            [ lw ctx w ]
+            (fun xs ->
+                ELet(
+                    tmp,
+                    EEmit("fable_rt.weakTryGet($0)", xs, TOpt outVar.Ty),
+                    EIf(
+                        EPrim("not", [ ETest(EVar tmp, "None", TOpt outVar.Ty) ], tBool),
+                        ESeq(EAssign(outVar, EGet(EVar tmp, PSome, outVar.Ty)), ELit("true", tBool)),
+                        ELit("false", tBool),
+                        tBool
+                    )
+                )
+            )
+    // `GC.Collect()`: free every cycle that is dead now
+    | "System.GC", "Collect", [] -> pure' "_ = fable_rt.collect()" [] tVoid
+
+    | _ -> Unchecked.defaultof<Expr>

@@ -15,6 +15,15 @@ type ZigFile =
     }
 
 let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
+    // (the .NET members by domain, which come after the lowering, given to it)
+    Lower.domainCalls <-
+        function
+        | "async" -> DotnetAsync.call
+        | "collections" -> DotnetCollections.call
+        | "text" -> DotnetText.call
+        | "numbers" -> DotnetNumbers.call
+        | _ -> DotnetMisc.call
+
     let timing = System.Environment.GetEnvironmentVariable "FABLE_ZIG_TIME" = "1"
     let sw = System.Diagnostics.Stopwatch.StartNew()
     let state = Lower.lowerFile com file
