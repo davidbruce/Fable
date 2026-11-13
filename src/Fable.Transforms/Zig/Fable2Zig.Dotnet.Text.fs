@@ -412,6 +412,19 @@ let call
             entRef.FullName = "System.Span`1" || entRef.FullName = "System.ReadOnlySpan`1"
             ->
             pure' "fable_rt.spanEmpty($R)" [] (mapType ctx r t)
+        | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.Uri" ->
+            libraryCall
+                ctx
+                r
+                "Uri"
+                "empty"
+                { info with
+                    ThisArg = None
+                    Args = []
+                    GenericArgs = []
+                }
+                [ Fable.Value(Fable.UnitConstant, None) ]
+                t
         // (a union of one case without fields has one value, which stands for it; null on
         // .NET, where nothing but a test for null tells them apart)
         | Fable.DeclaredType(entRef, []) when
@@ -680,6 +693,9 @@ let call
         | Fable.List _ -> shapeCall "fable_rt.toText" "fable_rt.toTextShape" false
         | Fable.DeclaredType(ent, _) when ent.FullName = mapName || ent.FullName = setName ->
             shapeCall "fable_rt.toText" "fable_rt.toTextShape" false
+        // (a `Uri`: the library's Uri.fs writes it)
+        | Fable.DeclaredType(e, []) when e.FullName = "System.Uri" ->
+            libraryCall ctx r "Uri" "toString" { info with ThisArg = None } [ x ] t
         // (an object: its class's ToString, or .NET's name of its class)
         | Fable.DeclaredType _ when (objOfType ctx r x.Type).IsSome -> rt "fable_rt.objText($0)" [ x ] tStr
         | Fable.Char ->

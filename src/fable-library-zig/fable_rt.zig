@@ -5566,6 +5566,7 @@ pub const KeyNotFoundException = Class("System.Collections.Generic.KeyNotFoundEx
 pub const AggregateException = Class("System.AggregateException", null);
 pub const InvalidCastException = Class("System.InvalidCastException", SystemException);
 pub const TimeoutException = Class("System.TimeoutException", SystemException);
+pub const UriFormatException = Class("System.UriFormatException", FormatException);
 pub const IOException = Class("System.IO.IOException", SystemException);
 pub const FileNotFoundException = Class("System.IO.FileNotFoundException", IOException);
 pub const DirectoryNotFoundException = Class("System.IO.DirectoryNotFoundException", IOException);

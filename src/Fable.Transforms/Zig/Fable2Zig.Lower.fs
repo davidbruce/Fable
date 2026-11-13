@@ -522,6 +522,7 @@ let dotnetExceptions =
         "NotFiniteNumberException"
         "RankException"
         "ArrayTypeMismatchException"
+        "UriFormatException"
     ]
     |> List.map (fun name -> "System." + name, "fable_rt." + name)
     |> List.append
@@ -557,6 +558,7 @@ let defaultExnMessages =
             "System.AggregateException", "One or more errors occurred."
             "System.InvalidCastException", "Specified cast is not valid."
             "System.TimeoutException", "The operation has timed out."
+            "System.UriFormatException", "Invalid URI: The format of the URI could not be determined."
             "System.UnauthorizedAccessException", "Attempted to perform an unauthorized operation."
             "System.OperationCanceledException", "The operation was canceled."
             "System.ApplicationException", "Error in the application."
@@ -1134,6 +1136,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     // (F#'s `Event<'T>`: the record of the library's Event.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpEvent`1" ->
         TEnt(libRecordEnt ctx "Event" "EventOf_1", [ mapType ctx r item ])
+    // (.NET's `Uri`: the record of the library's Uri.fs)
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Uri" -> TEnt(libRecordEnt ctx "Uri" "UriOf", [])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
@@ -1754,6 +1758,17 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                 [
                     "handlers", TEnt(netEnt ctx.State "ResizeArray", [ TFn([ tAny; TGen "T" ], tVoid) ])
                 ]
+            | "UriOf" ->
+                [
+                    "original", tStr
+                    "isAbsolute", tBool
+                    "scheme", tStr
+                    "host", tStr
+                    "port", tI32
+                    "path", tStr
+                    "query", tStr
+                    "fragment", tStr
+                ]
             | _ -> []
 
         // (records with fields that can be assigned are counted cells, as the library declares them)
@@ -1777,7 +1792,12 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                          KRecord
                      else
                          KRefRecord)
-                TypeParams = [ "T" ]
+                // (`AsyncOf_1` and the others of one type parameter; `UriOf` of none)
+                TypeParams =
+                    (if name.EndsWith("_1", System.StringComparison.Ordinal) then
+                         [ "T" ]
+                     else
+                         [])
                 Cases = [ "", fields ]
                 MutableFields = mutableFields
                 Managed = true
@@ -3591,6 +3611,17 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         ctx
                         [ lw ctx source; lw ctx target[1] ]
                         (fun xs -> EEmit("fable_rt.dictTryGet($0, $1)", xs, TOpt valueTy))
+                // (`Uri.TryCreate(s, kind, &uri)` and `Uri.TryCreate(baseUri, relative, &uri)`)
+                | "TryCreate" when imp.Path.EndsWith("System.Uri", System.StringComparison.Ordinal) ->
+                    let args = info.Args |> List.take (info.Args.Length - 1)
+
+                    let fn =
+                        if args.Head.Type = Fable.String then
+                            "tryCreateOption"
+                        else
+                            "tryCreateFromBaseOption"
+
+                    libraryCall ctx r "Uri" fn { info with ThisArg = None } args (Fable.Option(out.Type, false))
                 | other -> fail r "the Zig target does not support %s with a value of this type yet" other
             | _ -> fail e.Range "internal: not a call"
 
@@ -5042,6 +5073,8 @@ and showShapeOf (ctx: Ctx) (r: SourceLocation option) (strict: bool) (root: Fabl
                 && entRef.FullName <> setName
                 && not (isDictionaryName entRef.FullName)
                 && entRef.FullName <> "System.Collections.Generic.HashSet`1"
+                // (a `Uri` is written by its `ToString`)
+                && entRef.FullName <> "System.Uri"
                 && checkedSeen.Add key
             then
                 match ctx.Com.TryGetEntity entRef with
@@ -5313,9 +5346,19 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                         || ent.FullName = "System.Text.StringBuilder"
                     | _ -> false
 
+                // (a `Uri`: its `ToString` also for `%A`, as F# writes a class)
+                let uriText =
+                    (letter = 'A' || letter = 'P' || letter = 'O')
+                    && (
+                        match args[i].Type with
+                        | Fable.DeclaredType(ent, []) -> ent.FullName = "System.Uri"
+                        | _ -> false
+                    )
+
                 if
-                    (letter = 'P' || letter = 'O')
-                    && ((ownToString ctx args[i].Type).IsSome || netToString)
+                    uriText
+                    || (letter = 'P' || letter = 'O')
+                       && ((ownToString ctx args[i].Type).IsSome || netToString)
                 then
                     values[i] <- toStringCall args[i]
 
@@ -5347,6 +5390,7 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                 // what the specifier means for the type of its value
                 let kind =
                     match letter, value.Type with
+                    | _ when uriText -> 's'
                     | 'P', Fable.String -> 's'
                     | 'O', Fable.String -> 'O'
                     | ('P' | 'O'), Fable.Char -> 'c'

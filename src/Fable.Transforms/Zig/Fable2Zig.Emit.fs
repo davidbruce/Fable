@@ -1051,8 +1051,17 @@ let dropUnreadPaths (body: string) =
     let decl = Regex(@"^\s*const (\w+): [^=]+ = [\w.\[\]@""]+;\s*$")
 
     let lines = body.Split('\n')
-    // (what the comments say is not a use)
-    let code = Regex.Replace(body, "//[^\n]*", "")
+    // (what the comments say is not a use; a `//` inside a string literal is no comment)
+    let code =
+        Regex.Replace(
+            body,
+            @"""(?:[^""\\\n]|\\.)*""|//[^\n]*",
+            fun m ->
+                if m.Value.StartsWith "//" then
+                    ""
+                else
+                    m.Value
+        )
 
     // how often each name is written, not as a field (`.name`): one walk of the text
     let counts = Dictionary<string, int>()

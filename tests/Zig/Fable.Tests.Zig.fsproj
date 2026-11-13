@@ -66,6 +66,7 @@
     <Compile Include="EventTests.fs" />
     <Compile Include="ObservableTests.fs" />
     <Compile Include="NullableTests.fs" />
+    <Compile Include="UriTests.fs" />
     <Compile Include="RandomTests.fs" />
     <Compile Include="NullnessTests.fs" />
   </ItemGroup>

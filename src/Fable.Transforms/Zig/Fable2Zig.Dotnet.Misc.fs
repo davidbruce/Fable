@@ -402,6 +402,61 @@ let call
     | "System.Random", "Next", [ rnd; min; max ] -> rt "fable_rt.randomNextRange($0, $1, $2)" [ rnd; min; max ] tI32
     | "System.Random", "NextDouble", [ rnd ] -> pure' "fable_rt.randomNextDouble($0)" [ rnd ] tF64
     | "System.Random", "NextBytes", [ rnd; buffer ] -> pure' "fable_rt.randomNextBytes($0, $1)" [ rnd; buffer ] tVoid
+    // ---- `System.Uri`: the library's Uri.fs ----
+    | "System.Uri", ".ctor", args ->
+        let fn =
+            match args with
+            | [ _ ] -> "create"
+            | [ _; kind ] when
+                kind.Type <> Fable.String
+                && (
+                    match kind.Type with
+                    | Fable.DeclaredType(e, _) -> e.FullName <> "System.Uri"
+                    | _ -> true
+                )
+                ->
+                "createWithKind"
+            | [ _; rel ] when rel.Type = Fable.String -> "createFromBase"
+            | _ -> "createFromBaseUri"
+
+        libraryCall ctx r "Uri" fn { info with ThisArg = None } args t
+    // (`Uri.TryCreate(s, kind, &uri)`: the URI goes to `uri`)
+    | "System.Uri", "TryCreate", [ a; b; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+        ctx.Vars.ContainsKey out.Name
+        ->
+        let outVar = ctx.Vars[out.Name]
+
+        let fn =
+            if a.Type = Fable.String then
+                "tryCreate"
+            else
+                "tryCreateFromBase"
+
+        let pairT = Fable.Tuple([ Fable.Boolean; out.Type ], false)
+        let pairIr = libraryCall ctx r "Uri" fn info [ a; b ] pairT
+        let pair = ctx.State.NewVar("created", typeOf pairIr, VLocal, false)
+
+        ELet(pair, pairIr, ESeq(EAssign(outVar, EGet(EVar pair, PItem 1, outVar.Ty)), EGet(EVar pair, PItem 0, tBool)))
+    | "System.Uri", "TryCreate", [ a; b ] ->
+        let fn =
+            if a.Type = Fable.String then
+                "tryCreate"
+            else
+                "tryCreateFromBase"
+
+        libraryCall ctx r "Uri" fn info [ a; b ] t
+    | "System.Uri", getter, [ u ] when
+        getter.StartsWith("get_", System.StringComparison.Ordinal)
+        || getter = "ToString"
+        ->
+        let fn =
+            if getter = "ToString" then
+                "toString"
+            else
+                let n = getter.Substring 4
+                n.Substring(0, 1).ToLowerInvariant() + n.Substring 1
+
+        libraryCall ctx r "Uri" fn { info with ThisArg = None } [ u ] t
     // ---- F#'s nullness operators (a value of a type without null here is never null) ----
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] -> pure' "fable_rt.isNullValue($0)" [ x ] tBool
     | "Microsoft.FSharp.Core.Operators", ("NonNull" | "NonNullQuickPattern"), [ x ] ->
