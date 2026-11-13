@@ -330,6 +330,8 @@ let call
         | _ -> fail r "the Zig target does not support HashSet.%s yet" name
 
     // ---- lazy ----
+    // (`Lazy<T>(fun () -> ...)`: as `lazy`)
+    | "System.Lazy`1", ".ctor", [ f ]
     | "Microsoft.FSharp.Control.LazyExtensions", "Create", [ f ] ->
         pure' "fable_rt.lazyNew($R, $0)" [ f ] (mapType ctx r t)
     | "Microsoft.FSharp.Control.LazyExtensions", "CreateFromValue", [ v ] ->

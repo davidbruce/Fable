@@ -1146,6 +1146,13 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     // (F#'s `Event<'T>`: the record of the library's Event.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpEvent`1" ->
         TEnt(libRecordEnt ctx "Event" "EventOf_1", [ mapType ctx r item ])
+    // (a unit of measure given as a type argument: nothing here; the numbers it marks are
+    // plain numbers)
+    | Fable.Measure _ -> tVoid
+    | Fable.DeclaredType(ent, _) when
+        ent.FullName.StartsWith("Microsoft.FSharp.Core.CompilerServices.Measure", System.StringComparison.Ordinal)
+        ->
+        tVoid
     // (.NET's `Uri`: the record of the library's Uri.fs)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Uri" -> TEnt(libRecordEnt ctx "Uri" "UriOf", [])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
@@ -2968,6 +2975,7 @@ let objDecl (com: Compiler) (r: SourceLocation option) (o: ObjInfo) (dotnetName:
 /// their values.
 let constructorBodyWith
     (fieldNames: string list)
+    (defaults: string -> Fable.Expr option)
     (finish: Fable.Expr list -> Fable.Expr)
     (body: Fable.Expr)
     : Fable.Expr
@@ -3006,8 +3014,10 @@ let constructorBodyWith
             let values =
                 fieldNames
                 |> List.map (fun f ->
-                    match set.TryGetValue f with
-                    | true, id -> Fable.IdentExpr id
+                    match set.TryGetValue f, defaults f with
+                    | (true, id), _ -> Fable.IdentExpr id
+                    // (`[<DefaultValue>] val mutable`: the default of its type)
+                    | _, Some d -> d
                     | _ ->
                         raise (
                             ZigError(
@@ -3041,14 +3051,25 @@ let constructorBody
     (classRef: Fable.EntityRef)
     (genArgs: Fable.Type list)
     (fieldNames: string list)
+    (defaults: string -> Fable.Expr option)
     (body: Fable.Expr)
     : Fable.Expr
     =
-    constructorBodyWith fieldNames (fun values -> Fable.Value(Fable.NewRecord(values, classRef, genArgs), None)) body
+    constructorBodyWith
+        fieldNames
+        defaults
+        (fun values -> Fable.Value(Fable.NewRecord(values, classRef, genArgs), None))
+        body
 
 /// The constructor of a class that takes part in inheritance: the chain of its fields, the
 /// parent's (which its constructor computes, first) and its own.
-let objConstructorBody (o: ObjInfo) (baseCall: Fable.Expr option) (body: Fable.Expr) : Fable.Expr =
+let objConstructorBody
+    (o: ObjInfo)
+    (defaults: string -> Fable.Expr option)
+    (baseCall: Fable.Expr option)
+    (body: Fable.Expr)
+    : Fable.Expr
+    =
     let fields = caseFields (TEnt(o.Part, [])) "" |> List.map fst
 
     let baseId (t: Fable.Type) : Fable.Ident =
@@ -3072,7 +3093,7 @@ let objConstructorBody (o: ObjInfo) (baseCall: Fable.Expr option) (body: Fable.E
 
         Fable.Value(Fable.NewRecord(chain, o.Chain.Ref, []), None)
 
-    let inner = constructorBodyWith fields finish body
+    let inner = constructorBodyWith fields defaults finish body
 
     match o.Parent, baseCall with
     | Some p, Some(Fable.Call(callee, info, _, r)) ->
@@ -3130,6 +3151,28 @@ let rec hasDefault (t: Fable.Type) : bool =
     | Fable.Option _ -> true
     | Fable.Tuple(ts, _) -> List.forall hasDefault ts
     | _ -> false
+
+/// The default value of a class's field the constructor does not set (`[<DefaultValue>] val
+/// mutable`), if its type has one
+let fieldDefaults (ent: Fable.Entity) (name: string) : Fable.Expr option =
+    ent.FSharpFields
+    |> List.tryFind (fun f -> f.Name = name && not f.IsStatic && hasDefault f.FieldType)
+    |> Option.map (fun f ->
+        Fable.Call(
+            Fable.Import(
+                {
+                    Selector = "DefaultOf"
+                    Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators.Unchecked"
+                    Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                },
+                Fable.Any,
+                None
+            ),
+            Fable.CallInfo.Create(genArgs = [ f.FieldType ]),
+            f.FieldType,
+            None
+        )
+    )
 
 /// The item type of `IEnumerator<T>`.
 let enumeratorItem (t: Fable.Type) : Fable.Type =
@@ -7036,6 +7079,8 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
     let attached = List<Fable.MemberDecl>()
     let mutable actions = 0
+    /// the module value that holds a static field -> its type
+    let staticTypes = Dictionary<string, Fable.Type>()
 
     let rec membersOf (decls: Fable.Declaration list) : Fable.MemberDecl list =
         decls
@@ -7174,10 +7219,13 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 | Some ent ->
                     for f in ent.FSharpFields do
                         if f.IsStatic then
-                            state.StaticFields[c.Name + "." + f.Name] <-
+                            let name =
                                 c.Name
                                 + "__static_"
                                 + System.Text.RegularExpressions.Regex.Replace(f.Name, "[^A-Za-z0-9_]", "_")
+
+                            state.StaticFields[c.Name + "." + f.Name] <- name
+                            staticTypes[name] <- f.FieldType
                 | None -> ()
 
                 match com.TryGetEntity c.Entity with
@@ -7224,7 +7272,8 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                             let finish (values: Fable.Expr list) =
                                 Fable.Value(Fable.NewRecord(message :: values, c.Entity, []), None)
 
-                            attached.Add { ctor with Body = constructorBodyWith fields finish ctor.Body }
+                            attached.Add
+                                { ctor with Body = constructorBodyWith fields (fieldDefaults ent) finish ctor.Body }
                         | None -> report None $"the Zig target needs a primary constructor of %s{c.Name}"
 
                         for m in c.AttachedMembers do
@@ -7247,7 +7296,9 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
                     try
                         match c.Constructor with
-                        | Some ctor -> attached.Add { ctor with Body = objConstructorBody o c.BaseCall ctor.Body }
+                        | Some ctor ->
+                            attached.Add
+                                { ctor with Body = objConstructorBody o (fieldDefaults ent) c.BaseCall ctor.Body }
                         | None -> ()
 
                         state.Objs.Add(objDecl com None o (dotnetTypeName com ent))
@@ -7300,7 +7351,10 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                                 (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
                                 |> List.map (fun f -> f.Name)
 
-                            attached.Add { ctor with Body = constructorBody c.Entity genArgs fields ctor.Body }
+                            attached.Add
+                                { ctor with
+                                    Body = constructorBody c.Entity genArgs fields (fieldDefaults ent) ctor.Body
+                                }
                         | _ -> ()
                     with ZigError(msg, r) ->
                         report r msg
@@ -7340,6 +7394,49 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
         )
 
     let decls = membersOf file.Declarations
+
+    // (a static field that nothing initializes, `[<DefaultValue>] static val mutable`: its
+    // default value)
+    let decls =
+        let given = decls |> List.map (fun d -> d.Name) |> set
+
+        let defaults =
+            staticTypes
+            |> Seq.filter (fun kv -> not (given.Contains kv.Key))
+            |> Seq.map (fun kv ->
+                let body =
+                    Fable.Call(
+                        Fable.Import(
+                            {
+                                Selector = "DefaultOf"
+                                Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators.Unchecked"
+                                Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                            },
+                            Fable.Any,
+                            None
+                        ),
+                        Fable.CallInfo.Create(genArgs = [ kv.Value ]),
+                        kv.Value,
+                        None
+                    )
+
+                ({
+                    Name = kv.Key
+                    Args = []
+                    Body = body
+                    MemberRef = Fable.GeneratedMember.Value(kv.Key, kv.Value, isInstance = false, isMutable = true)
+                    IsMangled = false
+                    ImplementedSignatureRef = None
+                    UsedNames = Set.empty
+                    XmlDoc = None
+                    Tags = []
+                }
+                : Fable.MemberDecl)
+            )
+            |> List.ofSeq
+
+        defaults @ decls
+
     let decls = decls @ List.ofSeq attached
 
     // (for work on the target: what Fable hands over for a file)
