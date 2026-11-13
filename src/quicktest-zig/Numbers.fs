@@ -159,6 +159,27 @@ let run () : int =
             "Argument: The input sequence was empty. (Parameter 'source')"
             (raised (fun () -> string (List.average ([]: float list))))
         + check (Array.sum [| 1; 2; 3 |] = 6 && Array.average [| 1.0; 3.0 |] = 2.0)
+        // `open Checked`
+        + same
+            "Overflow: Arithmetic operation resulted in an overflow."
+            (raised (fun () -> string (Checked.(+) System.Int32.MaxValue 1)))
+        + same
+            "Overflow: Arithmetic operation resulted in an overflow."
+            (raised (fun () -> string (Checked.(*) System.Int32.MaxValue 2)))
+        + same
+            "Overflow: Arithmetic operation resulted in an overflow."
+            (raised (fun () -> string (Checked.(~-) System.Int32.MinValue)))
+        + same
+            "Overflow: Arithmetic operation resulted in an overflow."
+            (raised (fun () -> string (Checked.int 3000000000L)))
+        + same "Overflow: Arithmetic operation resulted in an overflow." (raised (fun () -> string (Checked.byte 300)))
+        + same "Overflow: Arithmetic operation resulted in an overflow." (raised (fun () -> string (Checked.int 1e10)))
+        + check (
+            Checked.(+) 2 3 = 5
+            && Checked.(-) 2 3 = -1
+            && Checked.int 7L = 7
+            && Checked.(+) 1.5 1.0 = 2.5
+        )
 
     printfn "numbers: %d" failed
     failed

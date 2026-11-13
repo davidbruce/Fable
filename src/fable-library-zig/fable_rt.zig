@@ -4512,6 +4512,7 @@ pub const NullReferenceException = Class("System.NullReferenceException", System
 pub const FormatException = Class("System.FormatException", SystemException);
 pub const KeyNotFoundException = Class("System.Collections.Generic.KeyNotFoundException", SystemException);
 pub const MatchFailureException = Class("Microsoft.FSharp.Core.MatchFailureException", null);
+pub const AggregateException = Class("System.AggregateException", null);
 
 /// Raise an exception of a .NET class with a message.
 pub fn raise(comptime C: type, message: String) Raised {
@@ -4633,6 +4634,49 @@ pub fn leaked() bool {
 // ---------------------------------------------------------------------------------------------
 // Numbers: what F#'s operators and System.Math do, raising what they raise on .NET
 // ---------------------------------------------------------------------------------------------
+
+fn overflow() Raised {
+    return raise(OverflowException, str("Arithmetic operation resulted in an overflow."));
+}
+
+/// `a + b` under `open Checked`
+pub fn checkedAdd(a: anytype, b: @TypeOf(a)) Raised!@TypeOf(a) {
+    const r = @addWithOverflow(a, b);
+    if (r[1] != 0) return overflow();
+    return r[0];
+}
+
+pub fn checkedSub(a: anytype, b: @TypeOf(a)) Raised!@TypeOf(a) {
+    const r = @subWithOverflow(a, b);
+    if (r[1] != 0) return overflow();
+    return r[0];
+}
+
+pub fn checkedMul(a: anytype, b: @TypeOf(a)) Raised!@TypeOf(a) {
+    const r = @mulWithOverflow(a, b);
+    if (r[1] != 0) return overflow();
+    return r[0];
+}
+
+pub fn checkedNeg(a: anytype) Raised!@TypeOf(a) {
+    return checkedSub(@as(@TypeOf(a), 0), a);
+}
+
+/// `int x` under `open Checked`: a value that does not fit raises.
+pub fn checkedConv(comptime To: type, x: anytype) Raised!To {
+    switch (@typeInfo(@TypeOf(x))) {
+        .int, .comptime_int => {
+            if (x < std.math.minInt(To) or x > std.math.maxInt(To)) return overflow();
+            return @intCast(x);
+        },
+        .float, .comptime_float => {
+            const t = @trunc(x);
+            if (t != t or t < @as(f64, @floatFromInt(std.math.minInt(To))) or t > @as(f64, @floatFromInt(std.math.maxInt(To)))) return overflow();
+            return @intFromFloat(t);
+        },
+        else => @compileError("checkedConv: " ++ @typeName(@TypeOf(x))),
+    }
+}
 
 /// `abs x`: the smallest whole number has no absolute value, and .NET raises for it.
 pub fn absOf(x: anytype) Raised!@TypeOf(x) {

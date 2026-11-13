@@ -97,6 +97,9 @@ let private nativeOp r t (opName: string) (args: Expr list) : Expr option =
 let tryCall (com: ICompiler) (ctx: Context) r t (info: CallInfo) (thisArg: Expr option) (args: Expr list) =
     let native =
         match thisArg with
+        // (`open Checked`: arithmetic that raises on overflow stays a call, which the target
+        // checks)
+        | None when info.DeclaringEntityFullName = "Microsoft.FSharp.Core.Operators.Checked" -> None
         | None when args |> List.forall (fun a -> isNative a.Type) -> nativeOp r t info.CompiledName args
         | _ -> None
 

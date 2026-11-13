@@ -91,6 +91,26 @@ let work (n: int) (log: ResizeArray<string>) : Async<int> =
         return total + count + safe
     }
 
+let tdouble (n: int) : System.Threading.Tasks.Task<int> = task { return n * 2 }
+let tfailing () : System.Threading.Tasks.Task<int> = task { return failwith "boom" }
+
+let twork () : System.Threading.Tasks.Task<int> =
+    task {
+        let! a = tdouble 3
+        do! System.Threading.Tasks.Task.Delay 1
+        let mutable total = a
+
+        for i in [ 1; 2 ] do
+            let! d = tdouble i
+            total <- total + d
+
+        try
+            let! x = tfailing ()
+            return x
+        with e ->
+            return total + e.Message.Length
+    }
+
 let run () : int =
     let before = liveCells ()
     let log = ResizeArray<string>()
@@ -118,6 +138,27 @@ let run () : int =
         + check (result = 10 + 12 + 2 + 5)
         + same "seq [\"start\"; \"checked\"; \"finally\"]" (sprintf "%A" log)
         + same "[|2; 4; 6|]" (sprintf "%A" all)
+        + check (
+            (twork ()).Result = 16
+            && (tfailing ()).IsFaulted
+            && (System.Threading.Tasks.Task.FromResult 3).Result = 3
+        )
+        + same
+            "One or more errors occurred. (boom)|[|1; 2|]"
+            ((try
+                string (tfailing ()).Result
+              with e ->
+                  e.Message)
+             + "|"
+             + sprintf
+                 "%A"
+                 (System.Threading.Tasks.Task.WhenAll(
+                     [|
+                         System.Threading.Tasks.Task.FromResult 1
+                         System.Threading.Tasks.Task.FromResult 2
+                     |]
+                 ))
+                     .Result)
         + same
             "boom|out|1"
             ((match caught with

@@ -302,7 +302,18 @@ result and with an exception (continuations). There is one thread and nothing wa
 in order; what a computation gives and raises, and the order of its effects, are .NET's. The
 builder (`async`) has no state; its members, `RunSynchronously`, `StartImmediate`, `Start`,
 `Catch`, `Ignore` and `Parallel` are the library's. A builder of the program's own is a class
-like any other. Not yet: `task`, cancellation, `Async.FromContinuations`, `use!`.
+like any other. Not yet: cancellation, `Async.FromContinuations`, `use!`.
+
+`Task.fs` is F#'s `task`. With one thread a task runs to its end where it is made (it starts
+there on .NET too), so a task is what it ended with: its result or its exception. `let!` of a
+faulted task raises the exception again; `.Result` and `.Wait()` of one raise
+`AggregateException` ("One or more errors occurred. (boom)"), as on .NET. Fable gives the
+builder's intermediate calls no usable type (they are F#'s resumable code); a pass before the
+lowering gives each the type its arguments say. `Task.FromResult`, `Task.Delay` (which does not
+wait), `Task.WhenAll`, `IsCompleted` and `IsFaulted` work.
+
+`open Checked`: `+`, `-`, `*`, unary `-` of whole numbers and the conversions raise
+`OverflowException` where the result does not fit, as on .NET.
 
 So far: `List.fs` (the `List` module, sorting included: a merge sort, stable as F#'s),
 `Option.fs`, `Result.fs`, `Map.fs` and `Set.fs`. `Map` and `Set` are balanced trees ordered

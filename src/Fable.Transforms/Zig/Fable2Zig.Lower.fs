@@ -415,6 +415,7 @@ let private dotnetExceptions =
         "SystemException"
         "ArithmeticException"
         "NullReferenceException"
+        "AggregateException"
     ]
     |> List.map (fun name -> "System." + name, "fable_rt." + name)
     |> List.append
@@ -458,6 +459,9 @@ let private dotnetExnEntIn (state: FileState) (fullName: string) : Ent =
         e
 
 /// F#'s `ref` cell: a generic reference record that the runtime library declares.
+/// (the type this target gives what the task builder makes of a body: Fable gives none)
+let private taskCodeName = "Fable.Library.Zig.Task.TaskCode`1"
+
 let private resultName = "Microsoft.FSharp.Core.FSharpResult`2"
 let private mapName = "Microsoft.FSharp.Collections.FSharpMap`2"
 let private setName = "Microsoft.FSharp.Collections.FSharpSet`1"
@@ -766,6 +770,15 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsync`1" ->
         TEnt(libRecordEnt ctx "Async" "AsyncOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, []) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsyncBuilder" -> tVoid
+    // a task and what the builder makes of `task { }`: records of the library's Task.fs; the
+    // builder has no state
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Threading.Tasks.Task`1" ->
+        TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ mapType ctx r item ])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Tasks.Task" ->
+        TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ tVoid ])
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = taskCodeName ->
+        TEnt(libRecordEnt ctx "Task" "TaskCode_1", [ mapType ctx r item ])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "Microsoft.FSharp.Control.TaskBuilder" -> tVoid
     // a sequence: the record of the library's Seq.fs
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.IEnumerable`1" ->
         TEnt(seqEnt ctx, [ mapType ctx r item ])
@@ -1073,6 +1086,8 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             match name with
             | "AsyncOf_1" -> [ "fable_async", TFn([ contTy () ], tVoid) ]
             | "Cont_1" -> [ "ok", TFn([ TGen "T" ], tVoid); "fail", TFn([ tExn ], tVoid) ]
+            | "TaskOf_1" -> [ "fable_task", TEnt(resultEnt ctx.State, [ TGen "T"; tExn ]) ]
+            | "TaskCode_1" -> [ "code", TFn([ tVoid ], TGen "T") ]
             | _ -> []
 
         let e =
@@ -1851,6 +1866,76 @@ let private seqEntRef: Fable.EntityRef =
         FullName = "System.Collections.Generic.IEnumerable`1"
         Path = Fable.CoreAssemblyName "System.Runtime"
     }
+
+
+let private taskCodeOf (t: Fable.Type) : Fable.Type =
+    Fable.DeclaredType(
+        {
+            FullName = taskCodeName
+            Path = Fable.CoreAssemblyName "FSharp.Core"
+        },
+        [ t ]
+    )
+
+/// F#'s resumable code (`TaskCode`): a delegate of a byref to a state machine.
+let rec private isResumableCode (t: Fable.Type) : bool =
+    match t with
+    | Fable.DelegateType(args, _) ->
+        args
+        |> List.exists (fun a ->
+            match a with
+            | Fable.DeclaredType(_, [ Fable.DeclaredType(sm, _); _ ]) ->
+                sm.FullName.StartsWith(
+                    "Microsoft.FSharp.Core.CompilerServices.ResumableStateMachine",
+                    System.StringComparison.Ordinal
+                )
+            | _ -> false
+        )
+    | Fable.DeclaredType(ent, _) ->
+        ent.FullName.StartsWith("Microsoft.FSharp.Control.TaskCode", System.StringComparison.Ordinal)
+    | _ -> false
+
+/// The calls of `task { }` have no type in what Fable gives (`Any`): the type of each is found
+/// here from its arguments, from the inside out.
+let private typeTaskBuilders (body: Fable.Expr) : Fable.Expr =
+    let itemOf (t: Fable.Type) =
+        match t with
+        | Fable.DeclaredType(_, [ item ]) -> item
+        | _ -> Fable.Any
+
+    let retOf (t: Fable.Type) =
+        match t with
+        | Fable.LambdaType(_, ret) -> ret
+        | Fable.DelegateType(_, ret) -> ret
+        | _ -> Fable.Any
+
+    body
+    |> AST.visitFromInsideOut (fun e ->
+        match e with
+        | Fable.Call(Fable.Import(imp, it, ir) as callee, info, callTy, r) when
+            imp.Path.StartsWith(
+                Replacements.DotnetPrefix + "Microsoft.FSharp.Control.TaskBuilder",
+                System.StringComparison.Ordinal
+            )
+            && (callTy = Fable.Any || isResumableCode callTy)
+            ->
+            let name = imp.Selector.Substring(imp.Selector.LastIndexOf '.' + 1)
+
+            let t =
+                match name, info.Args with
+                | "Return", [ x ] -> taskCodeOf x.Type
+                | "Zero", _ -> taskCodeOf Fable.Unit
+                | "Delay", [ f ] -> retOf f.Type
+                | "Bind", [ _; cont ] -> retOf cont.Type
+                | "ReturnFrom", [ task ] -> taskCodeOf (itemOf task.Type)
+                | "Combine", [ _; second ] -> second.Type
+                | ("While" | "For"), _ -> taskCodeOf Fable.Unit
+                | ("TryWith" | "TryFinally"), b :: _ -> b.Type
+                | _ -> Fable.Any
+
+            Fable.Call(callee, info, t, r)
+        | _ -> e
+    )
 
 /// Is this F#'s `seq<'T>`?
 let private isSeqType (t: Fable.Type) : bool =
@@ -3787,6 +3872,192 @@ and dotnetCall
                 (fun xs -> ERt($"fable_rt.listAverageBy(%s{zigTypeOf ty}, $0, $1)", xs, ty))
         | _ -> fail r "internal: a sum"
 
+    // ---- task: the builder (which has no state) and the members of a task ----
+    | "Microsoft.FSharp.Control.TaskBuilderModule", "task", _ -> EUnit
+    | ("Microsoft.FSharp.Control.TaskBuilder" | "Microsoft.FSharp.Control.TaskBuilderBase" | "Microsoft.FSharp.Control.TaskBuilderExtensions.LowPriority" | "Microsoft.FSharp.Control.TaskBuilderExtensions.HighPriority" | "Microsoft.FSharp.Control.TaskBuilderExtensions.MediumPriority"),
+      _,
+      _ when entity.StartsWith("Microsoft.FSharp.Control.TaskBuilder", System.StringComparison.Ordinal) ->
+        let member' = name.Substring(name.LastIndexOf '.' + 1)
+
+        let given =
+            args
+            |> List.filter (fun a ->
+                match a.Type with
+                | Fable.DeclaredType(ent, _) -> ent.FullName <> "Microsoft.FSharp.Control.TaskBuilder"
+                | _ -> true
+            )
+
+        let itemOf (t: Fable.Type) =
+            match t with
+            | Fable.DeclaredType(_, [ item ]) -> item
+            | _ -> Fable.Unit
+
+        let retItem (f: Fable.Expr) =
+            match f.Type with
+            | Fable.LambdaType(_, ret)
+            | Fable.DelegateType(_, ret) -> itemOf ret
+            | _ -> Fable.Unit
+
+        let typeArgs =
+            match member', given with
+            | "Run", [ c ] -> [ itemOf c.Type ]
+            | "Delay", [ f ] -> [ retItem f ]
+            | "Return", [ x ] -> [ x.Type ]
+            | "Bind", [ task; cont ] -> [ itemOf task.Type; retItem cont ]
+            | "ReturnFrom", [ task ] -> [ itemOf task.Type ]
+            | "Combine", [ _; second ] -> [ itemOf second.Type ]
+            | ("TryWith" | "TryFinally"), b :: _ -> [ itemOf b.Type ]
+            | "For", [ sq; _ ] -> [ itemOf sq.Type ]
+            | _ -> []
+
+        let resultTy =
+            match member' with
+            | "Run" -> t
+            | _ when t <> Fable.Any -> t
+            | _ -> taskCodeOf (List.tryHead typeArgs |> Option.defaultValue Fable.Unit)
+
+        libraryCall
+            ctx
+            r
+            "Task"
+            ("builder" + member')
+            { info with
+                GenericArgs = typeArgs
+                SignatureArgTypes = []
+                MemberRef = None
+                ThisArg = None
+                Args = given
+            }
+            given
+            resultTy
+    | "System.Threading.Tasks.Task`1", ("get_Result" | "Wait" | "get_IsCompleted" | "get_IsFaulted"), [ task ] ->
+        let fn =
+            match name with
+            | "get_Result" -> "resultOf"
+            | "Wait" -> "waitFor"
+            | "get_IsCompleted" -> "isCompleted"
+            | _ -> "isFaulted"
+
+        let item =
+            match task.Type with
+            | Fable.DeclaredType(_, [ item ]) -> item
+            | _ -> Fable.Unit
+
+        libraryCall
+            ctx
+            r
+            "Task"
+            fn
+            { info with
+                GenericArgs = [ item ]
+                SignatureArgTypes = []
+                MemberRef = None
+                ThisArg = None
+                Args = [ task ]
+            }
+            [ task ]
+            t
+    | "System.Threading.Tasks.Task", ("Wait" | "get_IsCompleted" | "get_IsFaulted"), [ task ] ->
+        let fn =
+            match name with
+            | "Wait" -> "waitFor"
+            | "get_IsCompleted" -> "isCompleted"
+            | _ -> "isFaulted"
+
+        // (a member of Task called on a Task<'T>: the item type is the object's)
+        let item =
+            match task.Type with
+            | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Threading.Tasks.Task`1" -> item
+            | _ -> Fable.Unit
+
+        libraryCall
+            ctx
+            r
+            "Task"
+            fn
+            { info with
+                GenericArgs = [ item ]
+                SignatureArgTypes = []
+                MemberRef = None
+                ThisArg = None
+                Args = [ task ]
+            }
+            [ task ]
+            t
+    | "System.Threading.Tasks.Task", "FromResult", [ x ] ->
+        libraryCall
+            ctx
+            r
+            "Task"
+            "fromResult"
+            { info with
+                GenericArgs = [ x.Type ]
+                SignatureArgTypes = []
+                MemberRef = None
+            }
+            [ x ]
+            t
+    | "System.Threading.Tasks.Task", "Delay", [ ms ] ->
+        libraryCall
+            ctx
+            r
+            "Task"
+            "delay"
+            { info with
+                GenericArgs = []
+                SignatureArgTypes = []
+                MemberRef = None
+            }
+            [ ms ]
+            t
+    | "System.Threading.Tasks.Task", "get_CompletedTask", [] ->
+        libraryCall
+            ctx
+            r
+            "Task"
+            "completedTask"
+            { info with
+                GenericArgs = []
+                SignatureArgTypes = []
+                MemberRef = None
+            }
+            []
+            t
+    | "System.Threading.Tasks.Task", "WhenAll", [ tasks ] ->
+        let item =
+            match t with
+            | Fable.DeclaredType(_, [ Fable.Array(item, _) ]) -> item
+            | _ -> Fable.Unit
+
+        let tasksSeq =
+            match tasks with
+            | Fable.Value(Fable.NewArray(Fable.ArrayValues _, _, _), _) ->
+                Fable.TypeCast(
+                    tasks,
+                    Fable.DeclaredType(
+                        seqEntRef,
+                        [
+                            (match tasks.Type with
+                             | Fable.Array(i, _) -> i
+                             | i -> i)
+                        ]
+                    )
+                )
+            | _ -> tasks
+
+        libraryCall
+            ctx
+            r
+            "Task"
+            "whenAll"
+            { info with
+                GenericArgs = [ item ]
+                SignatureArgTypes = []
+                MemberRef = None
+            }
+            [ tasksSeq ]
+            t
+
     // ---- async: `async` is the builder, which has no state ----
     | "Microsoft.FSharp.Core.ExtraTopLevelOperators", "DefaultAsyncBuilder", _ -> EUnit
 
@@ -4452,6 +4723,43 @@ and dotnetCall
         bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 0, mapType ctx r t))
     | "Microsoft.FSharp.Core.Operators", "Snd", [ x ] ->
         bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 1, mapType ctx r t))
+    // ---- `open Checked`: whole-number arithmetic and conversions that raise on overflow ----
+    | "Microsoft.FSharp.Core.Operators.Checked", ("op_Addition" | "op_Subtraction" | "op_Multiply"), [ a; b ] ->
+        let ty = mapType ctx r a.Type
+
+        if intBits ty > 0 then
+            let f =
+                match name with
+                | "op_Addition" -> "Add"
+                | "op_Subtraction" -> "Sub"
+                | _ -> "Mul"
+
+            rt $"fable_rt.checked%s{f}(@as($R, $0), $1)" [ a; b ] ty
+        else
+            let op =
+                match name with
+                | "op_Addition" -> "add"
+                | "op_Subtraction" -> "sub"
+                | _ -> "mul"
+
+            bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim(op, xs, ty))
+    | "Microsoft.FSharp.Core.Operators.Checked", "op_UnaryNegation", [ a ] ->
+        let ty = mapType ctx r a.Type
+
+        if intBits ty > 0 then
+            rt "fable_rt.checkedNeg(@as($R, $0))" [ a ] ty
+        else
+            bindArgs ctx [ lw ctx a ] (fun xs -> EPrim("neg", xs, ty))
+    | "Microsoft.FSharp.Core.Operators.Checked", _, [ x ] when name.StartsWith("To", System.StringComparison.Ordinal) ->
+        let ty = mapType ctx r t
+
+        if x.Type = Fable.String then
+            dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
+        elif intBits ty > 0 then
+            bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.checkedConv(%s{zigTypeOf ty}, $0)", xs, ty))
+        else
+            dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
+
     // ---- numbers ----
     | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Abs", [ x ] ->
         rt "fable_rt.absOf(@as($R, $0))" [ x ] (mapType ctx r x.Type)
@@ -4751,7 +5059,7 @@ and libraryCall
         args
         |> List.map (fun arg ->
             match arg with
-            | _ when file = "Seq" || file = "Async" -> arg
+            | _ when file = "Seq" || file = "Async" || file = "Task" -> arg
             | Fable.Value(Fable.NewOption(None, Fable.Any, isStruct), r) ->
                 Fable.Value(Fable.NewOption(None, Fable.Unit, isStruct), r)
             | Fable.Value(Fable.NewList(None, Fable.Any), r) -> Fable.Value(Fable.NewList(None, Fable.Unit), r)
@@ -4872,7 +5180,7 @@ and libraryCall
     // holds)
     let lowerArg (arg: Fable.Expr) : Expr =
         match arg with
-        | _ when file = "Seq" || file = "Async" -> lw ctx arg
+        | _ when file = "Seq" || file = "Async" || file = "Task" -> lw ctx arg
         // (a sequence given to a function that takes a list: the list of what it gives)
         | Fable.TypeCast(inner, _)
         | inner when isSeqType inner.Type && isSeqType arg.Type ->
@@ -5094,6 +5402,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         )
 
                 let ret = mapType ctx d.Body.Range d.Body.Type
+                let d = { d with Body = typeTaskBuilders d.Body }
 
                 // `[<StackArena(bytes)>]`: what the function allocates comes from its stack
                 match
