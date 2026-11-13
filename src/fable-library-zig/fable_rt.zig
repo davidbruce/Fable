@@ -503,7 +503,9 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     if (comptime !isManaged(T) and !holdsDecimal(T)) return std.meta.eql(a, b);
     // (a sequence is an object on .NET: equal only to itself, here the same walk and what it holds)
     if (comptime @typeInfo(T) == .@"struct" and @hasField(T, "fable_seq")) return a.fable_seq.env == b.fable_seq.env and a.fable_seq.code == b.fable_seq.code;
-    if (comptime isFunc(T)) @compileError("function values cannot be compared");
+    // (F# does not compare function values; what does is an interface value, a struct of them
+    // that stands for an object, which .NET compares by identity: the same code and environment)
+    if (comptime isFunc(T)) return a.env == b.env and a.code == b.code;
     if (T == Obj) return objEql(a, b);
     if (T == Exn) return a == b or (a.type == b.type and if (a.type.eql) |f| f(a, b) else false);
     if (T == String) return strEql(a, b);
@@ -2940,7 +2942,7 @@ pub fn hash(x: anytype) i32 {
     }
     if (T == Exn or T == Obj) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
     if (comptime isDecimal(T)) return decHash(x);
-    if (comptime isFunc(T)) @compileError("fable: function values cannot be hashed");
+    if (comptime isFunc(T)) return @truncate(@as(isize, @bitCast(@intFromPtr(x.env) ^ @intFromPtr(x.code))));
     switch (@typeInfo(T)) {
         .void => return 0,
         .bool => return @intFromBool(x),

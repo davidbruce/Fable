@@ -981,6 +981,27 @@ let (|DomainCall|_|)
     else
         Some lowered
 
+/// Is the function bound to `name` only given as a value in `e`, never called there? Then it is
+/// one value, made once (a delegate given to `AddHandler` and then to `RemoveHandler` is the
+/// same delegate, as on .NET), rather than a function of the file made into a value at each use.
+let onlyAsValue (name: string) (e: Fable.Expr) : bool =
+    let mutable called = false
+    let mutable used = false
+
+    let rec walk (e: Fable.Expr) =
+        match e with
+        | Fable.Call(Fable.IdentExpr i, info, _, _) when i.Name = name ->
+            called <- true
+            info.Args |> List.iter walk
+        | Fable.CurriedApply(Fable.IdentExpr i, args, _, _) when i.Name = name ->
+            called <- true
+            args |> List.iter walk
+        | Fable.IdentExpr i when i.Name = name -> used <- true
+        | _ -> AST.getSubExpressions e |> List.iter walk
+
+    walk e
+    used && not called
+
 /// A dictionary: .NET's, or what F#'s `dict` and `readOnlyDict` give
 let isDictionaryName (name: string) =
     name = "System.Collections.Generic.Dictionary`2"
@@ -1089,6 +1110,9 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
     | Fable.DeclaredType(ent, _) when (objInfo ctx r ent).IsSome -> tObj
     // an async computation: the record of the library's Async.fs; the builder has no state
+    // (F#'s `Event<'T>`: the record of the library's Event.fs)
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpEvent`1" ->
+        TEnt(libRecordEnt ctx "Event" "EventOf_1", [ mapType ctx r item ])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
@@ -1699,6 +1723,24 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "Cont_1" -> [ "ok", TFn([ TGen "T" ], tVoid); "fail", TFn([ tExn ], tVoid) ]
             | "TaskOf_1" -> [ "fable_task", TEnt(resultEnt ctx.State, [ TGen "T"; tExn ]) ]
             | "TaskCode_1" -> [ "code", TFn([ tVoid ], TGen "T") ]
+            | "StackOf_1" -> [ "items", TEnt(netEnt ctx.State "ResizeArray", [ TGen "T" ]) ]
+            | "QueueOf_1" ->
+                [
+                    "items", TEnt(netEnt ctx.State "ResizeArray", [ TGen "T" ])
+                    "head", TPrim "i32"
+                ]
+            | "EventOf_1" ->
+                [
+                    "handlers", TEnt(netEnt ctx.State "ResizeArray", [ TFn([ tAny; TGen "T" ], tVoid) ])
+                ]
+            | _ -> []
+
+        // (records with fields that can be assigned are counted cells, as the library declares them)
+        let mutableFields =
+            match name with
+            | "StackOf_1" -> [ "items" ]
+            | "QueueOf_1" -> [ "items"; "head" ]
+            | "EventOf_1" -> [ "handlers" ]
             | _ -> []
 
         let e =
@@ -1709,10 +1751,14 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                         FullName = $"Fable.Library.Zig.%s{file}.%s{name.Replace('_', '`')}"
                         Path = Fable.CoreAssemblyName "FSharp.Core"
                     }
-                Kind = KRecord
+                Kind =
+                    (if mutableFields.IsEmpty then
+                         KRecord
+                     else
+                         KRefRecord)
                 TypeParams = [ "T" ]
                 Cases = [ "", fields ]
-                MutableFields = []
+                MutableFields = mutableFields
                 Managed = true
                 Cyclic = false
                 ReachesOpaque = false
@@ -2399,6 +2445,8 @@ let libraryFunction (entity: string) (name: string) : (string * string) option =
     | "Microsoft.FSharp.Collections.SetModule" when name = "IntersectMany" -> Some("Set", "intersectMany")
     | "Microsoft.FSharp.Collections.ArrayModule" when name = "OfSeq" -> Some("Seq", "toArray")
     | "Microsoft.FSharp.Collections.SeqModule" when name = "Tail" -> Some("Seq", "tail")
+    | "Microsoft.FSharp.Control.ObservableModule" -> Some("Observable", small name)
+    | "Microsoft.FSharp.Control.EventModule" -> Some("Event", small name)
     | "Microsoft.FSharp.Collections.SeqModule" when name.StartsWith("Random", System.StringComparison.Ordinal) ->
         Some("Seq", small name)
     // (what `while`, `try ... finally` and `try ... with` in `seq { }` are)
@@ -3401,7 +3449,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             globalVar name ty false
 
     // A function declared inside this one becomes a function of the file (see `LocalFn`).
-    | Fable.Let(id, (Fable.Lambda _ | Fable.Delegate _ as fnExpr), body) when not id.IsMutable ->
+    | Fable.Let(id, (Fable.Lambda _ | Fable.Delegate _ as fnExpr), body) when
+        not id.IsMutable
+        && not (onlyAsValue id.Name body && not ((namesRead fnExpr).Contains id.Name))
+        ->
         liftGroup ctx id.Range [ Some id.Name, id.Name, fnExpr ] |> ignore
         lw ctx body
 
@@ -3971,6 +4022,55 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         // arguments F# knows)
         | Fable.Call(callee, info, _, cr) -> lw ctx (Fable.Call(callee, info, e.Type, cr))
         | _ -> lw ctx x
+    // a value of a .NET interface seen as one it inherits (an `IEvent` as an `IObservable`): the
+    // struct of the other's members, taken from it
+    | Fable.TypeCast(x, (Fable.DeclaredType(target, _) as targetType)) when
+        (match target.Path with
+         | Fable.SourcePath _ -> false
+         | _ -> true)
+        && (
+            match x.Type with
+            | Fable.DeclaredType(source, _) ->
+                source.FullName <> target.FullName
+                && (
+                    match source.Path with
+                    | Fable.SourcePath _ -> false
+                    | _ -> true
+                )
+                && (
+                    match ctx.Com.TryGetEntity source, ctx.Com.TryGetEntity target with
+                    | Some s, Some t -> s.IsInterface && t.IsInterface
+                    | _ -> false
+                )
+            | _ -> false
+        )
+        // (both structs of members: not a sequence, a dictionary, ..., which are what they are)
+        && (let isStruct (ty: Ty) =
+                match ty with
+                | TEnt(e, _) -> e.Name.StartsWith("fable_anon_", System.StringComparison.Ordinal)
+                | _ -> false
+
+            isStruct (mapType ctx e.Range targetType)
+            && isStruct (mapType ctx e.Range x.Type))
+        ->
+        let targetTy = mapType ctx e.Range targetType
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                let fromFields = caseFields (typeOf xs.Head) ""
+
+                let values =
+                    caseFields targetTy ""
+                    |> List.map (fun (f, fty) ->
+                        match fromFields |> List.tryFind (fun (g, _) -> g = f) with
+                        | Some(_, gty) -> EDup(EGet(xs.Head, PField f, gty), gty)
+                        | None -> fail e.Range "the Zig target cannot see %A as %A yet" x.Type targetType
+                    )
+
+                ECon(targetTy, "", values, None)
+            )
     // a collection given where a sequence is expected: a sequence that walks it
     | Fable.TypeCast(x, Fable.DeclaredType(seqRef, [ item ])) when
         seqRef.FullName = "System.Collections.Generic.IEnumerable`1"
@@ -4345,6 +4445,27 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         // (a member of a type is a function whose first argument is the object)
         let allArgs = Option.toList info.ThisArg @ info.Args
+
+        // (a property read as a value, as `[<CLIEvent>]` makes it: the getter takes its unit, which
+        // the call does not give; and the other way round)
+        // (only for a function of this file: its parameters include the object; those that the
+        // members of another file list do not)
+        let allArgs =
+            match
+                (match callee with
+                 | Fable.IdentExpr _ -> tryCallable ctx callee
+                 | _ -> None)
+            with
+            | Some c when allArgs.Length + 1 = c.ArgTypes.Length && List.last c.ArgTypes = Fable.Unit ->
+                allArgs @ [ Fable.Value(Fable.UnitConstant, None) ]
+            | Some c when
+                allArgs.Length = c.ArgTypes.Length + 1
+                && (List.last allArgs).Type = Fable.Unit
+                && not c.ArgTypes.IsEmpty
+                ->
+                List.take c.ArgTypes.Length allArgs
+            | _ -> allArgs
+
         let args = allArgs |> List.map (lw ctx)
 
         match tryCallable ctx callee, callee with
@@ -6631,7 +6752,16 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                     else
                         MConst ty
             else
-                members[d.Name] <- MFunction(typeParamsOf info, d.Args |> List.map (fun a -> a.Type), d.Body.Type)
+                members[d.Name] <-
+                    MFunction(
+                        typeParamsOf info,
+                        // (a member without parameters, as `[<CLIEvent>]` makes, takes unit)
+                        (if d.Args.IsEmpty && not (isEntryPoint info) then
+                             [ Fable.Unit ]
+                         else
+                             d.Args |> List.map (fun a -> a.Type)),
+                        d.Body.Type
+                    )
         with ZigError(msg, r) ->
             report r msg
 
@@ -6670,11 +6800,17 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             else
                 let entry = isEntryPoint info
 
+                let args =
+                    if d.Args.IsEmpty then
+                        [ AST.makeTypedIdent Fable.Unit "unitVar" ]
+                    else
+                        d.Args
+
                 let ps =
                     if entry then
                         [] // (the argument array is not available yet)
                     else
-                        d.Args
+                        args
                         |> List.map (fun a ->
                             let v = state.NewVar(a.Name, mapType ctx a.Range a.Type, VParam, false)
                             ctx.Vars[a.Name] <- v

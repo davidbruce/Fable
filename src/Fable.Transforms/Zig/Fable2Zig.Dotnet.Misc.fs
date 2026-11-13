@@ -34,6 +34,38 @@ let call
     let contents = contents r
 
     match entity, name, args with
+    // `source.Add f` and `source.Subscribe f` of an observable: the Observable module's
+    | "Microsoft.FSharp.Control.CommonExtensions", ("AddToObservable" | "SubscribeToObservable"), [ source; f ] ->
+        // (an event is given as the observable it also is)
+        let source =
+            match source.Type, t with
+            | Fable.DeclaredType(e, [ _; item ]), _ when e.FullName = "Microsoft.FSharp.Control.IEvent`2" ->
+                Fable.TypeCast(
+                    source,
+                    Fable.DeclaredType(
+                        {
+                            FullName = "System.IObservable`1"
+                            Path = Fable.CoreAssemblyName "System.Runtime"
+                        },
+                        [ item ]
+                    )
+                )
+            | _ -> source
+
+        libraryCall
+            ctx
+            r
+            "Observable"
+            (if name = "AddToObservable" then
+                 "add"
+             else
+                 "subscribe")
+            { info with
+                ThisArg = None
+                SignatureArgTypes = []
+            }
+            [ f; source ]
+            t
     // a member of a .NET interface called on a value of that interface: its function in the
     // struct of function values (`d.Dispose()` of an `IDisposable`)
     | _, _, this :: rest when
@@ -46,7 +78,8 @@ let call
                   | _ -> true)
                  && (
                      match ctx.Com.TryGetEntity e with
-                     | Some ent -> ent.IsInterface && ent.FullName = entity
+                     // (the interface, or one it inherits: its members are in its struct too)
+                     | Some ent -> ent.IsInterface
                      | None -> false
                  )
                  ->
@@ -73,6 +106,29 @@ let call
         inner.Type <> Fable.Any && mapType ctx r inner.Type = mapType ctx r t
         ->
         lw ctx inner
+    // `d.Invoke(a, b)` of a delegate: a call of the function value it is
+    | _, "Invoke", f :: rest when
+        (match f.Type with
+         | Fable.DelegateType _ -> true
+         | _ -> false)
+        ->
+        bindArgs
+            ctx
+            (lw ctx f :: (rest |> List.map (lw ctx)))
+            (fun xs ->
+                ECallClo(
+                    xs.Head,
+                    (if xs.Tail.IsEmpty then
+                         [ EUnit ]
+                     else
+                         xs.Tail),
+                    mapType ctx r t
+                )
+            )
+    // F#'s `Event<'T>`: the library's Event.fs
+    | "Microsoft.FSharp.Control.FSharpEvent`1", ".ctor", _ -> libraryCall ctx r "Event" "create" info [] t
+    | "Microsoft.FSharp.Control.FSharpEvent`1", "Trigger", _ -> libraryCall ctx r "Event" "trigger" info args t
+    | "Microsoft.FSharp.Control.FSharpEvent`1", "get_Publish", _ -> libraryCall ctx r "Event" "publish" info args t
     // `using resource f`: `f resource`, then `resource.Dispose()`, also when it raises
     | "Microsoft.FSharp.Core.Operators", "Using", [ resource; f ] ->
         let rid = AST.makeTypedIdent resource.Type "resource"
