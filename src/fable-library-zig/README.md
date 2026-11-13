@@ -52,6 +52,10 @@ to compile, rather than doing something else. The known exceptions:
 - `%A` of a type that contains a `voption`, a struct tuple or a function is refused.
 - Comparison by a culture (`String.Compare` without `StringComparison.Ordinal`) is refused;
   `StackTrace` is not supported.
+- Immutable records, unions and tuples are values, not objects: `obj.ReferenceEquals` and
+  `PhysicalEquality` of them are refused (`[<ReferenceEquality>]` gives a type's values an
+  identity). An exception thrown by a type's own `Equals`, `GetHashCode` or `CompareTo` while
+  `=`, `hash` or `compare` runs it stops the program.
 - `Array.zeroCreate` of a reference record gives records of default fields, where .NET gives
   nulls.
 - Not yet supported: reflection, generic classes in class hierarchies, arrays of more than two

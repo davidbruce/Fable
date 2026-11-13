@@ -457,6 +457,7 @@ let private listEnt (state: FileState) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         e.Cases <- [ "Empty", []; "Cons", [ "Head", TGen "T"; "Tail", TEnt(e, [ TGen "T" ]) ] ]
@@ -571,6 +572,7 @@ let private dotnetExnEntIn (state: FileState) (fullName: string) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         state.Ents[key] <- e
@@ -608,6 +610,7 @@ let private resultEnt (state: FileState) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         state.Ents[resultName] <- e
@@ -642,6 +645,7 @@ let private choiceEnt (state: FileState) (fullName: string) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         state.Ents[fullName] <- e
@@ -671,6 +675,7 @@ let private arrayEnt (state: FileState) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         state.Ents["$array"] <- e
@@ -717,6 +722,7 @@ let private netEnt (state: FileState) (name: string) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         state.Ents[key] <- e
@@ -752,6 +758,7 @@ let private anonEnt (state: FileState) (names: string[]) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         state.Ents[key] <- e
@@ -781,6 +788,7 @@ let private lazyEnt (state: FileState) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         state.Ents["$lazy"] <- e
@@ -814,6 +822,7 @@ let private refEnt (state: FileState) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         state.Ents[refName] <- e
@@ -842,6 +851,8 @@ type ObjInfo =
     }
 
 let private tObj = TPrim "fable_rt.Obj"
+/// `obj`: an object (of a class, or a boxed value), or null
+let private tAny = TOpt tObj
 
 let private isClassEntity (ent: Fable.Entity) =
     not (
@@ -961,6 +972,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, genArgs) when ent.FullName = mapName || ent.FullName = setName ->
         TEnt(treeEnt ctx (ent.FullName = mapName), genArgs |> List.map (mapTypeArg ctx r))
     | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapTypeArg ctx r))
+    | Fable.Any -> tAny
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
 
 /// A type argument: `obj` stands for the item type of something empty (an `obj` value cannot be
@@ -1007,12 +1019,29 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
 
         let recursive = reachesSelf ctx.Com true ent
 
+        // (a record or union compared by reference, `[<ReferenceEquality>]` or `[<NoEquality>]`
+        // without an `Equals` of its own: its values are cells, so that each has an identity)
+        let byReference =
+            (ent.IsFSharpRecord || ent.IsFSharpUnion)
+            && not ent.IsValueType
+            && (ent.Attributes
+                |> Seq.exists (fun a -> a.Entity.FullName = "Microsoft.FSharp.Core.ReferenceEqualityAttribute")
+                || ent.Attributes
+                   |> Seq.exists (fun a -> a.Entity.FullName = "Microsoft.FSharp.Core.NoEqualityAttribute")
+                   && not (
+                       ent.MembersFunctionsAndValues
+                       |> Seq.exists (fun m ->
+                           m.IsOverrideOrExplicitInterfaceImplementation && m.CompiledName = "Equals"
+                       )
+                   ))
+
         // A record that can be assigned to (and is not a struct), or that contains itself, is a
         // reference: a pointer to a counted cell.
         let isReference =
             isClass
             || ent.IsFSharpRecord
-               && ((recursive && reachesSelf ctx.Com false ent)
+               && (byReference
+                   || (recursive && reachesSelf ctx.Com false ent)
                    || (not ent.IsValueType && ent.FSharpFields |> List.exists (fun f -> f.IsMutable)))
 
         // a name in this file, or `alias.name` for a type another file declares
@@ -1031,7 +1060,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                         KRefRecord
                     elif not ent.IsFSharpUnion then
                         KRecord
-                    elif recursive then
+                    elif recursive || byReference then
                         KHeapUnion
                     else
                         KValueUnion
@@ -1052,6 +1081,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 Copyable = true
                 IsLocal = isLocal
                 Hooks = None
+                Overrides = []
             }
 
         // a resource: `IResource<'T>` (destroyed after its last use, move-only) or
@@ -1108,6 +1138,50 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
 
             e.Copyable <- shared
         | None -> ()
+
+        // the `Equals`, `GetHashCode` and `IComparable.CompareTo` of its own, which `=`, `hash`
+        // and `compare` call (F#'s own for a record or a union unless it says otherwise)
+        let hasAttr (name: string) =
+            ent.Attributes |> Seq.exists (fun a -> a.Entity.FullName = name)
+
+        let ownEquality =
+            not (ent.IsFSharpRecord || ent.IsFSharpUnion)
+            || hasAttr "Microsoft.FSharp.Core.CustomEqualityAttribute"
+            || hasAttr "Microsoft.FSharp.Core.NoEqualityAttribute"
+
+        let ownComparison =
+            not (ent.IsFSharpRecord || ent.IsFSharpUnion)
+            || hasAttr "Microsoft.FSharp.Core.CustomComparisonAttribute"
+            || hasAttr "Microsoft.FSharp.Core.NoComparisonAttribute"
+
+        let declares (compiled: string) =
+            ent.MembersFunctionsAndValues
+            |> Seq.exists (fun m ->
+                m.IsInstance
+                && m.IsOverrideOrExplicitInterfaceImplementation
+                && m.CompiledName = compiled
+            )
+
+        if isLocal && not ent.IsInterface then
+            e.Overrides <-
+                [
+                    if byReference then
+                        "fable_reference_equality", ""
+                    if declares "ToString" && (ent.IsFSharpRecord || ent.IsFSharpUnion) then
+                        "fable_to_string", name + "__ToString"
+                    if ownEquality && declares "Equals" then
+                        "fable_equals", name + "__Equals"
+                    if ownEquality && declares "GetHashCode" then
+                        "fable_hash", name + "__GetHashCode"
+                    if ownComparison && declares "System.IComparable.CompareTo" then
+                        "fable_compare", implName name "System.IComparable.CompareTo"
+                ]
+
+            if not e.Overrides.IsEmpty && not ent.GenericParameters.IsEmpty then
+                fail
+                    r
+                    "the Zig target does not support Equals, GetHashCode or CompareTo of a generic type yet (%s)"
+                    entRef.FullName
 
         ctx.State.Ents[entRef.FullName] <- e
         ctx.State.EntDepth <- ctx.State.EntDepth + 1
@@ -1224,6 +1298,7 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
                     Copyable = true
                     IsLocal = isLocal
                     Hooks = None
+                    Overrides = []
                 }
 
             let part = synth "part"
@@ -1353,6 +1428,7 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
                     Copyable = true
                     IsLocal = isLocal
                     Hooks = None
+                    Overrides = []
                 }
 
             ctx.State.Ents[entRef.FullName] <- e
@@ -1415,6 +1491,7 @@ and seqEnt (ctx: Ctx) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         ctx.State.Ents["$seq"] <- e
@@ -1457,6 +1534,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         ctx.State.Ents[key] <- e
@@ -1485,6 +1563,7 @@ and walkEnt (ctx: Ctx) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         ctx.State.Ents["$walk"] <- e
@@ -1545,6 +1624,7 @@ and treeEnt (ctx: Ctx) (isMap: bool) : Ent =
                 Copyable = true
                 IsLocal = false
                 Hooks = None
+                Overrides = []
             }
 
         let self = TEnt(e, e.TypeParams |> List.map TGen)
@@ -2555,6 +2635,17 @@ let private objDecl (com: Compiler) (r: SourceLocation option) (o: ObjInfo) (dot
             |> List.tryFind (fun k -> classImplements com k "ToString")
             |> Option.map (fun k -> k.Prefix + "__ToString")
         Thunks = []
+        Overrides =
+            [
+                "equals", "Equals"
+                "hash", "GetHashCode"
+                "compare", "System.IComparable.CompareTo"
+            ]
+            |> List.choose (fun (hook, slot) ->
+                ancestors o
+                |> List.tryFind (fun k -> classImplements com k slot)
+                |> Option.map (fun k -> hook, implName k.Prefix slot)
+            )
     }
 
 /// A constructor as a function that computes the fields in order and ends with `finish` of
@@ -2883,6 +2974,26 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
                 EStore(place, xs[1])
             )
+    // `o :? T` of an `obj` (not one F# made by boxing a value of a known type, as `use` does)
+    | Fable.Test(x, Fable.TypeTest t, r) when x.Type = Fable.Any && (let (Unboxed inner) = x in inner.Type = Fable.Any) ->
+        match t with
+        | Fable.DeclaredType(cls, _) when (objInfo ctx r cls).IsSome ->
+            let o = (objInfo ctx r cls).Value
+            ctx.State.UsesRuntime <- true
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.anyIsClass($0, &%s{objTypeName o})", xs, tBool))
+        | _ ->
+            let found = ctx.State.NewVar("unboxed", TOpt(mapType ctx r t), VLocal, false)
+
+            bindArgs
+                ctx
+                [ lw ctx x ]
+                (fun xs ->
+                    ELet(
+                        found,
+                        EEmit("fable_rt.tryUnbox($R, $0)", xs, TOpt(mapType ctx r t)),
+                        EPrim("not", [ ETest(EVar found, "None", found.Ty) ], tBool)
+                    )
+                )
     // `x :? Circle`
     | Fable.Test(x, Fable.TypeTest(Fable.DeclaredType(cls, _)), r) when
         (objInfo ctx r cls).IsSome && (objOfType ctx r x.Type).IsSome
@@ -2892,6 +3003,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.Value(kind, r) ->
         match kind with
         | Fable.UnitConstant -> EUnit
+        // `null`: of a string and of `obj` (other types have no null here)
+        | Fable.Null Fable.String -> ELit("@as(fable_rt.String, null)", tStr)
+        | Fable.Null Fable.Any ->
+            ctx.State.UsesRuntime <- true
+            ELit("@as(fable_rt.Any, null)", tAny)
         | Fable.BoolConstant b ->
             ELit(
                 (if b then
@@ -3670,6 +3786,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 Copyable = true
                 IsLocal = true
                 Hooks = None
+                Overrides = []
             }
 
         let part = synth "part" (slots |> List.map (fun (slot, ty, _) -> slot, ty))
@@ -3737,6 +3854,17 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     ancestors parent
                     |> List.tryFind (fun k -> classImplements ctx.Com k "ToString")
                     |> Option.map (fun k -> k.Prefix + "__ToString")
+                Overrides =
+                    [
+                        "equals", "Equals"
+                        "hash", "GetHashCode"
+                        "compare", "System.IComparable.CompareTo"
+                    ]
+                    |> List.choose (fun (hook, slot) ->
+                        ancestors parent
+                        |> List.tryFind (fun k -> classImplements ctx.Com k slot)
+                        |> Option.map (fun k -> hook, implName k.Prefix slot)
+                    )
                 Thunks =
                     slots
                     |> List.map (fun (slot, ty, _) ->
@@ -4031,6 +4159,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ctx.Vars[id.Name] <- iv
         bindArgs ctx [ lw ctx start; lw ctx limit ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, lwStmt ctx body))
 
+    // `x :> obj` and `box x`: an object holds it
+    | Fable.TypeCast(x, Fable.Any) when x.Type <> Fable.Any -> boxed ctx x
+    // `o :?> T` of an `obj`
+    | Fable.TypeCast(x, t) when x.Type = Fable.Any && t <> Fable.Any -> unboxed ctx e.Range x t
     | Fable.TypeCast(x, t) ->
         let ir = lw ctx x
 
@@ -4144,6 +4276,28 @@ and ownToString (ctx: Ctx) (t: Fable.Type) : string option =
             | _ -> None
         | _ -> None
     | _ -> None
+
+/// `box x`: `x` in an object (an object of a class is one already). It borrows `x`.
+and boxed (ctx: Ctx) (x: Fable.Expr) : Expr =
+    ctx.State.UsesRuntime <- true
+    let ir = lw ctx x
+
+    match ir with
+    // (a literal is given its type first: Zig's literals have none)
+    | ELit(_, ty) ->
+        let v = ctx.State.NewVar("boxed", ty, VLocal, false)
+        ELet(v, ir, EEmit("fable_rt.box($0)", [ EVar v ], tAny))
+    | _ -> bindArgs ctx [ ir ] (fun xs -> EEmit("fable_rt.box($0)", xs, tAny))
+
+/// `unbox<T> o` and `o :?> T`: what the object holds, or InvalidCastException
+and unboxed (ctx: Ctx) (r: SourceLocation option) (x: Fable.Expr) (t: Fable.Type) : Expr =
+    ctx.State.UsesRuntime <- true
+
+    match t with
+    | Fable.DeclaredType(cls, _) when (objInfo ctx r cls).IsSome ->
+        let o = (objInfo ctx r cls).Value
+        bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.anyToClass($0, &%s{objTypeName o})", xs, tObj))
+    | _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ERt("fable_rt.unbox($R, $0)", xs, mapType ctx r t))
 
 /// `x.ToString()`, as an expression of Fable's.
 and toStringCall (x: Fable.Expr) : Fable.Expr =
@@ -5724,9 +5878,21 @@ and dotnetCall
         | Fable.Number _
         | Fable.Char -> ELit("0", mapType ctx r t)
         | Fable.Boolean -> ELit("false", tBool)
+        | Fable.Any -> ELit("@as(fable_rt.Any, null)", tAny)
         | Fable.Option(inner, _) -> ECon(mapType ctx r t, "None", [], None)
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
-    | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String -> pure' "($0 == null)" [ x ] tBool
+    | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String || x.Type = Fable.Any ->
+        pure' "($0 == null)" [ x ] tBool
+    | "System.Decimal", "Equals", [ a; b ] when isDec a && isDec b -> pure' "fable_rt.eql($0, $1)" [ a; b ] tBool
+    // `x.Equals y` and `x.CompareTo y` of numbers, chars and bools (NaN equals NaN, as .NET's
+    // `Equals` has it)
+    | ("System.Double" | "System.Single" | "System.Int32" | "System.Int64" | "System.Int16" | "System.SByte" | "System.Byte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Char" | "System.Boolean" | "System.Decimal" | "System.Numerics.BigInteger"),
+      ("Equals" | "CompareTo"),
+      [ a; b ] when a.Type = b.Type ->
+        if name = "Equals" then
+            pure' "(fable_rt.compare($0, $1) == 0)" [ a; b ] tBool
+        else
+            pure' "fable_rt.compare($0, $1)" [ a; b ] tI32
     | "System.String", "get_Length", [ s ] when neverNull s -> pure' "fable_rt.strLength($0)" [ s ] tI32
     | "System.String", "get_Length", [ s ] -> rt "fable_rt.strLen($0)" [ s ] tI32
     | "Microsoft.FSharp.Core.StringModule", "Length", [ s ] -> pure' "fable_rt.strLength($0)" [ s ] tI32
@@ -5913,6 +6079,11 @@ and dotnetCall
         )
         ->
         dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
+    | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when x.Type = Fable.Any ->
+        if entity = "System.Object" then
+            rt "fable_rt.anyToString($0, false)" [ x ] tStr
+        else
+            rt "fable_rt.anyToString($0, true)" [ x ] tStr
     | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when (ownToString ctx x.Type).IsSome ->
         bindArgs ctx [ lw ctx x ] (fun xs -> ECall((ownToString ctx x.Type).Value, [], xs @ [ EUnit ], tStr))
     | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when x.Type <> unByref x.Type ->
@@ -6292,6 +6463,48 @@ and dotnetCall
         else
             dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
 
+    // ---- obj ----
+    | "Microsoft.FSharp.Core.Operators", "Box", [ x ] when x.Type <> Fable.Any -> boxed ctx x
+    | "Microsoft.FSharp.Core.Operators", "Box", [ x ] -> lw ctx x
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
+      ("Unbox" | "UnboxGeneric" | "UnboxFast"),
+      [ Uncast x ] when x.Type = Fable.Any && t <> Fable.Any -> unboxed ctx r x t
+    // `obj.ReferenceEquals(a, b)` and `PhysicalEquality a b`: the same cell (what F# boxes for
+    // the call is looked through: a record is not copied by it on .NET)
+    | ("System.Object" | "Microsoft.FSharp.Core.LanguagePrimitives"),
+      ("ReferenceEquals" | "PhysicalEquality"),
+      [ Uncast a; Uncast b ] ->
+        let a, b =
+            if a.Type = b.Type then
+                a, b
+            else
+                Fable.TypeCast(a, Fable.Any), Fable.TypeCast(b, Fable.Any)
+
+        // (a record, a union or a tuple that is a value here has no identity to compare)
+        match mapType ctx r a.Type with
+        | TEnt(e, _) when e.Kind = KRecord || e.Kind = KValueUnion ->
+            fail
+                r
+                "the Zig target keeps %s as a value, which has no identity: ReferenceEquals and PhysicalEquality cannot be answered as on .NET (mark the type [<ReferenceEquality>] to give its values one)"
+                e.Ref.FullName
+        | TTuple _ ->
+            fail
+                r
+                "the Zig target keeps tuples as values, which have no identity: ReferenceEquals cannot be answered as on .NET"
+        | _ -> pure' "fable_rt.refEql($0, $1)" [ a; b ] tBool
+    // `x.Equals(o)`: by the type's `Equals`, through an object
+    | "System.Object", "Equals", [ a; b ] ->
+        let asObj (x: Fable.Expr) =
+            match x with
+            | Uncast inner when inner.Type <> Fable.Any -> Fable.TypeCast(inner, Fable.Any)
+            | _ -> x
+
+        pure' "fable_rt.eql($0, $1)" [ asObj a; asObj b ] tBool
+    | "System.Object", "GetHashCode", [ x ] -> pure' "fable_rt.hash($0)" [ x ] tI32
+    | "System.Collections.Generic.EqualityComparer`1", "Equals", [ _; a; b ] ->
+        pure' "fable_rt.eql($0, $1)" [ a; b ] tBool
+    | "System.Collections.Generic.EqualityComparer`1", "GetHashCode", [ _; x ] -> pure' "fable_rt.hash($0)" [ x ] tI32
+    | "System.Collections.Generic.EqualityComparer`1", "get_Default", [] -> EUnit
     // ---- numbers ----
     | "System.MathF", _, _ -> dotnetCall ctx r "System.Math" name info t
     | ("System.Double" | "System.Single"),
@@ -7084,6 +7297,8 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
                             if m.Name = "ToString" then
                                 Some { m with Name = c.Name + "__ToString" }
+                            elif m.Name = "Equals" || m.Name = "GetHashCode" then
+                                Some { m with Name = c.Name + "__" + m.Name }
                             elif compiled.Contains "." then
                                 Some { m with Name = implName c.Name compiled }
                             else

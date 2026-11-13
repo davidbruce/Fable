@@ -50,6 +50,9 @@ type Ent =
         /// a resource (`IResource<'T>`, `ISharedResource<'T>`): the functions that destroy a
         /// value and that copy one (None: the type is move-only)
         mutable Hooks: (string * string option) option
+        /// the `Equals`, `GetHashCode` and `IComparable.CompareTo` the type declares, which
+        /// `=`, `hash` and `compare` call: the runtime's name of the hook, and the function
+        mutable Overrides: (string * string) list
     }
 
 type Ty =
@@ -624,6 +627,9 @@ type ObjDecl =
         Tables: (Ty * (string * string * Ty) list) option list
         /// the function of the class's `ToString` (its own or the nearest inherited one)
         ToString: string option
+        /// the functions of its `Equals`, `GetHashCode` and `IComparable.CompareTo` (its own or
+        /// the nearest inherited ones), by the runtime's names of them
+        Overrides: (string * string) list
         /// (an object expression's class) the functions of its table that call the function
         /// values it holds: name, pointer type of its fields, the Zig names of the structs of
         /// fields of its chain, the field, and the type of the function value

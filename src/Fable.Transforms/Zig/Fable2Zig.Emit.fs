@@ -303,6 +303,25 @@ let rec ex (em: Em) (e: Expr) : string =
         | "shr", [ x; y ] -> $"(%s{x} >> %s{shiftCount y})"
         // (values that hold cells are compared through them)
         | "eql", [ x; y ] ->
+            // (a `None` or `[]` that F# generalized has the type of the other side)
+            let x, y, argT =
+                match xs with
+                | [ xe; ye ] when typeOf xe <> typeOf ye ->
+                    let rec placeholder (t: Ty) =
+                        match t with
+                        | TPrim "void" -> true
+                        | TOpt t -> placeholder t
+                        | TEnt(_, args) -> args |> List.exists placeholder
+                        | _ -> false
+
+                    if placeholder (typeOf ye) then
+                        x, $"fable_rt.emptyAs(%s{zigType (typeOf xe)}, %s{y})", typeOf xe
+                    elif placeholder (typeOf xe) then
+                        $"fable_rt.emptyAs(%s{zigType (typeOf ye)}, %s{x})", y, typeOf ye
+                    else
+                        x, y, argT
+                | _ -> x, y, argT
+
             if isManaged argT || holdsDecimal argT then
                 $"fable_rt.eql(%s{x}, %s{y})"
             else
@@ -1474,19 +1493,36 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
     out.AppendLine() |> ignore
 
 /// A resource's hooks, as declarations the runtime looks for: `fable_destroy`, `fable_dup`.
-let hookDecls (e: Ent) (ind: string) : string =
-    match e.Hooks with
-    | Some(destroy, dup) ->
-        let one (name: string) (fn: string) =
-            $"%s{ind}    pub const %s{name} = %s{callTarget fn};\n"
+/// `fable_rt.Hook(file, "name")` of a function of this file or of another (`alias.name`)
+let hookOf (fn: string) =
+    match fn.IndexOf '.' with
+    | -1 -> $"fable_rt.Hook(@\"$file\", \"%s{topIdent fn}\")"
+    | i -> $"fable_rt.Hook(%s{fn.Substring(0, i)}, \"%s{topIdent (fn.Substring(i + 1))}\")"
 
-        one "fable_destroy" destroy
-        + (
-            match dup with
-            | Some d -> one "fable_dup" d
-            | None -> ""
+let hookDecls (e: Ent) (ind: string) : string =
+    let overrides =
+        e.Overrides
+        |> List.map (fun (decl, fn) ->
+            if fn = "" then
+                $"%s{ind}    pub const %s{decl} = {{}};\n"
+            else
+                $"%s{ind}    pub const %s{decl} = %s{hookOf fn};\n"
         )
-    | None -> ""
+        |> String.concat ""
+
+    overrides
+    + match e.Hooks with
+      | Some(destroy, dup) ->
+          let one (name: string) (fn: string) =
+              $"%s{ind}    pub const %s{name} = %s{callTarget fn};\n"
+
+          one "fable_destroy" destroy
+          + (
+              match dup with
+              | Some d -> one "fable_dup" d
+              | None -> ""
+          )
+      | None -> ""
 
 /// The text of one file, without its imports (their paths are only known to the writer).
 let emitFile (state: FileState) : string =
@@ -1565,7 +1601,10 @@ let emitFile (state: FileState) : string =
                 | None -> ""
 
             let payload =
-                decl + (cellHeader e @ fields (snd e.Cases.Head) |> String.concat ", ")
+                decl
+                + (hookDecls e "").Replace("\n", " ").Trim()
+                + " "
+                + (cellHeader e @ fields (snd e.Cases.Head) |> String.concat ", ")
 
             match e.TypeParams with
             | [] ->
@@ -1613,6 +1652,8 @@ let emitFile (state: FileState) : string =
             match cyclicDecl e with
             | Some verdict -> out.AppendLine($"%s{ind}    pub const fable_cyclic = %s{verdict};") |> ignore
             | None -> ()
+
+            out.Append(hookDecls e ind) |> ignore
 
             // (the trees of `Map` and `Set`: the runtime compares and writes them by what they
             // hold, not by their shape)
@@ -1834,7 +1875,19 @@ let emitFile (state: FileState) : string =
             | None -> "null"
 
         out.AppendLine(
-            $"pub const %s{topIdent d.TypeName}: fable_rt.ObjType = fable_rt.objType(%s{zigType d.Chain}, \"%s{d.DotnetName}\", %s{parent}, &.{{ %s{tables} }}, %s{toString});"
+            if d.Overrides.IsEmpty then
+                $"pub const %s{topIdent d.TypeName}: fable_rt.ObjType = fable_rt.objType(%s{zigType d.Chain}, \"%s{d.DotnetName}\", %s{parent}, &.{{ %s{tables} }}, %s{toString});"
+            else
+                let hook (name: string) (asObj: string) =
+                    match d.Overrides |> List.tryFind (fun (h, _) -> h = name) with
+                    | Some(_, fn) -> $"%s{hookOf fn}.%s{asObj}"
+                    | None -> "null"
+
+                let eq = hook "equals" "objEquals"
+                let hs = hook "hash" "objHash"
+                let cmp = hook "compare" "objCompare"
+
+                $"pub const %s{topIdent d.TypeName}: fable_rt.ObjType = fable_rt.objTypeWith(%s{zigType d.Chain}, \"%s{d.DotnetName}\", %s{parent}, &.{{ %s{tables} }}, %s{toString}, %s{eq}, %s{hs}, %s{cmp});"
         )
         |> ignore
 

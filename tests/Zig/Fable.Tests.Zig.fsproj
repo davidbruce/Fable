@@ -37,5 +37,6 @@
     <Compile Include="StringTests.fs" />
     <Compile Include="CharTests.fs" />
     <Compile Include="ArithmeticTests.fs" />
+    <Compile Include="ComparisonTests.fs" />
   </ItemGroup>
 </Project>

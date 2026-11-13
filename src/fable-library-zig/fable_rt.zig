@@ -476,8 +476,16 @@ fn treeHash(x: anytype) i32 {
 }
 
 /// Structural equality, as F#'s `=` on records, unions, tuples and options.
+/// A record or union with `[<ReferenceEquality>]` (or `[<NoEquality>]`): its values are cells,
+/// equal only to themselves
+fn byReference(comptime T: type) bool {
+    return hookOf(T, "fable_reference_equality");
+}
+
 pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     const T = @TypeOf(a);
+    if (comptime byReference(T)) return std.meta.eql(a, b);
+    if (comptime hookOf(T, "fable_equals")) return hookType(T).fable_equals.call(.{ a, box(b) });
     if (comptime isCollection(T)) return treeEql(a, b);
     if (comptime isSlice(T)) {
         if (a.len != b.len) return false;
@@ -496,7 +504,7 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     // (a sequence is an object on .NET: equal only to itself, here the same walk and what it holds)
     if (comptime @typeInfo(T) == .@"struct" and @hasField(T, "fable_seq")) return a.fable_seq.env == b.fable_seq.env and a.fable_seq.code == b.fable_seq.code;
     if (comptime isFunc(T)) @compileError("function values cannot be compared");
-    if (T == Obj) return a == b;
+    if (T == Obj) return objEql(a, b);
     if (T == Exn) return a == b or (a.type == b.type and if (a.type.eql) |f| f(a, b) else false);
     if (T == String) return strEql(a, b);
     switch (@typeInfo(T)) {
@@ -2485,6 +2493,11 @@ pub const ObjType = struct {
     destroy: *const fn (Obj) void,
     /// the class's `ToString` (its own or the nearest one it inherits), if it has one
     to_string: ?*const fn (?*Env, Obj, void) Raised!String = null,
+    /// `Equals(obj)`, `GetHashCode()` and `IComparable.CompareTo(obj)`, where the class or the
+    /// boxed type has them (without `equals` an object is equal only to itself)
+    equals: ?*const fn (Obj, Obj) bool = null,
+    hash: ?*const fn (Obj) i32 = null,
+    compare: ?*const fn (Obj, Obj) i32 = null,
 };
 
 pub const ObjHeader = struct {
@@ -2621,7 +2634,264 @@ pub fn objType(
     comptime vtables: []const ?*const anyopaque,
     comptime to_string: ?*const fn (?*Env, Obj, void) Raised!String,
 ) ObjType {
-    return .{ .name = name, .parent = parent, .vtables = vtables, .destroy = ObjCell(Chain).destroy, .to_string = to_string };
+    return objTypeWith(Chain, name, parent, vtables, to_string, null, null, null);
+}
+
+/// (a class that overrides `Equals` or `GetHashCode`, or implements `IComparable`: the hooks
+/// that call them, `Hook(...).asObj...`)
+pub fn objTypeWith(
+    comptime Chain: type,
+    comptime name: []const u8,
+    comptime parent: ?*const ObjType,
+    comptime vtables: []const ?*const anyopaque,
+    comptime to_string: ?*const fn (?*Env, Obj, void) Raised!String,
+    comptime equals: ?*const fn (Obj, Obj) bool,
+    comptime hash_: ?*const fn (Obj) i32,
+    comptime compare_: ?*const fn (Obj, Obj) i32,
+) ObjType {
+    return .{ .name = name, .parent = parent, .vtables = vtables, .destroy = ObjCell(Chain).destroy, .to_string = to_string, .equals = equals, .hash = hash_, .compare = compare_ };
+}
+
+// ---------------------------------------------------------------------------------------------
+// `obj`: an object of a class, a boxed value, or null
+// ---------------------------------------------------------------------------------------------
+
+/// `obj`. An object of a class is one already; any other value is boxed: put in an object
+/// whose type (`boxType`) knows how to compare, hash and write it.
+pub const Any = ?Obj;
+
+fn BoxPart(comptime T: type) type {
+    return struct { value: T };
+}
+
+fn BoxChain(comptime T: type) type {
+    return struct { own: BoxPart(T) };
+}
+
+fn boxed(comptime T: type, o: Obj) *BoxPart(T) {
+    return objPart(*BoxPart(T), &.{BoxPart(T)}, o);
+}
+
+/// .NET's name of a type, for messages and for the text of a boxed value
+fn netTypeName(comptime T: type) [:0]const u8 {
+    return switch (T) {
+        i8 => "System.SByte",
+        u8 => "System.Byte",
+        i16 => "System.Int16",
+        c_ushort => "System.UInt16",
+        u16 => "System.Char",
+        i32 => "System.Int32",
+        u32 => "System.UInt32",
+        i64 => "System.Int64",
+        u64 => "System.UInt64",
+        f32 => "System.Single",
+        f64 => "System.Double",
+        bool => "System.Boolean",
+        String => "System.String",
+        BigInt => "System.Numerics.BigInteger",
+        NetDecimal => "System.Decimal",
+        void => "Microsoft.FSharp.Core.Unit",
+        else => @typeName(T),
+    };
+}
+
+/// The type of the objects that hold a boxed `T`
+pub fn boxType(comptime T: type) *const ObjType {
+    return &struct {
+        const ty: ObjType = .{
+            .name = netTypeName(T),
+            .parent = null,
+            .vtables = &.{},
+            .destroy = ObjCell(BoxChain(T)).destroy,
+            .to_string = boxText,
+            .equals = boxEquals,
+            .hash = boxHash,
+            .compare = if (comparable(T)) boxCompare else null,
+        };
+        fn boxText(_: ?*Env, o: Obj, _: void) Raised!String {
+            defer drop(o);
+            const x = boxed(T, o).value;
+            if (comptime hookOf(T, "fable_to_string")) return hookType(T).fable_to_string.call(.{x});
+            // (a record, a union, a list, ...: `%A`, which is their `ToString`)
+            return switch (@typeInfo(T)) {
+                .int, .float, .bool => format(.{x}),
+                else => if (T == String or T == BigInt or T == NetDecimal) format(.{x}) else anyText(x),
+            };
+        }
+        fn boxEquals(a: Obj, b: Obj) bool {
+            return a.type == b.type and eql(boxed(T, a).value, boxed(T, b).value);
+        }
+        fn boxHash(o: Obj) i32 {
+            return hash(boxed(T, o).value);
+        }
+        fn boxCompare(a: Obj, b: Obj) i32 {
+            if (a.type != b.type) @panic("fable: Object must be of type " ++ comptime netTypeName(T) ++ ".");
+            return compare(boxed(T, a).value, boxed(T, b).value);
+        }
+    }.ty;
+}
+
+fn comparable(comptime T: type) bool {
+    return !(isFunc(T) or T == Exn or T == Obj or (isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity")));
+}
+
+/// `box x` (it borrows `x`). A null string and `None` box to null, as on .NET.
+pub fn box(x: anytype) Any {
+    const T = @TypeOf(x);
+    if (T == Any) return dup(x);
+    if (T == Obj) return dup(x);
+    if (T == String and x == null) return null;
+    if (comptime @typeInfo(T) == .optional and T != String) {
+        if (x == null) return null;
+    }
+    return objNew(boxType(T), BoxChain(T){ .own = .{ .value = x } });
+}
+
+/// `o :? T` (of a type that is not a class: those are `anyIsClass`)
+pub fn isType(comptime T: type, o: Any) bool {
+    const p = o orelse return false;
+    return p.type == boxType(T);
+}
+
+/// `o :? T` with what it holds: `?T`, null when it is not a `T` (`OT` is `?T`)
+pub fn tryUnbox(comptime OT: type, o: Any) OT {
+    const T = @typeInfo(OT).optional.child;
+    const p = o orelse return null;
+    if (T == Any or T == Obj) return dup(p);
+    if (p.type == boxType(T)) return dup(boxed(T, p).value);
+    return null;
+}
+
+/// `o :? C` of a class
+pub fn anyIsClass(o: Any, ty: *const ObjType) bool {
+    const p = o orelse return false;
+    return objIs(p, ty);
+}
+
+/// `o :?> C` of a class
+pub fn anyToClass(o: Any, ty: *const ObjType) Raised!Obj {
+    const p = o orelse return nullRef();
+    return objCast(p, ty);
+}
+
+/// `unbox<T> o` and `o :?> T`
+pub fn unbox(comptime T: type, o: Any) Raised!T {
+    if (T == Any) return dup(o);
+    const p = o orelse {
+        if (comptime @typeInfo(T) == .optional) return null;
+        return nullRef();
+    };
+    if (T == Obj) return dup(p);
+    if (p.type == boxType(T)) return dup(boxed(T, p).value);
+    var b: TextBuilder = .{};
+    b.addAscii("Unable to cast object of type '");
+    b.addAscii(p.type.name);
+    b.addAscii("' to type '");
+    b.addAscii(netTypeName(T));
+    b.addAscii("'.");
+    return raise(InvalidCastException, b.finish());
+}
+
+/// `o.ToString()` (null raises) and `string o` (null is "")
+pub fn anyToString(o: Any, comptime null_is_empty: bool) Raised!String {
+    const p = o orelse return if (null_is_empty) str("") else nullRef();
+    return objText(p);
+}
+
+/// A `None` or an empty list whose item type F# left open, as a value of type `T`
+pub fn emptyAs(comptime T: type, x: anytype) T {
+    const X = @TypeOf(x);
+    if (X == T) return x;
+    switch (@typeInfo(T)) {
+        .optional => {
+            if (x != null) @panic("fable: emptyAs of a value that is not empty");
+            return null;
+        },
+        .@"union" => {
+            if (comptime !@hasField(T, "Empty")) @compileError("fable: emptyAs of " ++ @typeName(T));
+            return .Empty;
+        },
+        else => @compileError("fable: emptyAs of " ++ @typeName(T)),
+    }
+}
+
+fn objEql(a: Obj, b: Obj) bool {
+    if (a == b) return true;
+    if (a.type.equals) |f| return f(a, b);
+    return false;
+}
+
+/// `obj.ReferenceEquals(a, b)` and `LanguagePrimitives.PhysicalEquality`: the same cell. (A
+/// value that is not a cell is boxed anew on .NET: never the same object.)
+pub fn refEql(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
+    if (comptime T == String or T == Any or T == Obj or T == Exn or isCellPtr(T)) return a == b;
+    if (comptime @typeInfo(T) == .@"union" and @hasDecl(T, "fable_cyclic")) return std.meta.eql(a, b);
+    return false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The `Equals`, `GetHashCode` and `CompareTo` a type declares, called by `=`, `hash` and
+// `compare`: `pub const fable_equals = fable_rt.Hook(file, "name");` in the type
+// ---------------------------------------------------------------------------------------------
+
+fn Unraised(comptime R: type) type {
+    return switch (@typeInfo(R)) {
+        .error_union => |e| e.payload,
+        else => R,
+    };
+}
+
+pub fn Hook(comptime M: type, comptime name: []const u8) type {
+    return struct {
+        const f = @field(M, name);
+        const F = @TypeOf(f);
+        const Args = std.meta.ArgsTuple(F);
+        const params = @typeInfo(Args).@"struct".field_names;
+        const sig = if (@hasDecl(M, name ++ "$sig")) @field(M, name ++ "$sig") else .{ .borrows = @as([params.len]bool, @splat(true)), .result_borrowed = false };
+        const R = Unraised(@typeInfo(F).@"fn".return_type.?);
+
+        /// `f(this, ...)`: the first is lent, the others given
+        pub fn call(args: anytype) R {
+            var a: Args = undefined;
+            comptime var uses: [params.len]Use = undefined;
+            inline for (0..params.len) |i| {
+                if (i < args.len) {
+                    a[i] = args[i];
+                    uses[i] = if (i == 0) .keep else .give;
+                } else {
+                    a[i] = {};
+                    uses[i] = .plain;
+                }
+            }
+            const raw = across(f, sig, uses, a);
+            const r = if (comptime isRaised(@TypeOf(raw))) raw catch @panic("fable: " ++ name ++ " raised an exception, which `=`, `hash` and `compare` cannot pass on here") else raw;
+            return r;
+        }
+
+        // (as the hooks of a class's type: the object is the first argument)
+        pub fn objEquals(a: Obj, b: Obj) bool {
+            return call(.{ a, @as(Any, dup(b)) });
+        }
+        pub fn objHash(a: Obj) i32 {
+            return call(.{a});
+        }
+        pub fn objCompare(a: Obj, b: Obj) i32 {
+            return call(.{ a, @as(Any, dup(b)) });
+        }
+    };
+}
+
+fn hookOf(comptime T: type, comptime decl: []const u8) bool {
+    const C = if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .one) @typeInfo(T).pointer.child else T;
+    return switch (@typeInfo(C)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(C, decl),
+        else => false,
+    };
+}
+
+fn hookType(comptime T: type) type {
+    return if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .one) @typeInfo(T).pointer.child else T;
 }
 
 /// A new object of class `ty` with these fields (which it shares).
@@ -3524,13 +3794,17 @@ pub fn strCompare(a: String, b: String) i32 {
 /// first when one starts the other; arrays by length, then item by item.
 pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
     const T = @TypeOf(a);
+    if (comptime hookOf(T, "fable_compare")) return hookType(T).fable_compare.call(.{ a, box(b) });
+    if (T == Obj) {
+        if (a.type.compare) |f| return f(a, b);
+        @panic("fable: At least one object must implement IComparable.");
+    }
     if (T == String) return strCompare(a, b);
     if (comptime isBigInt(T)) return bigCompare(a, b);
     if (comptime isDecimal(T)) return decCompare(a, b);
     if (T == bool) return @as(i32, @intFromBool(a)) - @as(i32, @intFromBool(b));
     if (T == void) return 0;
     if (T == Exn) @compileError("fable: exceptions cannot be compared");
-    if (T == Obj) @compileError("fable: objects of a class cannot be compared");
     if (comptime isFunc(T)) @compileError("fable: function values cannot be compared");
     switch (@typeInfo(T)) {
         .int, .float, .comptime_int, .comptime_float => {
@@ -3666,6 +3940,16 @@ pub fn minOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
 /// hash of anything else is this library's.
 pub fn hash(x: anytype) i32 {
     const T = @TypeOf(x);
+    if (comptime byReference(T)) {
+        const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&x));
+        return @bitCast(@as(u32, @truncate(h)));
+    }
+    if (comptime hookOf(T, "fable_hash")) return hookType(T).fable_hash.call(.{x});
+    // (null hashes to 0, as on .NET; an object by its own hash)
+    if (T == Any) return if (x) |o| hash(o) else 0;
+    if (T == Obj) {
+        if (x.type.hash) |f| return f(x);
+    }
     if (comptime isBigInt(T)) {
         const t = bigText(x);
         defer drop(t);
@@ -5483,6 +5767,15 @@ pub const Shower = struct {
     }
 };
 
+fn writeObj(out: *TextBuilder, o: Obj) void {
+    if (o.type.to_string) |f| {
+        const t = f(null, dup(o), {}) catch return out.addAscii(o.type.name);
+        defer drop(t);
+        return out.add(unitsOf(t));
+    }
+    out.addAscii(o.type.name);
+}
+
 /// `%A`: the value as F# would write it.
 pub fn anyText(x: anytype) String {
     if (@TypeOf(x) == String and x == null) return str("<null>");
@@ -5517,7 +5810,7 @@ fn writeNet(out: *TextBuilder, x: anytype) void {
         return out.addAscii(decAscii(x, &buf));
     }
     if (T == u16) return out.addOne(x);
-    if (T == Obj) return out.addAscii(x.type.name);
+    if (T == Obj) return writeObj(out, x);
     // (`Append(chars)`: the chars; `Append(builder)`: what it holds)
     if (comptime T == Array(u16)) return out.add(x.items);
     if (comptime T == StringBuilder) return out.add(x.units.items);
@@ -7273,14 +7566,14 @@ test "reference records: identity, stores and long chains" {
     // the field gets a new value: the old one stays alive through `second`
     store(&head.next, null);
     try std.testing.expectEqual(@as(i32, 199_998), second.id);
-    const box = new(Ref(TestList), .{ .contents = testRange(3) });
-    const alias = dup(box);
+    const r = new(Ref(TestList), .{ .contents = testRange(3) });
+    const alias = dup(r);
     store(&alias.contents, testRange(5));
-    try std.testing.expectEqual(@as(i32, 15), testSum(box.contents));
-    try std.testing.expect(eql(box, alias));
+    try std.testing.expectEqual(@as(i32, 15), testSum(r.contents));
+    try std.testing.expect(eql(r, alias));
     drop(head);
     drop(second);
-    drop(box);
+    drop(r);
     drop(alias);
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }
@@ -8233,4 +8526,27 @@ test "conv follows .NET" {
     try std.testing.expectEqual(@as(i32, 2147483647), conv(i32, @as(f64, 1e30)));
     try std.testing.expectEqual(@as(i32, 0), conv(i32, std.math.nan(f64)));
     try std.testing.expectEqual(@as(f64, 7.0), conv(f64, @as(i32, 7)));
+}
+
+test "box" {
+    const a = box(@as(i32, 5));
+    const b = box(@as(i32, 5));
+    const c = box(str("x"));
+    defer drop(a);
+    defer drop(b);
+    defer drop(c);
+    try std.testing.expect(eql(a, b));
+    try std.testing.expect(!eql(a, c));
+    try std.testing.expect(!refEql(a, b));
+    try std.testing.expect(isType(i32, a));
+    try std.testing.expect(!isType(i64, a));
+    try std.testing.expectEqual(@as(i32, 5), try unbox(i32, a));
+    try std.testing.expectEqual(hash(@as(i32, 5)), hash(a));
+    try std.testing.expectEqual(@as(i32, 0), compare(a, b));
+    try std.testing.expectError(error.Raised, unbox(i64, a));
+    drop(take());
+    const t = try anyToString(c, false);
+    defer drop(t);
+    try std.testing.expect(strEql(t, str("x")));
+    try std.testing.expect(box(@as(String, null)) == null);
 }
