@@ -3179,6 +3179,289 @@ pub fn leaked() bool {
 // ---------------------------------------------------------------------------------------------
 // Numbers
 // ---------------------------------------------------------------------------------------------
+// Numbers: what F#'s operators and System.Math do, raising what they raise on .NET
+// ---------------------------------------------------------------------------------------------
+
+/// `abs x`: the smallest whole number has no absolute value, and .NET raises for it.
+pub fn absOf(x: anytype) Raised!@TypeOf(x) {
+    const T = @TypeOf(x);
+    if (comptime @typeInfo(T) == .int and @typeInfo(T).int.signedness == .signed) {
+        if (x == std.math.minInt(T)) return raise(OverflowException, str("Negating the minimum value of a twos complement number is invalid."));
+    }
+    return if (comptime @typeInfo(T) == .float) @abs(x) else if (x < 0) -x else x;
+}
+
+/// `sign x`: -1, 0 or 1; not a number has no sign.
+pub fn signOf(x: anytype) Raised!i32 {
+    if (comptime @typeInfo(@TypeOf(x)) == .float) {
+        if (x != x) return raise(ArithmeticException, str("Function does not accept floating point Not-a-Number values."));
+    }
+    return if (x < 0) -1 else if (x > 0) 1 else 0;
+}
+
+/// `pown x n`: by squaring, wrapping for whole numbers; a negative power of a whole number
+/// raises nothing on .NET and is 0 unless x is 1 or -1 (F# divides 1 by the power).
+pub fn pown(x: anytype, n: i32) @TypeOf(x) {
+    const T = @TypeOf(x);
+    if (n < 0) {
+        if (comptime @typeInfo(T) == .float) return 1 / pown(x, -%n);
+        return if (x == 1) 1 else if (x == -1 and @rem(n, 2) != 0) -1 else if (x == -1) 1 else 0;
+    }
+    var result: T = 1;
+    var base = x;
+    var e: u32 = @intCast(n);
+    while (e != 0) : (e >>= 1) {
+        if (e & 1 != 0) result = if (comptime @typeInfo(T) == .float) result * base else result *% base;
+        base = if (comptime @typeInfo(T) == .float) base * base else base *% base;
+    }
+    return result;
+}
+
+/// `round x`: to the nearest, a tie to the even number, as .NET.
+pub fn roundEven(x: anytype) @TypeOf(x) {
+    const r = @round(x);
+    if (@abs(x - @trunc(x)) == 0.5) return 2 * @round(x / 2);
+    return r;
+}
+
+/// `Math.Round(x, digits)`
+pub fn roundTo(x: f64, digits: i32) f64 {
+    if (digits <= 0) return roundEven(x);
+    const scale = std.math.pow(f64, 10, @floatFromInt(digits));
+    return roundEven(x * scale) / scale;
+}
+
+/// `Math.Log(x, b)`
+pub fn logBase(x: f64, b: f64) f64 {
+    return @log(x) / @log(b);
+}
+
+/// `Math.Clamp(x, lo, hi)`
+pub fn clamp(x: anytype, lo: @TypeOf(x), hi: @TypeOf(x)) Raised!@TypeOf(x) {
+    if (lo > hi) return raise(ArgumentException, format(.{ "'", lo, "' cannot be greater than ", hi, "." }));
+    return if (x < lo) lo else if (x > hi) hi else x;
+}
+
+/// The name .NET gives a whole-number type in an overflow message.
+fn netIntName(comptime T: type) []const u8 {
+    return switch (T) {
+        i8 => "a signed byte",
+        u8 => "an unsigned byte",
+        i16 => "an Int16",
+        u16 => "a UInt16",
+        i32 => "an Int32",
+        u32 => "a UInt32",
+        i64 => "an Int64",
+        u64 => "a UInt64",
+        else => @typeName(T),
+    };
+}
+
+fn trimmed(s: String) []const u16 {
+    var u = unitsOf(s);
+    while (u.len != 0 and unicode.isWhiteSpace(u[0])) u = u[1..];
+    while (u.len != 0 and unicode.isWhiteSpace(u[u.len - 1])) u = u[0 .. u.len - 1];
+    return u;
+}
+
+fn badFormat(s: String) Raised {
+    return raise(FormatException, format(.{ "The input string '", s, "' was not in a correct format." }));
+}
+
+const ParseStyle = enum {
+    /// `Int32.Parse`: white space, a sign, decimal digits
+    dotnet,
+    /// F#'s `int s`: also `0x`, `0o` and `0b` and `_` between digits
+    fsharp,
+};
+
+/// A whole number from text, or null if the text is not one; error.Overflow if it is one
+/// that does not fit in 64 bits (or in `T`, for which the caller says what to raise).
+fn parseWhole(comptime T: type, u: []const u16, comptime style: ParseStyle) error{ Format, Overflow }!T {
+    var i: usize = 0;
+    var negative = false;
+    if (u.len != 0 and (u[0] == '-' or u[0] == '+')) {
+        negative = u[0] == '-';
+        i = 1;
+    }
+    var radix: u8 = 10;
+    if (style == .fsharp and u.len >= i + 2 and u[i] == '0') {
+        switch (u[i + 1]) {
+            'x', 'X' => radix = 16,
+            'o', 'O' => radix = 8,
+            'b', 'B' => radix = 2,
+            else => {},
+        }
+        if (radix != 10) i += 2;
+    }
+    if (i == u.len) return error.Format;
+    var value: u128 = 0;
+    var digits: usize = 0;
+    while (i < u.len) : (i += 1) {
+        const c = u[i];
+        if (style == .fsharp and c == '_' and digits != 0 and i + 1 < u.len) continue;
+        const d: u8 = switch (c) {
+            '0'...'9' => @intCast(c - '0'),
+            'a'...'f' => @intCast(c - 'a' + 10),
+            'A'...'F' => @intCast(c - 'A' + 10),
+            else => return error.Format,
+        };
+        if (d >= radix) return error.Format;
+        value = value * radix + d;
+        digits += 1;
+        if (value > std.math.maxInt(u64) + 1) return error.Overflow;
+    }
+    const info = @typeInfo(T).int;
+    // (F# reads 0x, 0o and 0b numbers as the bits of the type: 0xFFFFFFFF is -1)
+    if (radix != 10) {
+        if (value > std.math.maxInt(@Int(.unsigned, info.bits))) return error.Overflow;
+        const bits: @Int(.unsigned, info.bits) = @intCast(value);
+        const v: T = @bitCast(bits);
+        return if (negative) 0 -% v else v;
+    }
+    if (negative) {
+        if (value > @as(u128, @intCast(-@as(i129, std.math.minInt(T))))) return error.Overflow;
+        return @intCast(-@as(i129, @intCast(value)));
+    }
+    if (value > std.math.maxInt(T)) return error.Overflow;
+    return @intCast(value);
+}
+
+/// `Int32.Parse s` and the others.
+pub fn parseInt(comptime T: type, s: String) Raised!T {
+    if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
+    return parseWhole(T, trimmed(s), .dotnet) catch |e| switch (e) {
+        error.Format => badFormat(s),
+        error.Overflow => raise(OverflowException, str("Value was either too large or too small for " ++ netIntName(T) ++ ".")),
+    };
+}
+
+/// F#'s `int s`, `byte s`, ...: the types of 32 bits and less are read as 32 bits and then
+/// converted with a check, as F# does.
+pub fn parseIntFs(comptime T: type, s: String) Raised!T {
+    const u = trimmed(s);
+    if (u.len == 0) return raise(FormatException, str("Input string was not in a correct format."));
+    const info = @typeInfo(T).int;
+    const Wide = if (info.bits >= 64) T else if (info.signedness == .signed) i32 else u32;
+    const wide = parseWhole(Wide, u, .fsharp) catch |e| return switch (e) {
+        error.Format => badFormat(s),
+        error.Overflow => raise(OverflowException, str("Value was either too large or too small for " ++ netIntName(Wide) ++ ".")),
+    };
+    if (Wide == T) return wide;
+    if (wide < std.math.minInt(T) or wide > std.math.maxInt(T)) return raise(OverflowException, str("Arithmetic operation resulted in an overflow."));
+    return @intCast(wide);
+}
+
+/// `Int32.TryParse(s, &v)`: the number, or null.
+pub fn tryParseInt(comptime T: type, s: String) ?T {
+    if (s == null) return null;
+    return parseWhole(T, trimmed(s), .dotnet) catch null;
+}
+
+fn parseReal(comptime T: type, u: []const u16) ?T {
+    var buf: [128]u8 = undefined;
+    if (u.len == 0 or u.len > buf.len) return null;
+    for (u, 0..) |c, i| {
+        // (Zig reads `_`, hexadecimal and `inf`, which .NET does not)
+        if (c > 0x7F or c == '_' or c == 'x' or c == 'X' or c == 'p' or c == 'P') return null;
+        buf[i] = @intCast(c);
+    }
+    const text = buf[0..u.len];
+    const body = if (text[0] == '-' or text[0] == '+') text[1..] else text;
+    const negative = text[0] == '-';
+    if (std.mem.eql(u8, body, "NaN")) return std.math.nan(T);
+    if (std.mem.eql(u8, body, "Infinity") or std.mem.eql(u8, body, "∞")) return if (negative) -std.math.inf(T) else std.math.inf(T);
+    for (body) |c| {
+        if (std.ascii.isAlphabetic(c) and c != 'e' and c != 'E') return null;
+    }
+    return std.fmt.parseFloat(T, text) catch null;
+}
+
+/// `Double.Parse s` and F#'s `float s`
+pub fn parseFloat(comptime T: type, s: String) Raised!T {
+    if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
+    return parseReal(T, trimmed(s)) orelse badFormat(s);
+}
+
+pub fn tryParseFloat(comptime T: type, s: String) ?T {
+    if (s == null) return null;
+    return parseReal(T, trimmed(s));
+}
+
+/// `Boolean.Parse s`
+pub fn parseBool(s: String) Raised!bool {
+    const u = trimmed(s);
+    if (u.len == 4 and unicode.toLower(u[0]) == 't' and unicode.toLower(u[1]) == 'r' and unicode.toLower(u[2]) == 'u' and unicode.toLower(u[3]) == 'e') return true;
+    if (u.len == 5 and unicode.toLower(u[0]) == 'f' and unicode.toLower(u[1]) == 'a' and unicode.toLower(u[2]) == 'l' and unicode.toLower(u[3]) == 's' and unicode.toLower(u[4]) == 'e') return false;
+    return raise(FormatException, format(.{ "String '", s, "' was not recognized as a valid Boolean." }));
+}
+
+fn addOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    return if (comptime @typeInfo(@TypeOf(a)) == .float) a + b else a +% b;
+}
+
+/// `List.sum xs`
+pub fn listSum(xs: anytype) @FieldType(@typeInfo(@FieldType(@TypeOf(xs), "Cons")).pointer.child, "Head") {
+    var total: @TypeOf(xs.Cons.Head) = 0;
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) total = addOf(total, rest.Cons.Head);
+    return total;
+}
+
+/// `List.sumBy f xs`
+pub fn listSumBy(comptime R: type, f: anytype, xs: anytype) Raised!R {
+    var total: R = 0;
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) total = addOf(total, try f.code(f.env, dup(rest.Cons.Head)));
+    return total;
+}
+
+fn emptyInput(comptime what: []const u8) Raised {
+    return raise(ArgumentException, str("The input " ++ what ++ " was empty. (Parameter 'source')"));
+}
+
+/// `List.average xs`
+pub fn listAverage(xs: anytype) Raised!@TypeOf(xs.Cons.Head) {
+    var total: @TypeOf(xs.Cons.Head) = 0;
+    var n: usize = 0;
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        total += rest.Cons.Head;
+        n += 1;
+    }
+    if (n == 0) return emptyInput("sequence");
+    return total / @as(@TypeOf(total), @floatFromInt(n));
+}
+
+/// `List.averageBy f xs`
+pub fn listAverageBy(comptime R: type, f: anytype, xs: anytype) Raised!R {
+    var total: R = 0;
+    var n: usize = 0;
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        total += try f.code(f.env, dup(rest.Cons.Head));
+        n += 1;
+    }
+    if (n == 0) return emptyInput("sequence");
+    return total / @as(R, @floatFromInt(n));
+}
+
+/// `Array.sum a`
+pub fn arraySum(a: anytype) ItemOf(@TypeOf(a)) {
+    var total: ItemOf(@TypeOf(a)) = 0;
+    for (a.items) |x| total = addOf(total, x);
+    return total;
+}
+
+/// `Array.average a`
+pub fn arrayAverage(a: anytype) Raised!ItemOf(@TypeOf(a)) {
+    if (a.items.len == 0) return raise(ArgumentException, str("The input array was empty. (Parameter 'array')"));
+    var total: ItemOf(@TypeOf(a)) = 0;
+    for (a.items) |x| total += x;
+    return total / @as(ItemOf(@TypeOf(a)), @floatFromInt(a.items.len));
+}
+
+// ---------------------------------------------------------------------------------------------
 
 /// A conversion between number types with the result .NET gives:
 /// - integer to integer keeps the low bits (sign- or zero-extending the source first);
@@ -4096,6 +4379,40 @@ test "arrays: identity, items, what they raise" {
     drop(zeros);
     drop(list);
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "numbers: what .NET raises and returns" {
+    try std.testing.expectEqual(@as(i32, 5), try absOf(@as(i32, -5)));
+    try expectRaised(OverflowException, "Negating the minimum value of a twos complement number is invalid.", absOf(@as(i32, std.math.minInt(i32))));
+    try expectRaised(ArithmeticException, "Function does not accept floating point Not-a-Number values.", signOf(std.math.nan(f64)));
+    try std.testing.expectEqual(@as(i32, 1024), pown(@as(i32, 2), 10));
+    try std.testing.expectEqual(@as(f64, 0.25), pown(@as(f64, 2), -2));
+    try std.testing.expectEqual(@as(f64, 2), roundEven(@as(f64, 2.5)));
+    try std.testing.expectEqual(@as(f64, 4), roundEven(@as(f64, 3.5)));
+    try std.testing.expectEqual(@as(f64, -2), roundEven(@as(f64, -2.5)));
+    try std.testing.expectEqual(@as(f64, 2.57), roundTo(2.567, 2));
+    try std.testing.expectEqual(@as(i32, -7), try parseIntFs(i32, str(" -7 ")));
+    try std.testing.expectEqual(@as(i32, 31), try parseIntFs(i32, str("0x1F")));
+    try std.testing.expectEqual(@as(i32, 5), try parseIntFs(i32, str("0b101")));
+    try std.testing.expectEqual(@as(i32, 10), try parseIntFs(i32, str("1_0")));
+    try std.testing.expectEqual(@as(i64, 9223372036854775807), try parseIntFs(i64, str("9223372036854775807")));
+    try expectRaised(FormatException, "The input string '4x' was not in a correct format.", parseIntFs(i32, str("4x")));
+    try expectRaised(FormatException, "Input string was not in a correct format.", parseIntFs(i32, str("")));
+    try expectRaised(OverflowException, "Value was either too large or too small for an Int32.", parseIntFs(i32, str("99999999999")));
+    try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", parseIntFs(u8, str("256")));
+    try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", parseIntFs(i16, str("40000")));
+    try expectRaised(OverflowException, "Value was either too large or too small for a UInt32.", parseIntFs(u16, str("-1")));
+    try expectRaised(FormatException, "The input string '0x1F' was not in a correct format.", parseInt(i32, str("0x1F")));
+    try expectRaised(OverflowException, "Value was either too large or too small for an unsigned byte.", parseInt(u8, str("300")));
+    try std.testing.expectEqual(@as(?i32, 12), tryParseInt(i32, str("12")));
+    try std.testing.expectEqual(@as(?i32, null), tryParseInt(i32, str("x")));
+    try std.testing.expectEqual(@as(f64, 1000), try parseFloat(f64, str(" 1e3 ")));
+    try std.testing.expectEqual(@as(f64, 0.5), try parseFloat(f64, str(".5")));
+    try std.testing.expect(std.math.isNan(try parseFloat(f64, str("NaN"))));
+    try std.testing.expectEqual(-std.math.inf(f64), try parseFloat(f64, str("-Infinity")));
+    try expectRaised(FormatException, "The input string 'abc' was not in a correct format.", parseFloat(f64, str("abc")));
+    try expectRaised(FormatException, "The input string 'inf' was not in a correct format.", parseFloat(f64, str("inf")));
+    try std.testing.expect(try parseBool(str("True")) and !try parseBool(str("false")));
 }
 
 test "conv follows .NET" {

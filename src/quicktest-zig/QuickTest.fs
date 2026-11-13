@@ -347,3 +347,4 @@ let main _ =
     + Values.run ()
     + Lists.run ()
     + Order.run ()
+    + Numbers.run ()

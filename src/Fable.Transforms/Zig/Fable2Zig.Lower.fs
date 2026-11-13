@@ -2399,6 +2399,12 @@ and dotnetCall
         bindArgs ctx (xs |> List.map (lw ctx)) (fun irs -> EEmit(macro, irs, ty))
 
     let tChar = TPrim "u16"
+    let tF64 = TPrim "f64"
+
+    let zigTypeName (ty: Ty) =
+        match ty with
+        | TPrim name -> name
+        | _ -> fail r "internal: not a number type"
 
     let isInt (x: Fable.Expr) =
         match x.Type with
@@ -2741,6 +2747,119 @@ and dotnetCall
         bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 0, mapType ctx r t))
     | "Microsoft.FSharp.Core.Operators", "Snd", [ x ] ->
         bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 1, mapType ctx r t))
+    // ---- numbers ----
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Abs", [ x ] ->
+        rt "fable_rt.absOf(@as($R, $0))" [ x ] (mapType ctx r x.Type)
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Sign", [ x ] ->
+        rt $"fable_rt.signOf(%s{typedArg ctx r x 0})" [ x ] tI32
+    | "Microsoft.FSharp.Core.Operators", "PowInteger", [ x; n ] ->
+        pure' "fable_rt.pown(@as($R, $0), $1)" [ x; n ] (mapType ctx r x.Type)
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), ("op_Exponentiation" | "Pow"), [ x; y ] ->
+        pure' "std.math.pow($R, $0, $1)" [ x; y ] (mapType ctx r x.Type)
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Round", [ x ] ->
+        pure' "fable_rt.roundEven(@as($R, $0))" [ x ] (mapType ctx r x.Type)
+    | "System.Math", "Round", [ x; digits ] when isInt digits -> pure' "fable_rt.roundTo($0, $1)" [ x; digits ] tF64
+    | "System.Math", "Log", [ x; b ] -> pure' "fable_rt.logBase($0, $1)" [ x; b ] tF64
+    | "System.Math", "Clamp", [ x; lo; hi ] ->
+        rt "fable_rt.clamp(@as($R, $0), $1, $2)" [ x; lo; hi ] (mapType ctx r x.Type)
+    | "System.Math", ("Max" | "Min"), [ a; b ] ->
+        let f =
+            if name = "Max" then
+                "maxOf"
+            else
+                "minOf"
+
+        pure' $"fable_rt.%s{f}(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
+    | "System.Math", "get_PI", [] -> ELit("std.math.pi", tF64)
+    | "System.Math", "get_E", [] -> ELit("std.math.e", tF64)
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math"),
+      ("Sqrt" | "Sin" | "Cos" | "Tan" | "Exp" | "Log" | "Log10" | "Floor" | "Ceiling" | "Truncate" | "Asin" | "Acos" | "Atan" | "Sinh" | "Cosh" | "Tanh" | "Log2"),
+      [ x ] ->
+        let zig =
+            match name with
+            | "Sqrt" -> "@sqrt($0)"
+            | "Sin" -> "@sin($0)"
+            | "Cos" -> "@cos($0)"
+            | "Tan" -> "@tan($0)"
+            | "Exp" -> "@exp($0)"
+            | "Log" -> "@log($0)"
+            | "Log10" -> "@log10($0)"
+            | "Log2" -> "@log2($0)"
+            | "Floor" -> "@floor($0)"
+            | "Ceiling" -> "@ceil($0)"
+            | "Truncate" -> "@trunc($0)"
+            | "Asin" -> "std.math.asin($0)"
+            | "Acos" -> "std.math.acos($0)"
+            | "Atan" -> "std.math.atan($0)"
+            | "Sinh" -> "std.math.sinh($0)"
+            | "Cosh" -> "std.math.cosh($0)"
+            | _ -> "std.math.tanh($0)"
+
+        pure' (zig.Replace("$0", "@as($R, $0)")) [ x ] (mapType ctx r x.Type)
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), ("Atan2" | "Atan2"), [ y; x ] ->
+        pure' "std.math.atan2(@as(f64, $0), @as(f64, $1))" [ y; x ] tF64
+    // text to numbers: F#'s conversions read `0x`, `0o`, `0b` and `_`; .NET's `Parse` does not
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when
+        name.StartsWith("To", System.StringComparison.Ordinal) && x.Type = Fable.String
+        ->
+        let ty = mapType ctx r t
+
+        if isFloatTy ty then
+            rt "fable_rt.parseFloat($R, $0)" [ x ] ty
+        elif intBits ty > 0 then
+            rt "fable_rt.parseIntFs($R, $0)" [ x ] ty
+        elif t = Fable.Boolean then
+            rt "fable_rt.parseBool($0)" [ x ] ty
+        else
+            fail r "the Zig target does not support %s.%s of a string yet" entity name
+    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64"),
+      "Parse",
+      [ x ] -> rt "fable_rt.parseInt($R, $0)" [ x ] (mapType ctx r t)
+    | ("System.Double" | "System.Single"), "Parse", [ x ] -> rt "fable_rt.parseFloat($R, $0)" [ x ] (mapType ctx r t)
+    | "System.Boolean", "Parse", [ x ] -> rt "fable_rt.parseBool($0)" [ x ] tBool
+    // `TryParse(s, &v)`: what F# gives is `(ok, v)`, with `v` an out-variable of its own
+    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single"),
+      "TryParse",
+      [ x; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+        ctx.Vars.ContainsKey out.Name
+        ->
+        let outVar = ctx.Vars[out.Name]
+        let ty = outVar.Ty
+
+        let f =
+            if isFloatTy ty then
+                "tryParseFloat"
+            else
+                "tryParseInt"
+
+        ctx.State.UsesRuntime <- true
+        let tmp = ctx.State.NewVar("parsed", TOpt ty, VLocal, false)
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                ELet(
+                    tmp,
+                    EEmit($"fable_rt.%s{f}($R, $0)".Replace("$R", zigTypeName ty), xs, TOpt ty),
+                    ESeq(
+                        EAssign(outVar, EEmit("($0 orelse 0)", [ EVar tmp ], ty)),
+                        EEmit("($0 != null)", [ EVar tmp ], tBool)
+                    )
+                )
+            )
+    // sums and averages: the runtime adds with `+` of the item type
+    | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] -> pure' "fable_rt.listSum($0)" [ xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ListModule", "SumBy", [ f; xs ] ->
+        rt "fable_rt.listSumBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ListModule", "Average", [ xs ] ->
+        rt "fable_rt.listAverage($0)" [ xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ListModule", "AverageBy", [ f; xs ] ->
+        rt "fable_rt.listAverageBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] -> pure' "fable_rt.arraySum($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Average", [ a ] ->
+        rt "fable_rt.arrayAverage($0)" [ a ] (mapType ctx r t)
+
     // int, int64, byte, float, char, ...: conversions between numbers, with .NET's results
     | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when
         name.StartsWith("To", System.StringComparison.Ordinal)

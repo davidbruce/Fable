@@ -222,6 +222,23 @@ itself and a `ref` cell. Its equality is still structural, as in F#.
 - Nothing is remembered about what such a field holds, and such reads are not moved to the
   start of their branch: they happen where the program does them.
 
+## Numbers
+
+`abs`, `sign`, `pown`, `**`, `round` (a tie to the even number, as .NET), `sqrt`, `exp`, `log`,
+the trigonometric functions, `floor`, `ceil`, `truncate`, and of `System.Math` also `Round`
+with digits, `Log` with a base, `Clamp`, `Max`, `Min`, `PI`, `E`. `abs` of the smallest
+whole number raises `OverflowException`, `sign nan` raises `ArithmeticException`, as on .NET.
+
+Text to numbers: F#'s `int s`, `float s`, `byte s`, ... read white space, a sign, and `0x`,
+`0o`, `0b` and `_` as F# does; the types of 32 bits and less are read as 32 bits and then
+converted with a check, so the messages are F#'s. `Int32.Parse` and the other `Parse`s read
+what .NET reads, and `TryParse` in its F# form (`match Int32.TryParse s with | true, v ->`).
+`List.sum`, `sumBy`, `average`, `averageBy`, `Array.sum` and `Array.average` add with the
+item type's `+` (wrapping for whole numbers).
+
+Not yet: `decimal`, `bigint`, `Checked` arithmetic, sums of types with an `+` of their own,
+culture-specific parsing.
+
 ## The library
 
 The runtime library has two parts. `fable_rt.zig` (with `fable_sgc.zig` and
