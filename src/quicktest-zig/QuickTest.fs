@@ -354,3 +354,4 @@ let main _ =
     + Classes.run ()
     + Sequences.run ()
     + Computations.run ()
+    + Strings2.run ()

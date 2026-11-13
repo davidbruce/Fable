@@ -3775,6 +3775,317 @@ pub fn anyText(x: anytype) String {
 }
 
 // ---------------------------------------------------------------------------------------------
+// .NET's ToString of a value: what `string x`, `{x}`, `Append x` and `String.Join` give
+// ---------------------------------------------------------------------------------------------
+
+/// Write `x` as .NET's ToString writes it: a string as it is, a number as `string` writes it,
+/// `Some(1)`, `(1, a)`, `[1; 2; 3; ... ]` (three items), `map [(1, a)]`; a record or a union as
+/// `%A`; None (null on .NET) as nothing.
+fn writeNet(out: *TextBuilder, x: anytype) void {
+    const T = @TypeOf(x);
+    if (T == String) return out.add(unitsOf(x));
+    if (T == u16) return out.addOne(x);
+    if (T == Exn) {
+        const m = exnMessage(x);
+        defer drop(m);
+        out.addAscii(x.type.name);
+        out.addAscii(": ");
+        return out.add(unitsOf(m));
+    }
+    switch (@typeInfo(T)) {
+        .void => {},
+        .int, .float, .bool => {
+            var scratch: [scratch_len]u8 align(2) = undefined;
+            out.addAscii(pieceOf(.{}, x, &scratch).ascii);
+        },
+        .optional => if (x) |v| {
+            out.addAscii("Some(");
+            writeNet(out, v);
+            out.addOne(')');
+        },
+        .@"struct" => |st| {
+            if (st.is_tuple) {
+                out.addOne('(');
+                inline for (st.field_names, 0..) |name, i| {
+                    if (i != 0) out.addAscii(", ");
+                    writeNet(out, @field(x, name));
+                }
+                out.addOne(')');
+            } else {
+                const text = anyText(x);
+                defer drop(text);
+                out.add(unitsOf(text));
+            }
+        },
+        .@"union" => {
+            if (comptime @hasDecl(T, "fable_list")) {
+                out.addOne('[');
+                var rest = x;
+                var n: usize = 0;
+                while (rest == .Cons) : (rest = rest.Cons.Tail) {
+                    if (n == 3) {
+                        out.addAscii("; ... ");
+                        break;
+                    }
+                    if (n != 0) out.addAscii("; ");
+                    writeNet(out, rest.Cons.Head);
+                    n += 1;
+                }
+                out.addOne(']');
+                return;
+            }
+            if (comptime isCollection(T)) {
+                out.addAscii(if (T.fable_collection == .map) "map [" else "set [");
+                var w = TreeWalk(T).init(x);
+                var n: usize = 0;
+                while (w.next()) |node| {
+                    if (n == 3) {
+                        out.addAscii("; ... ");
+                        break;
+                    }
+                    if (n != 0) out.addAscii("; ");
+                    if (comptime T.fable_collection == .map) {
+                        out.addOne('(');
+                        writeNet(out, node.key);
+                        out.addAscii(", ");
+                        writeNet(out, node.value);
+                        out.addOne(')');
+                    } else writeNet(out, node.key);
+                    n += 1;
+                }
+                out.addOne(']');
+                return;
+            }
+            const text = anyText(x);
+            defer drop(text);
+            out.add(unitsOf(text));
+        },
+        else => {
+            const text = anyText(x);
+            defer drop(text);
+            out.add(unitsOf(text));
+        },
+    }
+}
+
+/// `string x` and `x.ToString()` of an option, a tuple, a list, a map, a set.
+pub fn toText(x: anytype) String {
+    var out: TextBuilder = .{};
+    writeNet(&out, x);
+    return out.finish();
+}
+
+/// `String.Join(sep, items)` and `String.concat sep items`, of a list of any items.
+pub fn joinList(sep: String, items: anytype) String {
+    var out: TextBuilder = .{};
+    var rest = items;
+    var first = true;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        if (!first) out.add(unitsOf(sep));
+        first = false;
+        writeNet(&out, rest.Cons.Head);
+    }
+    return out.finish();
+}
+
+// ---------------------------------------------------------------------------------------------
+// StringBuilder
+// ---------------------------------------------------------------------------------------------
+
+pub const StringBuilder = *struct {
+    pub const fable_identity = {};
+    @"$rc": u32 = 1,
+    units: std.ArrayList(u16) = .empty,
+
+    pub fn fable_free(c: anytype) void {
+        c.units.deinit(allocator);
+    }
+
+    pub fn fable_show(b: *Shower, x: anytype, depth: i32) *Layout {
+        _ = depth;
+        return b.leaf(false, b.arena.dupe(u16, x.units.items) catch @panic("fable: out of memory"), false);
+    }
+};
+
+pub fn sbNew(init: String) StringBuilder {
+    const c = allocator.create(@typeInfo(StringBuilder).pointer.child) catch @panic("fable: out of memory");
+    c.* = .{};
+    c.units.appendSlice(allocator, unitsOf(init)) catch @panic("fable: out of memory");
+    if (track) thread.stats.allocs += 1;
+    return c;
+}
+
+/// `sb.Append x`: the builder again (a reference of its own).
+pub fn sbAppend(sb: StringBuilder, x: anytype) StringBuilder {
+    var out: TextBuilder = .{ .list = sb.units };
+    writeNet(&out, x);
+    sb.units = out.list;
+    return dup(sb);
+}
+
+pub fn sbAppendLine(sb: StringBuilder, x: anytype) StringBuilder {
+    var out: TextBuilder = .{ .list = sb.units };
+    writeNet(&out, x);
+    out.addOne('\n');
+    sb.units = out.list;
+    return dup(sb);
+}
+
+pub fn sbToString(sb: StringBuilder) String {
+    return strFrom(sb.units.items);
+}
+
+pub fn sbLength(sb: StringBuilder) i32 {
+    return @intCast(sb.units.items.len);
+}
+
+pub fn sbClear(sb: StringBuilder) StringBuilder {
+    sb.units.clearRetainingCapacity();
+    return dup(sb);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Split, Join, characters, comparison that ignores case
+// ---------------------------------------------------------------------------------------------
+
+fn splitPush(parts: *std.ArrayList(String), piece: []const u16, remove_empty: bool, trim: bool) void {
+    var p = piece;
+    if (trim) {
+        while (p.len != 0 and unicode.isWhiteSpace(p[0])) p = p[1..];
+        while (p.len != 0 and unicode.isWhiteSpace(p[p.len - 1])) p = p[0 .. p.len - 1];
+    }
+    if (remove_empty and p.len == 0) return;
+    parts.append(allocator, strFrom(p)) catch @panic("fable: out of memory");
+}
+
+fn splitDone(parts: *std.ArrayList(String)) Array(String) {
+    const A = Array(String);
+    const items = arrayItems(A, parts.items.len);
+    @memcpy(items, parts.items);
+    parts.deinit(allocator);
+    return arrayFrom(A, items);
+}
+
+/// `s.Split(chars, options)`: by any of the chars (white space if there are none). `options`
+/// is .NET's StringSplitOptions: 1 removes empty parts, 2 trims each part.
+pub fn strSplitChars(s: String, chars: []const u16, options: i32) Raised!Array(String) {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    var parts: std.ArrayList(String) = .empty;
+    var start: usize = 0;
+    for (u, 0..) |c, i| {
+        const sep = if (chars.len == 0) unicode.isWhiteSpace(c) else std.mem.indexOfScalar(u16, chars, c) != null;
+        if (sep) {
+            splitPush(&parts, u[start..i], options & 1 != 0, options & 2 != 0);
+            start = i + 1;
+        }
+    }
+    splitPush(&parts, u[start..], options & 1 != 0, options & 2 != 0);
+    return splitDone(&parts);
+}
+
+/// `s.Split(separators, options)` by strings (the first that matches at each place).
+pub fn strSplitStrings(s: String, separators: []const String, options: i32) Raised!Array(String) {
+    const p = s orelse return nullRef();
+    const u = p.units();
+    var parts: std.ArrayList(String) = .empty;
+    var start: usize = 0;
+    var i: usize = 0;
+    outer: while (i < u.len) {
+        for (separators) |sepStr| {
+            const sep = unitsOf(sepStr);
+            if (sep.len != 0 and std.mem.startsWith(u16, u[i..], sep)) {
+                splitPush(&parts, u[start..i], options & 1 != 0, options & 2 != 0);
+                i += sep.len;
+                start = i;
+                continue :outer;
+            }
+        }
+        i += 1;
+    }
+    splitPush(&parts, u[start..], options & 1 != 0, options & 2 != 0);
+    return splitDone(&parts);
+}
+
+pub fn strSplitString(s: String, separator: String, options: i32) Raised!Array(String) {
+    return strSplitStrings(s, &.{separator}, options);
+}
+
+/// `s.ToCharArray()`
+pub fn strToChars(s: String) Raised!Array(u16) {
+    const p = s orelse return nullRef();
+    const A = Array(u16);
+    const items = arrayItems(A, p.len);
+    @memcpy(items, p.units());
+    return arrayFrom(A, items);
+}
+
+/// `String(chars)`
+pub fn strOfChars(a: Array(u16)) String {
+    return strFrom(a.items);
+}
+
+fn foldUnits(a: []const u16, b: []const u16) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (unicode.toUpper(x) != unicode.toUpper(y)) return false;
+    }
+    return true;
+}
+
+/// Comparisons with `StringComparison.OrdinalIgnoreCase`: each code unit by its upper case.
+pub fn strEqualsIgnoreCase(a: String, b: String) bool {
+    if (a == null or b == null) return a == b;
+    return foldUnits(unitsOf(a), unitsOf(b));
+}
+
+pub fn strCompareIgnoreCase(a: String, b: String) i32 {
+    if (a == null or b == null) return @as(i32, @intFromBool(a != null)) - @as(i32, @intFromBool(b != null));
+    const x = unitsOf(a);
+    const y = unitsOf(b);
+    for (x[0..@min(x.len, y.len)], y[0..@min(x.len, y.len)]) |c, d| {
+        const cu: i32 = unicode.toUpper(c);
+        const du: i32 = unicode.toUpper(d);
+        if (cu != du) return cu - du;
+    }
+    return @as(i32, @intCast(x.len)) - @as(i32, @intCast(y.len));
+}
+
+pub fn strStartsWithIgnoreCase(s: String, value: String) Raised!bool {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    return p.len >= v.len and foldUnits(p.units()[0..v.len], v.units());
+}
+
+pub fn strEndsWithIgnoreCase(s: String, value: String) Raised!bool {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    return p.len >= v.len and foldUnits(p.units()[p.len - v.len ..], v.units());
+}
+
+pub fn strIndexOfIgnoreCase(s: String, value: String) Raised!i32 {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    const u = p.units();
+    if (v.len > u.len) return -1;
+    var i: usize = 0;
+    while (i + v.len <= u.len) : (i += 1) {
+        if (foldUnits(u[i..][0..v.len], v.units())) return @intCast(i);
+    }
+    return -1;
+}
+
+/// `Char.GetNumericValue c`: the value of a digit, -1 for anything else. (Digits of every
+/// script; .NET also knows fractions and roman numerals, which give -1 here.)
+pub fn charNumericValue(c: u16) f64 {
+    if (!unicode.isDigit(c)) return -1;
+    // (the digits of a script are ten code units in a row, 0 first)
+    var zero = c;
+    while (zero > 0 and unicode.isDigit(zero - 1) and c - (zero - 1) < 10) zero -= 1;
+    return @floatFromInt(c - zero);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Function values
 //
 // A function value is a pointer to code and a pointer to the values the code captured:
@@ -5404,6 +5715,30 @@ test ".NET's collections: ResizeArray, Dictionary, HashSet" {
     for (0..1000) |i| dictSet(d, @intCast(i), str("n"));
     try std.testing.expectEqual(@as(i32, 1000), htCount(d));
     _ = before;
+}
+
+test ".NET's ToString, Split, StringBuilder, categories" {
+    try expectText("Some(1)|(1, a)|[1; 2; 3; ... ]|[a]", format(.{
+        toText(@as(?i32, 1)), "|", toText(@as(struct { i32, String }, .{ 1, str("a") })), "|", toText(listOf(i32, &.{ 1, 2, 3, 4 })), "|", toText(listOf(String, &.{str("a")})),
+    }));
+    try expectAny("[|\"a\"; \"b\"; \"\"; \"c\"|]", try strSplitChars(str("a,b,,c"), &.{','}, 0));
+    try expectAny("[|\"a\"; \"b\"|]", try strSplitChars(str("a,,b"), &.{','}, 1));
+    try expectAny("[|\"a\"; \"b\"; \"c\"|]", try strSplitString(str("a--b--c"), str("--"), 0));
+    try expectAny("[|\"a\"; \"b\"; \"c\"|]", try strSplitChars(str("a b\tc"), &.{}, 0));
+    const sb = sbNew(str(""));
+    drop(sbAppend(sb, str("a")));
+    drop(sbAppend(sb, @as(i32, 1)));
+    drop(sbAppend(sb, @as(u16, 'c')));
+    drop(sbAppend(sb, @as(f64, 2.5)));
+    drop(sbAppend(sb, true));
+    try expectText("a1c2.5True", sbToString(sb));
+    drop(sb);
+    var sum: u32 = 0;
+    for (0..0x10000) |c| sum = sum *% 31 +% @backingInt(unicode.category(@intCast(c)));
+    // (the same sum over Char.GetUnicodeCategory on .NET 10)
+    try std.testing.expectEqual(@as(u32, 3966132137), sum);
+    try std.testing.expect(strEqualsIgnoreCase(str("abc"), str("ABC")) and strCompareIgnoreCase(str("a"), str("A")) == 0);
+    try std.testing.expectEqual(@as(f64, 7), charNumericValue('7'));
 }
 
 test "conv follows .NET" {

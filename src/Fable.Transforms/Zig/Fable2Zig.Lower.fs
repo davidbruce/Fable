@@ -546,6 +546,7 @@ let private netEnt (state: FileState) (name: string) : Ent =
             match name with
             | "Dictionary" -> [ "K"; "V" ], [ "key", TGen "K"; "value", TGen "V" ]
             | "HashSet" -> [ "T" ], [ "key", TGen "T" ]
+            | "StringBuilder" -> [], []
             | _ -> [ "T" ], [ "items", TGen "T" ]
 
         let e =
@@ -553,7 +554,12 @@ let private netEnt (state: FileState) (name: string) : Ent =
                 Name = "fable_rt." + name
                 Ref =
                     {
-                        FullName = "System.Collections.Generic." + name
+                        FullName =
+                            (if name = "StringBuilder" then
+                                 "System.Text."
+                             else
+                                 "System.Collections.Generic.")
+                            + name
                         Path = Fable.CoreAssemblyName "System.Runtime"
                     }
                 Kind = KRefRecord
@@ -699,6 +705,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
     | Fable.AnonymousRecordType(names, genArgs, _) -> TEnt(anonEnt ctx.State names, genArgs |> List.map (mapType ctx r))
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Lazy`1" -> TEnt(lazyEnt ctx.State, [ mapType ctx r t ])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Text.StringBuilder" ->
+        TEnt(netEnt ctx.State "StringBuilder", [])
     | Fable.Array(t, _) -> TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Collections.Generic.Dictionary`2" ->
         TEnt(netEnt ctx.State "Dictionary", [ mapType ctx r k; mapType ctx r v ])
@@ -2904,8 +2912,23 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                 let i = next
                 next <- next + 1
 
-                // (`{x}` and `%O` of a value whose type has a `ToString` of its own)
-                if (letter = 'P' || letter = 'O') && (ownToString ctx args[i].Type).IsSome then
+                // (`{x}` and `%O` of a value whose type has a `ToString` of its own, or of an
+                // option, a tuple, a list, a map or a set: .NET's ToString)
+                let netToString =
+                    match args[i].Type with
+                    | Fable.Option _
+                    | Fable.Tuple _
+                    | Fable.List _ -> true
+                    | Fable.DeclaredType(ent, _) ->
+                        ent.FullName = mapName
+                        || ent.FullName = setName
+                        || ent.FullName = "System.Text.StringBuilder"
+                    | _ -> false
+
+                if
+                    (letter = 'P' || letter = 'O')
+                    && ((ownToString ctx args[i].Type).IsSome || netToString)
+                then
                     values[i] <- toStringCall args[i]
 
                 let value = values[i]
@@ -3003,6 +3026,123 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
      | [] -> ".{}"
      | _ -> texts |> String.concat ", " |> sprintf ".{ %s }"),
     List.ofArray values
+
+/// `String.Format("{0} {1:N2}", a, b)`: the format is taken apart here, as an interpolated
+/// string's is: `{i,width:format}` becomes `%widthP(format)` of the value i.
+and compositeFormat
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (fmt: string)
+    (values: Fable.Expr list)
+    (t: Fable.Type)
+    : Expr
+    =
+    // (`String.Format(fmt, [| a; b |])`, or the values one by one)
+    let values =
+        match values with
+        | [ Fable.Value(Fable.NewArray(Fable.ArrayValues vs, _, _), _) ] -> vs
+        | _ -> values
+        |> List.map (fun v ->
+            match v with
+            | Uncast inner -> inner
+        )
+
+    // each value is evaluated once, in order, whatever the format uses
+    let temps =
+        values
+        |> List.mapi (fun i v ->
+            let name = $"format_arg_%d{i}_%d{ctx.State.Vars.Count}"
+            let var = ctx.State.NewVar(name, mapType ctx r v.Type, VLocal, false)
+
+            let ident: Fable.Ident =
+                {
+                    Name = name
+                    Type = v.Type
+                    IsMutable = false
+                    IsThisArgument = false
+                    IsCompilerGenerated = true
+                    Range = None
+                    IsInlineIfLambda = false
+                }
+
+            ctx.Vars[name] <- var
+            var, lw ctx v, ident
+        )
+
+    let text = System.Text.StringBuilder()
+    let holes = List<Fable.Expr>()
+    let mutable bad = false
+    let mutable i = 0
+
+    while i < fmt.Length do
+        let c = fmt[i]
+
+        if c = '{' && i + 1 < fmt.Length && fmt[i + 1] = '{' then
+            text.Append('{') |> ignore
+            i <- i + 2
+        elif c = '}' && i + 1 < fmt.Length && fmt[i + 1] = '}' then
+            text.Append('}') |> ignore
+            i <- i + 2
+        elif c = '{' then
+            let close = fmt.IndexOf('}', i)
+
+            if close < 0 then
+                fail r "the format of String.Format is not well formed"
+
+            let item = fmt.Substring(i + 1, close - i - 1)
+
+            let head, format =
+                match item.IndexOf ':' with
+                | -1 -> item, ""
+                | k -> item.Substring(0, k), item.Substring(k + 1)
+
+            let index, width =
+                match head.IndexOf ',' with
+                | -1 -> int (head.Trim()), 0
+                | k -> int (head.Substring(0, k).Trim()), int (head.Substring(k + 1).Trim())
+
+            if index >= temps.Length then
+                bad <- true
+            else
+                let _, _, ident = temps[index]
+                holes.Add(Fable.IdentExpr ident)
+
+                let flags =
+                    if width < 0 then
+                        "-"
+                    else
+                        ""
+
+                let widthText =
+                    if width <> 0 then
+                        string (abs width)
+                    else
+                        ""
+
+                text.Append($"%%%s{flags}%s{widthText}P(%s{format})") |> ignore
+
+            i <- close + 1
+        elif c = '%' then
+            text.Append("%%") |> ignore
+            i <- i + 1
+        else
+            text.Append(c) |> ignore
+            i <- i + 1
+
+    let body =
+        if bad then
+            let message =
+                ELit(
+                    stringLiteral
+                        "Index (zero based) must be greater than or equal to zero and less than the size of the argument list.",
+                    tStr
+                )
+
+            raiseDotnet ctx r "System.FormatException" message t
+        else
+            formatted ctx r "PrintFormatToString" (text.ToString()) (List.ofSeq holes) t
+
+    List.foldBack (fun (var, ir, _) acc -> ELet(var, ir, acc)) temps body
 
 /// printf and its relatives: text is built from the format's parts and printed, returned or
 /// raised.
@@ -3563,6 +3703,154 @@ and dotnetCall
         rt "fable_rt.lazyForce($0)" [ l ] (mapType ctx r t)
     | "System.Lazy`1", "get_IsValueCreated", [ l ] -> pure' "fable_rt.lazyIsCreated($0)" [ l ] tBool
 
+    // ---- StringBuilder ----
+    | "System.Text.StringBuilder", ".ctor", [] -> pure' "fable_rt.sbNew(null)" [] (mapType ctx r t)
+    | "System.Text.StringBuilder", ".ctor", [ init ] when init.Type = Fable.String ->
+        pure' "fable_rt.sbNew($0)" [ init ] (mapType ctx r t)
+    | "System.Text.StringBuilder", ("Append" | "AppendLine"), sb :: rest ->
+        let f =
+            if name = "Append" then
+                "sbAppend"
+            else
+                "sbAppendLine"
+
+        match rest with
+        | [] -> pure' $"fable_rt.%s{f}($0, @as(fable_rt.String, null))" [ sb ] (mapType ctx r t)
+        | [ x ] ->
+            bindArgs
+                ctx
+                [ lw ctx sb; lw ctx x ]
+                (fun xs -> EEmit($"fable_rt.%s{f}($0, %s{typedArg ctx r x 1})", xs, mapType ctx r t))
+        | _ -> fail r "the Zig target does not support this StringBuilder.%s yet" name
+    | "System.Text.StringBuilder", "get_Length", [ sb ] -> pure' "fable_rt.sbLength($0)" [ sb ] tI32
+    | "System.Text.StringBuilder", "Clear", [ sb ] -> pure' "fable_rt.sbClear($0)" [ sb ] (mapType ctx r t)
+    | ("System.Object" | "System.Text.StringBuilder" | "Microsoft.FSharp.Core.Operators"), "ToString", [ sb ] when
+        (match sb.Type with
+         | Fable.DeclaredType(ent, _) -> ent.FullName = "System.Text.StringBuilder"
+         | _ -> false)
+        ->
+        pure' "fable_rt.sbToString($0)" [ sb ] tStr
+
+    // ---- Split, Join, Format ----
+    | "System.String", "Split", s0 :: rest ->
+        let options =
+            match List.tryLast rest with
+            | Some o when rest.Length >= 2 -> Some o
+            | _ -> None
+
+        let sepArg =
+            match rest with
+            | [] -> None
+            | x :: _ -> Some x
+
+        let opts = options |> Option.map (lw ctx) |> Option.defaultValue (ELit("0", tI32))
+
+        let call macro (xs: Fable.Expr list) =
+            ctx.State.UsesRuntime <- true
+
+            bindArgs
+                ctx
+                (s0 :: xs |> List.map (lw ctx) |> fun l -> l @ [ opts ])
+                (fun irs -> ERt(macro, irs, mapType ctx r t))
+
+        match sepArg |> Option.map (fun a -> a, a.Type) with
+        | None -> call "fable_rt.strSplitChars($0, &.{}, @intCast($1))" []
+        | Some(c, Fable.Char) -> call "fable_rt.strSplitChars($0, &.{ $1 }, @intCast($2))" [ c ]
+        | Some(a, Fable.Array(Fable.Char, _)) -> call "fable_rt.strSplitChars($0, $1.items, @intCast($2))" [ a ]
+        | Some(sep, Fable.String) -> call "fable_rt.strSplitString($0, $1, @intCast($2))" [ sep ]
+        | Some(a, Fable.Array(Fable.String, _)) -> call "fable_rt.strSplitStrings($0, $1.items, @intCast($2))" [ a ]
+        | _ -> fail r "the Zig target does not support this String.Split yet"
+    | "System.String", "Join", [ sep; items ]
+    | "Microsoft.FSharp.Core.StringModule", "Concat", [ sep; items ] when sep.Type = Fable.String ->
+        let (Uncast inner) = items
+
+        let listIr =
+            match inner.Type with
+            | Fable.Array(item, _) ->
+                bindArgs
+                    ctx
+                    [ lw ctx inner ]
+                    (fun xs -> EEmit("fable_rt.arrayToList($0)", xs, TEnt(listEnt ctx.State, [ mapType ctx r item ])))
+            | t when isSeqType t ->
+                let itemTy = itemOf (lw ctx inner)
+
+                bindArgs
+                    ctx
+                    [ lw ctx inner ]
+                    (fun xs ->
+                        ECall(libraryTarget ctx "Seq" "toList", [ itemTy ], xs, TEnt(listEnt ctx.State, [ itemTy ]))
+                    )
+            | _ ->
+                match forInSource ctx inner with
+                | Some(listExpr, "list") -> listExpr
+                | _ -> fail r "the Zig target cannot join a value of this type yet (%A)" inner.Type
+
+        ctx.State.UsesRuntime <- true
+        bindArgs ctx [ lw ctx sep; listIr ] (fun xs -> EEmit("fable_rt.joinList($0, $1)", xs, tStr))
+    | "System.String", "Format", (Fable.Value(Fable.StringConstant fmt, _)) :: values ->
+        compositeFormat ctx r fmt values t
+    | "System.String", "ToCharArray", [ s0 ] -> rt "fable_rt.strToChars($0)" [ s0 ] (mapType ctx r t)
+    | "System.String", ".ctor", [ chars ] when
+        (match chars.Type with
+         | Fable.Array(Fable.Char, _) -> true
+         | _ -> false)
+        ->
+        pure' "fable_rt.strOfChars($0)" [ chars ] tStr
+    | "System.Char",
+      ("IsDigit" | "IsLetter" | "IsLetterOrDigit" | "IsUpper" | "IsLower" | "IsNumber" | "IsPunctuation" | "IsSymbol" | "IsSeparator" | "IsControl" | "IsSurrogate"),
+      [ c ] -> pure' $"fable_rt.unicode.is%s{name.Substring 2}($0)" [ c ] tBool
+    | "System.Char", "GetNumericValue", [ c ] -> pure' "fable_rt.charNumericValue($0)" [ c ] tF64
+    // comparisons that say how: ordinal, or ordinal with the case ignored (a culture's order is
+    // not known here)
+    | "System.String", ("Equals" | "StartsWith" | "EndsWith" | "IndexOf" | "Compare" | "Contains"), _ when
+        (match List.tryLast args with
+         | Some last ->
+             match last.Type with
+             | Fable.Number(_, Fable.NumberInfo.IsEnum ent) -> ent.FullName = "System.StringComparison"
+             | _ -> false
+         | None -> false)
+        ->
+        let how =
+            match List.last args with
+            | Fable.Value(Fable.NumberConstant(v, _), _) ->
+                match v with
+                | Fable.NumberValue.Int32 n -> n
+                | _ -> -1
+            | _ -> -1
+
+        let a, b =
+            match args with
+            | [ a; b; _ ] -> a, b
+            | _ -> fail r "the Zig target does not support this String.%s yet" name
+
+        match how with
+        | 4 ->
+            match name with
+            | "Equals" -> pure' "fable_rt.strEql($0, $1)" [ a; b ] tBool
+            | "StartsWith" -> rt "fable_rt.strStartsWith($0, $1)" [ a; b ] tBool
+            | "EndsWith" -> rt "fable_rt.strEndsWith($0, $1)" [ a; b ] tBool
+            | "IndexOf" -> rt "fable_rt.strIndexOf($0, $1, 0)" [ a; b ] tI32
+            | "Contains" -> rt "fable_rt.strContains($0, $1)" [ a; b ] tBool
+            | _ -> pure' "fable_rt.strCompare($0, $1)" [ a; b ] tI32
+        | 5 ->
+            match name with
+            | "Equals" -> pure' "fable_rt.strEqualsIgnoreCase($0, $1)" [ a; b ] tBool
+            | "StartsWith" -> rt "fable_rt.strStartsWithIgnoreCase($0, $1)" [ a; b ] tBool
+            | "EndsWith" -> rt "fable_rt.strEndsWithIgnoreCase($0, $1)" [ a; b ] tBool
+            | "IndexOf" -> rt "fable_rt.strIndexOfIgnoreCase($0, $1)" [ a; b ] tI32
+            | "Contains" ->
+                bindArgs
+                    ctx
+                    [ rt "fable_rt.strIndexOfIgnoreCase($0, $1)" [ a; b ] tI32 ]
+                    (fun xs -> EPrim("ge", [ xs.Head; ELit("0", tI32) ], tBool))
+            | _ -> pure' "fable_rt.strCompareIgnoreCase($0, $1)" [ a; b ] tI32
+        | _ ->
+            fail
+                r
+                "the Zig target does not support comparing strings by a culture (String.%s with StringComparison %d): use Ordinal or OrdinalIgnoreCase"
+                name
+                how
+
     // ---- chars: each code unit to what .NET maps it to (there is no current culture) ----
     | "System.Char", ("ToUpper" | "ToUpperInvariant"), [ c ] -> pure' "fable_rt.unicode.toUpper($0)" [ c ] tChar
     | "System.Char", ("ToLower" | "ToLowerInvariant"), [ c ] -> pure' "fable_rt.unicode.toLower($0)" [ c ] tChar
@@ -3738,6 +4026,11 @@ and dotnetCall
             ->
             checkShowable ctx r x.Type
             pure' "fable_rt.anyText($0)" [ x ] tStr
+        | Fable.Option _
+        | Fable.Tuple _
+        | Fable.List _ -> pure' "fable_rt.toText($0)" [ x ] tStr
+        | Fable.DeclaredType(ent, _) when ent.FullName = mapName || ent.FullName = setName ->
+            pure' "fable_rt.toText($0)" [ x ] tStr
         | Fable.Char ->
             bindArgs
                 ctx

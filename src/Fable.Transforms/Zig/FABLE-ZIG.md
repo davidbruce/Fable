@@ -560,16 +560,24 @@ contains itself is cut with `...` where it comes round again. `string x` and `{x
 record or a union are its `%A`, and so is the message of an F# exception. The printer reads
 the Zig types: field and case names are the F# ones, so nothing is generated per type.
 
+Also: `Split` (by chars, a string or strings, with `StringSplitOptions`), `String.Join` and
+`String.concat` of any collection or sequence, `ToCharArray`, `String(chars)`,
+`StringBuilder` (`Append` of any value, `AppendLine`, `Clear`, `Length`, `ToString`),
+`String.Format` with a literal format (taken apart at compile time like an interpolated
+string: `{0,5:N2}`), and the classes of characters (`Char.IsDigit`, `IsLetter`, `IsUpper`,
+`IsPunctuation`, ...: .NET's Unicode categories, a table written out from .NET).
+`string x`, `{x}` and `Append x` of an option, a tuple, a list, a map or a set are .NET's
+ToString: `Some(1)`, `(1, a)`, `[1; 2; 3; ... ]`. Comparisons that say how compare
+`Ordinal` or `OrdinalIgnoreCase` (each code unit by its upper case).
+
 Not yet, each of them a compile error and not a different text:
 
 - `%A` of a type that mentions a `uint16`, a `voption`, a struct tuple or a function. (The
   first three are the same Zig type as `char`, `option` and a tuple. In the message of an F#
   exception, where nothing can be refused, they are written as those.)
-- A width or flags on `%A`; a custom .NET format (`{x:0.00}`); `String.Format`.
-- Methods that take a `StringComparison` or a culture; `CompareTo` and `String.Compare`
-  (they order by culture); `Split`, `Join`, `ToCharArray` and whatever else needs arrays;
-  `StringBuilder`; the other functions of `System.Char` (they need Unicode's categories).
-- `string` of an option, a list or a tuple (.NET writes those differently from `%A`).
+- A width or flags on `%A`; a custom .NET format (`{x:0.00}`); `String.Format` of a format that is not a literal.
+- Comparison by a culture: `CompareTo`, `String.Compare` without `Ordinal`, and the
+  `CurrentCulture` and `InvariantCulture` kinds of `StringComparison`.
 
 Appending to a string in a loop copies it each time, as on .NET. A program that declares an
 F# exception links the `%A` printer, because any exception may be asked for its message.
