@@ -1802,7 +1802,10 @@ and walkEnt (ctx: Ctx) : Ent =
                     }
                 Kind = KRecord
                 TypeParams = [ "T" ]
-                Cases = [ "", [ "next", TFn([ tVoid ], TOpt(TGen "T")) ] ]
+                Cases =
+                    [
+                        "", [ "next", TFn([ tVoid ], TOpt(TGen "T")); "close", TFn([ tVoid ], tVoid) ]
+                    ]
                 MutableFields = []
                 Managed = true
                 Cyclic = false
@@ -3604,16 +3607,19 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     )
                 )
             | "seq" ->
-                // a sequence: start a walk, and ask it for each item until it has none
+                // a sequence: start a walk, ask it for each item until it has none, and close on exit
                 let walkTy = TEnt(walkEnt ctx, [ itemTy ])
                 let nextTy = TFn([ tVoid ], TOpt itemTy)
+                let closeTy = TFn([ tVoid ], tVoid)
                 let walk = ctx.State.NewVar("walk", walkTy, VLocal, false)
                 let go = ctx.State.NewVar("go", tBool, VLocal, true)
                 let next = ctx.State.NewVar("next", TOpt itemTy, VLocal, false)
+                let exV = ctx.State.NewVar("exn", tExn, VLocal, false)
 
-                ELet(
-                    walk,
-                    ECallClo(EGet(source, PField "fable_seq", TFn([ tVoid ], walkTy)), [ EUnit ], walkTy),
+                let closeWalk () =
+                    ECallClo(EGet(EVar walk, PField "close", closeTy), [ EUnit ], tVoid)
+
+                let loop =
                     ELet(
                         go,
                         ELit("true", tBool),
@@ -3631,6 +3637,13 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                             )
                         )
                     )
+
+                let onRaise = ESeq(closeWalk (), ERaise(EVar exV, tVoid))
+
+                ELet(
+                    walk,
+                    ECallClo(EGet(source, PField "fable_seq", TFn([ tVoid ], walkTy)), [ EUnit ], walkTy),
+                    ESeq(ETry(loop, exV, onRaise, tVoid), closeWalk ())
                 )
             | _ ->
                 // a string, by index

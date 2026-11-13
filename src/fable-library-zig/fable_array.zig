@@ -24,7 +24,7 @@ const gcTick = rt.gcTick;
 const hasGc = rt.hasGc;
 const holdsCyclic = rt.holdsCyclic;
 const raise = rt.raise;
-const stored = rt.stored;
+const storeValue = rt.storeValue;
 const str = rt.str;
 const thread = rt.thread;
 const touch = rt.touch;
@@ -164,7 +164,7 @@ pub fn arrayPut(a: anytype, i: usize, value: @typeInfo(@TypeOf(a.items)).pointer
     a.items[i] = value;
     if (gcOf(a)) |h| {
         eachHdr(old, h, unstored);
-        eachHdr(value, h, stored);
+        storeValue(h, value);
     } else {
         touch(value);
     }

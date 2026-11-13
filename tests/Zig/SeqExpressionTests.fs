@@ -159,6 +159,45 @@ let ``test use in seq expressions works`` () =
     equal 1 n
 
 [<Fact>]
+let ``test try...finally in seq expressions runs on early exit`` () =
+    let mutable n = 0
+    let s =
+        seq {
+            try
+                yield 1
+                yield 2
+                yield 3
+            finally
+                n <- n + 1
+        }
+    s |> Seq.take 2 |> Seq.toList |> equal [1; 2]
+    equal 1 n
+    s |> Seq.head |> equal 1
+    equal 2 n
+    s |> Seq.exists (fun x -> x = 1) |> equal true
+    equal 3 n
+    Seq.zip s [10] |> Seq.toList |> equal [1, 10]
+    equal 4 n
+    try
+        for x in s do
+            if x = 2 then failwith "stop"
+    with _ -> ()
+    equal 5 n
+
+[<Fact>]
+let ``test use in seq expressions disposes on early exit`` () =
+    let mutable order = []
+    let s =
+        seq {
+            use _a = new DisposableAction(fun () -> order <- "a" :: order)
+            use _b = new DisposableAction(fun () -> order <- "b" :: order)
+            yield 1
+            yield 2
+        }
+    s |> Seq.head |> equal 1
+    equal ["a"; "b"] order
+
+[<Fact>]
 let ``test array expressions work`` () =
     [| for x in 1 .. 10 do yield x |]
     |> Array.length |> equal 10

@@ -596,7 +596,7 @@ pub inline fn storeIn(owner: anytype, comptime field: []const u8, value: @FieldT
     @field(owner, field) = value;
     if (gcOf(owner)) |h| {
         eachHdr(old, h, unstored);
-        eachHdr(value, h, stored);
+        storeValue(h, value);
     } else {
         touch(value);
     }
@@ -609,6 +609,26 @@ pub fn unstored(owner: *sgc.Hdr, old: *sgc.Hdr) void {
 
 pub fn stored(owner: *sgc.Hdr, child: *sgc.Hdr) void {
     thread.collector.onStore(owner, child);
+}
+
+const StoreCtx = struct {
+    owner: *sgc.Hdr,
+    was_new: bool,
+};
+
+fn storeOne(ctx: StoreCtx, child: *sgc.Hdr) void {
+    // When `owner` enters a structure on an earlier header of the same stored value, `.close`
+    // already traces the whole newly written field, so only merge headers in other structures.
+    if (ctx.was_new and ctx.owner.st != 0) {
+        if (child.st == 0 or thread.collector.root(child) == thread.collector.root(ctx.owner)) return;
+    }
+    thread.collector.onStore(ctx.owner, child);
+}
+
+/// Report a newly stored composite value to the collector without double-counting sibling headers.
+pub inline fn storeValue(owner: *sgc.Hdr, value: anytype) void {
+    const ctx: StoreCtx = .{ .owner = owner, .was_new = owner.st == 0 };
+    eachHdr(value, ctx, storeOne);
 }
 
 /// F#'s `ref` cell.
@@ -900,7 +920,7 @@ pub fn lazyState(l: anytype, new_state: @TypeOf(l.state)) void {
     l.state = new_state;
     if (gcOf(l)) |h| {
         eachHdr(old, h, unstored);
-        eachHdr(l.state, h, stored);
+        storeValue(h, l.state);
     } else touch(l.state);
     drop(old);
 }
@@ -1063,7 +1083,7 @@ pub fn raAdd(r: anytype, x: rItem(@TypeOf(r))) void {
     // (put in place as an assignment of the array would be, for the collector)
     const n = r.items.len - 1;
     r.items[n] = dup(x);
-    if (gcOf(r)) |h| eachHdr(r.items[n], h, stored) else touch(r.items[n]);
+    if (gcOf(r)) |h| storeValue(h, r.items[n]) else touch(r.items[n]);
 }
 
 /// `ResizeArray xs` of a list
@@ -1104,7 +1124,7 @@ pub fn raInsert(r: anytype, i: i32, x: rItem(@TypeOf(r))) Raised!void {
     r.items.len += 1;
     std.mem.copyBackwards(rItem(@TypeOf(r)), r.items[at + 1 ..], r.items[at .. r.items.len - 1]);
     r.items[at] = dup(x);
-    if (gcOf(r)) |h| eachHdr(r.items[at], h, stored) else touch(r.items[at]);
+    if (gcOf(r)) |h| storeValue(h, r.items[at]) else touch(r.items[at]);
 }
 
 pub fn raTake(r: anytype, at: usize) void {
@@ -1324,7 +1344,7 @@ fn htPut(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d)), replace
         e.kv.?.value = dup(value);
         if (gcOf(d)) |h| {
             eachHdr(old, h, unstored);
-            eachHdr(e.kv.?.value, h, stored);
+            storeValue(h, e.kv.?.value);
         } else touch(e.kv.?.value);
         drop(old);
         return true;
@@ -1344,7 +1364,7 @@ fn htPut(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d)), replace
     const bucket = htBucket(d, h);
     d.entries[at] = .{ .hash = h, .next = d.buckets[bucket] - 1, .kv = .{ .key = dup(key), .value = dup(value) } };
     d.buckets[bucket] = @intCast(at + 1);
-    if (gcOf(d)) |hdr| eachHdr(d.entries[at].kv.?, hdr, stored) else touch(d.entries[at].kv.?);
+    if (gcOf(d)) |hdr| storeValue(hdr, d.entries[at].kv.?) else touch(d.entries[at].kv.?);
     return true;
 }
 
@@ -2196,7 +2216,7 @@ pub inline fn objStore(o: Obj, place: anytype, value: @TypeOf(place.*)) void {
     place.* = value;
     if (o.gc) |h| {
         eachHdr(old, h, unstored);
-        eachHdr(value, h, stored);
+        storeValue(h, value);
     } else {
         touch(value);
     }
@@ -4632,6 +4652,7 @@ pub const Shower = struct {
                         return b.word("seq [...]");
                     };
                     defer drop(walk);
+                    defer walk.close.code(walk.close.env, {}) catch drop(take());
                     while (true) {
                         const next = walk.next.code(walk.next.env, {}) catch {
                             drop(take());
@@ -5979,6 +6000,31 @@ test "the collector can be stepped and tuned" {
     collectorPause();
     collectorResume();
     try std.testing.expectEqual(@as(i32, 0), collect());
+}
+
+test "storing a composite value with two cyclic cells does not double-count" {
+    const before = thread.stats;
+    const Fn = Func(*const fn (?*Env, i32) Raised!i32);
+    const Pair = struct { first: Fn, second: Fn };
+    const Cap = struct { box: Ref(?Pair) };
+    const r = new(Ref(?Pair), .{ .contents = null });
+    const f1 = closure(Fn, Cap, .{ .box = dup(r) }, struct {
+        fn call(_: ?*Env, x: i32) Raised!i32 {
+            return x;
+        }
+    }.call);
+    const f2 = closure(Fn, Cap, .{ .box = dup(r) }, struct {
+        fn call(_: ?*Env, x: i32) Raised!i32 {
+            return x;
+        }
+    }.call);
+    storeIn(r, "contents", .{ .first = f1, .second = f2 });
+    const f2_keep = dup(r.contents.?.second);
+    storeIn(r, "contents", null);
+    drop(f2_keep);
+    drop(r);
+    _ = collect();
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }
 
 pub fn expectText(expected: []const u8, s: String) !void {

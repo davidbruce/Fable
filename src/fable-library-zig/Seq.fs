@@ -4,16 +4,55 @@
 /// this `SeqOf`; the runtime knows it by its field, to write it with `%A` (`seq [1; 2; ...]`).
 module Fable.Library.Zig.Seq
 
-/// A walk: the function that gives the next item.
-type Walk<'T> = { next: unit -> 'T option }
+/// A walk: `next` gives the next item, and `close` runs any cleanup if stopped early.
+type Walk<'T> =
+    {
+        next: unit -> 'T option
+        close: unit -> unit
+    }
 
 type SeqOf<'T> = { fable_seq: unit -> Walk<'T> }
 
 let private make (start: unit -> Walk<'T>) : SeqOf<'T> = { fable_seq = start }
 
-let private walker (next: unit -> 'T option) : Walk<'T> = { next = next }
+let private noop () = ()
+
+let private walker (next: unit -> 'T option) : Walk<'T> =
+    {
+        next = next
+        close = noop
+    }
+
+let private walkerClose (next: unit -> 'T option) (close: unit -> unit) : Walk<'T> =
+    {
+        next = next
+        close = close
+    }
 
 let private walk (source: SeqOf<'T>) : Walk<'T> = source.fable_seq ()
+
+let private walking (source: SeqOf<'T>) (useWalk: Walk<'T> -> 'R) : 'R =
+    let w = walk source
+
+    try
+        useWalk w
+    finally
+        w.close ()
+
+let private walking2 (source1: SeqOf<'T1>) (source2: SeqOf<'T2>) (useWalks: Walk<'T1> -> Walk<'T2> -> 'R) : 'R =
+    walking source1 (fun a -> walking source2 (fun b -> useWalks a b))
+
+let private walkPair (source1: SeqOf<'T1>) (source2: SeqOf<'T2>) : Walk<'T1> * Walk<'T2> =
+    let a = walk source1
+
+    let b =
+        try
+            walk source2
+        with _ ->
+            a.close ()
+            reraise ()
+
+    a, b
 
 let private emptyInput () =
     invalidArg "source" "The input sequence was empty."
@@ -70,21 +109,38 @@ let ofArray<'T> (source: 'T[]) : SeqOf<'T> =
 
 let append<'T> (source1: SeqOf<'T>) (source2: SeqOf<'T>) : SeqOf<'T> =
     make (fun () ->
-        let mutable first = true
-        let mutable current = walk source1
+        let mutable stage = 0
+        let mutable current: Walk<'T> option = Some(walk source1)
+
+        let closeCurrent () =
+            match current with
+            | Some w ->
+                current <- None
+                w.close ()
+            | None -> ()
+
+        let close () =
+            stage <- 2
+            closeCurrent ()
 
         let rec next () =
-            match current.next () with
-            | Some x -> Some x
-            | None ->
-                if first then
-                    first <- false
-                    current <- walk source2
-                    next ()
-                else
-                    None
+            match current with
+            | None -> None
+            | Some w ->
+                match w.next () with
+                | Some x -> Some x
+                | None ->
+                    closeCurrent ()
 
-        walker next
+                    if stage = 0 then
+                        stage <- 1
+                        current <- Some(walk source2)
+                        next ()
+                    else
+                        stage <- 2
+                        None
+
+        walkerClose next close
     )
 
 // ---- what `seq { }` is made of besides `for` and `yield` ----
@@ -94,64 +150,87 @@ let append<'T> (source1: SeqOf<'T>) (source2: SeqOf<'T>) : SeqOf<'T> =
 let enumerateWhile<'T> (guard: unit -> bool) (source: SeqOf<'T>) : SeqOf<'T> =
     make (fun () ->
         let mutable current: Walk<'T> option = None
+        let mutable closed = false
 
-        let rec next () =
+        let close () =
+            closed <- true
+
             match current with
             | Some w ->
-                match w.next () with
-                | Some x -> Some x
-                | None ->
-                    current <- None
-                    next ()
-            | None ->
-                if guard () then
-                    current <- Some(walk source)
-                    next ()
-                else
-                    None
+                current <- None
+                w.close ()
+            | None -> ()
 
-        walker next
+        let rec next () =
+            if closed then
+                None
+            else
+                match current with
+                | Some w ->
+                    match w.next () with
+                    | Some x -> Some x
+                    | None ->
+                        current <- None
+                        w.close ()
+                        next ()
+                | None ->
+                    if guard () then
+                        current <- Some(walk source)
+                        next ()
+                    else
+                        closed <- true
+                        None
+
+        walkerClose next close
     )
 
-/// `try yield! source finally compensation ()`: the compensation runs once, when the walk ends
-/// or raises. (A walk that is left before its end does not run it yet: the library's walks
-/// have no way to be stopped.)
+/// `try yield! source finally compensation ()`: the compensation runs once, when the walk ends,
+/// raises, or is closed early.
 let enumerateThenFinally<'T> (source: SeqOf<'T>) (compensation: unit -> unit) : SeqOf<'T> =
     make (fun () ->
         let mutable finished = false
+        let mutable current: Walk<'T> option = None
 
         let finish () =
             if not finished then
                 finished <- true
-                compensation ()
+                let wOpt = current
+                current <- None
 
-        let mutable current: Walk<'T> option = None
+                try
+                    match wOpt with
+                    | Some w -> w.close ()
+                    | None -> ()
+                finally
+                    compensation ()
 
-        walker
-        <| fun () ->
-            if finished then
-                None
-            else
-                let r =
-                    try
-                        let w =
-                            match current with
-                            | Some w -> w
-                            | None ->
-                                let w = walk source
-                                current <- Some w
-                                w
-
-                        w.next ()
-                    with _ ->
-                        finish ()
-                        reraise ()
-
-                match r with
-                | Some x -> Some x
-                | None ->
-                    finish ()
+        walkerClose
+            (fun () ->
+                if finished then
                     None
+                else
+                    let r =
+                        try
+                            let w =
+                                match current with
+                                | Some w -> w
+                                | None ->
+                                    let w = walk source
+                                    current <- Some w
+                                    w
+
+                            w.next ()
+                        with _ ->
+                            finish ()
+                            reraise ()
+
+                    match r with
+                    | Some x -> Some x
+                    | None ->
+                        finish ()
+                        None
+            )
+            finish
     )
 
 /// `try yield! source with e -> yield! handler e` (F#'s `filter` says whether the handler takes
@@ -160,57 +239,76 @@ let enumerateTryWith<'T> (source: SeqOf<'T>) (filter: exn -> int) (handler: exn 
     make (fun () ->
         let mutable current: Walk<'T> option = None
         let mutable handled = false
+        let mutable closed = false
+
+        let closeCurrent () =
+            match current with
+            | Some w ->
+                current <- None
+                w.close ()
+            | None -> ()
+
+        let close () =
+            closed <- true
+            closeCurrent ()
 
         let rec next () =
-            match current with
-            | None when not handled ->
-                let w =
-                    try
-                        Choice1Of2(walk source)
-                    with e ->
-                        Choice2Of2 e
+            if closed then
+                None
+            else
+                match current with
+                | None when not handled ->
+                    let w =
+                        try
+                            Choice1Of2(walk source)
+                        with e ->
+                            Choice2Of2 e
 
-                match w with
-                | Choice1Of2 w -> current <- Some w
-                | Choice2Of2 e ->
-                    if filter e = 1 then
-                        handled <- true
-                        current <- Some(walk (handler e))
-                    else
-                        raise e
+                    match w with
+                    | Choice1Of2 w -> current <- Some w
+                    | Choice2Of2 e ->
+                        if filter e = 1 then
+                            handled <- true
+                            current <- Some(walk (handler e))
+                        else
+                            raise e
 
-                next ()
-            | None -> None
-            | Some w when handled -> w.next ()
-            | Some w ->
-                let r =
-                    try
-                        Choice1Of2(w.next ())
-                    with e ->
-                        Choice2Of2 e
+                    next ()
+                | None -> None
+                | Some w when handled -> w.next ()
+                | Some w ->
+                    let r =
+                        try
+                            Choice1Of2(w.next ())
+                        with e ->
+                            Choice2Of2 e
 
-                match r with
-                | Choice1Of2 x -> x
-                | Choice2Of2 e ->
-                    if filter e = 1 then
-                        handled <- true
-                        current <- Some(walk (handler e))
-                        next ()
-                    else
-                        raise e
+                    match r with
+                    | Choice1Of2 x -> x
+                    | Choice2Of2 e ->
+                        closeCurrent ()
 
-        walker next
+                        if filter e = 1 then
+                            handled <- true
+                            current <- Some(walk (handler e))
+                            next ()
+                        else
+                            raise e
+
+        walkerClose next close
     )
 
 let map<'T, 'U> (mapping: 'T -> 'U) (source: SeqOf<'T>) : SeqOf<'U> =
     make (fun () ->
         let w = walk source
 
-        walker
-        <| fun () ->
-            match w.next () with
-            | Some x -> Some(mapping x)
-            | None -> None
+        walkerClose
+            (fun () ->
+                match w.next () with
+                | Some x -> Some(mapping x)
+                | None -> None
+            )
+            w.close
     )
 
 let mapIndexed<'T, 'U> (mapping: int -> 'T -> 'U) (source: SeqOf<'T>) : SeqOf<'U> =
@@ -218,13 +316,15 @@ let mapIndexed<'T, 'U> (mapping: int -> 'T -> 'U) (source: SeqOf<'T>) : SeqOf<'U
         let w = walk source
         let mutable i = -1
 
-        walker
-        <| fun () ->
-            match w.next () with
-            | Some x ->
-                i <- i + 1
-                Some(mapping i x)
-            | None -> None
+        walkerClose
+            (fun () ->
+                match w.next () with
+                | Some x ->
+                    i <- i + 1
+                    Some(mapping i x)
+                | None -> None
+            )
+            w.close
     )
 
 let filter<'T> (predicate: 'T -> bool) (source: SeqOf<'T>) : SeqOf<'T> =
@@ -240,7 +340,7 @@ let filter<'T> (predicate: 'T -> bool) (source: SeqOf<'T>) : SeqOf<'T> =
                     next ()
             | None -> None
 
-        walker next
+        walkerClose next w.close
     )
 
 let choose<'T, 'U> (chooser: 'T -> 'U option) (source: SeqOf<'T>) : SeqOf<'U> =
@@ -255,30 +355,50 @@ let choose<'T, 'U> (chooser: 'T -> 'U option) (source: SeqOf<'T>) : SeqOf<'U> =
                 | None -> next ()
             | None -> None
 
-        walker next
+        walkerClose next w.close
     )
 
 let collect<'T, 'U> (mapping: 'T -> SeqOf<'U>) (source: SeqOf<'T>) : SeqOf<'U> =
     make (fun () ->
         let outer = walk source
         let mutable inner: Walk<'U> option = None
+        let mutable closed = false
+
+        let close () =
+            if not closed then
+                closed <- true
+
+                try
+                    match inner with
+                    | Some w ->
+                        inner <- None
+                        w.close ()
+                    | None -> ()
+                finally
+                    outer.close ()
 
         let rec next () =
-            match inner with
-            | Some w ->
-                match w.next () with
-                | Some y -> Some y
+            if closed then
+                None
+            else
+                match inner with
+                | Some w ->
+                    match w.next () with
+                    | Some y -> Some y
+                    | None ->
+                        inner <- None
+                        w.close ()
+                        next ()
                 | None ->
-                    inner <- None
-                    next ()
-            | None ->
-                match outer.next () with
-                | Some x ->
-                    inner <- Some(walk (mapping x))
-                    next ()
-                | None -> None
+                    match outer.next () with
+                    | Some x ->
+                        inner <- Some(walk (mapping x))
+                        next ()
+                    | None ->
+                        close ()
+                        None
 
-        walker next
+        walkerClose next close
     )
 
 let concat<'T> (sources: SeqOf<SeqOf<'T>>) : SeqOf<'T> = collect id sources
@@ -329,66 +449,95 @@ let take<'T> (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
     make (fun () ->
         let w = walk source
         let mutable taken = 0
+        let mutable closed = false
 
-        walker
-        <| fun () ->
-            if taken = count then
-                None
-            else
-                match w.next () with
-                | Some x ->
-                    taken <- taken + 1
-                    Some x
-                | None ->
-                    raise (
-                        System.InvalidOperationException(
-                            "The input sequence has an insufficient number of elements.\ntried to take "
-                            + string (count - taken)
-                            + " past the end of the seq. Use Seq.truncate to get "
-                            + string taken
-                            + " or less elements"
+        let close () =
+            if not closed then
+                closed <- true
+                w.close ()
+
+        walkerClose
+            (fun () ->
+                if closed then
+                    None
+                elif taken = count then
+                    close ()
+                    None
+                else
+                    match w.next () with
+                    | Some x ->
+                        taken <- taken + 1
+                        Some x
+                    | None ->
+                        close ()
+
+                        raise (
+                            System.InvalidOperationException(
+                                "The input sequence has an insufficient number of elements.\ntried to take "
+                                + string (count - taken)
+                                + " past the end of the seq. Use Seq.truncate to get "
+                                + string taken
+                                + " or less elements"
+                            )
                         )
-                    )
+            )
+            close
     )
 
 let truncate<'T> (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
-    make (fun () ->
-        let w = walk source
-        let mutable taken = 0
+    if count <= 0 then
+        empty ()
+    else
+        make (fun () ->
+            let w = walk source
+            let mutable taken = 0
+            let mutable closed = false
 
-        walker
-        <| fun () ->
-            if taken >= count then
-                None
-            else
-                taken <- taken + 1
-                w.next ()
-    )
+            let close () =
+                if not closed then
+                    closed <- true
+                    w.close ()
+
+            walkerClose
+                (fun () ->
+                    if closed then
+                        None
+                    elif taken >= count then
+                        close ()
+                        None
+                    else
+                        taken <- taken + 1
+                        w.next ()
+                )
+                close
+        )
 
 let skip<'T> (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
     make (fun () ->
         let w = walk source
         let mutable skipped = false
 
-        walker
-        <| fun () ->
-            if not skipped then
-                skipped <- true
+        walkerClose
+            (fun () ->
+                if not skipped then
+                    skipped <- true
 
-                for i in 1..count do
-                    match w.next () with
-                    | Some _ -> ()
-                    | None ->
-                        // (FSharp.Core's message, as it is)
-                        raise (
-                            System.InvalidOperationException(
-                                "tried to skip The input sequence has an insufficient number of elements. "
-                                + string i
-                                + " past the end of the seq"
+                    for i in 1..count do
+                        match w.next () with
+                        | Some _ -> ()
+                        | None ->
+                            // (FSharp.Core's message, as it is)
+                            raise (
+                                System.InvalidOperationException(
+                                    "tried to skip The input sequence has an insufficient number of elements. "
+                                    + string i
+                                    + " past the end of the seq"
+                                )
                             )
-                        )
 
-            w.next ()
+                w.next ()
+            )
+            w.close
     )
 
 let takeWhile<'T> (predicate: 'T -> bool) (source: SeqOf<'T>) : SeqOf<'T> =
@@ -396,16 +545,23 @@ let takeWhile<'T> (predicate: 'T -> bool) (source: SeqOf<'T>) : SeqOf<'T> =
         let w = walk source
         let mutable ended = false
 
-        walker
-        <| fun () ->
-            if ended then
-                None
-            else
-                match w.next () with
-                | Some x when predicate x -> Some x
-                | _ ->
-                    ended <- true
+        let close () =
+            if not ended then
+                ended <- true
+                w.close ()
+
+        walkerClose
+            (fun () ->
+                if ended then
                     None
+                else
+                    match w.next () with
+                    | Some x when predicate x -> Some x
+                    | _ ->
+                        close ()
+                        None
+            )
+            close
     )
 
 let skipWhile<'T> (predicate: 'T -> bool) (source: SeqOf<'T>) : SeqOf<'T> =
@@ -420,19 +576,35 @@ let skipWhile<'T> (predicate: 'T -> bool) (source: SeqOf<'T>) : SeqOf<'T> =
                 skipping <- false
                 other
 
-        walker next
+        walkerClose next w.close
     )
 
 let zip<'T1, 'T2> (source1: SeqOf<'T1>) (source2: SeqOf<'T2>) : SeqOf<'T1 * 'T2> =
     make (fun () ->
-        let a = walk source1
-        let b = walk source2
+        let a, b = walkPair source1 source2
+        let mutable closed = false
 
-        walker
-        <| fun () ->
-            match a.next (), b.next () with
-            | Some x, Some y -> Some(x, y)
-            | _ -> None
+        let close () =
+            if not closed then
+                closed <- true
+
+                try
+                    a.close ()
+                finally
+                    b.close ()
+
+        walkerClose
+            (fun () ->
+                if closed then
+                    None
+                else
+                    match a.next (), b.next () with
+                    | Some x, Some y -> Some(x, y)
+                    | _ ->
+                        close ()
+                        None
+            )
+            close
     )
 
 let indexed<'T> (source: SeqOf<'T>) : SeqOf<int * 'T> = mapIndexed (fun i x -> (i, x)) source
@@ -440,32 +612,43 @@ let indexed<'T> (source: SeqOf<'T>) : SeqOf<int * 'T> = mapIndexed (fun i x -> (
 let pairwise<'T> (source: SeqOf<'T>) : SeqOf<'T * 'T> =
     make (fun () ->
         let w = walk source
-        let mutable last = w.next ()
 
-        walker
-        <| fun () ->
-            match last with
-            | Some a ->
-                match w.next () with
-                | Some b ->
-                    last <- Some b
-                    Some(a, b)
-                | None ->
-                    last <- None
-                    None
-            | None -> None
+        let mutable last =
+            try
+                w.next ()
+            with _ ->
+                w.close ()
+                reraise ()
+
+        walkerClose
+            (fun () ->
+                match last with
+                | Some a ->
+                    match w.next () with
+                    | Some b ->
+                        last <- Some b
+                        Some(a, b)
+                    | None ->
+                        last <- None
+                        None
+                | None -> None
+            )
+            w.close
     )
 
 // ---- what walks a sequence to its end ----
 
 let iterate<'T> (action: 'T -> unit) (source: SeqOf<'T>) : unit =
-    let w = walk source
-    let mutable go = true
+    walking
+        source
+        (fun w ->
+            let mutable go = true
 
-    while go do
-        match w.next () with
-        | Some x -> action x
-        | None -> go <- false
+            while go do
+                match w.next () with
+                | Some x -> action x
+                | None -> go <- false
+        )
 
 let iterateIndexed<'T> (action: int -> 'T -> unit) (source: SeqOf<'T>) : unit =
     let mutable i = 0
@@ -478,16 +661,19 @@ let iterateIndexed<'T> (action: int -> 'T -> unit) (source: SeqOf<'T>) : unit =
         source
 
 let fold<'State, 'T> (folder: 'State -> 'T -> 'State) (state: 'State) (source: SeqOf<'T>) : 'State =
-    let w = walk source
-    let mutable acc = state
-    let mutable go = true
+    walking
+        source
+        (fun w ->
+            let mutable acc = state
+            let mutable go = true
 
-    while go do
-        match w.next () with
-        | Some x -> acc <- folder acc x
-        | None -> go <- false
+            while go do
+                match w.next () with
+                | Some x -> acc <- folder acc x
+                | None -> go <- false
 
-    acc
+            acc
+        )
 
 let toList<'T> (source: SeqOf<'T>) : 'T list =
     List.rev (fold (fun acc x -> x :: acc) [] source)
@@ -497,14 +683,18 @@ let toArray<'T> (source: SeqOf<'T>) : 'T[] = Array.ofList (toList source)
 let length<'T> (source: SeqOf<'T>) : int = fold (fun n _ -> n + 1) 0 source
 
 let isEmpty<'T> (source: SeqOf<'T>) : bool =
-    match (walk source).next() with
-    | Some _ -> false
-    | None -> true
+    walking
+        source
+        (fun w ->
+            match w.next () with
+            | Some _ -> false
+            | None -> true
+        )
 
-let tryHead<'T> (source: SeqOf<'T>) : 'T option = (walk source).next()
+let tryHead<'T> (source: SeqOf<'T>) : 'T option = walking source (fun w -> w.next ())
 
 let head<'T> (source: SeqOf<'T>) : 'T =
-    match (walk source).next() with
+    match tryHead source with
     | Some x -> x
     | None -> emptyInput ()
 
@@ -519,22 +709,25 @@ let tryItem<'T> (index: int) (source: SeqOf<'T>) : 'T option =
     if index < 0 then
         None
     else
-        let w = walk source
-        let mutable i = 0
-        let mutable result = None
-        let mutable go = true
+        walking
+            source
+            (fun w ->
+                let mutable i = 0
+                let mutable result = None
+                let mutable go = true
 
-        while go do
-            match w.next () with
-            | Some x ->
-                if i = index then
-                    result <- Some x
-                    go <- false
+                while go do
+                    match w.next () with
+                    | Some x ->
+                        if i = index then
+                            result <- Some x
+                            go <- false
 
-                i <- i + 1
-            | None -> go <- false
+                        i <- i + 1
+                    | None -> go <- false
 
-        result
+                result
+            )
 
 let item<'T> (index: int) (source: SeqOf<'T>) : 'T =
     match tryItem index source with
@@ -598,7 +791,7 @@ let distinct<'T when 'T: equality> (source: SeqOf<'T>) : SeqOf<'T> =
                     next ()
             | None -> None
 
-        walker next
+        walkerClose next w.close
     )
 
 let max<'T when 'T: comparison> (source: SeqOf<'T>) : 'T = List.max (toList source)
@@ -774,30 +967,78 @@ let tail<'T> (source: SeqOf<'T>) : SeqOf<'T> =
 
 let map2<'T1, 'T2, 'U> (mapping: 'T1 -> 'T2 -> 'U) (source1: SeqOf<'T1>) (source2: SeqOf<'T2>) : SeqOf<'U> =
     make (fun () ->
-        let a = walk source1
-        let b = walk source2
+        let a, b = walkPair source1 source2
+        let mutable closed = false
 
-        walker
-        <| fun () ->
-            match a.next () with
-            | Some x ->
-                match b.next () with
-                | Some y -> Some(mapping x y)
-                | None -> None
-            | None -> None
+        let close () =
+            if not closed then
+                closed <- true
+
+                try
+                    a.close ()
+                finally
+                    b.close ()
+
+        walkerClose
+            (fun () ->
+                if closed then
+                    None
+                else
+                    match a.next () with
+                    | Some x ->
+                        match b.next () with
+                        | Some y -> Some(mapping x y)
+                        | None ->
+                            close ()
+                            None
+                    | None ->
+                        close ()
+                        None
+            )
+            close
     )
 
 let zip3<'T1, 'T2, 'T3> (source1: SeqOf<'T1>) (source2: SeqOf<'T2>) (source3: SeqOf<'T3>) : SeqOf<'T1 * 'T2 * 'T3> =
     make (fun () ->
-        let a = walk source1
-        let b = walk source2
-        let c = walk source3
+        let a, b = walkPair source1 source2
 
-        walker
-        <| fun () ->
-            match a.next (), b.next (), c.next () with
-            | Some x, Some y, Some z -> Some(x, y, z)
-            | _ -> None
+        let c =
+            try
+                walk source3
+            with _ ->
+                try
+                    a.close ()
+                finally
+                    b.close ()
+
+                reraise ()
+
+        let mutable closed = false
+
+        let close () =
+            if not closed then
+                closed <- true
+
+                try
+                    a.close ()
+                finally
+                    try
+                        b.close ()
+                    finally
+                        c.close ()
+
+        walkerClose
+            (fun () ->
+                if closed then
+                    None
+                else
+                    match a.next (), b.next (), c.next () with
+                    | Some x, Some y, Some z -> Some(x, y, z)
+                    | _ ->
+                        close ()
+                        None
+            )
+            close
     )
 
 let scan<'State, 'T> (folder: 'State -> 'T -> 'State) (state: 'State) (source: SeqOf<'T>) : SeqOf<'State> =
@@ -806,17 +1047,19 @@ let scan<'State, 'T> (folder: 'State -> 'T -> 'State) (state: 'State) (source: S
         let mutable acc = state
         let mutable started = false
 
-        walker
-        <| fun () ->
-            if not started then
-                started <- true
-                Some acc
-            else
-                match w.next () with
-                | Some x ->
-                    acc <- folder acc x
+        walkerClose
+            (fun () ->
+                if not started then
+                    started <- true
                     Some acc
-                | None -> None
+                else
+                    match w.next () with
+                    | Some x ->
+                        acc <- folder acc x
+                        Some acc
+                    | None -> None
+            )
+            w.close
     )
 
 let replicate<'T> (count: int) (initial: 'T) : SeqOf<'T> =
@@ -839,7 +1082,7 @@ let distinctBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (source: S
                     next ()
             | None -> None
 
-        walker next
+        walkerClose next w.close
     )
 
 let except<'T when 'T: equality> (itemsToExclude: SeqOf<'T>) (source: SeqOf<'T>) : SeqOf<'T> =
@@ -856,7 +1099,7 @@ let except<'T when 'T: equality> (itemsToExclude: SeqOf<'T>) (source: SeqOf<'T>)
                     next ()
             | None -> None
 
-        walker next
+        walkerClose next w.close
     )
 
 let windowed<'T> (windowSize: int) (source: SeqOf<'T>) : SeqOf<'T[]> =
@@ -881,7 +1124,7 @@ let windowed<'T> (windowSize: int) (source: SeqOf<'T>) : SeqOf<'T[]> =
                     next ()
             | None -> None
 
-        walker next
+        walkerClose next w.close
     )
 
 let chunkBySize<'T> (chunkSize: int) (source: SeqOf<'T>) : SeqOf<'T[]> =
@@ -892,25 +1135,27 @@ let chunkBySize<'T> (chunkSize: int) (source: SeqOf<'T>) : SeqOf<'T[]> =
         let w = walk source
         let mutable finished = false
 
-        walker
-        <| fun () ->
-            if finished then
-                None
-            else
-                let chunk = ResizeArray<'T>()
-                let mutable go = true
-
-                while go && chunk.Count < chunkSize do
-                    match w.next () with
-                    | Some x -> chunk.Add x
-                    | None ->
-                        finished <- true
-                        go <- false
-
-                if chunk.Count = 0 then
+        walkerClose
+            (fun () ->
+                if finished then
                     None
                 else
-                    Some(chunk.ToArray())
+                    let chunk = ResizeArray<'T>()
+                    let mutable go = true
+
+                    while go && chunk.Count < chunkSize do
+                        match w.next () with
+                        | Some x -> chunk.Add x
+                        | None ->
+                            finished <- true
+                            go <- false
+
+                    if chunk.Count = 0 then
+                        None
+                    else
+                        Some(chunk.ToArray())
+            )
+            w.close
     )
 
 let cast<'T> (source: SeqOf<'T>) : SeqOf<'T> = source
@@ -920,17 +1165,20 @@ let readOnly<'T> (source: SeqOf<'T>) : SeqOf<'T> = source
 // ---- walking two at once ----
 
 let iterate2<'T1, 'T2> (action: 'T1 -> 'T2 -> unit) (source1: SeqOf<'T1>) (source2: SeqOf<'T2>) : unit =
-    let a = walk source1
-    let b = walk source2
-    let mutable go = true
+    walking2
+        source1
+        source2
+        (fun a b ->
+            let mutable go = true
 
-    while go do
-        match a.next () with
-        | Some x ->
-            match b.next () with
-            | Some y -> action x y
-            | None -> go <- false
-        | None -> go <- false
+            while go do
+                match a.next () with
+                | Some x ->
+                    match b.next () with
+                    | Some y -> action x y
+                    | None -> go <- false
+                | None -> go <- false
+        )
 
 let fold2<'State, 'T1, 'T2>
     (folder: 'State -> 'T1 -> 'T2 -> 'State)
@@ -944,66 +1192,75 @@ let fold2<'State, 'T1, 'T2>
     acc
 
 let exists2<'T1, 'T2> (predicate: 'T1 -> 'T2 -> bool) (source1: SeqOf<'T1>) (source2: SeqOf<'T2>) : bool =
-    let a = walk source1
-    let b = walk source2
-    let mutable found = false
-    let mutable go = true
+    walking2
+        source1
+        source2
+        (fun a b ->
+            let mutable found = false
+            let mutable go = true
 
-    while go && not found do
-        match a.next () with
-        | Some x ->
-            match b.next () with
-            | Some y -> found <- predicate x y
-            | None -> go <- false
-        | None -> go <- false
+            while go && not found do
+                match a.next () with
+                | Some x ->
+                    match b.next () with
+                    | Some y -> found <- predicate x y
+                    | None -> go <- false
+                | None -> go <- false
 
-    found
+            found
+        )
 
 let forAll2<'T1, 'T2> (predicate: 'T1 -> 'T2 -> bool) (source1: SeqOf<'T1>) (source2: SeqOf<'T2>) : bool =
     not (exists2 (fun x y -> not (predicate x y)) source1 source2)
 
 let compareWith<'T> (comparer: 'T -> 'T -> int) (source1: SeqOf<'T>) (source2: SeqOf<'T>) : int =
-    let a = walk source1
-    let b = walk source2
-    let mutable result = 0
-    let mutable go = true
+    walking2
+        source1
+        source2
+        (fun a b ->
+            let mutable result = 0
+            let mutable go = true
 
-    while go do
-        match a.next (), b.next () with
-        | Some x, Some y ->
-            let c = comparer x y
+            while go do
+                match a.next (), b.next () with
+                | Some x, Some y ->
+                    let c = comparer x y
 
-            if c <> 0 then
-                result <- c
-                go <- false
-        | Some _, None ->
-            result <- 1
-            go <- false
-        | None, Some _ ->
-            result <- -1
-            go <- false
-        | None, None -> go <- false
+                    if c <> 0 then
+                        result <- c
+                        go <- false
+                | Some _, None ->
+                    result <- 1
+                    go <- false
+                | None, Some _ ->
+                    result <- -1
+                    go <- false
+                | None, None -> go <- false
 
-    result
+            result
+        )
 
 // ---- what needs the whole sequence: through a list ----
 
 let tryFindIndex<'T> (predicate: 'T -> bool) (source: SeqOf<'T>) : int option =
-    let w = walk source
-    let mutable i = 0
-    let mutable found = None
-    let mutable go = true
+    walking
+        source
+        (fun w ->
+            let mutable i = 0
+            let mutable found = None
+            let mutable go = true
 
-    while go && found.IsNone do
-        match w.next () with
-        | Some x ->
-            if predicate x then
-                found <- Some i
+            while go && found.IsNone do
+                match w.next () with
+                | Some x ->
+                    if predicate x then
+                        found <- Some i
 
-            i <- i + 1
-        | None -> go <- false
+                    i <- i + 1
+                | None -> go <- false
 
-    found
+            found
+        )
 
 let findIndex<'T> (predicate: 'T -> bool) (source: SeqOf<'T>) : int =
     match tryFindIndex predicate source with
@@ -1039,24 +1296,28 @@ let foldBack2<'State, 'T1, 'T2>
     List.foldBack (fun (x, y) acc -> folder x y acc) (toList (zip source1 source2)) state
 
 let exactlyOne<'T> (source: SeqOf<'T>) : 'T =
-    let w = walk source
-
-    match w.next () with
-    | None -> emptyInput ()
-    | Some x ->
-        match w.next () with
-        | None -> x
-        | Some _ -> invalidArg "source" "The input sequence contains more than one element."
+    walking
+        source
+        (fun w ->
+            match w.next () with
+            | None -> emptyInput ()
+            | Some x ->
+                match w.next () with
+                | None -> x
+                | Some _ -> invalidArg "source" "The input sequence contains more than one element."
+        )
 
 let tryExactlyOne<'T> (source: SeqOf<'T>) : 'T option =
-    let w = walk source
-
-    match w.next () with
-    | None -> None
-    | Some x ->
-        match w.next () with
-        | None -> Some x
-        | Some _ -> None
+    walking
+        source
+        (fun w ->
+            match w.next () with
+            | None -> None
+            | Some x ->
+                match w.next () with
+                | None -> Some x
+                | Some _ -> None
+        )
 
 let reduceBack<'T> (reduction: 'T -> 'T -> 'T) (source: SeqOf<'T>) : 'T =
     match toList source with
@@ -1149,7 +1410,7 @@ let private edited<'T>
 
                         next ()
 
-        walker next
+        walkerClose next w.close
     )
 
 let insertAt<'T> (index: int) (value: 'T) (source: SeqOf<'T>) : SeqOf<'T> =
@@ -1341,16 +1602,22 @@ let ofGetEnumerator<'T> (get: unit -> System.Collections.Generic.IEnumerator<'T>
         let e = get ()
         let mutable ended = false
 
-        walker
-        <| fun () ->
-            if ended then
-                None
-            elif e.MoveNext() then
-                Some e.Current
-            else
+        let close () =
+            if not ended then
                 ended <- true
                 e.Dispose()
-                None
+
+        walkerClose
+            (fun () ->
+                if ended then
+                    None
+                elif e.MoveNext() then
+                    Some e.Current
+                else
+                    close ()
+                    None
+            )
+            close
     )
 
 /// `(s :> IEnumerable<'T>).GetEnumerator()`: an enumerator over a walk of the sequence
@@ -1375,5 +1642,5 @@ let getEnumerator<'T> (source: SeqOf<'T>) : System.Collections.Generic.IEnumerat
           member _.Reset() =
               raise (System.NotSupportedException "Specified method is not supported.")
       interface System.IDisposable with
-          member _.Dispose() = ()
+          member _.Dispose() = w.close ()
     }

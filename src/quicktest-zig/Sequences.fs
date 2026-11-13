@@ -63,6 +63,23 @@ let run () : int =
     for i in 10..-3..1 do
         walked <- walked + string i
 
+    let mutable closedEarly = 0
+
+    let guarded =
+        seq {
+            try
+                yield 10
+                yield 20
+                yield 30
+            finally
+                closedEarly <- closedEarly + 1
+        }
+
+    let takenOne = guarded |> Seq.take 1 |> Seq.toList
+    let headItem = guarded |> Seq.head
+    let truncZero = guarded |> Seq.truncate 0 |> Seq.toList
+    let picked = guarded |> Seq.tryFind (fun x -> x = 20)
+
     let failed =
         same
             "[2; 4; 6]|[1; 2; 3; 4; 5]|[|0; 2; 4; 6; 8; 10|]"
@@ -141,6 +158,13 @@ let run () : int =
             && List.ofSeq (ResizeArray [ 1; 2 ]) = [ 1; 2 ]
         )
         + check (Seq.length (Seq.initInfinite id |> Seq.take 1000) = 1000)
+        + check (
+            takenOne = [ 10 ]
+            && headItem = 10
+            && truncZero = []
+            && picked = Some 20
+            && closedEarly = 3
+        )
 
     printfn "sequences: %d" failed
 
