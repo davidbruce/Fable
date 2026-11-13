@@ -1080,7 +1080,7 @@ let ``test Convert.ToHexStringLower works`` () =
     Convert.ToHexStringLower([||]) |> equal ""
     Convert.ToHexStringLower(bytes, 1, 3) |> equal "fbfcfd"
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: a null array, System.Guid)
+#if !FABLE_COMPILER_ZIG // (a default value of this type)
 [<Fact>]
 let ``test Convert.ToHexString checks its arguments`` () =
     let bytes = [| 250uy; 251uy; 252uy; 253uy; 254uy |]
@@ -1513,7 +1513,6 @@ let ``test BigInt.ToString works`` () =
 //-------------------------------------
 
 // id is prefixed for guid creation as we check at compile time (if able) to create a string const
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: a null array, System.Guid)
 [<Fact>]
 let ``test Guid.Parse works`` () =
     let guids = [
@@ -1541,9 +1540,7 @@ let ``test Guid.Parse works`` () =
 
     guids
     |> List.iter (fun g -> g.ToString() |> equal "96258006-c4ba-4a7f-80c4-de7f2b2898c5")
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: a null array, System.Guid)
 [<Fact>]
 let ``test Guid.TryParse works`` () =
     let successGuids = [
@@ -1577,9 +1574,7 @@ let ``test Guid.TryParse works`` () =
 
     failGuids
     |> List.iter (fst >> (equal false))
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: a null array, System.Guid)
 [<Fact>]
 let ``test Parsed guids with different case are considered the same`` () = // See #1718
     let aGuid = Guid.NewGuid()
@@ -1591,4 +1586,3 @@ let ``test Parsed guids with different case are considered the same`` () = // Se
     let lowerGuid = Guid.Parse lower
     let upperGuid = Guid.Parse upper
     lowerGuid = upperGuid |> equal true
-#endif
