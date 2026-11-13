@@ -120,6 +120,7 @@ let handle (args: string list) =
     BuildFableLibraryPython().Run(true)
     BuildFableLibraryRust().Run(true)
     BuildFableLibraryTypeScript().Run(true)
+    BuildFableLibraryZig().Run(true)
 
     // Handle the NPM packages
 

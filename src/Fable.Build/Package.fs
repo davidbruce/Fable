@@ -20,6 +20,7 @@ let handle (args: string list) =
     BuildFableLibraryPython().Run(forceFableLibrary)
     BuildFableLibraryRust().Run(forceFableLibrary)
     BuildFableLibraryTypeScript().Run(forceFableLibrary)
+    BuildFableLibraryZig().Run(forceFableLibrary)
 
     Directory.clean packageDestination
 
