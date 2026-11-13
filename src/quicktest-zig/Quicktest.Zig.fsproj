@@ -23,6 +23,7 @@
     <Compile Include="Numbers.fs" />
     <Compile Include="Maps.fs" />
     <Compile Include="Loops.fs" />
+    <Compile Include="Features.fs" />
     <Compile Include="QuickTest.fs" />
   </ItemGroup>
   <ItemGroup>

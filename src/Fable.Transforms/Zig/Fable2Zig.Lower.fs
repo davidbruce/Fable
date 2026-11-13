@@ -449,6 +449,39 @@ let private resultEnt (state: FileState) : Ent =
         state.UsesRuntime <- true
         e
 
+/// F#'s `Choice<..>` (what a multi-case active pattern gives): a union of the runtime library.
+let private choiceEnt (state: FileState) (fullName: string) : Ent =
+    match state.Ents.TryGetValue fullName with
+    | true, e -> e
+    | _ ->
+        let n = int (fullName.Substring(fullName.IndexOf '`' + 1))
+        let typeParams = List.init n (fun i -> $"T%d{i + 1}")
+
+        let e =
+            {
+                Name = $"fable_rt.Choice%d{n}"
+                Ref =
+                    {
+                        FullName = fullName
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KValueUnion
+                TypeParams = typeParams
+                Cases =
+                    typeParams
+                    |> List.mapi (fun i p -> $"Choice%d{i + 1}Of%d{n}", [ "Item", TGen p ])
+                MutableFields = []
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        state.Ents[fullName] <- e
+        state.UsesRuntime <- true
+        e
+
 /// F#'s array: a cell of the runtime library whose items can be assigned.
 let private arrayEnt (state: FileState) : Ent =
     match state.Ents.TryGetValue "$array" with
@@ -511,6 +544,68 @@ let private netEnt (state: FileState) (name: string) : Ent =
             }
 
         state.Ents[key] <- e
+        state.UsesRuntime <- true
+        e
+
+/// An anonymous record: a struct of the runtime library, one type per shape (the names of the
+/// fields, which F# sorts), whichever file makes it.
+let private anonEnt (state: FileState) (names: string[]) : Ent =
+    let key = "$anon:" + String.concat "," names
+
+    match state.Ents.TryGetValue key with
+    | true, e -> e
+    | _ ->
+        let typeParams = names |> Array.mapi (fun i _ -> $"A%d{i}") |> List.ofArray
+
+        let e =
+            {
+                // (a name of the file, declared at its top as the runtime's type of this shape)
+                Name = "fable_anon_" + String.concat "_" names + ".of"
+                Ref =
+                    {
+                        FullName = key
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KRecord
+                TypeParams = typeParams
+                Cases = [ "", List.zip (List.ofArray names) (typeParams |> List.map TGen) ]
+                MutableFields = []
+                Managed = false
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        state.Ents[key] <- e
+        state.UsesRuntime <- true
+        e
+
+/// `lazy`: a cell of the runtime library that holds the code, then the value.
+let private lazyEnt (state: FileState) : Ent =
+    match state.Ents.TryGetValue "$lazy" with
+    | true, e -> e
+    | _ ->
+        let e =
+            {
+                Name = "fable_rt.Lazy"
+                Ref =
+                    {
+                        FullName = "System.Lazy`1"
+                        Path = Fable.CoreAssemblyName "System.Runtime"
+                    }
+                Kind = KRefRecord
+                TypeParams = [ "T" ]
+                Cases = [ "", [ "value", TGen "T"; "thunk", TFn([ tVoid ], TGen "T") ] ]
+                MutableFields = [ "value"; "thunk" ]
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        state.Ents["$lazy"] <- e
         state.UsesRuntime <- true
         e
 
@@ -578,6 +673,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
+    | Fable.AnonymousRecordType(names, genArgs, _) -> TEnt(anonEnt ctx.State names, genArgs |> List.map (mapType ctx r))
+    | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Lazy`1" -> TEnt(lazyEnt ctx.State, [ mapType ctx r t ])
     | Fable.Array(t, _) -> TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Collections.Generic.Dictionary`2" ->
         TEnt(netEnt ctx.State "Dictionary", [ mapType ctx r k; mapType ctx r v ])
@@ -607,6 +704,8 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
     match ctx.State.Ents.TryGetValue entRef.FullName with
     | true, e -> e
     | _ when entRef.FullName = resultName -> resultEnt ctx.State
+    | _ when entRef.FullName.StartsWith("Microsoft.FSharp.Core.FSharpChoice`", System.StringComparison.Ordinal) ->
+        choiceEnt ctx.State entRef.FullName
     | _ ->
         let ent =
             match ctx.Com.TryGetEntity entRef with
@@ -1507,6 +1606,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 ctx
                 (values |> List.map (lw ctx))
                 (fun xs -> ECon(TTuple(xs |> List.map typeOf), "", xs, None))
+        | Fable.NewAnonymousRecord(values, names, genArgs, _) ->
+            let ty = TEnt(anonEnt ctx.State names, genArgs |> List.map (mapType ctx r))
+            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
         // `[| a; b |]`, and an array of a given length
         | Fable.NewArray(Fable.ArrayValues values, t, _) ->
             let ty = TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
@@ -2255,6 +2357,8 @@ and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
         | Fable.List inner -> go inner
         | Fable.Option(_, true) -> fail r "the Zig target cannot write a voption with %%A yet"
         | Fable.Tuple(ts, false) -> List.iter go ts
+        | Fable.AnonymousRecordType(_, genArgs, _) -> List.iter go genArgs
+        | Fable.DeclaredType(ent, [ inner ]) when ent.FullName = "System.Lazy`1" -> go inner
         | Fable.Tuple(_, true) -> fail r "the Zig target cannot write a struct tuple with %%A yet"
         | Fable.LambdaType _
         | Fable.DelegateType _ -> fail r "the Zig target cannot write a function value with %%A yet"
@@ -2905,6 +3009,15 @@ and dotnetCall
         | "UnionWith", [ Uncast xs ] when (listItem xs.Type).IsSome ->
             pure' "fable_rt.setUnionList($0, $1)" [ h; xs ] tVoid
         | _ -> fail r "the Zig target does not support HashSet.%s yet" name
+
+    // ---- lazy ----
+    | "Microsoft.FSharp.Control.LazyExtensions", "Create", [ f ] ->
+        pure' "fable_rt.lazyNew($R, $0)" [ f ] (mapType ctx r t)
+    | "Microsoft.FSharp.Control.LazyExtensions", "CreateFromValue", [ v ] ->
+        pure' "fable_rt.lazyOf($R, $0)" [ v ] (mapType ctx r t)
+    | ("Microsoft.FSharp.Control.LazyExtensions" | "System.Lazy`1"), ("Force" | "get_Value"), l :: _ ->
+        rt "fable_rt.lazyForce($0)" [ l ] (mapType ctx r t)
+    | "System.Lazy`1", "get_IsValueCreated", [ l ] -> pure' "fable_rt.lazyIsCreated($0)" [ l ] tBool
 
     // ---- chars: each code unit to what .NET maps it to (there is no current culture) ----
     | "System.Char", ("ToUpper" | "ToUpperInvariant"), [ c ] -> pure' "fable_rt.unicode.toUpper($0)" [ c ] tChar

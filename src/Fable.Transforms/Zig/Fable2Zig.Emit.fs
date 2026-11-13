@@ -1635,6 +1635,17 @@ let emitFile (state: FileState) : string =
     if state.Consts.Count > 0 then
         out.AppendLine() |> ignore
 
+    // the anonymous records the file uses: the runtime's type of each shape
+    for kv in state.Ents do
+        if kv.Key.StartsWith("$anon:", System.StringComparison.Ordinal) then
+            let names = kv.Key.Substring(6).Split(',')
+            let quoted = names |> Array.map (fun n -> "\"" + n + "\"") |> String.concat ", "
+
+            let alias = "fable_anon_" + String.concat "_" names
+
+            out.AppendLine($"const %s{alias} = fable_rt.Anon%d{names.Length}(.{{ %s{quoted} }});")
+            |> ignore
+
     // Module-level values that are computed: each has a place, filled when the program starts
     // (after the values of the files this one uses) and given up when it ends.
     for (name, ty, _) in state.Values do

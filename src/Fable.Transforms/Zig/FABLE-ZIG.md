@@ -77,6 +77,14 @@ of its own, because the value may be replaced while the reader still uses it.
 A `let mutable` inside a function that a function declared there reads or assigns is a ref
 cell that both share, which is what F# makes of it on .NET.
 
+Active patterns (also partial, parameterised and with several cases, which give F#'s `Choice`,
+a union of the runtime library), enums, struct records and unions, and units of measure work
+as they do on .NET. An anonymous record is a struct of the runtime library, one type per shape
+(`fable_rt.Anon2(.{ "Age", "Name" }).of(i32, String)`, declared at the top of each file that
+uses it), so two files that make the same shape have the same type. `lazy` is a cell that
+holds the code, then the value, or the exception the code raised, which every later `Force`
+raises again, as on .NET.
+
 `[<Emit("...")>]` is supported for Zig text, with `$0`, `$1`, ... standing for the arguments.
 
 ## Ownership

@@ -199,14 +199,19 @@ pub fn isManaged(comptime T: type) bool {
     }
 }
 
-/// A union whose cases are cells: the handle of a recursive union.
+/// A union whose cases are cells: the handle of a recursive union. (Every case with fields is
+/// a cell of its own; an exception is a cell too, so a union that holds one among other
+/// values is not one.)
 fn isHeapUnion(comptime T: type) bool {
     switch (@typeInfo(T)) {
         .@"union" => |u| {
+            var any = false;
             inline for (u.field_types) |F| {
-                if (isCellPtr(F)) return true;
+                if (F == void) continue;
+                if (!isCellPtr(F) or F == Exn) return false;
+                any = true;
             }
-            return false;
+            return any;
         },
         else => return false,
     }
@@ -535,6 +540,310 @@ pub fn Result(comptime T: type, comptime E: type) type {
         Ok: struct { ResultValue: T },
         Error: struct { ErrorValue: E },
     };
+}
+
+/// F#'s `Choice` of two to seven cases.
+pub fn Choice2(comptime T1: type, comptime T2: type) type {
+    return union(enum) { Choice1Of2: struct { Item: T1 }, Choice2Of2: struct { Item: T2 } };
+}
+
+pub fn Choice3(comptime T1: type, comptime T2: type, comptime T3: type) type {
+    return union(enum) { Choice1Of3: struct { Item: T1 }, Choice2Of3: struct { Item: T2 }, Choice3Of3: struct { Item: T3 } };
+}
+
+pub fn Choice4(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type) type {
+    return union(enum) { Choice1Of4: struct { Item: T1 }, Choice2Of4: struct { Item: T2 }, Choice3Of4: struct { Item: T3 }, Choice4Of4: struct { Item: T4 } };
+}
+
+pub fn Choice5(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type) type {
+    return union(enum) { Choice1Of5: struct { Item: T1 }, Choice2Of5: struct { Item: T2 }, Choice3Of5: struct { Item: T3 }, Choice4Of5: struct { Item: T4 }, Choice5Of5: struct { Item: T5 } };
+}
+
+pub fn Choice6(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type) type {
+    return union(enum) { Choice1Of6: struct { Item: T1 }, Choice2Of6: struct { Item: T2 }, Choice3Of6: struct { Item: T3 }, Choice4Of6: struct { Item: T4 }, Choice5Of6: struct { Item: T5 }, Choice6Of6: struct { Item: T6 } };
+}
+
+pub fn Choice7(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type) type {
+    return union(enum) { Choice1Of7: struct { Item: T1 }, Choice2Of7: struct { Item: T2 }, Choice3Of7: struct { Item: T3 }, Choice4Of7: struct { Item: T4 }, Choice5Of7: struct { Item: T5 }, Choice6Of7: struct { Item: T6 }, Choice7Of7: struct { Item: T7 } };
+}
+
+/// An anonymous record with these fields (F# sorts them by name): one type per shape,
+/// whichever file makes it. `Anon2(.{ "Age", "Name" }).of(i32, String)`.
+pub fn Anon1(comptime names: [1][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type) type {
+            return @Struct(.auto, null, &names, &.{T1}, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon2(comptime names: [2][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon3(comptime names: [3][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon4(comptime names: [4][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon5(comptime names: [5][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon6(comptime names: [6][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon7(comptime names: [7][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon8(comptime names: [8][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon9(comptime names: [9][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon10(comptime names: [10][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon11(comptime names: [11][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon12(comptime names: [12][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon13(comptime names: [13][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon14(comptime names: [14][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon15(comptime names: [15][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon16(comptime names: [16][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon17(comptime names: [17][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon18(comptime names: [18][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon19(comptime names: [19][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon20(comptime names: [20][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon21(comptime names: [21][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon22(comptime names: [22][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon23(comptime names: [23][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type, comptime T23: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23 }, &@splat(.{}));
+        }
+    };
+}
+
+pub fn Anon24(comptime names: [24][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type, comptime T23: type, comptime T24: type) type {
+            return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23, T24 }, &@splat(.{}));
+        }
+    };
+}
+
+/// F#'s `lazy`: the code that computes the value, then the value, or the exception the code
+/// raised, which every later `Force` raises again (as on .NET).
+pub fn Lazy(comptime T: type) type {
+    return *struct {
+        const Self = @This();
+        pub const fable_identity = {};
+        pub const fable_cyclic = functions_in_cycles or holdsCyclic(T);
+        @"$rc": u32 = 1,
+        @"$gc": GcHdr(fable_cyclic) = undefined,
+        state: union(enum) {
+            thunk: Func(*const fn (?*Env, void) Raised!T),
+            value: T,
+            failed: Exn,
+        },
+
+        pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
+            return switch (x.state) {
+                // (.NET writes the value's ToString)
+                .value => |v| showPlain(b, v, depth),
+                else => b.word("Value is not created."),
+            };
+        }
+    };
+}
+
+/// `lazy (expr)`
+pub fn lazyNew(comptime L: type, thunk: anytype) L {
+    const C = @typeInfo(L).pointer.child;
+    if (comptime hasGc(C)) gcTick();
+    const c = allocator.create(C) catch @panic("fable: out of memory");
+    c.* = .{ .state = .{ .thunk = dup(thunk) } };
+    if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
+    if (track) thread.stats.allocs += 1;
+    return c;
+}
+
+/// `Lazy.CreateFromValue v`
+pub fn lazyOf(comptime L: type, value: anytype) L {
+    const C = @typeInfo(L).pointer.child;
+    if (comptime hasGc(C)) gcTick();
+    const c = allocator.create(C) catch @panic("fable: out of memory");
+    c.* = .{ .state = .{ .value = dup(value) } };
+    if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
+    if (track) thread.stats.allocs += 1;
+    return c;
+}
+
+fn lazyState(l: anytype, new_state: @TypeOf(l.state)) void {
+    const old = l.state;
+    l.state = new_state;
+    if (gcOf(l)) |h| {
+        eachHdr(old, h, unstored);
+        eachHdr(l.state, h, stored);
+    } else touch(l.state);
+    drop(old);
+}
+
+/// `l.Force()`, `l.Value`
+pub fn lazyForce(l: anytype) Raised!@FieldType(@TypeOf(l.state), "value") {
+    switch (l.state) {
+        .value => |v| return dup(v),
+        .failed => |e| {
+            throw(dup(e));
+            return error.Raised;
+        },
+        .thunk => |f| {
+            // (the code is kept alive while it runs: it may drop the last other reference)
+            const code = dup(f);
+            defer drop(code);
+            const v = code.code(code.env, {}) catch |err| {
+                const e = take();
+                lazyState(l, .{ .failed = dup(e) });
+                throw(e);
+                return err;
+            };
+            lazyState(l, .{ .value = v });
+            return dup(v);
+        },
+    }
+}
+
+pub fn lazyIsCreated(l: anytype) bool {
+    return l.state == .value;
 }
 
 /// F#'s list.
