@@ -5208,11 +5208,7 @@ and dotnetCall
     let tChar = TPrim "u16"
     let tF64 = TPrim "f64"
 
-    let zigTypeOf (ty: Ty) =
-        match ty with
-        | TPrim name -> name
-        | _ -> fail r "internal: not a number type"
-
+    // (the Zig name of a number type)
     let zigTypeName (ty: Ty) =
         match ty with
         | TPrim name -> name
@@ -5390,12 +5386,12 @@ and dotnetCall
         | "Sum", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.listSum($0)", xs, ty))
         | "Average", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> ERt("fable_rt.listAverage($0)", xs, ty))
         | "SumBy", [ f; _ ] ->
-            bindArgs ctx [ lw ctx f; listIr ] (fun xs -> ERt($"fable_rt.listSumBy(%s{zigTypeOf ty}, $0, $1)", xs, ty))
+            bindArgs ctx [ lw ctx f; listIr ] (fun xs -> ERt($"fable_rt.listSumBy(%s{zigTypeName ty}, $0, $1)", xs, ty))
         | "AverageBy", [ f; _ ] ->
             bindArgs
                 ctx
                 [ lw ctx f; listIr ]
-                (fun xs -> ERt($"fable_rt.listAverageBy(%s{zigTypeOf ty}, $0, $1)", xs, ty))
+                (fun xs -> ERt($"fable_rt.listAverageBy(%s{zigTypeName ty}, $0, $1)", xs, ty))
         | _ -> fail r "internal: a sum"
 
     // ---- task: the builder (which has no state) and the members of a task ----
@@ -6782,9 +6778,9 @@ and dotnetCall
         let ty = mapType ctx r t
 
         if isFloatTy ty then
-            pure' $"fable_rt.decToFloat(%s{zigTypeOf ty}, $0)" [ x ] ty
+            pure' $"fable_rt.decToFloat(%s{zigTypeName ty}, $0)" [ x ] ty
         elif intBits ty > 0 then
-            rt $"fable_rt.decToInt(%s{zigTypeOf ty}, $0)" [ x ] ty
+            rt $"fable_rt.decToInt(%s{zigTypeName ty}, $0)" [ x ] ty
         else
             fail r "the Zig target cannot convert a decimal to %A yet" t
 
@@ -6855,9 +6851,9 @@ and dotnetCall
         let ty = mapType ctx r t
 
         if isFloatTy ty then
-            pure' $"fable_rt.bigToFloat(%s{zigTypeOf ty}, $0)" [ x ] ty
+            pure' $"fable_rt.bigToFloat(%s{zigTypeName ty}, $0)" [ x ] ty
         elif intBits ty > 0 then
-            rt $"fable_rt.bigToInt(%s{zigTypeOf ty}, $0)" [ x ] ty
+            rt $"fable_rt.bigToInt(%s{zigTypeName ty}, $0)" [ x ] ty
         elif ty = tBig then
             lw ctx x
         else
@@ -6898,7 +6894,7 @@ and dotnetCall
         if x.Type = Fable.String then
             dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
         elif intBits ty > 0 then
-            bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.checkedConv(%s{zigTypeOf ty}, $0)", xs, ty))
+            bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.checkedConv(%s{zigTypeName ty}, $0)", xs, ty))
         else
             dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
 
@@ -8396,12 +8392,19 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         IsEntryPoint = entry
                         Range = d.Body.Range
                     }
-        with ZigError(msg, r) ->
+        with
+        | ZigError(msg, r) ->
             report
                 (match r with
                  | Some _ -> r
                  | None -> d.Body.Range)
                 msg
+        // (a case the target did not foresee: an error at the declaration, not a crash of the
+        // whole file)
+        | e when not (e :? System.OutOfMemoryException) ->
+            report
+                d.Body.Range
+                $"internal error of the Zig target while compiling %s{d.Name}: %s{e.GetType().Name}: %s{e.Message}"
 
     settleCyclic state
     settleCycles state

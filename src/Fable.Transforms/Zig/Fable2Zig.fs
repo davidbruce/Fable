@@ -37,8 +37,17 @@ let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
                 eprintfn "ZIGTIME emit %dms" sw.ElapsedMilliseconds
 
             text
-        with ZigError(msg, r) ->
+        with
+        | ZigError(msg, r) ->
             com.AddLog(msg, Severity.Error, ?range = r, fileName = com.CurrentFile)
+            ""
+        | e when not (e :? System.OutOfMemoryException) ->
+            com.AddLog(
+                $"internal error of the Zig target: %s{e.GetType().Name}: %s{e.Message}",
+                Severity.Error,
+                fileName = com.CurrentFile
+            )
+
             ""
 
     {
