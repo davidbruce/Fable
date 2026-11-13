@@ -4403,18 +4403,6 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.ObjectExpr(members, ifaceType, None) when isInterfaceType ctx.Com ifaceType ->
         let ifaceTy = mapType ctx e.Range ifaceType
 
-        let byName =
-            members
-            |> List.map (fun m ->
-                let compiled =
-                    match ctx.Com.TryGetMember m.MemberRef with
-                    | Some info -> info.CompiledName
-                    | None -> m.Name
-
-                compiled, m
-            )
-            |> dict
-
         let rec usesIdent (name: string) (e: Fable.Expr) =
             match e with
             | Fable.IdentExpr id -> id.Name = name
@@ -4445,22 +4433,18 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
                 let notObj (m: Fable.ObjectExprMember) = m.Body.Type <> Fable.Any
 
-                match several |> List.tryFind (snd >> returns) with
-                | Some(_, m) -> Some m
-                | None ->
-                    match several |> List.tryFind (snd >> notObj) with
-                    | Some(_, m) -> Some m
-                    | None -> Some(snd several.Head)
+                several
+                |> List.tryFind (snd >> returns)
+                |> Option.orElse (several |> List.tryFind (snd >> notObj))
+                |> Option.defaultValue several.Head
+                |> snd
+                |> Some
 
         let closures =
             caseFields ifaceTy ""
             |> List.map (fun (f, fty) ->
-                match
-                    pick f fty
-                    |> Option.map (fun m -> true, m)
-                    |> Option.defaultValue (false, Unchecked.defaultof<_>)
-                with
-                | true, m ->
+                match pick f fty with
+                | Some m ->
                     match m.Args with
                     | this :: args ->
                         if usesIdent this.Name m.Body then
@@ -4468,7 +4452,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
                         lw ctx (Fable.Delegate(args, m.Body, None, []))
                     | [] -> fail e.Range "internal: a member without its object"
-                | _ -> fail e.Range "the Zig target cannot find the member %s in this object expression" f
+                | None -> fail e.Range "the Zig target cannot find the member %s in this object expression" f
             )
 
         bindArgsIn true ctx closures (fun xs -> ECon(ifaceTy, "", xs, None))
