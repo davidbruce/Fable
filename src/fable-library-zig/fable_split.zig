@@ -485,8 +485,8 @@ pub fn strEndsWithOpt(s: String, value: String, ignore_case: bool) Raised!bool {
     return if (ignore_case) strEndsWithIgnoreCase(s, value) else rt.strEndsWith(s, value);
 }
 
-// Primary ASCII linguistic weights matching .NET's InvariantCulture sort order
-// (punctuation/symbols < digits < letters, case folded).
+// The base weights of ASCII in .NET's InvariantCulture order (punctuation and symbols <
+// digits < letters, case folded).
 const ascii_primary: [128]u8 = blk: {
     @setEvalBranchQuota(10000);
     var tbl: [128]u8 = @splat(0);
@@ -510,37 +510,85 @@ const ascii_primary: [128]u8 = blk: {
     break :blk tbl;
 };
 
-fn primaryWeight(c: u16) u32 {
-    if (c < 128) return ascii_primary[c];
-    return 0x100 + @as(u32, unicode.toUpper(c));
+const collation = @import("fable_collation.zig");
+
+/// One collation element: its base weight, its accent rank, its case (lower before upper)
+const CollElem = struct { primary: u32, secondary: u8, tertiary: u8 };
+
+/// The collation elements of a string, one by one: ignorable chars give none, a char like Æ
+/// gives two (A, E)
+/// the base weight of an ASCII char (room after each for the letters sorted after it)
+fn base(c: u8) u32 {
+    return @as(u32, ascii_primary[c]) * 256;
 }
 
-fn caseWeight(c: u16) u2 {
-    if (unicode.toUpper(c) != c) return 0;
-    if (unicode.toLower(c) != c) return 1;
-    return 2;
-}
+const CollIter = struct {
+    units: []const u16,
+    i: usize = 0,
+    pending: ?CollElem = null,
 
-/// Linguistic / InvariantCulture ordering of two UTF-16 unit slices: primary base weight
-/// first (case-insensitive), then lowercase before uppercase when primary weights match.
-pub fn strCompareCultureUnits(x: []const u16, y: []const u16, ignore_case: bool) i32 {
-    const n = @min(x.len, y.len);
-    for (x[0..n], y[0..n]) |c, d| {
-        const pc = primaryWeight(c);
-        const pd = primaryWeight(d);
-        if (pc != pd) return if (pc < pd) -1 else 1;
-    }
-    if (x.len != y.len) return if (x.len < y.len) -1 else 1;
-    if (ignore_case) return 0;
-    for (x, y) |c, d| {
-        if (c != d) {
-            const wc = caseWeight(c);
-            const wd = caseWeight(d);
-            if (wc != wd) return if (wc < wd) -1 else 1;
-            return if (c < d) -1 else 1;
+    fn next(it: *CollIter) ?CollElem {
+        if (it.pending) |e| {
+            it.pending = null;
+            return e;
         }
+        while (it.i < it.units.len) {
+            const c = it.units[it.i];
+            it.i += 1;
+            if (c < collation.latin_coll.len) {
+                const e = collation.latin_coll[c];
+                const t: u8 = e.ter;
+                switch (e.kind) {
+                    1 => continue,
+                    2 => {
+                        if (e.b1 != 0) it.pending = .{ .primary = base(e.b1), .secondary = 0, .tertiary = t };
+                        return .{ .primary = base(e.b0), .secondary = e.sec, .tertiary = t };
+                    },
+                    3 => return .{ .primary = base(e.b0) + e.sec, .secondary = 0, .tertiary = t },
+                    else => if (c < 128) return .{ .primary = base(@intCast(c)), .secondary = 0, .tertiary = 0 },
+                }
+            }
+            // (other scripts: by the code point of the upper case, after the Latin letters)
+            const upper = unicode.toUpper(c);
+            return .{ .primary = 0x10000 + @as(u32, upper), .secondary = 0, .tertiary = @intFromBool(upper == c and unicode.toLower(c) != c) };
+        }
+        return null;
     }
-    return 0;
+};
+
+fn collLevel(x: []const u16, y: []const u16, comptime level: u2) i32 {
+    var a: CollIter = .{ .units = x };
+    var b: CollIter = .{ .units = y };
+    while (true) {
+        const ea = a.next();
+        const eb = b.next();
+        if (ea == null and eb == null) return 0;
+        if (ea == null) return -1;
+        if (eb == null) return 1;
+        const wa: u32 = switch (level) {
+            0 => ea.?.primary,
+            1 => ea.?.secondary,
+            else => ea.?.tertiary,
+        };
+        const wb: u32 = switch (level) {
+            0 => eb.?.primary,
+            1 => eb.?.secondary,
+            else => eb.?.tertiary,
+        };
+        if (wa != wb) return if (wa < wb) -1 else 1;
+    }
+}
+
+/// InvariantCulture ordering of two UTF-16 unit slices, as .NET's: the base letters first
+/// (punctuation < digits < letters, control chars ignored), then accents, then case (lower
+/// before upper) unless it is ignored. Latin (U+0000..U+024F) is .NET's, from a table made
+/// with .NET; other scripts are ordered by code point.
+pub fn strCompareCultureUnits(x: []const u16, y: []const u16, ignore_case: bool) i32 {
+    const p = collLevel(x, y, 0);
+    if (p != 0) return p;
+    const s = collLevel(x, y, 1);
+    if (s != 0 or ignore_case) return s;
+    return collLevel(x, y, 2);
 }
 
 pub fn strCompareCulture(a: String, b: String, ignore_case: bool) i32 {

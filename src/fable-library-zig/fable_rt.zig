@@ -7228,4 +7228,26 @@ test "culture string comparison matches .NET InvariantCulture weights" {
     try std.testing.expect(try strStartsWithOpt(str("ABCD"), str("ab"), true));
     try std.testing.expect(try strEndsWithOpt(str("ABCD"), str("cd"), true));
     try std.testing.expectEqual(@as(i32, 1), try strIndexOfCharIgnoreCase(str("aBc"), 'B'));
+    // (pairs checked with .NET: accents after the base letter, expansions, ignorable control
+    // chars, letters without a base after their neighbour; the table was also checked against
+    // 3,000 random pairs over U+0000..U+024F, see fable_collation.zig)
+    const pairs = .{
+        .{ "e", "é", -1 },
+        .{ "é", "f", -1 },
+        .{ "z", "é", 1 },
+        .{ "co-op", "coop", -1 },
+        .{ "a-b", "ab", -1 },
+        .{ "Æ", "AE", 1 },
+        .{ "ss", "ß", -1 },
+        .{ "résumé", "resume", 1 },
+        .{ "ı", "z", -1 },
+        .{ "o", "ı", 1 },
+        .{ "\u{1}", "", 0 },
+        .{ "\u{a0}", " ", 1 },
+        .{ "file10", "file9", -1 },
+        .{ "a", "A", -1 },
+    };
+    inline for (pairs) |t| {
+        try std.testing.expectEqual(@as(i32, t[2]), strCompareCulture(str(t[0]), str(t[1]), false));
+    }
 }
