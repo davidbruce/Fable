@@ -2074,6 +2074,8 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
     | "Microsoft.FSharp.Collections.FSharpList`1" when name = "GetSlice" -> Some("List", "getSlice")
     | "Microsoft.FSharp.Collections.FSharpList`1" when name = "Cons" -> Some("List", "cons")
     | "Microsoft.FSharp.Collections.ListModule" when name = "ToSeq" -> Some("Seq", "ofList")
+    | "Microsoft.FSharp.Collections.ArrayModule" when name = "ToSeq" -> Some("Seq", "ofArray")
+    | "Microsoft.FSharp.Collections.ArrayModule" when name = "OfSeq" -> Some("Seq", "toArray")
     | "Microsoft.FSharp.Collections.SeqModule" when name = "Tail" -> Some("Seq", "tail")
     | "Microsoft.FSharp.Core.OptionModule"
     | "Microsoft.FSharp.Core.ValueOption" when
@@ -2144,7 +2146,9 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
              SortDescending SortByDescending SortInPlaceWith SortInPlace SortInPlaceBy Distinct DistinctBy GroupBy
              CountBy Indexed Zip Unzip Map2 Iterate2 Fold2 Exists2 ForAll2 Partition Take Truncate Skip TakeWhile
              SkipWhile SplitAt ChunkBySize Windowed Pairwise AllPairs Except CopyTo InsertAt InsertManyAt RemoveAt
-             RemoveManyAt UpdateAt"
+             RemoveManyAt UpdateAt Where Tail TryExactlyOne TryFindIndexBack FindIndexBack FindBack ReduceBack ScanBack
+             MapFold MapFoldBack Map3 MapIndexed2 IterateIndexed2 FoldBack2 Zip3 Unzip3 Transpose SplitInto Permute
+             CompareWith"
         ->
         Some(
             "Array",
@@ -5475,7 +5479,17 @@ and dotnetCall
     | "System.String", "IsNullOrWhiteSpace", [ s ] -> pure' "fable_rt.strIsNullOrWhiteSpace($0)" [ s ] tBool
     | "System.String", "CompareOrdinal", [ a; b ] -> pure' "fable_rt.strCompare($0, $1)" [ a; b ] tI32
     // `x.Equals y` of a value of F#'s: its equality (structural for records, unions, lists, ...)
-    | "System.Object", "Equals", a :: Uncast b :: _ when a.Type = b.Type && a.Type <> Fable.String ->
+    // (`Equals` of arrays is that of .NET's objects: they are the same array)
+    | "System.Object", "Equals", Uncast a :: Uncast b :: _ when
+        a.Type = b.Type
+        && (
+            match a.Type with
+            | Fable.Array _ -> true
+            | _ -> false
+        )
+        ->
+        pure' "($0 == $1)" [ a; b ] tBool
+    | "System.Object", "Equals", Uncast a :: Uncast b :: _ when a.Type = b.Type && a.Type <> Fable.String ->
         bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("eql", xs, tBool))
     | "System.String", "Equals", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
         if info.ThisArg.IsSome then
@@ -6129,6 +6143,22 @@ and dotnetCall
     | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] -> pure' "fable_rt.arraySum($0)" [ a ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ArrayModule", "Average", [ a ] ->
         rt "fable_rt.arrayAverage($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "SumBy", [ f; a ] ->
+        rt "fable_rt.arraySumBy($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "AverageBy", [ f; a ] ->
+        rt "fable_rt.arrayAverageBy($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "System.Array", "Copy", [ Uncast src; Uncast dst; n ] ->
+        rt "fable_rt.arrayCopyRange($0, 0, $1, 0, $2)" [ src; dst; n ] tVoid
+    | "System.Array", "Copy", [ Uncast src; si; Uncast dst; di; n ] ->
+        rt "fable_rt.arrayCopyRange($0, $1, $2, $3, $4)" [ src; si; dst; di; n ] tVoid
+    | "System.Array", "IndexOf", [ Uncast a; Uncast x ] -> rt "fable_rt.arrayIndexOf($0, $1, 0, null)" [ a; x ] tI32
+    | "System.Array", "IndexOf", [ Uncast a; Uncast x; start ] ->
+        rt "fable_rt.arrayIndexOf($0, $1, $2, null)" [ a; x; start ] tI32
+    | "System.Array", "IndexOf", [ Uncast a; Uncast x; start; count ] ->
+        rt "fable_rt.arrayIndexOf($0, $1, $2, $3)" [ a; x; start; count ] tI32
+    | "System.Array", "ConvertAll", [ a; f ] -> rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Core.Operators.OperatorIntrinsics", "SetArraySlice", [ target; lo; hi; source ] ->
+        rt "fable_rt.arraySetSlice($0, $1, $2, $3)" [ target; lo; hi; source ] tVoid
 
     // int, int64, byte, float, char, ...: conversions between numbers, with .NET's results
     | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when

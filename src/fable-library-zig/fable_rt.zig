@@ -6578,6 +6578,65 @@ pub fn arraySum(a: anytype) ItemOf(@TypeOf(a)) {
     return total;
 }
 
+/// `Array.sumBy f a`
+pub fn arraySumBy(comptime R: type, f: anytype, a: anytype) Raised!R {
+    var total = zeroOf(R);
+    for (a.items) |x| {
+        const v = f.code(f.env, dup(x)) catch |e| {
+            drop(total);
+            return e;
+        };
+        total = accumulate(total, v) catch |e| {
+            drop(v);
+            return e;
+        };
+        drop(v);
+    }
+    return total;
+}
+
+/// `Array.averageBy f a`
+pub fn arrayAverageBy(comptime R: type, f: anytype, a: anytype) Raised!R {
+    if (a.items.len == 0) return raise(ArgumentException, str("The input array was empty. (Parameter 'array')"));
+    var total = zeroOf(R);
+    for (a.items) |x| total = try accumulate(total, try f.code(f.env, dup(x)));
+    return averageOf(total, a.items.len);
+}
+
+/// `Array.Copy(source, sourceIndex, target, targetIndex, length)`
+pub fn arrayCopyRange(source: anytype, si: i32, target: @TypeOf(source), ti: i32, n: i32) Raised!void {
+    if (si < 0 or n < 0 or si + n > source.items.len) return raise(ArgumentException, str("Source array was not long enough. Check the source index, length, and the array's lower bounds. (Parameter 'sourceArray')"));
+    if (ti < 0 or ti + n > target.items.len) return raise(ArgumentException, str("Destination array was not long enough. Check the destination index, length, and the array's lower bounds. (Parameter 'destinationArray')"));
+    const from: usize = @intCast(si);
+    const to: usize = @intCast(ti);
+    const count: usize = @intCast(n);
+    if (source == target and to > from) {
+        var k = count;
+        while (k > 0) : (k -= 1) arrayPut(target, to + k - 1, dup(source.items[from + k - 1]));
+    } else {
+        for (0..count) |k| arrayPut(target, to + k, dup(source.items[from + k]));
+    }
+}
+
+/// `target.[lo..hi] <- source`
+pub fn arraySetSlice(target: anytype, lo: ?i32, hi: ?i32, source: @TypeOf(target)) Raised!void {
+    const start = lo orelse 0;
+    const finish = hi orelse @as(i32, @intCast(target.items.len)) - 1;
+    return arrayCopyRange(source, 0, target, start, finish - start + 1);
+}
+
+/// `Array.IndexOf(a, x, start, count)`: items are compared with `Equals`
+pub fn arrayIndexOf(a: anytype, x: ItemOf(@TypeOf(a)), start: i32, count: ?i32) Raised!i32 {
+    const len: i32 = @intCast(a.items.len);
+    if (start < 0 or start > len) return argRange("startIndex", "Index was out of range. Must be non-negative and less than or equal to the size of the collection.");
+    const n = count orelse len - start;
+    if (n < 0 or start + n > len) return argRange("count", "Count must be positive and count must refer to a location within the string/array/collection.");
+    for (a.items[@intCast(start)..][0..@intCast(n)], 0..) |item, i| {
+        if (eql(item, x)) return start + @as(i32, @intCast(i));
+    }
+    return -1;
+}
+
 /// `Array.average a`
 pub fn arrayAverage(a: anytype) Raised!ItemOf(@TypeOf(a)) {
     if (a.items.len == 0) return raise(ArgumentException, str("The input array was empty. (Parameter 'array')"));

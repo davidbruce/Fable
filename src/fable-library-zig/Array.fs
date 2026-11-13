@@ -505,3 +505,250 @@ let updateAt<'T> (index: int) (value: 'T) (source: 'T[]) : 'T[] =
             else
                 source.[i]
         )
+
+let private differentLengths3 (a: int) (b: int) (c: int) =
+    invalidArg
+        "array1, array2, array3"
+        ("The arrays have different lengths.\n array1.Length = "
+         + string a
+         + ", array2.Length = "
+         + string b
+         + ", array3.Length = "
+         + string c)
+
+let where<'T> (predicate: 'T -> bool) (array: 'T[]) : 'T[] = Array.filter predicate array
+
+let tail<'T> (array: 'T[]) : 'T[] =
+    if array.Length = 0 then
+        invalidArg "array" "The input sequence has an insufficient number of elements."
+
+    Array.init (array.Length - 1) (fun i -> array.[i + 1])
+
+let tryExactlyOne<'T> (array: 'T[]) : 'T option =
+    if array.Length = 1 then
+        Some array.[0]
+    else
+        None
+
+let tryFindIndexBack<'T> (predicate: 'T -> bool) (array: 'T[]) : int option =
+    let mutable i = array.Length - 1
+    let mutable found = None
+
+    while found.IsNone && i >= 0 do
+        if predicate array.[i] then
+            found <- Some i
+
+        i <- i - 1
+
+    found
+
+let findIndexBack<'T> (predicate: 'T -> bool) (array: 'T[]) : int =
+    match tryFindIndexBack predicate array with
+    | Some i -> i
+    | None -> notFound ()
+
+let findBack<'T> (predicate: 'T -> bool) (array: 'T[]) : 'T =
+    match tryFindIndexBack predicate array with
+    | Some i -> array.[i]
+    | None -> notFound ()
+
+let reduceBack<'T> (reduction: 'T -> 'T -> 'T) (array: 'T[]) : 'T =
+    if array.Length = 0 then
+        emptyArray ()
+
+    let mutable acc = array.[array.Length - 1]
+
+    for i in array.Length - 2 .. -1 .. 0 do
+        acc <- reduction array.[i] acc
+
+    acc
+
+let scanBack<'State, 'T> (folder: 'T -> 'State -> 'State) (array: 'T[]) (state: 'State) : 'State[] =
+    let result = Array.create (array.Length + 1) state
+
+    for i in array.Length - 1 .. -1 .. 0 do
+        result.[i] <- folder array.[i] result.[i + 1]
+
+    result
+
+let mapFold<'Result, 'State, 'T>
+    (mapping: 'State -> 'T -> 'Result * 'State)
+    (state: 'State)
+    (array: 'T[])
+    : 'Result[] * 'State
+    =
+    let mutable acc = state
+
+    let result =
+        Array.init
+            array.Length
+            (fun i ->
+                let y, next = mapping acc array.[i]
+                acc <- next
+                y
+            )
+
+    result, acc
+
+let mapFoldBack<'Result, 'State, 'T>
+    (mapping: 'T -> 'State -> 'Result * 'State)
+    (array: 'T[])
+    (state: 'State)
+    : 'Result[] * 'State
+    =
+    let mutable acc = state
+    let result: 'Result option[] = Array.create array.Length None
+
+    for i in array.Length - 1 .. -1 .. 0 do
+        let y, next = mapping array.[i] acc
+        result.[i] <- Some y
+        acc <- next
+
+    Array.map (fun (x: 'Result option) -> x.Value) result, acc
+
+let map3<'T1, 'T2, 'T3, 'U> (mapping: 'T1 -> 'T2 -> 'T3 -> 'U) (array1: 'T1[]) (array2: 'T2[]) (array3: 'T3[]) : 'U[] =
+    if array1.Length <> array2.Length || array2.Length <> array3.Length then
+        differentLengths3 array1.Length array2.Length array3.Length
+
+    Array.init array1.Length (fun i -> mapping array1.[i] array2.[i] array3.[i])
+
+let mapIndexed2<'T1, 'T2, 'U> (mapping: int -> 'T1 -> 'T2 -> 'U) (array1: 'T1[]) (array2: 'T2[]) : 'U[] =
+    if array1.Length <> array2.Length then
+        differentLengths array1.Length array2.Length
+
+    Array.init array1.Length (fun i -> mapping i array1.[i] array2.[i])
+
+let iterateIndexed2<'T1, 'T2> (action: int -> 'T1 -> 'T2 -> unit) (array1: 'T1[]) (array2: 'T2[]) : unit =
+    if array1.Length <> array2.Length then
+        differentLengths array1.Length array2.Length
+
+    for i in 0 .. array1.Length - 1 do
+        action i array1.[i] array2.[i]
+
+let foldBack2<'State, 'T1, 'T2>
+    (folder: 'T1 -> 'T2 -> 'State -> 'State)
+    (array1: 'T1[])
+    (array2: 'T2[])
+    (state: 'State)
+    : 'State
+    =
+    if array1.Length <> array2.Length then
+        differentLengths array1.Length array2.Length
+
+    let mutable acc = state
+
+    for i in array1.Length - 1 .. -1 .. 0 do
+        acc <- folder array1.[i] array2.[i] acc
+
+    acc
+
+let zip3<'T1, 'T2, 'T3> (array1: 'T1[]) (array2: 'T2[]) (array3: 'T3[]) : ('T1 * 'T2 * 'T3)[] =
+    if array1.Length <> array2.Length || array2.Length <> array3.Length then
+        differentLengths3 array1.Length array2.Length array3.Length
+
+    Array.init array1.Length (fun i -> array1.[i], array2.[i], array3.[i])
+
+let unzip3<'T1, 'T2, 'T3> (array: ('T1 * 'T2 * 'T3)[]) : 'T1[] * 'T2[] * 'T3[] =
+    Array.map (fun (a, _, _) -> a) array, Array.map (fun (_, b, _) -> b) array, Array.map (fun (_, _, c) -> c) array
+
+/// (FSharp.Core takes a sequence of arrays: the target gives the library the list of them)
+let transpose<'T> (rows: 'T[] list) : 'T[][] =
+    let arrays = Array.ofList rows
+
+    if arrays.Length = 0 then
+        [||]
+    else
+        let n = arrays.[0].Length
+
+        for i in 1 .. arrays.Length - 1 do
+            if arrays.[i].Length <> n then
+                invalidArg
+                    "array.[0]"
+                    ("The arrays have different lengths.\narray.[0].Length = "
+                     + string n
+                     + ", array.["
+                     + string i
+                     + "].Length = "
+                     + string arrays.[i].Length)
+
+        Array.init n (fun j -> Array.init arrays.Length (fun i -> arrays.[i].[j]))
+
+let splitInto<'T> (count: int) (array: 'T[]) : 'T[][] =
+    if count <= 0 then
+        invalidArg "count" ("The input must be positive.\ncount = " + string count)
+
+    let n = array.Length
+
+    let parts =
+        if n < count then
+            n
+        else
+            count
+
+    let size =
+        if parts = 0 then
+            0
+        else
+            n / parts
+
+    let extra =
+        if parts = 0 then
+            0
+        else
+            n % parts
+
+    Array.init
+        parts
+        (fun k ->
+            let start =
+                k * size
+                + (if k < extra then
+                       k
+                   else
+                       extra)
+
+            let len =
+                if k < extra then
+                    size + 1
+                else
+                    size
+
+            Array.sub array start len
+        )
+
+let permute<'T> (indexMap: int -> int) (array: 'T[]) : 'T[] =
+    let n = array.Length
+    let result: 'T option[] = Array.create n None
+
+    for i in 0 .. n - 1 do
+        let j = indexMap i
+
+        if j < 0 || j >= n || result.[j].IsSome then
+            invalidArg "indexMap" "The function did not compute a permutation."
+
+        result.[j] <- Some array.[i]
+
+    Array.map (fun (x: 'T option) -> x.Value) result
+
+let compareWith<'T> (comparer: 'T -> 'T -> int) (array1: 'T[]) (array2: 'T[]) : int =
+    let n =
+        if array1.Length < array2.Length then
+            array1.Length
+        else
+            array2.Length
+
+    let mutable i = 0
+    let mutable c = 0
+
+    while c = 0 && i < n do
+        c <- comparer array1.[i] array2.[i]
+        i <- i + 1
+
+    if c <> 0 then
+        c
+    elif array1.Length < array2.Length then
+        -1
+    elif array1.Length > array2.Length then
+        1
+    else
+        0
