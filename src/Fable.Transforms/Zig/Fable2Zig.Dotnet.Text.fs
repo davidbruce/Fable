@@ -473,7 +473,11 @@ let call
                      |> List.filter (fun f -> not f.IsStatic)
                      |> List.forall (fun f -> hasDefault f.FieldType))
              | None -> false)
-            && entRef.FullName <> "System.Guid"
+            && (
+                match entRef.Path with
+                | Fable.SourcePath _ -> true
+                | _ -> false
+            )
             ->
             let ent = ctx.Com.GetEntity entRef
 
@@ -500,6 +504,19 @@ let call
                 )
 
             ECon(mapType ctx r t, "", defaults, None)
+        | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.TimeSpan" ->
+            libraryCall
+                ctx
+                r
+                "TimeSpan"
+                "zero"
+                { info with
+                    ThisArg = None
+                    Args = []
+                    GenericArgs = []
+                }
+                [ Fable.Value(Fable.UnitConstant, None) ]
+                t
         | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.Guid" ->
             libraryCall
                 ctx
@@ -800,6 +817,19 @@ let call
                 ctx
                 r
                 "Uri"
+                "toString"
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                [ x ]
+                t
+        | Fable.DeclaredType(e, []) when e.FullName = "System.TimeSpan" ->
+            libraryCall
+                ctx
+                r
+                "TimeSpan"
                 "toString"
                 { info with
                     ThisArg = None

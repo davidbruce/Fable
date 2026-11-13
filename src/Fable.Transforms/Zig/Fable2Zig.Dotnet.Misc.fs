@@ -466,6 +466,213 @@ let call
                 tStr
             ))
             t
+    // (`t1 + t2` and the other operators of TimeSpan, as F# gives them)
+    | "Microsoft.FSharp.Core.Operators",
+      ("op_Addition" | "op_Subtraction" | "op_Multiply" | "op_Division" | "op_UnaryNegation" | "op_UnaryPlus"),
+      args when
+        args
+        |> List.exists (fun a ->
+            match a.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = "System.TimeSpan"
+            | _ -> false
+        )
+        ->
+        dotnetCall
+            ctx
+            r
+            "System.TimeSpan"
+            name
+            { info with
+                ThisArg = None
+                Args = args
+            }
+            t
+    // ---- `System.TimeSpan`: the library's TimeSpan.fs ----
+    | "System.TimeSpan", name, args ->
+        let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]
+
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "TimeSpan"
+                fn
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                xs
+                t
+
+        let isFloat (x: Fable.Expr) =
+            match x.Type with
+            | Fable.Number((Float64 | Float32), _) -> true
+            | _ -> false
+
+        let int64T = Fable.Number(Int64, Fable.NumberInfo.Empty)
+
+        let asInt64 (x: Fable.Expr) =
+            match x.Type with
+            | Fable.Number(Int64, _) -> x
+            | _ ->
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = "ToInt64"
+                            Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    Fable.CallInfo.Create(args = [ x ], genArgs = [ x.Type ]),
+                    int64T,
+                    r
+                )
+
+        // (a part given as an option, an optional argument, or as itself)
+        let asPart (x: Fable.Expr) =
+            match x.Type with
+            | Fable.Option(inner, _) ->
+                let v = AST.makeTypedIdent inner "part"
+
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = "Map"
+                            Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.OptionModule"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    Fable.CallInfo.Create(
+                        args = [ Fable.Delegate([ v ], asInt64 (Fable.IdentExpr v), None, []); x ],
+                        genArgs = [ inner; int64T ]
+                    ),
+                    Fable.Option(int64T, false),
+                    r
+                )
+            | _ -> Fable.Value(Fable.NewOption(Some(asInt64 x), int64T, false), r)
+
+        let nonePart = Fable.Value(Fable.NewOption(None, int64T, false), r)
+
+        let int64Const (v: int64) =
+            Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int64 v, Fable.NumberInfo.Empty), None)
+
+        let units =
+            dict
+                [
+                    "FromDays", 864_000_000_000L
+                    "FromHours", 36_000_000_000L
+                    "FromMinutes", 600_000_000L
+                    "FromSeconds", 10_000_000L
+                    "FromMilliseconds", 10_000L
+                    "FromMicroseconds", 10L
+                ]
+
+        match name, args with
+        | ".ctor", [] -> call "zero" unitArg
+        | ".ctor", [ ticks ] -> call "ofTicks" [ ticks ]
+        | ".ctor", [ h; m; s ] -> call "create3" [ h; m; s ]
+        | ".ctor", [ d; h; m; s ] -> call "create4" [ d; h; m; s ]
+        | ".ctor", [ d; h; m; s; ms ] -> call "create5" [ d; h; m; s; ms ]
+        | ".ctor", [ d; h; m; s; ms; us ] -> call "create6" [ d; h; m; s; ms; us ]
+        | from, [ v ] when units.ContainsKey from && isFloat v ->
+            call (from.Substring(0, 1).ToLowerInvariant() + from.Substring 1) [ v ]
+        | from, [ v ] when units.ContainsKey from -> call "ofUnits" [ asInt64 v; int64Const units[from] ]
+        | from, parts when units.ContainsKey from && parts.Length > 1 ->
+            let skip =
+                match from with
+                | "FromDays" -> 0
+                | "FromHours" -> 1
+                | "FromMinutes" -> 2
+                | "FromSeconds" -> 3
+                | "FromMilliseconds" -> 4
+                | _ -> 5
+
+            let given = parts |> List.map asPart
+
+            let all =
+                List.replicate skip nonePart
+                @ given
+                @ List.replicate (6 - skip - given.Length) nonePart
+
+            call "ofComponents" all
+        | "FromTicks", [ v ] -> call "ofTicks" [ v ]
+        | ("get_Zero" | "get_MinValue" | "get_MaxValue"), [] ->
+            call
+                (match name with
+                 | "get_Zero" -> "zero"
+                 | "get_MinValue" -> "minValue"
+                 | _ -> "maxValue")
+                unitArg
+        | "get_TicksPerDay", [] -> lw ctx (int64Const 864_000_000_000L)
+        | "get_TicksPerHour", [] -> lw ctx (int64Const 36_000_000_000L)
+        | "get_TicksPerMinute", [] -> lw ctx (int64Const 600_000_000L)
+        | "get_TicksPerSecond", [] -> lw ctx (int64Const 10_000_000L)
+        | "get_TicksPerMillisecond", [] -> lw ctx (int64Const 10_000L)
+        | getter, [ x ] when getter.StartsWith("get_", System.StringComparison.Ordinal) ->
+            let n = getter.Substring 4
+            call (n.Substring(0, 1).ToLowerInvariant() + n.Substring 1) [ x ]
+        | ("Add" | "op_Addition"), [ a; b ] -> call "add" [ a; b ]
+        | ("Subtract" | "op_Subtraction"), [ a; b ] -> call "subtract" [ a; b ]
+        | ("Negate" | "op_UnaryNegation"), [ a ] -> call "negate" [ a ]
+        | "op_UnaryPlus", [ a ] -> lw ctx a
+        | "Duration", [ a ] -> call "duration" [ a ]
+        | ("Multiply" | "op_Multiply"), [ a; b ] when isFloat b -> call "multiply" [ a; b ]
+        | "op_Multiply", [ a; b ] when isFloat a -> call "multiply" [ b; a ]
+        | ("Divide" | "op_Division"), [ a; b ] when isFloat b -> call "divide" [ a; b ]
+        | ("Divide" | "op_Division"), [ a; b ] -> call "divideBy" [ a; b ]
+        | ("Compare" | "CompareTo"), [ a; b ] -> call "compare" [ a; b ]
+        | "Equals", [ a; b ] -> lw ctx (Fable.Operation(Fable.Binary(BinaryEqual, a, b), [], Fable.Boolean, r))
+        | "ToString", [ x ] -> call "toString" [ x ]
+        | "ToString", x :: format :: _ -> call "toStringFormat" [ x; format ]
+        | "Parse", s :: _ -> call "parse" [ s ]
+        | "TryParse", s :: rest when
+            (match t with
+             | Fable.Tuple _ -> true
+             | _ -> false)
+            && rest.Length <= 1
+            ->
+            call "tryParse" [ s ]
+        // (`TimeSpan.TryParse(s, &t)`, with a culture or not: the value goes to `t`)
+        | "TryParse", s :: rest when
+            (match List.last rest with
+             | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ->
+                 ctx.Vars.ContainsKey out.Name
+             | _ -> false)
+            ->
+            let out =
+                match List.last rest with
+                | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) -> out
+                | _ -> fail r "internal: TryParse"
+
+            let outVar = ctx.Vars[out.Name]
+
+            let pairIr =
+                libraryCall
+                    ctx
+                    r
+                    "TimeSpan"
+                    "tryParse"
+                    { info with
+                        ThisArg = None
+                        GenericArgs = []
+                        SignatureArgTypes = []
+                    }
+                    [ s ]
+                    (Fable.Tuple([ Fable.Boolean; out.Type ], false))
+
+            let pair = ctx.State.NewVar("parsed", typeOf pairIr, VLocal, false)
+
+            ELet(
+                pair,
+                pairIr,
+                ESeq(EAssign(outVar, EGet(EVar pair, PItem 1, outVar.Ty)), EGet(EVar pair, PItem 0, tBool))
+            )
+        | _ -> fail r "the Zig target does not support TimeSpan.%s with these arguments yet" name
     // ---- `System.Guid`: the library's Guid.fs ----
     | "System.Guid", name, args when
         (match name with

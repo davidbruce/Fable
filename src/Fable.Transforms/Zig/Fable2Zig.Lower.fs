@@ -1182,6 +1182,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     // (.NET's `Uri` and `Guid`: records of the library's Uri.fs and Guid.fs)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Uri" -> TEnt(libRecordEnt ctx "Uri" "UriOf", [])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Guid" -> TEnt(libRecordEnt ctx "Guid" "GuidOf", [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.TimeSpan" ->
+        TEnt(libRecordEnt ctx "TimeSpan" "TimeSpanOf", [])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
@@ -1861,6 +1863,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                 [
                     "handlers", TEnt(netEnt ctx.State "ResizeArray", [ TFn([ tAny; TGen "T" ], tVoid) ])
                 ]
+            | "TimeSpanOf" -> [ "ticks", TPrim "i64" ]
             | "GuidOf" -> [ "a", TPrim "u32"; "b", tI32; "c", tI32; "rest", TPrim "u64" ]
             | "UriOf" ->
                 [
@@ -3918,6 +3921,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         [ lw ctx source; lw ctx target[1] ]
                         (fun xs -> EEmit("fable_rt.dictTryGet($0, $1)", xs, TOpt valueTy))
                 // (`Uri.TryCreate(s, kind, &uri)` and `Uri.TryCreate(baseUri, relative, &uri)`)
+                // (`TimeSpan.TryParse(s[, culture], &t)`)
+                | "TryParse" when imp.Path.EndsWith("System.TimeSpan", System.StringComparison.Ordinal) ->
+                    libraryCall
+                        ctx
+                        r
+                        "TimeSpan"
+                        "tryParseOption"
+                        { info with ThisArg = None }
+                        [ info.Args.Head ]
+                        (Fable.Option(out.Type, false))
                 // (`Guid.TryParse(s, &g)`)
                 | "TryParse" when imp.Path.EndsWith("System.Guid", System.StringComparison.Ordinal) ->
                     libraryCall
@@ -5624,6 +5637,7 @@ and showShapeOf (ctx: Ctx) (r: SourceLocation option) (strict: bool) (root: Fabl
                 // (a `Uri` and a `Guid` are written by their `ToString`)
                 && entRef.FullName <> "System.Uri"
                 && entRef.FullName <> "System.Guid"
+                && entRef.FullName <> "System.TimeSpan"
                 && checkedSeen.Add key
             then
                 match ctx.Com.TryGetEntity entRef with
@@ -5900,7 +5914,10 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                     (letter = 'A' || letter = 'P' || letter = 'O')
                     && (
                         match args[i].Type with
-                        | Fable.DeclaredType(ent, []) -> ent.FullName = "System.Uri" || ent.FullName = "System.Guid"
+                        | Fable.DeclaredType(ent, []) ->
+                            ent.FullName = "System.Uri"
+                            || ent.FullName = "System.Guid"
+                            || ent.FullName = "System.TimeSpan"
                         | _ -> false
                     )
 
