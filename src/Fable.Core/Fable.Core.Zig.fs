@@ -86,3 +86,20 @@ module Counters =
     /// References added to, or taken off, cells that stayed shared.
     [<Emit("fable_rt.counted(.shared)")>]
     let sharedCounts () : int = 0
+
+    /// The times a resource was destroyed (its `Destroy` ran).
+    [<Emit("fable_rt.counted(.destroys)")>]
+    let resourceDestroys () : int = 0
+
+    /// The times a shared resource was copied (its `Dup` ran).
+    [<Emit("fable_rt.counted(.copies)")>]
+    let resourceCopies () : int = 0
+
+/// Run the heap allocations of this function out of a buffer of `bytes` bytes on the stack
+/// (for kernel and interrupt code, where there is no heap). The function may neither take nor
+/// give values that live on the heap: they would outlive the buffer. Under .NET it does
+/// nothing.
+[<System.AttributeUsage(System.AttributeTargets.Method)>]
+type StackArenaAttribute(bytes: int) =
+    inherit System.Attribute()
+    member _.Bytes = bytes

@@ -166,10 +166,22 @@ let private settleManaged (state: FileState) =
             let m =
                 e.Kind = KHeapUnion
                 || e.Kind = KRefRecord
+                || e.Hooks.IsSome
                 || e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> isManagedDecl))
 
             if m <> e.Managed then
                 e.Managed <- m
+                changed <- true
+
+            // (a resource without Dup is move-only, and so is what holds one)
+            let c =
+                (match e.Hooks with
+                 | Some(_, None) -> false
+                 | _ -> true)
+                && e.Cases |> List.forall (fun (_, fs) -> fs |> List.forall (snd >> isCopyable))
+
+            if c <> e.Copyable then
+                e.Copyable <- c
                 changed <- true
 
 /// Which types can be part of a reference cycle?
@@ -378,6 +390,7 @@ let private listEnt (state: FileState) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         e.Cases <- [ "Empty", []; "Cons", [ "Head", TGen "T"; "Tail", TEnt(e, [ TGen "T" ]) ] ]
@@ -437,6 +450,7 @@ let private dotnetExnEntIn (state: FileState) (fullName: string) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         state.Ents[key] <- e
@@ -470,6 +484,7 @@ let private resultEnt (state: FileState) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         state.Ents[resultName] <- e
@@ -503,6 +518,7 @@ let private choiceEnt (state: FileState) (fullName: string) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         state.Ents[fullName] <- e
@@ -531,6 +547,7 @@ let private arrayEnt (state: FileState) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         state.Ents["$array"] <- e
@@ -576,6 +593,7 @@ let private netEnt (state: FileState) (name: string) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         state.Ents[key] <- e
@@ -610,6 +628,7 @@ let private anonEnt (state: FileState) (names: string[]) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         state.Ents[key] <- e
@@ -638,6 +657,7 @@ let private lazyEnt (state: FileState) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         state.Ents["$lazy"] <- e
@@ -670,6 +690,7 @@ let private refEnt (state: FileState) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         state.Ents[refName] <- e
@@ -822,7 +843,63 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = isLocal
+                Hooks = None
             }
+
+        // a resource: `IResource<'T>` (destroyed after its last use, move-only) or
+        // `ISharedResource<'T>` (copies share it)
+        let resourceKind =
+            if ent.IsInterface then
+                Seq.empty
+            else
+                ent.DeclaredInterfaces
+            |> Seq.map (fun i -> i.Entity.FullName)
+            |> Seq.fold
+                (fun acc n ->
+                    if n.EndsWith("ISharedResource`1", System.StringComparison.Ordinal) then
+                        Some true
+                    elif n.EndsWith("IResource`1", System.StringComparison.Ordinal) && acc.IsNone then
+                        Some false
+                    else
+                        acc
+                )
+                None
+
+        match resourceKind with
+        | Some shared ->
+            if e.Kind = KHeapUnion || e.Kind = KRefRecord then
+                fail
+                    r
+                    "%s: a record that can be assigned or a type that contains itself is already a counted reference; IResource is for values that stand for something outside the program"
+                    entRef.FullName
+
+            if not ent.GenericParameters.IsEmpty then
+                fail r "the Zig target does not support generic resources yet (%s)" entRef.FullName
+
+            let hook (member': string) =
+                ent.MembersFunctionsAndValues
+                |> Seq.tryFind (fun m ->
+                    m.CompiledName.IndexOf("Resource<", System.StringComparison.Ordinal) >= 0
+                    && m.CompiledName.EndsWith("." + member', System.StringComparison.Ordinal)
+                )
+                |> Option.map (fun m -> implName name m.CompiledName)
+
+            let destroy =
+                match hook "Destroy" with
+                | Some d -> d
+                | None -> fail r "%s: a resource needs its static member Destroy" entRef.FullName
+
+            e.Hooks <-
+                Some(
+                    destroy,
+                    if shared then
+                        hook "Dup"
+                    else
+                        None
+                )
+
+            e.Copyable <- shared
+        | None -> ()
 
         ctx.State.Ents[entRef.FullName] <- e
         ctx.State.EntDepth <- ctx.State.EntDepth + 1
@@ -895,6 +972,7 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
                     ReachesOpaque = false
                     Copyable = true
                     IsLocal = isLocal
+                    Hooks = None
                 }
 
             ctx.State.Ents[entRef.FullName] <- e
@@ -956,6 +1034,7 @@ and seqEnt (ctx: Ctx) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         ctx.State.Ents["$seq"] <- e
@@ -995,6 +1074,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         ctx.State.Ents[key] <- e
@@ -1022,6 +1102,7 @@ and walkEnt (ctx: Ctx) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         ctx.State.Ents["$walk"] <- e
@@ -1081,6 +1162,7 @@ and treeEnt (ctx: Ctx) (isMap: bool) : Ent =
                 ReachesOpaque = false
                 Copyable = true
                 IsLocal = false
+                Hooks = None
             }
 
         let self = TEnt(e, e.TypeParams |> List.map TGen)
@@ -4875,6 +4957,29 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         )
 
                 let ret = mapType ctx d.Body.Range d.Body.Type
+
+                // `[<StackArena(bytes)>]`: what the function allocates comes from its stack
+                match
+                    info.Attributes
+                    |> Seq.tryFind (fun a ->
+                        a.Entity.FullName.EndsWith("StackArenaAttribute", System.StringComparison.Ordinal)
+                    )
+                with
+                | Some att ->
+                    let bytes =
+                        match att.ConstructorArgs with
+                        | [ :? int as n ] -> n
+                        | _ -> fail d.Body.Range "[<StackArena>] needs its size in bytes, as a literal"
+
+                    if isManaged ret || ps |> List.exists (fun p -> isManaged p.Ty) then
+                        fail
+                            d.Body.Range
+                            "%s: a [<StackArena>] function cannot take or give values that live on the heap (they would outlive the arena)"
+                            d.Name
+
+                    state.Arenas[d.Name] <- bytes
+                | None -> ()
+
                 let body = lw ctx d.Body
 
                 state.Fns.Add

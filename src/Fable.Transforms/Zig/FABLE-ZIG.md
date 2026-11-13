@@ -351,6 +351,29 @@ collection inside a loop over it raises; here the loop goes on over what it star
 
 Not yet: `dict`, `Stack`, `Queue`, `SortedDictionary`, LINQ, and the rarer members.
 
+## Resources and stack arenas
+
+For code that drives hardware, as in the prototype. A record or union that implements
+`IResource<'T>` (an interface of the program with `static abstract Destroy: 'T -> unit`) is a
+resource: its `Destroy` runs right after the last use of a value, and the type is move-only. A
+copy of it, or of anything that holds one, is a compile error ("a value of the move-only type
+Buf is needed again after it was given away"); reading it, borrowing it and moving it are
+fine. An `ISharedResource<'T>` (`inherit IResource<'T>`, `static abstract Dup: 'T -> 'T`) can
+be copied: each copy runs `Dup` and is destroyed once. The type's Zig declaration carries
+`fable_destroy` and `fable_dup`, which the runtime calls where it gives a value up and copies
+one. The hooks never run on .NET, so they may not change what the program computes: they may
+read the value and call `[<Emit>]` code (the hardware), and an assignment in one is a compile
+error. `Counters.resourceDestroys` and `resourceCopies` count them.
+
+`[<StackArena(bytes)>]` (Fable.Core.Zig) on a function runs its allocations out of a buffer of
+that size on its stack: the allocator is swapped on entry and back on exit, the collector's and
+the weak table's bookkeeping stay where they were, and running out of the buffer is a panic.
+The function may neither take nor give values that live on the heap; a cell made in it that is
+still alive when it ends is a panic in builds that count.
+
+Not yet: generic resources, `IResource` on classes, hooks that raise (what they raise is
+given up), and a stack arena shared between threads.
+
 ## Weak references
 
 `WeakReference<'T>` of a reference type (a class, a record with mutable fields, an array, ...)

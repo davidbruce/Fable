@@ -1112,6 +1112,9 @@ let private storedInto (body: Expr) : Set<int> =
 let private hasManaged (fn: FnInfo) =
     isManaged fn.Ret || fn.Params |> List.exists (fun p -> isManaged p.Ty)
 
+/// The `[<StackArena>]` functions of the file being written.
+let mutable private currentArenas = Dictionary<string, int>()
+
 let emitFunction
     (out: StringBuilder)
     (rootNames: HashSet<string>)
@@ -1229,6 +1232,17 @@ let emitFunction
     | None -> stmt em "    " fn.Body DReturn
 
     let bodyText = em.Out.ToString()
+
+    // `[<StackArena(bytes)>]`: the function's cells come from a buffer on its stack
+    let bodyText =
+        match currentArenas.TryGetValue fn.Name with
+        | true, bytes ->
+            $"    var fable_arena_buffer: [%d{bytes}]u8 align(16) = undefined;\n"
+            + "    var fable_arena_fba = std.heap.FixedBufferAllocator.init(&fable_arena_buffer);\n"
+            + "    const fable_arena = fable_rt.arenaEnter(&fable_arena_fba);\n"
+            + "    defer fable_rt.arenaLeave(fable_arena);\n"
+            + bodyText
+        | _ -> bodyText
 
     let sigParams =
         ps
@@ -1519,8 +1533,24 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
 
     out.AppendLine() |> ignore
 
+/// A resource's hooks, as declarations the runtime looks for: `fable_destroy`, `fable_dup`.
+let hookDecls (e: Ent) (ind: string) : string =
+    match e.Hooks with
+    | Some(destroy, dup) ->
+        let one (name: string) (fn: string) =
+            $"%s{ind}    pub const %s{name} = %s{callTarget fn};\n"
+
+        one "fable_destroy" destroy
+        + (
+            match dup with
+            | Some d -> one "fable_dup" d
+            | None -> ""
+        )
+    | None -> ""
+
 /// The text of one file, without its imports (their paths are only known to the writer).
 let emitFile (state: FileState) : string =
+    currentArenas <- state.Arenas
     let out = StringBuilder()
     let rootNames = HashSet<string>([ "result"; "hole"; "tail"; "env" ])
 
@@ -1620,11 +1650,13 @@ let emitFile (state: FileState) : string =
             |> ignore
         | KRecord ->
             out.AppendLine(opening "struct") |> ignore
+            out.Append(hookDecls e ind) |> ignore
 
             for f in fields (snd e.Cases.Head) do
                 out.AppendLine($"%s{ind}    %s{f},") |> ignore
         | KValueUnion ->
             out.AppendLine(opening "union(enum)") |> ignore
+            out.Append(hookDecls e ind) |> ignore
 
             for (c, fs) in e.Cases do
                 if fs.IsEmpty then

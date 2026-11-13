@@ -1008,7 +1008,17 @@ let private mkDup (what: Expr) (t: Ty) =
     if isCopyable t then
         EDup(what, t)
     else
-        fail None "internal: a value that cannot be copied is needed again after it was moved"
+        let rec name (t: Ty) =
+            match t with
+            | TEnt(e, _) -> e.Name
+            | TOpt t -> name t + " option"
+            | TTuple ts -> ts |> List.map name |> String.concat " * "
+            | _ -> "this value"
+
+        fail
+            None
+            "a value of the move-only type %s is needed again after it was given away (a type that implements IResource without being an ISharedResource, or that holds such a value, cannot be copied: implement ISharedResource to allow sharing)"
+            (name t)
 
 /// Rewrite a flat expression: a use in an owning position either moves the variable (the last
 /// use of an owned variable) or dups it. Returns the variables it consumed, and attaches a
@@ -1511,6 +1521,40 @@ let run (state: FileState) : unit =
             )
 
     inferBorrows p
+
+    // The hooks of a resource only borrow the value they are given: the runtime calls them when
+    // it gives the value up or copies it, and a hook that took it would give it up again.
+    let hooks =
+        state.Ents.Values
+        |> Seq.choose (fun e -> e.Hooks)
+        |> Seq.collect (fun (destroy, dup) -> destroy :: Option.toList dup)
+        |> HashSet
+
+    for fn in state.Fns do
+        if hooks.Contains fn.Name then
+            fn.Modes <- fn.Modes |> List.map (fun _ -> MBorrowed)
+
+            // A hook runs here and never on .NET: what it does must not change what the program
+            // computes. It may read the value and call `[<Emit>]` code (the hardware), nothing
+            // that assigns.
+            let assigns =
+                exists
+                    (fun x ->
+                        match x with
+                        | EStore _ -> true
+                        | EAssign(v, _) -> v.Kind = VGlobal
+                        | EEmit(m, _, _) -> m.StartsWith("fable_rt.store(", System.StringComparison.Ordinal)
+                        | _ -> false
+                    )
+                    fn.Body
+
+            if assigns then
+                raise (
+                    ZigError(
+                        $"%s{fn.Name}: a resource's Destroy and Dup run on the Zig target only (never on .NET), so they may not change what the program computes: they may read the value and call [<Emit>] code, but not assign",
+                        fn.Range
+                    )
+                )
 
     for fn in state.Fns do
         let owned =

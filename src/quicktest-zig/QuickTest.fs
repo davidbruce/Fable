@@ -357,3 +357,4 @@ let main _ =
     + Strings2.run ()
     + Arrays2.run ()
     + Weak.run ()
+    + Resources.run ()

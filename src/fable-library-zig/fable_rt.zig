@@ -40,6 +40,9 @@ pub const Stats = struct {
     reuses: i64 = 0,
     dups: i64 = 0,
     decs: i64 = 0,
+    /// the hooks of resources that ran: Destroy, Dup
+    destroys: i64 = 0,
+    copies: i64 = 0,
 };
 
 /// What belongs to one thread: its counters, its cycle collector and the exception it is
@@ -52,13 +55,21 @@ const thread = if (sgc.per_thread) struct {
     threadlocal var collector_ready: bool = false;
     threadlocal var current: ?Exn = null;
     threadlocal var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
+    threadlocal var book: ?std.mem.Allocator = null;
 } else struct {
     var stats: Stats = .{};
     var collector: sgc.Gc = undefined;
     var collector_ready: bool = false;
     var current: ?Exn = null;
     var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
+    var book: ?std.mem.Allocator = null;
 };
+
+/// Where the runtime's own bookkeeping (the collector's, the table of weak references) comes
+/// from: the allocator, unless a stack arena stands in for it now.
+fn bookkeeping() std.mem.Allocator {
+    return thread.book orelse allocator;
+}
 
 /// This thread's counters (all zero in builds that do not count).
 pub inline fn counters() *Stats {
@@ -182,6 +193,7 @@ fn isCellPtr(comptime T: type) bool {
 /// Does a value of this type hold references to cells? (Does not look through a cell.)
 pub fn isManaged(comptime T: type) bool {
     if (T == String) return true;
+    if (comptime isResource(T)) return true;
     if (isCellPtr(T)) return true;
     if (comptime isFunc(T)) return true;
     if (isSlice(T)) return isManaged(@typeInfo(T).pointer.child);
@@ -200,6 +212,25 @@ pub fn isManaged(comptime T: type) bool {
             return false;
         },
         else => return false,
+    }
+}
+
+/// A resource (`IResource<'T>`): a value whose hooks the runtime calls.
+fn isResource(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"union" => @hasDecl(T, "fable_destroy"),
+        else => false,
+    };
+}
+
+/// Call a hook of a resource; what it raises is given up (a hook runs where nothing can
+/// handle it: when a value is given up or copied).
+inline fn callHook(hook: anytype, x: anytype) void {
+    const r = hook(x);
+    if (comptime @typeInfo(@TypeOf(r)) == .error_union) {
+        if (r) |v| {
+            if (@TypeOf(v) != void) {} // (the copy Dup gives is the value itself: it shares)
+        } else |_| drop(take());
     }
 }
 
@@ -235,6 +266,11 @@ fn retainAll(x: anytype) void {
         return;
     }
     if (T == String) return strRetain(x);
+    // (a shared resource is told it is copied)
+    if (comptime isResource(T) and @hasDecl(T, "fable_dup")) {
+        callHook(T.fable_dup, x);
+        thread.stats.copies += 1;
+    }
     switch (@typeInfo(T)) {
         .pointer => retain(x),
         .optional => if (x) |v| retainAll(v),
@@ -265,6 +301,11 @@ pub fn drop(x: anytype) void {
     if (comptime isSlice(T)) {
         for (x) |item| drop(item);
         return;
+    }
+    // (a resource is destroyed, then what it holds is given up)
+    if (comptime isResource(T)) {
+        callHook(T.fable_destroy, x);
+        thread.stats.destroys += 1;
     }
     switch (@typeInfo(T)) {
         .pointer => dropRecord(T, x),
@@ -1676,6 +1717,33 @@ pub fn setToList(h: anytype) List(KeyOf(@TypeOf(h))) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Stack arenas: `[<StackArena(bytes)>]`
+// ---------------------------------------------------------------------------------------------
+
+pub const Arena = struct {
+    saved: std.mem.Allocator,
+    live: i64,
+};
+
+/// A `[<StackArena>]` function starts: its cells come from `buffer` (on its stack) until it
+/// ends. The runtime's own bookkeeping stays where it was.
+pub fn arenaEnter(fba: *std.heap.FixedBufferAllocator) Arena {
+    if (!thread.collector_ready) collectorSetup();
+    const a: Arena = .{ .saved = allocator, .live = live() };
+    thread.book = allocator;
+    allocator = fba.allocator();
+    return a;
+}
+
+/// ... and ends. (In builds that count, a cell made in the arena that is still alive now
+/// would point into a stack frame that is gone: that is a panic.)
+pub fn arenaLeave(a: Arena) void {
+    allocator = a.saved;
+    thread.book = null;
+    if (track and live() != a.live) @panic("fable: a value made in a [<StackArena>] function outlived it");
+}
+
+// ---------------------------------------------------------------------------------------------
 // Weak references
 //
 // `WeakReference<'T>` points at a cell without keeping it alive. It holds a handle, shared by
@@ -1697,9 +1765,9 @@ fn weakGone(addr: usize) void {
 }
 
 fn weakHandle(addr: usize) *WeakHandle {
-    const entry = thread.weak.getOrPut(allocator, addr) catch @panic("fable: out of memory");
+    const entry = thread.weak.getOrPut(bookkeeping(), addr) catch @panic("fable: out of memory");
     if (!entry.found_existing) {
-        const h = allocator.create(WeakHandle) catch @panic("fable: out of memory");
+        const h = bookkeeping().create(WeakHandle) catch @panic("fable: out of memory");
         h.* = .{ .target = addr, .refs = 0 };
         entry.value_ptr.* = h;
     }
@@ -1711,7 +1779,7 @@ fn weakLetGo(h: *WeakHandle) void {
     h.refs -= 1;
     if (h.refs != 0) return;
     if (h.target) |addr| _ = thread.weak.remove(addr);
-    allocator.destroy(h);
+    bookkeeping().destroy(h);
 }
 
 /// .NET's `WeakReference<'T>` of a reference type (a class, a record with mutable fields, an
@@ -2014,7 +2082,7 @@ fn Collected(comptime C: type, comptime gc_field: []const u8, comptime rc_offset
 }
 
 noinline fn collectorSetup() void {
-    thread.collector.init(.{}, null, allocator);
+    thread.collector.init(.{}, null, bookkeeping());
     thread.collector_ready = true;
 }
 
@@ -2099,8 +2167,10 @@ pub fn collectorSet(comptime knob: Knob, value: i32) void {
 /// For programs and tests that want to see what the runtime did (0 in builds that do not
 /// count): cells allocated, built in again, freed; references added to and taken off cells
 /// that stayed shared.
-pub fn counted(comptime what: enum { allocs, reuses, frees, shared }) i32 {
+pub fn counted(comptime what: enum { allocs, reuses, frees, shared, destroys, copies }) i32 {
     return @intCast(switch (what) {
+        .destroys => thread.stats.destroys,
+        .copies => thread.stats.copies,
         .allocs => thread.stats.allocs,
         .reuses => thread.stats.reuses,
         .frees => thread.stats.frees,
@@ -2117,7 +2187,7 @@ pub fn liveCells() i32 {
 /// look after may be alive.
 pub fn collectorDeinit() void {
     if (thread.collector_ready) thread.collector.deinit();
-    thread.weak.deinit(allocator);
+    thread.weak.deinit(bookkeeping());
     thread.weak = .empty;
 }
 

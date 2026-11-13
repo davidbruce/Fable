@@ -47,6 +47,9 @@ type Ent =
         mutable Copyable: bool
         /// declared in the file being compiled (its declaration is emitted there)
         IsLocal: bool
+        /// a resource (`IResource<'T>`, `ISharedResource<'T>`): the functions that destroy a
+        /// value and that copy one (None: the type is move-only)
+        mutable Hooks: (string * string option) option
     }
 
 type Ty =
@@ -589,6 +592,9 @@ type FileState() =
     member val LocalEnts = List<Ent>()
     /// module-level constants: name, type, literal text
     member val Consts = List<string * Ty * string>()
+
+    /// the `[<StackArena(bytes)>]` functions: name, bytes
+    member val Arenas = Dictionary<string, int>()
 
     /// the module-level values that are computed when the program starts: name, type, and the
     /// function that computes it
