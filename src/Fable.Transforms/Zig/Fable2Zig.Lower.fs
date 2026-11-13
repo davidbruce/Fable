@@ -2051,6 +2051,9 @@ let private kprintf
     | Some cont -> Fable.CurriedApply(cont, [ text ], t, r)
     | None -> text
 
+/// (for the names of the operands of `Math.DivRem`)
+let mutable private divRemTemps = 0
+
 /// Is this a culture or a format provider given to a .NET method (`CultureInfo.InvariantCulture`)?
 let private isCulture (x: Fable.Expr) =
     match x.Type with
@@ -5716,6 +5719,8 @@ and dotnetCall
         ELit("@as(fable_rt.String, null)", tStr)
     | "Microsoft.FSharp.Core.Operators.Unchecked", "DefaultOf", [] ->
         match t with
+        | Fable.Number(BigInt, _) -> pure' "fable_rt.bigOf(@as(i32, 0))" [] (mapType ctx r t)
+        | Fable.Number(Decimal, _) -> ELit("fable_rt.NetDecimal{}", mapType ctx r t)
         | Fable.Number _
         | Fable.Char -> ELit("0", mapType ctx r t)
         | Fable.Boolean -> ELit("false", tBool)
@@ -6092,7 +6097,14 @@ and dotnetCall
                     m
 
             decLit (string m) (int scale)
-        | _ -> fail r "the Zig target needs the parts of a decimal to be constants"
+        | _ -> rt "fable_rt.decOfParts($0, $1, $2, $3, $4)" [ lo; mid; hi; negative; scale ] tDec
+    | "System.Decimal", ".ctor", [ Uncast bits ] when
+        (match bits.Type with
+         | Fable.Array(Fable.Number(Int32, _), _) -> true
+         | _ -> false)
+        ->
+        rt "fable_rt.decOfBits($0)" [ bits ] tDec
+    | "System.Decimal", "GetBits", [ d ] -> pure' "fable_rt.decGetBits($0)" [ d ] (mapType ctx r t)
     | "System.Decimal", ("get_Zero" | "get_One" | "get_MinusOne" | "get_MaxValue" | "get_MinValue"), [] ->
         match name with
         | "get_Zero" -> decLit "0" 0
@@ -6281,6 +6293,76 @@ and dotnetCall
             dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
 
     // ---- numbers ----
+    | "System.MathF", _, _ -> dotnetCall ctx r "System.Math" name info t
+    | ("System.Double" | "System.Single"),
+      ("IsNaN" | "IsInfinity" | "IsPositiveInfinity" | "IsNegativeInfinity" | "IsFinite"),
+      [ x ] ->
+        let f =
+            match name with
+            | "IsNaN" -> "isNan"
+            | "IsInfinity" -> "isInf"
+            | "IsPositiveInfinity" -> "isPositiveInf"
+            | "IsNegativeInfinity" -> "isNegativeInf"
+            | _ -> "isFinite"
+
+        pure' $"std.math.%s{f}($0)" [ x ] tBool
+    // `Math.DivRem(a, b)`: `struct (a / b, a % b)`; with `&rem`, the remainder goes there
+    | ("System.Math" | "System.Numerics.BigInteger"), "DivRem", a :: b :: rest ->
+        let n = divRemTemps
+        divRemTemps <- divRemTemps + 1
+        let ai = AST.makeTypedIdent a.Type $"divRemA%d{n}"
+        let bi = AST.makeTypedIdent b.Type $"divRemB%d{n}"
+
+        let op k =
+            if isBig a then
+                // (bigint's operators are calls)
+                let selector =
+                    if k = BinaryDivide then
+                        "op_Division"
+                    else
+                        "op_Modulus"
+
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = selector
+                            Path = Replacements.DotnetPrefix + "System.Numerics.BigInteger"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create())
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    { info with
+                        Args = [ Fable.IdentExpr ai; Fable.IdentExpr bi ]
+                        ThisArg = None
+                    },
+                    a.Type,
+                    r
+                )
+            else
+                Fable.Operation(Fable.Binary(k, Fable.IdentExpr ai, Fable.IdentExpr bi), [], a.Type, r)
+
+        let body =
+            match rest, t with
+            | [ Fable.Operation(Fable.Unary(UnaryAddressOf, (Fable.IdentExpr _ as out)), _, _, _) ], _ ->
+                Fable.Sequential [ Fable.Set(out, Fable.ValueSet, a.Type, op BinaryModulus, r); op BinaryDivide ]
+            | [], Fable.Tuple(_, isStruct) ->
+                Fable.Value(Fable.NewTuple([ op BinaryDivide; op BinaryModulus ], isStruct), r)
+            | _ -> fail r "the Zig target does not support this DivRem yet"
+
+        lw ctx (Fable.Let(ai, a, Fable.Let(bi, b, body)))
+    | ("Microsoft.FSharp.Core.Operators" | "System.Numerics.BigInteger"),
+      ("op_BitwiseAnd" | "op_BitwiseOr" | "op_ExclusiveOr" | "op_LeftShift" | "op_RightShift"),
+      [ a; b ] when isBig a ->
+        let f =
+            match name with
+            | "op_BitwiseAnd" -> "bigAnd"
+            | "op_BitwiseOr" -> "bigOr"
+            | "op_ExclusiveOr" -> "bigXor"
+            | "op_LeftShift" -> "bigShl"
+            | _ -> "bigShr"
+
+        pure' $"fable_rt.%s{f}($0, $1)" [ a; b ] tBig
     | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Abs", [ x ] ->
         rt "fable_rt.absOf(@as($R, $0))" [ x ] (mapType ctx r x.Type)
     | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Sign", [ x ] ->
@@ -6298,9 +6380,9 @@ and dotnetCall
     | "System.Math", ("Max" | "Min"), [ a; b ] ->
         let f =
             if name = "Max" then
-                "maxOf"
+                "mathMax"
             else
-                "minOf"
+                "mathMin"
 
         pure' $"fable_rt.%s{f}(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
     | "System.Math", "get_PI", [] -> ELit("std.math.pi", tF64)

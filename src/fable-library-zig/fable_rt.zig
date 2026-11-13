@@ -1888,6 +1888,49 @@ pub fn bigDivRem(a: BigInt, b: BigInt, comptime quotient: bool) Raised!BigInt {
     return bigFrom(r);
 }
 
+pub fn bigAnd(a: BigInt, b: BigInt) BigInt {
+    var m = bigEmpty();
+    m.bitAnd(&a.value, &b.value) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+pub fn bigOr(a: BigInt, b: BigInt) BigInt {
+    var m = bigEmpty();
+    m.bitOr(&a.value, &b.value) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+pub fn bigXor(a: BigInt, b: BigInt) BigInt {
+    var m = bigEmpty();
+    m.bitXor(&a.value, &b.value) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+/// `a <<< n` (a negative `n` shifts right, as .NET)
+pub fn bigShl(a: BigInt, n: i32) BigInt {
+    if (n < 0) return bigShr(a, -n);
+    var m = bigEmpty();
+    m.shiftLeft(&a.value, @intCast(n)) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+/// `a >>> n`: arithmetic, rounding toward negative infinity as .NET
+pub fn bigShr(a: BigInt, n: i32) BigInt {
+    if (n < 0) return bigShl(a, -n);
+    var m = bigEmpty();
+    m.shiftRight(&a.value, @intCast(n)) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+test "bigint bitwise" {
+    try expectAny("2", bigAnd(bigOf(@as(i32, 6)), bigOf(@as(i32, 2))));
+    try expectAny("6", bigOr(bigOf(@as(i32, 4)), bigOf(@as(i32, 2))));
+    try expectAny("4", bigXor(bigOf(@as(i32, 6)), bigOf(@as(i32, 2))));
+    try expectAny("16", bigShl(bigOf(@as(i32, 4)), 2));
+    try expectAny("-3", bigShr(bigOf(@as(i32, -5)), 1));
+    try expectAny("-6", bigAnd(bigOf(@as(i32, -5)), bigOf(@as(i32, -2))));
+}
+
 pub fn bigNeg(a: BigInt) BigInt {
     var m = a.value.clone() catch |e| bigOom(e);
     m.negate();
@@ -2059,6 +2102,42 @@ fn decAligned(a: NetDecimal, b: NetDecimal) struct { i256, i256, u32 } {
 }
 
 /// a decimal literal
+/// `Decimal(lo, mid, hi, isNegative, scale)`
+pub fn decOfParts(lo: i32, mid: i32, hi: i32, negative: bool, scale: u8) Raised!NetDecimal {
+    if (scale > 28) return raise(ArgumentOutOfRangeException, str("Decimal's scale value must be between 0 and 28, inclusive. (Parameter 'scale')"));
+    const mag: i128 = (@as(i128, @as(u32, @bitCast(hi))) << 64) | (@as(i128, @as(u32, @bitCast(mid))) << 32) | @as(i128, @as(u32, @bitCast(lo)));
+    return .{ .m = if (negative) -mag else mag, .scale = scale };
+}
+
+/// `Decimal(bits)`: the four ints of `Decimal.GetBits`
+pub fn decOfBits(bits: Array(i32)) Raised!NetDecimal {
+    const b = bits.items;
+    if (b.len != 4 or b[3] & 0x7F00FFFF != 0) return raise(ArgumentException, str("Decimal constructor requires an array or span of four valid decimal bytes."));
+    const flags: u32 = @bitCast(b[3]);
+    return decOfParts(b[0], b[1], b[2], flags & 0x80000000 != 0, @intCast((flags >> 16) & 0xFF));
+}
+
+/// `Decimal.GetBits d`: the 96 bits of the magnitude, then the sign and the scale
+pub fn decGetBits(d: NetDecimal) Array(i32) {
+    const mag: u128 = @intCast(@abs(d.m));
+    const items = allocator.alloc(i32, 4) catch @panic("fable: out of memory");
+    items[0] = @bitCast(@as(u32, @truncate(mag)));
+    items[1] = @bitCast(@as(u32, @truncate(mag >> 32)));
+    items[2] = @bitCast(@as(u32, @truncate(mag >> 64)));
+    const sign: u32 = if (d.m < 0) 0x80000000 else 0;
+    items[3] = @bitCast(sign | (@as(u32, d.scale) << 16));
+    return arrayFrom(Array(i32), items);
+}
+
+test "decimal bits" {
+    const d = try decOfParts(-1, -1, -2, true, 0);
+    const bits = decGetBits(d);
+    try std.testing.expectEqual(@as(i32, -1), bits.items[0]);
+    try std.testing.expectEqual(@as(i32, -2), bits.items[2]);
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80000000))), bits.items[3]);
+    try std.testing.expect(std.meta.eql(d, try decOfBits(bits)));
+}
+
 pub fn decLit(comptime m: i128, comptime scale: u8) NetDecimal {
     return .{ .m = m, .scale = scale };
 }
@@ -3557,6 +3636,22 @@ pub fn maxOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
         if (b != b) return b;
     }
     return dup(if (compare(a, b) < 0) b else a);
+}
+
+/// `Math.Max(a, b)`: as `max`, but of floats +0.0 is greater than -0.0, as IEEE 754 says
+pub fn mathMax(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    if (comptime @typeInfo(@TypeOf(a)) == .float) {
+        if (a == 0 and b == 0) return if (std.math.signbit(a)) b else a;
+    }
+    return maxOf(a, b);
+}
+
+/// `Math.Min(a, b)`: of floats -0.0 is less than +0.0
+pub fn mathMin(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    if (comptime @typeInfo(@TypeOf(a)) == .float) {
+        if (a == 0 and b == 0) return if (std.math.signbit(a)) a else b;
+    }
+    return minOf(a, b);
 }
 
 pub fn minOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
@@ -6599,8 +6694,8 @@ pub fn logBase(x: f64, b: f64) f64 {
 
 /// `Math.Clamp(x, lo, hi)`
 pub fn clamp(x: anytype, lo: @TypeOf(x), hi: @TypeOf(x)) Raised!@TypeOf(x) {
-    if (lo > hi) return raise(ArgumentException, format(.{ "'", lo, "' cannot be greater than ", hi, "." }));
-    return if (x < lo) lo else if (x > hi) hi else x;
+    if (compare(lo, hi) > 0) return raise(ArgumentException, format(.{ "'", lo, "' cannot be greater than ", hi, "." }));
+    return if (compare(x, lo) < 0) lo else if (compare(x, hi) > 0) hi else x;
 }
 
 /// The name .NET gives a whole-number type in an overflow message.
