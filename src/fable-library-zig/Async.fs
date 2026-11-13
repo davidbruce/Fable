@@ -280,6 +280,20 @@ let private start (computation: AsyncOf<'T>) (k: Cont<'T>) : unit =
         else
             k.fail e
 
+/// `start` of a computation still to be made by `make`: what making it raises goes to `fail`
+/// too (a binder that raises before it gives its computation, as a bind resumed by a timer
+/// calls it with no other handler around)
+let private startMade (make: unit -> AsyncOf<'T>) (k: Cont<'T>) : unit =
+    let made =
+        try
+            Ok(make ())
+        with e ->
+            Error e
+
+    match made with
+    | Ok computation -> start computation k
+    | Error e -> k.fail e
+
 /// The same continuations for a result of another type
 let private withOk (k: Cont<'U>) (ok: 'T -> unit) : Cont<'T> =
     {
@@ -307,7 +321,7 @@ let builderDelay<'T> (generator: unit -> AsyncOf<'T>) : AsyncOf<'T> =
         if isCancelled k then
             k.cancel (canceled ())
         else
-            bounce (fun () -> start (generator ()) k)
+            bounce (fun () -> startMade generator k)
     )
 
 /// (a cancellation is seen here, before the computation runs)
@@ -316,7 +330,7 @@ let builderBind<'T, 'U> (computation: AsyncOf<'T>) (binder: 'T -> AsyncOf<'U>) :
         if isCancelled k then
             k.cancel (canceled ())
         else
-            start computation (withOk k (fun x -> bounce (fun () -> start (binder x) k)))
+            start computation (withOk k (fun x -> bounce (fun () -> startMade (fun () -> binder x) k)))
     )
 
 let builderCombine<'T> (computation1: AsyncOf<unit>) (computation2: AsyncOf<'T>) : AsyncOf<'T> =
@@ -328,7 +342,7 @@ let builderTryWith<'T> (computation: AsyncOf<'T>) (catchHandler: exn -> AsyncOf<
             computation
             {
                 ok = k.ok
-                fail = fun e -> bounce (fun () -> start (catchHandler e) k)
+                fail = fun e -> bounce (fun () -> startMade (fun () -> catchHandler e) k)
                 cancel = k.cancel
                 token = k.token
                 handOver = None
@@ -390,7 +404,8 @@ let builderFor<'T> (sequence: SeqOf<'T>) (body: 'T -> AsyncOf<unit>) : AsyncOf<u
                 k.cancel (canceled ())
             else
                 match rest with
-                | x :: tail -> start (body x) (withOk k (fun () -> bounce (fun () -> start (loop tail) k)))
+                | x :: tail ->
+                    startMade (fun () -> body x) (withOk k (fun () -> bounce (fun () -> start (loop tail) k)))
                 | [] -> k.ok ()
         )
 

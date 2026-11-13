@@ -724,7 +724,6 @@ let ``test Final statement inside async expressions can throw`` () =
         equal "1 boom!" data.Value
     } |> Async.StartImmediate
 
-#if !FABLE_COMPILER_ZIG // (an exception raised after a timer escapes to the caller instead of the handler)
 [<Fact>]
 let ``test Async.Bind propagates exceptions`` () = // See #724
     async {
@@ -765,7 +764,6 @@ let ``test Async.Bind propagates exceptions`` () = // See #724
         equal ("Ok", "Invalid access credentials") res1
         equal ("Ok", "Invalid access credentials") res2
     } |> Async.StartImmediate
-#endif
 
 
 [<Fact>]
@@ -841,13 +839,11 @@ let private assertChildFailure startChild (error: exn) =
         | _ -> failwith "Expected child failure"
     } |> Async.RunSynchronously
 
-#if !FABLE_COMPILER_ZIG // (an exception raised after a timer escapes to the caller instead of the handler)
 [<Fact>]
 let ``test Async.StartChild preserves child TimeoutException`` () =
     assertChildFailure
         (fun (computation, timeout) -> Async.StartChild(computation, timeout))
         (TimeoutException("child timeout"))
-#endif
 
 let private assertChildTimeout startChild assertError =
     async {
