@@ -186,7 +186,8 @@ let private reachesSelf (com: Compiler) (throughUnions: bool) (start: Fable.Enti
             ent.UnionCases
             |> List.collect (fun c -> c.UnionCaseFields |> List.map (fun f -> f.FieldType))
         else
-            ent.FSharpFields |> List.map (fun f -> f.FieldType)
+            (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+            |> List.map (fun f -> f.FieldType)
 
     let rec go (ent: Fable.Entity) =
         fieldTypes ent
@@ -904,6 +905,9 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.LambdaType(arg, ret) -> TFn([ mapType ctx r arg ], mapType ctx r ret)
     | Fable.DelegateType(args, ret) -> TFn(args |> List.map (mapType ctx r), mapType ctx r ret)
     | Fable.Tuple(ts, _) -> TTuple(ts |> List.map (mapType ctx r))
+    // (`Tuple<'T>`, which F# does not write as a tuple)
+    | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Tuple`1" || ent.FullName = "System.ValueTuple`1" ->
+        TTuple [ mapType ctx r t ]
     // (`None` and `[]` whose type F# leaves as `obj`: they hold nothing, so any item type is
     // theirs)
     | Fable.Option(Fable.Any, _) -> TOpt tVoid
@@ -913,7 +917,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
     | Fable.AnonymousRecordType(names, genArgs, _) ->
-        TEnt(anonEnt ctx.State names, genArgs |> List.map (mapTypeArg ctx r))
+        TEnt(anonEnt ctx.State names, genArgs |> List.map (FableTransforms.uncurryType >> mapTypeArg ctx r))
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Lazy`1" -> TEnt(lazyEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.WeakReference`1" ->
         TEnt(netEnt ctx.State "Weak", [ mapType ctx r t ])
@@ -1042,7 +1046,9 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
             || ent.IsFSharpRecord
                && (byReference
                    || (recursive && reachesSelf ctx.Com false ent)
-                   || (not ent.IsValueType && ent.FSharpFields |> List.exists (fun f -> f.IsMutable)))
+                   || (not ent.IsValueType
+                       && (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                          |> List.exists (fun f -> f.IsMutable)))
 
         // a name in this file, or `alias.name` for a type another file declares
         let name, isLocal =
@@ -1068,9 +1074,10 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 Cases = []
                 MutableFields =
                     if isClass then
-                        ent.FSharpFields |> List.map (fun f -> f.Name)
+                        (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                        |> List.map (fun f -> f.Name)
                     elif ent.IsFSharpRecord then
-                        ent.FSharpFields
+                        (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
                         |> List.filter (fun f -> f.IsMutable)
                         |> List.map (fun f -> f.Name)
                     else
@@ -1199,11 +1206,15 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 elif ent.IsFSharpUnion then
                     ent.UnionCases
                     |> List.map (fun c ->
-                        c.Name, c.UnionCaseFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
+                        c.Name,
+                        c.UnionCaseFields
+                        |> List.map (fun f -> f.Name, mapType ctx r (FableTransforms.uncurryType f.FieldType))
                     )
                 else
                     [
-                        "", ent.FSharpFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
+                        "",
+                        (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                        |> List.map (fun f -> f.Name, mapType ctx r (FableTransforms.uncurryType f.FieldType))
                     ]
         with _ ->
             ctx.State.EntDepth <- ctx.State.EntDepth - 1
@@ -1338,7 +1349,8 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
             ctx.State.ObjInfos[entRef.FullName] <- box info
 
             let fields =
-                ent.FSharpFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
+                (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                |> List.map (fun f -> f.Name, mapType ctx r (FableTransforms.uncurryType f.FieldType))
 
             part.Cases <- [ "", fields ]
             part.MutableFields <- fields |> List.map fst
@@ -1436,7 +1448,9 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
             try
                 e.Cases <-
                     [
-                        "", ent.FSharpFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
+                        "",
+                        (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                        |> List.map (fun f -> f.Name, mapType ctx r (FableTransforms.uncurryType f.FieldType))
                     ]
             with _ ->
                 ctx.State.Ents.Remove entRef.FullName |> ignore
@@ -2974,6 +2988,65 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
                 EStore(place, xs[1])
             )
+    // (what Fable's curry and uncurry of an option of functions call: `Option.map`)
+    | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
+        imp.Selector = "map"
+        && imp.Path.EndsWith("/Option.zig", System.StringComparison.Ordinal)
+        ->
+        match info.Args, t with
+        | [ fn; source ], Fable.Option(outItem, _) ->
+            // (the function's parameter says what the option holds: uncurried or not)
+            let inItem =
+                match fn, source.Type with
+                | Fable.Delegate([ p ], _, _, _), _ -> p.Type
+                | _, Fable.Option(item, _) -> item
+                | _ -> Fable.Any
+
+            lw
+                ctx
+                (Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = "Map"
+                            Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.OptionModule"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    { info with GenericArgs = [ inItem; outItem ] },
+                    t,
+                    r
+                ))
+        | _ -> fail r "internal: Option.map"
+    // a static field of a type of this file: a module-level value
+    | Fable.Get(Fable.IdentExpr id, Fable.FieldGet info, t, r) when
+        ctx.State.StaticFields.ContainsKey(id.Name + "." + info.Name)
+        ->
+        lw
+            ctx
+            (Fable.IdentExpr
+                { id with
+                    Name = ctx.State.StaticFields[id.Name + "." + info.Name]
+                    Type = t
+                })
+    | Fable.Set(Fable.IdentExpr id, Fable.FieldSet name, t, value, r) when
+        ctx.State.StaticFields.ContainsKey(id.Name + "." + name)
+        ->
+        lw
+            ctx
+            (Fable.Set(
+                Fable.IdentExpr
+                    { id with
+                        Name = ctx.State.StaticFields[id.Name + "." + name]
+                        Type = t
+                        IsMutable = true
+                    },
+                Fable.ValueSet,
+                t,
+                value,
+                r
+            ))
     // `o :? T` of an `obj` (not one F# made by boxing a value of a known type, as `use` does)
     | Fable.Test(x, Fable.TypeTest t, r) when x.Type = Fable.Any && (let (Unboxed inner) = x in inner.Type = Fable.Any) ->
         match t with
@@ -3068,7 +3141,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 (values |> List.map (lw ctx))
                 (fun xs -> ECon(TTuple(xs |> List.map typeOf), "", xs, None))
         | Fable.NewAnonymousRecord(values, names, genArgs, _) ->
-            let ty = TEnt(anonEnt ctx.State names, genArgs |> List.map (mapTypeArg ctx r))
+            let ty =
+                TEnt(anonEnt ctx.State names, genArgs |> List.map (FableTransforms.uncurryType >> mapTypeArg ctx r))
+
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
         // `[| a; b |]`, and an array of a given length
         | Fable.NewArray(Fable.ArrayValues values, t, _) ->
@@ -3356,10 +3431,6 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
          | Fable.DeclaredType(ent, _) -> ent.FullName = "Microsoft.FSharp.Core.byref`2"
          | _ -> false)
         ->
-        let ty = mapType ctx id.Range id.Type
-        let v = ctx.State.NewVar(id.Name, ty, VLocal, false)
-        ctx.Vars[id.Name] <- v
-
         let place =
             bindArgs
                 ctx
@@ -3371,11 +3442,34 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     | _ -> fail id.Range "the Zig target cannot take the address of this yet"
                 )
 
+        // (the address of what cannot be assigned, as F# takes to copy a struct record with
+        // some fields changed, only reads)
+        let ty =
+            match mapType ctx id.Range id.Type, typeOf place with
+            | TPtr(t, false), (TPtr(t2, true) as actual) when t = t2 -> actual
+            | ty, _ -> ty
+
+        let v = ctx.State.NewVar(id.Name, ty, VLocal, false)
+        ctx.Vars[id.Name] <- v
         ELet(v, place, lw ctx body)
 
     | Fable.Let(id, value, body) ->
         let rhs = lw ctx value
         let ty = mapType ctx id.Range id.Type
+
+        // (a function of several arguments read from a field is uncurried there, as Fable keeps
+        // it, though the variable's type says it is curried)
+        let ty =
+            match ty, typeOf rhs with
+            | (TFn _ | TOpt(TFn _)), (TFn _ | TOpt(TFn _) as actual) when
+                actual <> ty
+                && actual = mapType ctx id.Range (FableTransforms.uncurryType id.Type)
+                ->
+                actual
+            // (the address of what cannot be assigned, which F# takes to copy a struct record
+            // with some fields changed: a pointer that only reads)
+            | TPtr(t, false), (TPtr(t2, true) as actual) when t = t2 -> actual
+            | _ -> ty
 
         if isVoid ty then
             ESeq(asStmt ctx rhs, lw ctx body)
@@ -3935,16 +4029,34 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             (fun xs ->
                 let v = xs.Head
 
+                // (a function of several arguments is kept uncurried in a field, as Fable has it:
+                // the field's own type says how)
+                let stored (case: string) (field: string) =
+                    match ty with
+                    | TFn _
+                    | TOpt(TFn _) ->
+                        match caseFields (typeOf v) case |> List.tryFind (fun (f, _) -> f = field) with
+                        | Some(_, (TFn _ | TOpt(TFn _) as fty)) -> fty
+                        | _ -> ty
+                    | _ -> ty
+
                 match kind, typeOf v with
                 | Fable.FieldGet info, TEnt(ent, _) when ent.Kind = KRecord || ent.Kind = KRefRecord ->
-                    EGet(v, PField info.Name, ty)
+                    EGet(v, PField info.Name, stored "" info.Name)
                 | Fable.TupleIndex i, TTuple _ -> EGet(v, PItem i, ty)
                 | Fable.UnionField info, TEnt(ent, _) ->
                     let case, fields = List.item info.CaseIndex ent.Cases
-                    EGet(v, PCase(case, fst (List.item info.FieldIndex fields)), ty)
+                    let field = fst (List.item info.FieldIndex fields)
+                    EGet(v, PCase(case, field), stored case field)
                 | Fable.UnionTag, TEnt _ -> EPrim("tag", [ v ], tI32)
                 | Fable.ListHead, TEnt _ -> EGet(v, PCase("Cons", "Head"), ty)
                 | Fable.ListTail, TEnt _ -> EGet(v, PCase("Cons", "Tail"), ty)
+                | Fable.OptionValue, TOpt(TFn _ as inner) when
+                    (match ty with
+                     | TFn _ -> true
+                     | _ -> false)
+                    ->
+                    EGet(v, PSome, inner)
                 | Fable.OptionValue, TOpt _ -> EGet(v, PSome, ty)
                 | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
             )
@@ -4045,6 +4157,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 ctx
                 args
                 (fun xs ->
+                    // (a value that is not in a variable is put in one, whose address is given)
+                    let temps = List<Var * Expr>()
+
                     let xs =
                         List.map2
                             (fun x want ->
@@ -4052,12 +4167,18 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                                 | EVar v, true -> EAddr(EVar v, true)
                                 | EAddr _, _
                                 | _, false -> x
-                                | _ -> fail r "the Zig target can only give a variable where an inref is expected"
+                                | _ ->
+                                    let v = ctx.State.NewVar("inref", typeOf x, VLocal, false)
+                                    temps.Add((v, x))
+                                    EAddr(EVar v, true)
                             )
                             xs
                             wantsAddress
 
-                    ECall(c.Target, typeArgs, c.Captures @ xs, ty)
+                    Seq.foldBack
+                        (fun (v, x) body -> ELet(v, x, body))
+                        temps
+                        (ECall(c.Target, typeArgs, c.Captures @ xs, ty))
                 )
         | None, Fable.Import(imp, _, _) ->
             fail r "the Zig target does not support this library call yet (%s from %s)" imp.Selector imp.Path
@@ -4357,7 +4478,7 @@ and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
                         for field in case.UnionCaseFields do
                             go field.FieldType
                 | Some ent when ent.IsFSharpRecord || ent.IsFSharpExceptionDeclaration ->
-                    for field in ent.FSharpFields do
+                    for field in (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic)) do
                         go field.FieldType
                 | _ -> fail r "the Zig target cannot write a value of the type %s with %%A yet" entRef.FullName
         | other -> fail r "the Zig target cannot write a value of this type with %%A yet (%A)" other
@@ -6125,6 +6246,8 @@ and dotnetCall
         | Fable.Boolean
         | Fable.Number _ ->
             bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.format(.{{ %s{typedArg ctx r x 0} }})", xs, tStr))
+        // (a type parameter: what the type it stands for gives, known when the Zig is compiled)
+        | Fable.GenericParam _ -> rt "fable_rt.genericText($0)" [ x ] tStr
         | other -> fail r "the Zig target cannot turn a value of this type into text yet (%A)" other
     // ---- comparison of what is not a number: by `compare` ----
     | "Microsoft.FSharp.Core.Operators", "Max", [ a; b ] ->
@@ -6463,6 +6586,36 @@ and dotnetCall
         else
             dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
 
+    // ---- tuples: `Tuple(a, b)`, `Tuple.Create`, struct tuples, and the conversions between
+    // them (a tuple is a Zig tuple, struct or not) ----
+    | ("System.Tuple`1" | "System.Tuple`2" | "System.Tuple`3" | "System.Tuple`4" | "System.Tuple`5" | "System.Tuple`6" | "System.Tuple`7" | "System.ValueTuple`1" | "System.ValueTuple`2" | "System.ValueTuple`3" | "System.ValueTuple`4" | "System.ValueTuple`5" | "System.ValueTuple`6" | "System.ValueTuple`7"),
+      ".ctor",
+      items
+    | ("System.Tuple" | "System.ValueTuple"), "Create", items ->
+        lw ctx (Fable.Value(Fable.NewTuple(items, entity.StartsWith "System.ValueTuple"), r))
+    | "System.TupleExtensions", ("ToValueTuple" | "ToTuple"), [ x ] ->
+        let items =
+            match x.Type with
+            | Fable.Tuple(ts, _) -> ts
+            | _ -> fail r "internal: not a tuple"
+
+        let tmp = AST.makeTypedIdent x.Type "tuple"
+
+        lw
+            ctx
+            (Fable.Let(
+                tmp,
+                x,
+                Fable.Value(
+                    Fable.NewTuple(
+                        items
+                        |> List.mapi (fun i t -> Fable.Get(Fable.IdentExpr tmp, Fable.TupleIndex i, t, r)),
+                        name = "ToValueTuple"
+                    ),
+                    r
+                )
+            ))
+    | ("System.Tuple`1" | "System.ValueTuple`1"), "get_Item1", [ x ] -> lw ctx (Fable.Get(x, Fable.TupleIndex 0, t, r))
     // ---- obj ----
     | "Microsoft.FSharp.Core.Operators", "Box", [ x ] when x.Type <> Fable.Any -> boxed ctx x
     | "Microsoft.FSharp.Core.Operators", "Box", [ x ] -> lw ctx x
@@ -7154,6 +7307,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
         com.AddLog(msg, Severity.Error, ?range = r, fileName = com.CurrentFile)
 
     let attached = List<Fable.MemberDecl>()
+    let mutable actions = 0
 
     let rec membersOf (decls: Fable.Declaration list) : Fable.MemberDecl list =
         decls
@@ -7199,10 +7353,57 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 [ { m with Body = chainTail m.Body } ]
             | Fable.MemberDeclaration m -> [ m ]
             | Fable.ModuleDeclaration m -> membersOf m.Members
+            // A top-level statement runs when the program starts, in its place among the
+            // module-level values. The initializer of a type's static fields (`static let`,
+            // `static member val`) gives each its first value.
             | Fable.ActionDeclaration a ->
-                report a.Body.Range "the Zig target does not support top-level statements yet"
-                []
+                let rec flat (e: Fable.Expr) =
+                    match e with
+                    | Fable.Sequential stmts -> stmts |> List.collect flat
+                    | _ -> [ e ]
+
+                let stmts =
+                    match a.Body with
+                    | Fable.Call(Fable.Delegate(_, body, _, _), _, _, _) -> flat body
+                    | body -> flat body
+
+                let value (name: string) (body: Fable.Expr) (isMutable: bool) : Fable.MemberDecl =
+                    {
+                        Name = name
+                        Args = []
+                        Body = body
+                        MemberRef =
+                            Fable.GeneratedMember.Value(name, body.Type, isInstance = false, isMutable = isMutable)
+                        IsMangled = false
+                        ImplementedSignatureRef = None
+                        UsedNames = Set.empty
+                        XmlDoc = None
+                        Tags = []
+                    }
+
+                stmts
+                |> List.choose (fun stmt ->
+                    match stmt with
+                    | Fable.Set(Fable.IdentExpr id, Fable.FieldSet name, _, v, _) when
+                        state.StaticFields.ContainsKey(id.Name + "." + name)
+                        ->
+                        Some(value state.StaticFields[id.Name + "." + name] v true)
+                    | Fable.Value(Fable.UnitConstant, _) -> None
+                    | _ ->
+                        actions <- actions + 1
+                        Some(value $"top_level_%d{actions}" stmt false)
+                )
             | Fable.ClassDeclaration c ->
+                match com.TryGetEntity c.Entity with
+                | Some ent ->
+                    for f in ent.FSharpFields do
+                        if f.IsStatic then
+                            state.StaticFields[c.Name + "." + f.Name] <-
+                                c.Name
+                                + "__static_"
+                                + System.Text.RegularExpressions.Regex.Replace(f.Name, "[^A-Za-z0-9_]", "_")
+                | None -> ()
+
                 match com.TryGetEntity c.Entity with
                 | Some ent when ent.IsInterface ->
                     try
@@ -7279,7 +7480,10 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                                 ent.GenericParameters
                                 |> List.map (fun g -> Fable.GenericParam(g.Name, false, []))
 
-                            let fields = ent.FSharpFields |> List.map (fun f -> f.Name)
+                            let fields =
+                                (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                                |> List.map (fun f -> f.Name)
+
                             attached.Add { ctor with Body = constructorBody c.Entity genArgs fields ctor.Body }
                         | _ -> ()
                     with ZigError(msg, r) ->
@@ -7346,8 +7550,10 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             if info.IsValue then
                 let ty = mapType (newCtx d.Name) d.Body.Range d.Body.Type
 
+                // (a static field can be assigned: it is `static let mutable` or the field
+                // behind `static member val`)
                 members[d.Name] <-
-                    if info.IsMutable then
+                    if info.IsMutable || state.StaticFields.ContainsValue d.Name then
                         MValue ty
                     else
                         MConst ty
@@ -7368,7 +7574,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 // A value that is not a literal is computed when the program starts, by a
                 // function of its own, and kept until the program ends.
                 | (true, (MConst ty | MValue ty)), body ->
-                    if not (isVoid ty) then
+                    if true then
                         let init = uniqueName ctx (d.Name + "_init")
                         state.Values.Add((d.Name, ty, init))
 

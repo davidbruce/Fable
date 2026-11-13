@@ -458,6 +458,16 @@ let rec ex (em: Em) (e: Expr) : string =
         let args = xs |> List.map (ex em)
 
         let inits (fs: (string * Ty) list) =
+            if fs.Length <> args.Length then
+                fail
+                    None
+                    "internal: %s.%s is made of %d values, and has %d fields (%A)"
+                    (zigType t)
+                    case
+                    args.Length
+                    fs.Length
+                    (fs |> List.map fst)
+
             List.zip fs args
             |> List.map (fun ((f, _), a) -> $".%s{fieldIdent f} = %s{a}")
             |> String.concat ", "
@@ -492,6 +502,8 @@ let rec ex (em: Em) (e: Expr) : string =
         let o = ex em x
 
         match p with
+        // (a field of a value written out, `T{ ... }`, is read through parentheses)
+        | PField f when o.EndsWith "}" -> $"(%s{o}).%s{fieldIdent f}"
         | PField f -> $"%s{o}.%s{fieldIdent f}"
         | PCase(c, f) -> $"%s{o}.%s{fieldIdent c}.%s{fieldIdent f}"
         | PItem i -> $"%s{o}[%d{i}]"

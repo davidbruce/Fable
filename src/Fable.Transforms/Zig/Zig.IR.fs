@@ -654,6 +654,9 @@ type FileState() =
     member val Values = List<string * Ty * string>()
     /// the classes that take part in inheritance that this file declares
     member val Objs = List<ObjDecl>()
+    /// the static fields of the types of the file (`static let`, `static member val`), as
+    /// module-level values: `Type.field` to the value's name
+    member val StaticFields = Dictionary<string, string>()
     /// the functions marked as tests (`[<Fact>]`, `[<Test>]`): what the test is called, and
     /// the function; each becomes a Zig `test` that `zig test` runs
     member val Tests = List<string * string>()

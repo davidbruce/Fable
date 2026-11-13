@@ -2815,6 +2815,21 @@ pub fn emptyAs(comptime T: type, x: anytype) T {
     }
 }
 
+/// `string x` and `x.ToString()` of a value whose type is a type parameter: what they give for
+/// the type it stands for
+pub fn genericText(x: anytype) Raised!String {
+    const T = @TypeOf(x);
+    if (T == String) return strConcat(x, null);
+    if (T == u16) return format(.{arg(.{ .kind = 'c' }, x)});
+    if (T == Any) return anyToString(x, true);
+    if (T == Obj) return objText(x);
+    if (comptime hookOf(T, "fable_to_string")) return hookType(T).fable_to_string.call(.{x});
+    return switch (@typeInfo(T)) {
+        .int, .float, .bool => format(.{x}),
+        else => if (T == BigInt or T == NetDecimal) format(.{x}) else anyText(x),
+    };
+}
+
 fn objEql(a: Obj, b: Obj) bool {
     if (a == b) return true;
     if (a.type.equals) |f| return f(a, b);
