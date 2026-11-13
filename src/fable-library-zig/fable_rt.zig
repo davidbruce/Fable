@@ -51,11 +51,13 @@ const thread = if (sgc.per_thread) struct {
     threadlocal var collector: sgc.Gc = undefined;
     threadlocal var collector_ready: bool = false;
     threadlocal var current: ?Exn = null;
+    threadlocal var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
 } else struct {
     var stats: Stats = .{};
     var collector: sgc.Gc = undefined;
     var collector_ready: bool = false;
     var current: ?Exn = null;
+    var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
 };
 
 /// This thread's counters (all zero in builds that do not count).
@@ -151,6 +153,8 @@ fn movedOut(_: void, h: *sgc.Hdr) void {
 
 pub inline fn free(c: anytype) void {
     if (track) thread.stats.frees += 1;
+    // (a cell that weak references point at: they see it is gone)
+    if (thread.weak.count() != 0) weakGone(@intFromPtr(c));
     // (the blocks a cell holds besides itself: an array's items, a dictionary's entries)
     if (comptime @hasDecl(@TypeOf(c.*), "fable_array")) allocator.free(c.items);
     if (comptime @hasDecl(@TypeOf(c.*), "fable_free")) @TypeOf(c.*).fable_free(c);
@@ -1672,6 +1676,91 @@ pub fn setToList(h: anytype) List(KeyOf(@TypeOf(h))) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Weak references
+//
+// `WeakReference<'T>` points at a cell without keeping it alive. It holds a handle, shared by
+// every weak reference to the same cell and found through a table of this thread; when the
+// cell is freed (its last reference went, or the cycle collector found it dead) the handle is
+// cleared and every weak reference to it sees None from then on. While no weak reference
+// exists the table is empty, and freeing a cell costs one more compare.
+// ---------------------------------------------------------------------------------------------
+
+pub const WeakHandle = struct {
+    /// the cell, or null once it is freed
+    target: ?usize,
+    /// the weak references that hold this handle
+    refs: u32,
+};
+
+fn weakGone(addr: usize) void {
+    if (thread.weak.fetchRemove(addr)) |kv| kv.value.target = null;
+}
+
+fn weakHandle(addr: usize) *WeakHandle {
+    const entry = thread.weak.getOrPut(allocator, addr) catch @panic("fable: out of memory");
+    if (!entry.found_existing) {
+        const h = allocator.create(WeakHandle) catch @panic("fable: out of memory");
+        h.* = .{ .target = addr, .refs = 0 };
+        entry.value_ptr.* = h;
+    }
+    entry.value_ptr.*.refs += 1;
+    return entry.value_ptr.*;
+}
+
+fn weakLetGo(h: *WeakHandle) void {
+    h.refs -= 1;
+    if (h.refs != 0) return;
+    if (h.target) |addr| _ = thread.weak.remove(addr);
+    allocator.destroy(h);
+}
+
+/// .NET's `WeakReference<'T>` of a reference type (a class, a record with mutable fields, an
+/// array, ...: a cell).
+pub fn Weak(comptime T: type) type {
+    if (comptime !isCellPtr(T)) @compileError("fable: a weak reference needs a reference type (a class, a record with mutable fields, an array, ...), not " ++ @typeName(T));
+    return *struct {
+        const Self = @This();
+        pub const fable_identity = {};
+        pub const fable_weak = T;
+        @"$rc": u32 = 1,
+        handle: *WeakHandle,
+
+        pub fn fable_free(c: *Self) void {
+            weakLetGo(c.handle);
+        }
+
+        pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
+            _ = x;
+            _ = depth;
+            return b.word("System.WeakReference`1");
+        }
+    };
+}
+
+/// `WeakReference<'T>(target)`
+pub fn weakNew(comptime W: type, target: @typeInfo(W).pointer.child.fable_weak) W {
+    const c = allocator.create(@typeInfo(W).pointer.child) catch @panic("fable: out of memory");
+    c.* = .{ .handle = weakHandle(@intFromPtr(target)) };
+    if (track) thread.stats.allocs += 1;
+    return c;
+}
+
+/// `w.TryGetTarget(&target)`: the target (a reference of its own), or null once it is freed.
+pub fn weakTryGet(w: anytype) ?@typeInfo(@TypeOf(w)).pointer.child.fable_weak {
+    const T = @typeInfo(@TypeOf(w)).pointer.child.fable_weak;
+    const addr = w.handle.target orelse return null;
+    const target: T = @ptrFromInt(addr);
+    return dup(target);
+}
+
+/// `w.SetTarget(target)`
+pub fn weakSet(w: anytype, target: @typeInfo(@TypeOf(w)).pointer.child.fable_weak) void {
+    const old = w.handle;
+    w.handle = weakHandle(@intFromPtr(target));
+    weakLetGo(old);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Cycles
 //
 // Reference counting alone never frees a structure that reaches itself. A structure can only
@@ -2024,9 +2113,12 @@ pub fn liveCells() i32 {
     return @intCast(live());
 }
 
-/// Give back the collector's own bookkeeping. Nothing it looks after may be alive.
+/// Give back the collector's own bookkeeping, and the table of weak references. Nothing they
+/// look after may be alive.
 pub fn collectorDeinit() void {
     if (thread.collector_ready) thread.collector.deinit();
+    thread.weak.deinit(allocator);
+    thread.weak = .empty;
 }
 
 /// The collector's counters (see fable_sgc.zig), or null if no cell ever needed it.
@@ -5739,6 +5831,28 @@ test ".NET's ToString, Split, StringBuilder, categories" {
     try std.testing.expectEqual(@as(u32, 3966132137), sum);
     try std.testing.expect(strEqualsIgnoreCase(str("abc"), str("ABC")) and strCompareIgnoreCase(str("a"), str("A")) == 0);
     try std.testing.expectEqual(@as(f64, 7), charNumericValue('7'));
+}
+
+test "weak references see their target go" {
+    const before = thread.stats;
+    const R = *struct { @"$rc": u32 = 1, value: i32 };
+    const a = new(R, .{ .value = 7 });
+    const w = weakNew(Weak(R), a);
+    const w2 = weakNew(Weak(R), a);
+    const got = weakTryGet(w).?;
+    try std.testing.expectEqual(@as(i32, 7), got.value);
+    drop(got);
+    drop(a);
+    try std.testing.expect(weakTryGet(w) == null and weakTryGet(w2) == null);
+    const b = new(R, .{ .value = 8 });
+    weakSet(w, b);
+    try std.testing.expectEqual(@as(i32, 8), weakTryGet(w).?.value);
+    drop(b);
+    drop(b);
+    drop(w);
+    drop(w2);
+    try std.testing.expectEqual(@as(usize, 0), thread.weak.count());
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }
 
 test "conv follows .NET" {

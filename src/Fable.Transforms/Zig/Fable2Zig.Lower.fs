@@ -54,6 +54,9 @@ type Ctx =
         /// inside a `for ... in` loop: the enumerator's name, and the variable that holds the
         /// item of this round
         Enumerators: Dictionary<string, Var>
+        /// `(ok, value)` of a `TryGet...(&value)` whose value has no default here: the option
+        /// that stands for it
+        OutTuples: Dictionary<string, Var>
         /// inside a `with` handler: the exception it caught (for `reraise ()`)
         CaughtExn: Var option
     }
@@ -547,6 +550,8 @@ let private netEnt (state: FileState) (name: string) : Ent =
             | "Dictionary" -> [ "K"; "V" ], [ "key", TGen "K"; "value", TGen "V" ]
             | "HashSet" -> [ "T" ], [ "key", TGen "T" ]
             | "StringBuilder" -> [], []
+            // (a weak reference holds nothing that keeps its target alive)
+            | "Weak" -> [ "T" ], []
             | _ -> [ "T" ], [ "items", TGen "T" ]
 
         let e =
@@ -705,6 +710,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
     | Fable.AnonymousRecordType(names, genArgs, _) -> TEnt(anonEnt ctx.State names, genArgs |> List.map (mapType ctx r))
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Lazy`1" -> TEnt(lazyEnt ctx.State, [ mapType ctx r t ])
+    | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.WeakReference`1" ->
+        TEnt(netEnt ctx.State "Weak", [ mapType ctx r t ])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Text.StringBuilder" ->
         TEnt(netEnt ctx.State "StringBuilder", [])
     | Fable.Array(t, _) -> TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
@@ -1858,6 +1865,18 @@ let rec private neverNull (e: Fable.Expr) : bool =
             && (imp.Selector = "op_Addition" || imp.Selector = "ToString"))
     | _ -> false
 
+/// Has this type a default value here (what .NET's is: zero, false, null of a string, None)?
+let rec private hasDefault (t: Fable.Type) : bool =
+    match t with
+    | Fable.Number _
+    | Fable.Char
+    | Fable.Boolean
+    | Fable.String
+    | Fable.Unit
+    | Fable.Option _ -> true
+    | Fable.Tuple(ts, _) -> List.forall hasDefault ts
+    | _ -> false
+
 /// The item type of `IEnumerator<T>`.
 let private enumeratorItem (t: Fable.Type) : Fable.Type =
     match t with
@@ -2056,6 +2075,49 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     // a function with several arguments that is used one argument at a time
     | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
+
+    // `match w.TryGetTarget() with | true, x -> ...` where x's type has no default value (null on
+    // .NET): the pair is an option here, which the pattern reads
+    | Fable.Let(pair,
+                Fable.Let(out,
+                          Fable.Call(Fable.Import(defaultOf, _, _), _, _, _),
+                          Fable.Value(Fable.NewTuple([ tryCall; Fable.IdentExpr outRef ], _), _)),
+                body) when
+        defaultOf.Selector = "DefaultOf"
+        && outRef.Name = out.Name
+        && not (hasDefault out.Type)
+        ->
+        let valueTy = mapType ctx e.Range out.Type
+        let found = ctx.State.NewVar("found", TOpt valueTy, VLocal, false)
+
+        let tryIr =
+            match tryCall with
+            | Fable.Call(Fable.Import(imp, _, _), info, _, r) ->
+                let target = Option.toList info.ThisArg @ info.Args
+                let source = target.Head
+
+                match imp.Selector with
+                | "TryGetTarget" ->
+                    bindArgs ctx [ lw ctx source ] (fun xs -> EEmit("fable_rt.weakTryGet($0)", xs, TOpt valueTy))
+                | "TryGetValue" ->
+                    bindArgs
+                        ctx
+                        [ lw ctx source; lw ctx target[1] ]
+                        (fun xs -> EEmit("fable_rt.dictTryGet($0, $1)", xs, TOpt valueTy))
+                | other -> fail r "the Zig target does not support %s with a value of this type yet" other
+            | _ -> fail e.Range "internal: not a call"
+
+        ctx.State.UsesRuntime <- true
+        ctx.OutTuples[pair.Name] <- found
+        ELet(found, tryIr, lw ctx body)
+
+    | Fable.Get(Fable.IdentExpr pair, Fable.TupleIndex i, t, r) when ctx.OutTuples.ContainsKey pair.Name ->
+        let found = ctx.OutTuples[pair.Name]
+
+        if i = 0 then
+            EPrim("not", [ ETest(EVar found, "None", found.Ty) ], tBool)
+        else
+            EGet(EVar found, PSome, mapType ctx r t)
 
     // `for x in source do body`: Fable gives an enumerator and a `while` over `MoveNext`. Here
     // it is a loop of the source's own: down a list, along a string by index. A set or a map is
@@ -3718,6 +3780,36 @@ and dotnetCall
         rt "fable_rt.lazyForce($0)" [ l ] (mapType ctx r t)
     | "System.Lazy`1", "get_IsValueCreated", [ l ] -> pure' "fable_rt.lazyIsCreated($0)" [ l ] tBool
 
+    // ---- weak references ----
+    | "System.WeakReference`1", ".ctor", [ target ] -> pure' "fable_rt.weakNew($R, $0)" [ target ] (mapType ctx r t)
+    | "System.WeakReference`1", "SetTarget", [ w; target ] -> pure' "fable_rt.weakSet($0, $1)" [ w; target ] tVoid
+    | "System.WeakReference`1",
+      "TryGetTarget",
+      [ w; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+        ctx.Vars.ContainsKey out.Name
+        ->
+        let outVar = ctx.Vars[out.Name]
+        let tmp = ctx.State.NewVar("target", TOpt outVar.Ty, VLocal, false)
+        ctx.State.UsesRuntime <- true
+
+        bindArgs
+            ctx
+            [ lw ctx w ]
+            (fun xs ->
+                ELet(
+                    tmp,
+                    EEmit("fable_rt.weakTryGet($0)", xs, TOpt outVar.Ty),
+                    EIf(
+                        EPrim("not", [ ETest(EVar tmp, "None", TOpt outVar.Ty) ], tBool),
+                        ESeq(EAssign(outVar, EGet(EVar tmp, PSome, outVar.Ty)), ELit("true", tBool)),
+                        ELit("false", tBool),
+                        tBool
+                    )
+                )
+            )
+    // `GC.Collect()`: free every cycle that is dead now
+    | "System.GC", "Collect", [] -> pure' "_ = fable_rt.collect()" [] tVoid
+
     // ---- StringBuilder ----
     | "System.Text.StringBuilder", ".ctor", [] -> pure' "fable_rt.sbNew(null)" [] (mapType ctx r t)
     | "System.Text.StringBuilder", ".ctor", [ init ] when init.Type = Fable.String ->
@@ -4625,6 +4717,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             DecisionTargets = []
             Boxed = HashSet()
             Enumerators = Dictionary()
+            OutTuples = Dictionary()
             CaughtExn = None
         }
 

@@ -351,6 +351,21 @@ collection inside a loop over it raises; here the loop goes on over what it star
 
 Not yet: `dict`, `Stack`, `Queue`, `SortedDictionary`, LINQ, and the rarer members.
 
+## Weak references
+
+`WeakReference<'T>` of a reference type (a class, a record with mutable fields, an array, ...)
+points at a cell without keeping it alive. Every weak reference to one cell shares a handle,
+found through a table of the thread; when the cell is freed (its last reference went, or the
+cycle collector found it dead) the handle is cleared and `TryGetTarget` gives false from then
+on. While no weak reference exists the table is empty and freeing a cell costs one compare.
+`match w.TryGetTarget() with | true, x -> ...` and `match d.TryGetValue k with ...` of a value
+whose type has no default here (null on .NET) are read as an option.
+
+A cell is freed at the last use of its last reference, so a weak reference sees it gone at
+once, where on .NET it stays until the garbage collector runs; `GC.Collect()` runs the cycle
+collector. Not yet: the non-generic `WeakReference`, weak references to strings and to
+function values.
+
 ## Cycles
 
 Reference counting alone never frees a structure that reaches itself. The cycle collector
