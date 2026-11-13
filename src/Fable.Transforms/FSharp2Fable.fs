@@ -46,7 +46,9 @@ let private transformBaseConsCall
             WarningCodes.nonPrimaryBaseConstructor |> addWarningWithCode com [] r
 
         match makeCallFrom com ctx r Fable.Unit genArgs None baseArgs baseCons with
-        | Fable.Call(_baseExpr, info, t, r) when not (com.Options.Language = Rust) ->
+        // (Zig calls the base class's constructor function itself: it computes the fields
+        // that class declares)
+        | Fable.Call(_baseExpr, info, t, r) when not (com.Options.Language = Rust || com.Options.Language = Zig) ->
             // The baseExpr will be the exposed constructor function,
             // replace with a direct reference to the entity
             let baseExpr =

@@ -359,3 +359,4 @@ let main _ =
     + Weak.run ()
     + Resources.run ()
     + Pointers.run ()
+    + Inheritance.run ()

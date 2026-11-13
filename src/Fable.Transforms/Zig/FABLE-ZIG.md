@@ -68,10 +68,29 @@ Not yet: other overrides and interface implementations, classes, object expressi
 
 ## Classes, interfaces, object expressions
 
-A class is a counted cell of its fields (all of which can be assigned, so a class can close a
-cycle). Its constructor is a function that computes the fields in order, as locals, and makes
-the cell of them at the end; `this` cannot be used in a constructor yet. Members are functions
-whose first argument is the object, as for records.
+An object of a class is a counted cell that starts with a header naming its class
+(`fable_rt.Obj`, as an exception names its type), so that a file can derive from a class of
+another file without that file knowing. After the header come the fields each class of its
+chain declares, the root class's first. Where the fields of a class are depends only on the
+classes above it, so a member of a class reads its fields at a constant offset whatever class
+the object really is (no table is consulted). A class's constructor is a function that
+computes the fields in order, its parent's constructor first, and returns them (`Circle__chain`);
+making an object puts them in a new cell. `this` cannot be used in a constructor yet. Members
+are functions whose first argument is the object, as for records.
+
+Every class is such an object, because an earlier file cannot know that a later one derives
+from it (a generic class is still a plain counted cell unless it is abstract, derives from a
+class or has virtual members; those generic classes are not supported yet).
+
+Virtual members (`abstract` with `default`, and `override`) are called through the table of
+function values that the object's class has for the class that introduced the member: each
+class's type (`Circle__type`) holds one table for each class of its chain, filled with the
+most derived implementations. `base.M()` calls the parent's implementation directly. `:?`
+walks the chain of classes; `:?>` raises `InvalidCastException` with .NET's message. A class's
+`ToString` override is in its type too, so `string x` finds it whatever the static type; without
+one the text is .NET's name of the class (`Probe+Circle`). An interface that a base class
+implements works on objects of derived classes. Objects are equal only to themselves, as on
+.NET.
 
 An interface value is a struct of function values, one per member (a property is a function of
 unit). A value of a class given where an interface is expected becomes that struct: each member
@@ -82,9 +101,11 @@ what function values already do: ownership, raising, cycles; the cost is a funct
 member when a value is made an interface. `use` works with a class that implements
 `IDisposable` (the test and the call are settled from the class's type).
 
-Not yet: inheritance and abstract classes, `this` in a constructor or an object expression,
-interfaces that inherit interfaces, generic interface members, type tests against interfaces at
-run time, and overrides other than `ToString`.
+Not yet: generic classes that take part in inheritance, overloaded virtual members, object
+expressions that derive from a class, secondary constructors of derived classes, `this` in a
+constructor or an object expression, interfaces that inherit interfaces, generic interface
+members, type tests against interfaces at run time, `%A` of an object using its `ToString`, and
+overrides of `Equals` and `GetHashCode`.
 
 A module-level value that is not a literal is computed when the program starts: every file
 has an `$init` that first runs those of the files it uses and then fills its own values in

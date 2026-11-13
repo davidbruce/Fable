@@ -106,6 +106,7 @@ let rec isManaged (t: Ty) =
     // (a function value may own an environment)
     | TFn _ -> true
     | TPrim "fable_rt.Exn"
+    | TPrim "fable_rt.Obj"
     | TPrim "fable_rt.BigInt"
     | TPrim "fable_rt.String" -> true
     | _ -> false
@@ -137,6 +138,7 @@ let rec isManagedDecl (t: Ty) =
     | TTuple ts -> List.exists isManagedDecl ts
     | TFn _ -> true
     | TPrim "fable_rt.Exn"
+    | TPrim "fable_rt.Obj"
     | TPrim "fable_rt.BigInt"
     | TPrim "fable_rt.String" -> true
     | _ -> false
@@ -160,7 +162,8 @@ let rec mayHoldCyclic (t: Ty) : bool =
     match t with
     | TFn _
     | TGen _
-    | TPrim "fable_rt.Exn" -> true
+    | TPrim "fable_rt.Exn"
+    | TPrim "fable_rt.Obj" -> true
     | TEnt(e, args) ->
         e.Cyclic
         || e.ReachesOpaque
@@ -448,7 +451,9 @@ let rec touchesMutable (e: Expr) : bool =
     match e with
     | EGet(x, proj, _) ->
         (match proj, typeOf x with
-         | PField f, TEnt(ent, _) -> List.contains f ent.MutableFields
+         | PField f, TEnt(ent, _)
+         // (the fields of an object, reached through a pointer to its class's part)
+         | PField f, TPtr(TEnt(ent, _), _) -> List.contains f ent.MutableFields
          | _ -> false)
         || touchesMutable x
     | _ -> false
@@ -603,6 +608,22 @@ let tempName (e: Expr) =
     | _ -> "tmp"
 
 /// Per-file state of the lowering: fresh variables and the functions produced so far.
+/// A class that takes part in inheritance, as the file that declares it emits it: its type
+/// (`Circle__type`), the struct of its chain of fields, .NET's name, its parent's type, and for
+/// each class of its chain the table of virtual members: the table's type, and for each member
+/// the function that implements it and the type of the function value (None: that class
+/// introduces no virtual member, or this class is abstract).
+type ObjDecl =
+    {
+        TypeName: string
+        Chain: Ty
+        DotnetName: string
+        Parent: string option
+        Tables: (Ty * (string * string * Ty) list) option list
+        /// the function of the class's `ToString` (its own or the nearest inherited one)
+        ToString: string option
+    }
+
 type FileState() =
     let mutable varCounter = 0
     member val Fns = List<FnInfo>()
@@ -619,6 +640,10 @@ type FileState() =
     /// the module-level values that are computed when the program starts: name, type, and the
     /// function that computes it
     member val Values = List<string * Ty * string>()
+    /// the classes that take part in inheritance that this file declares
+    member val Objs = List<ObjDecl>()
+    /// what is known of such classes (see `objInfo`), by full name
+    member val ObjInfos = Dictionary<string, obj>()
     /// imports of other files: path -> local alias
     member val Imports = Dictionary<string, string>()
     /// the generated code calls the hand-written runtime (`fable_rt.zig`)
@@ -645,3 +670,113 @@ type FileState() =
 
         this.Vars[v.Id] <- v
         v
+
+// ---- Zig names (the emitter's, also used where the lowering writes Zig text) ----
+
+let zigKeywords =
+    set
+        [
+            "addrspace"
+            "align"
+            "allowzero"
+            "and"
+            "anyframe"
+            "anytype"
+            "asm"
+            "break"
+            "callconv"
+            "catch"
+            "comptime"
+            "const"
+            "continue"
+            "defer"
+            "else"
+            "enum"
+            "errdefer"
+            "error"
+            "export"
+            "extern"
+            "fn"
+            "for"
+            "if"
+            "inline"
+            "linksection"
+            "noalias"
+            "noinline"
+            "nosuspend"
+            "opaque"
+            "or"
+            "orelse"
+            "packed"
+            "pub"
+            "resume"
+            "return"
+            "struct"
+            "suspend"
+            "switch"
+            "test"
+            "threadlocal"
+            "try"
+            "union"
+            "unreachable"
+            "var"
+            "volatile"
+            "while"
+            "bool"
+            "void"
+            "type"
+            "true"
+            "false"
+            "null"
+            "undefined"
+            "anyerror"
+            "noreturn"
+            "usize"
+            "isize"
+            "f16"
+            "f32"
+            "f64"
+            "f80"
+            "f128"
+            "c_int"
+            "c_uint"
+            "c_long"
+            "c_char"
+            "comptime_int"
+            "comptime_float"
+            "anyopaque"
+            "std"
+            "main"
+            "fable_rt"
+        ]
+
+/// Zig reserves `i<N>` and `u<N>` for every N.
+let isReservedIdent (s: string) =
+    zigKeywords.Contains s
+    || System.Text.RegularExpressions.Regex.IsMatch(s, "^[iu][0-9]+$")
+
+let cleanIdent (s: string) =
+    let s = System.Text.RegularExpressions.Regex.Replace(s, "[^A-Za-z0-9_]", "_")
+
+    // (`_` alone is not a name in Zig: F#'s `member _.X` names the object so)
+    if s = "" || s = "_" then
+        "v"
+    elif System.Char.IsDigit s[0] then
+        "_" + s
+    else
+        s
+
+/// The Zig name of a module-level declaration.
+let topIdent (s: string) =
+    let c = cleanIdent s
+
+    if isReservedIdent c then
+        c + "_"
+    else
+        c
+
+/// A function or type of this file, or `alias.name` for one that another file declares.
+let callTarget (f: string) =
+    match f.IndexOf '.' with
+    | -1 -> topIdent f
+    | i -> f.Substring(0, i + 1) + topIdent (f.Substring(i + 1))

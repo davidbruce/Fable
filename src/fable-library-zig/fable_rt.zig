@@ -243,7 +243,7 @@ fn isHeapUnion(comptime T: type) bool {
             var any = false;
             inline for (u.field_types) |F| {
                 if (F == void) continue;
-                if (!isCellPtr(F) or F == Exn) return false;
+                if (!isCellPtr(F) or F == Exn or F == Obj) return false;
                 any = true;
             }
             return any;
@@ -293,7 +293,7 @@ pub fn drop(x: anytype) void {
         }
         return;
     }
-    if (T == Exn) {
+    if (T == Exn or T == Obj) {
         if (releaseIsLast(x)) x.type.destroy(x);
         return;
     }
@@ -494,7 +494,7 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or eql(a.items, b.items);
     if (comptime !isManaged(T) and !holdsDecimal(T)) return std.meta.eql(a, b);
     if (comptime isFunc(T)) @compileError("function values cannot be compared");
-    if (T == Exn) return a == b;
+    if (T == Exn or T == Obj) return a == b;
     if (T == String) return strEql(a, b);
     switch (@typeInfo(T)) {
         .pointer => |p| {
@@ -2354,6 +2354,231 @@ fn decRead(u: []const u16, comptime fsharp: bool) (error{Format} || Raised)!NetD
 }
 
 // ---------------------------------------------------------------------------------------------
+// Objects of classes that inherit or are inherited from
+//
+// Such an object is a counted cell that starts with a header naming its class, as an exception
+// does: the program can make classes that derive from a class no other file has to know about.
+// After the header comes the chain of the fields each class declares, the root class's first
+// (`chain.base.base.own`). A class's code finds its own fields through the offset its class
+// has in the object's chain, and calls a virtual member through the table of function values
+// the object's class has for the class that introduced the member.
+// ---------------------------------------------------------------------------------------------
+
+pub const ObjType = struct {
+    /// .NET's name of the class (`Probe+Circle`)
+    name: []const u8,
+    parent: ?*const ObjType,
+    /// the table of the virtual members each class of the chain introduces (null for a class
+    /// that introduces none, and in an abstract class)
+    vtables: []const ?*const anyopaque,
+    destroy: *const fn (Obj) void,
+    /// the class's `ToString` (its own or the nearest one it inherits), if it has one
+    to_string: ?*const fn (?*Env, Obj, void) Raised!String = null,
+};
+
+pub const ObjHeader = struct {
+    @"$rc": u32 = 1,
+    /// the collector's header of this object, if what it holds can be part of a cycle
+    gc: ?*sgc.Hdr = null,
+    type: *const ObjType,
+};
+
+/// An object of a class.
+pub const Obj = *ObjHeader;
+
+/// The fields each class of a chain declares, the root's first.
+fn partsOf(comptime Chain: type) []const type {
+    comptime {
+        const own: [1]type = .{@FieldType(Chain, "own")};
+        if (!@hasField(Chain, "base")) return &own;
+        const before = partsOf(@FieldType(Chain, "base"));
+        const all = before[0..before.len].* ++ own;
+        return &all;
+    }
+}
+
+fn PartAt(comptime C: type, comptime up: usize) type {
+    return if (up == 0) @FieldType(C, "own") else PartAt(@FieldType(C, "base"), up - 1);
+}
+
+/// The fields of the class `up` steps above the last in a chain.
+fn ownAt(comptime C: type, chain: C, comptime up: usize) PartAt(C, up) {
+    if (up == 0) return chain.own;
+    return ownAt(@FieldType(C, "base"), chain.base, up - 1);
+}
+
+/// Where the fields of the class `parts[i]` are, from the header. It depends only on the
+/// classes above it, so it is the same in every object of a class that derives from it.
+fn partOffset(comptime parts: []const type, comptime i: usize) usize {
+    var off: usize = @sizeOf(ObjHeader);
+    for (parts[0..i]) |P| off = std.mem.alignForward(usize, off, @alignOf(P)) + @sizeOf(P);
+    return std.mem.alignForward(usize, off, @alignOf(parts[i]));
+}
+
+/// An object whose class has the chain of fields `Chain`: the header, the fields of each class
+/// in turn, and the collector's header if what it holds can be part of a cycle.
+fn ObjCell(comptime Chain: type) type {
+    return struct {
+        const parts = partsOf(Chain);
+        const cyclic = functions_in_cycles and holdsCyclic(Chain);
+        const end = partOffset(parts, parts.len - 1) + @sizeOf(parts[parts.len - 1]);
+        const gc_at = std.mem.alignForward(usize, end, @alignOf(sgc.Hdr));
+        const size = if (cyclic) gc_at + @sizeOf(sgc.Hdr) else end;
+        const alignment = blk: {
+            var a: usize = @max(@alignOf(ObjHeader), if (cyclic) @alignOf(sgc.Hdr) else 1);
+            for (parts) |P| a = @max(a, @alignOf(P));
+            break :blk a;
+        };
+        const Raw = struct { bytes: [size]u8 align(alignment) };
+
+        inline fn part(o: Obj, comptime i: usize) *parts[i] {
+            return @ptrFromInt(@intFromPtr(o) + comptime partOffset(parts, i));
+        }
+
+        inline fn hdrOf(o: Obj) *sgc.Hdr {
+            return @ptrFromInt(@intFromPtr(o) + gc_at);
+        }
+
+        inline fn objOfHdr(h: *sgc.Hdr) Obj {
+            return @ptrFromInt(@intFromPtr(h) - gc_at);
+        }
+
+        fn chainPart(chain: Chain, comptime i: usize) parts[i] {
+            return ownAt(Chain, chain, parts.len - 1 - i);
+        }
+
+        fn destroy(o: Obj) void {
+            inline for (0..parts.len) |i| drop(part(o, i).*);
+            free(@as(*Raw, @ptrCast(@alignCast(o))));
+        }
+
+        fn new(ty: *const ObjType, chain: Chain) Obj {
+            if (comptime cyclic) gcTick();
+            const raw = allocator.create(Raw) catch @panic("fable: out of memory");
+            const o: Obj = @ptrCast(@alignCast(&raw.bytes));
+            o.* = .{ .type = ty };
+            inline for (0..parts.len) |i| part(o, i).* = chainPart(chain, i);
+            if (comptime cyclic) {
+                hdrOf(o).* = thread.collector.hdr(&desc, isLeaf(o));
+                o.gc = hdrOf(o);
+            }
+            if (track) thread.stats.allocs += 1;
+            return o;
+        }
+
+        fn trace(n: *sgc.Hdr, v: *sgc.Visitor) void {
+            const o = objOfHdr(n);
+            inline for (0..parts.len) |i| eachHdr(part(o, i).*, v, visit);
+        }
+
+        fn releaseOutside(n: *sgc.Hdr, _: ?*anyopaque) void {
+            const o = objOfHdr(n);
+            inline for (0..parts.len) |i| dropOutside(part(o, i).*);
+        }
+
+        fn freeCell(n: *sgc.Hdr, _: ?*anyopaque) void {
+            free(@as(*Raw, @ptrCast(@alignCast(objOfHdr(n)))));
+        }
+
+        fn finalize(n: *sgc.Hdr, _: ?*anyopaque) void {
+            const o = objOfHdr(n);
+            inline for (0..parts.len) |i| drop(part(o, i).*);
+            free(@as(*Raw, @ptrCast(@alignCast(o))));
+        }
+
+        fn isLeaf(o: Obj) bool {
+            var n: usize = 0;
+            inline for (0..parts.len) |i| eachHdr(part(o, i).*, &n, countOne);
+            return n == 0;
+        }
+
+        const desc: sgc.Desc = .{
+            .rc_offset = @as(isize, @offsetOf(ObjHeader, "$rc")) - @as(isize, gc_at),
+            .trace = trace,
+            .release_outside = releaseOutside,
+            .free = freeCell,
+            .finalize = finalize,
+        };
+    };
+}
+
+/// The class of the objects whose fields are `Chain`.
+pub fn objType(
+    comptime Chain: type,
+    comptime name: []const u8,
+    comptime parent: ?*const ObjType,
+    comptime vtables: []const ?*const anyopaque,
+    comptime to_string: ?*const fn (?*Env, Obj, void) Raised!String,
+) ObjType {
+    return .{ .name = name, .parent = parent, .vtables = vtables, .destroy = ObjCell(Chain).destroy, .to_string = to_string };
+}
+
+/// A new object of class `ty` with these fields (which it shares).
+pub fn objNew(ty: *const ObjType, chain: anytype) Obj {
+    return ObjCell(@TypeOf(chain)).new(ty, dup(chain));
+}
+
+/// The fields that the last class of `parts` (a class and the classes above it, the root
+/// first) declares, in an object of that class or of one that derives from it.
+pub inline fn objPart(comptime P: type, comptime parts: []const type, o: Obj) P {
+    return @ptrFromInt(@intFromPtr(o) + comptime partOffset(parts, parts.len - 1));
+}
+
+/// `string o`: its class's `ToString`, or .NET's name of its class.
+pub fn objText(o: Obj) Raised!String {
+    if (o.type.to_string) |f| return f(null, dup(o), {});
+    var b: TextBuilder = .{};
+    b.addAscii(o.type.name);
+    return b.finish();
+}
+
+/// The table of the virtual members that the class at `depth` introduces.
+pub inline fn objVt(comptime P: type, o: Obj, comptime depth: usize) P {
+    return @ptrCast(@alignCast(o.type.vtables[depth].?));
+}
+
+/// `o :? C`: is the object of class `ty`, or of a class that derives from it?
+pub fn objIs(o: Obj, ty: *const ObjType) bool {
+    var t: ?*const ObjType = o.type;
+    while (t) |class| : (t = class.parent) {
+        if (class == ty) return true;
+    }
+    return false;
+}
+
+/// `o :?> C`
+pub fn objCast(o: Obj, ty: *const ObjType) Raised!Obj {
+    if (objIs(o, ty)) return dup(o);
+    // (.NET names a class nested in a module without the module here)
+    const Short = struct {
+        fn of(name: []const u8) []const u8 {
+            return if (std.mem.lastIndexOfScalar(u8, name, '+')) |i| name[i + 1 ..] else name;
+        }
+    };
+    var b: TextBuilder = .{};
+    b.addAscii("Unable to cast object of type '");
+    b.addAscii(Short.of(o.type.name));
+    b.addAscii("' to type '");
+    b.addAscii(Short.of(ty.name));
+    b.addAscii("'.");
+    return raise(InvalidCastException, b.finish());
+}
+
+/// Store into a field of an object: the collector is told, as for a field of a reference
+/// record.
+pub inline fn objStore(o: Obj, place: anytype, value: @TypeOf(place.*)) void {
+    const old = place.*;
+    place.* = value;
+    if (o.gc) |h| {
+        eachHdr(old, h, unstored);
+        eachHdr(value, h, stored);
+    } else {
+        touch(value);
+    }
+    drop(old);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Weak references
 //
 // `WeakReference<'T>` points at a cell without keeping it alive. It holds a handle, shared by
@@ -2505,7 +2730,7 @@ fn hasGc(comptime C: type) bool {
 /// themselves (their type does not show what they hold); for any other cell it is in its type.
 inline fn gcOf(c: anytype) ?*sgc.Hdr {
     const C = @TypeOf(c.*);
-    if (C == Env or C == ExnHeader) return c.gc;
+    if (C == Env or C == ExnHeader or C == ObjHeader) return c.gc;
     if (comptime hasGc(C)) return &c.@"$gc";
     return null;
 }
@@ -2515,7 +2740,7 @@ inline fn gcOf(c: anytype) ?*sgc.Hdr {
 /// (Only declarations are looked at, never fields of cells: this is evaluated while the types
 /// that ask are still being put together.)
 pub fn holdsCyclic(comptime T: type) bool {
-    if (T == Exn) return functions_in_cycles;
+    if (T == Exn or T == Obj) return functions_in_cycles;
     switch (@typeInfo(T)) {
         .pointer => |p| {
             if (p.size == .slice) return holdsCyclic(p.child);
@@ -2545,7 +2770,7 @@ pub fn holdsCyclic(comptime T: type) bool {
 fn eachHdr(x: anytype, ctx: anytype, comptime f: anytype) void {
     const T = @TypeOf(x);
     if (comptime !holdsCyclic(T)) return;
-    if (T == Exn) {
+    if (T == Exn or T == Obj) {
         if (x.gc) |h| f(ctx, h);
         return;
     }
@@ -2581,7 +2806,7 @@ fn dropOutside(x: anytype) void {
     const T = @TypeOf(x);
     if (comptime !isManaged(T)) return;
     if (comptime !holdsCyclic(T)) return drop(x);
-    if (T == Exn) {
+    if (T == Exn or T == Obj) {
         if (x.gc) |h| {
             if (sgc.isGarbage(h)) return;
         }
@@ -2975,6 +3200,7 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
     if (T == bool) return @as(i32, @intFromBool(a)) - @as(i32, @intFromBool(b));
     if (T == void) return 0;
     if (T == Exn) @compileError("fable: exceptions cannot be compared");
+    if (T == Obj) @compileError("fable: objects of a class cannot be compared");
     if (comptime isFunc(T)) @compileError("fable: function values cannot be compared");
     switch (@typeInfo(T)) {
         .int, .float, .comptime_int, .comptime_float => {
@@ -3080,7 +3306,7 @@ pub fn hash(x: anytype) i32 {
         for (unitsOf(x)) |c| h = (h *% 33) ^ c;
         return @bitCast(h);
     }
-    if (T == Exn) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
+    if (T == Exn or T == Obj) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
     if (comptime isDecimal(T)) return decHash(x);
     if (comptime isFunc(T)) @compileError("fable: function values cannot be hashed");
     switch (@typeInfo(T)) {
@@ -4376,6 +4602,7 @@ pub const Shower = struct {
             return b.word(copy);
         }
         if (T == Exn) return x.type.show(b, x, prec, depth);
+        if (T == Obj) return b.word(x.type.name);
         if (comptime isFunc(T)) return b.word("<fun>");
         switch (@typeInfo(T)) {
             .void => return b.word("()"),
@@ -4600,6 +4827,7 @@ fn writeNet(out: *TextBuilder, x: anytype) void {
         return out.addAscii(decAscii(x, &buf));
     }
     if (T == u16) return out.addOne(x);
+    if (T == Obj) return out.addAscii(x.type.name);
     if (T == Exn) {
         const m = exnMessage(x);
         defer drop(m);
@@ -5141,6 +5369,7 @@ pub const FormatException = Class("System.FormatException", SystemException);
 pub const KeyNotFoundException = Class("System.Collections.Generic.KeyNotFoundException", SystemException);
 pub const MatchFailureException = Class("Microsoft.FSharp.Core.MatchFailureException", null);
 pub const AggregateException = Class("System.AggregateException", null);
+pub const InvalidCastException = Class("System.InvalidCastException", null);
 
 /// Raise an exception of a .NET class with a message.
 pub fn raise(comptime C: type, message: String) Raised {
@@ -6669,6 +6898,43 @@ test "weak references see their target go" {
     drop(w2);
     try std.testing.expectEqual(@as(usize, 0), thread.weak.count());
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "objects: parts, virtual members, type tests, cycles" {
+    const before = thread.stats;
+    const Shape = struct {
+        const Part = struct { name: String };
+        const Chain = struct { own: Part };
+        const VT = struct { area: *const fn (Obj) f64 };
+        const ty: ObjType = objType(Chain, "Probe+Shape", null, &.{null}, null);
+        fn name(o: Obj) String {
+            return objPart(*Part, &.{Part}, o).name;
+        }
+    };
+    const Circle = struct {
+        const Part = struct { r: f64, next: ?Obj };
+        const Chain = struct { base: Shape.Chain, own: Part };
+        fn area(o: Obj) f64 {
+            const r = objPart(*Part, &.{ Shape.Part, Part }, o).r;
+            return 3 * r * r;
+        }
+        const vt: Shape.VT = .{ .area = area };
+        const ty: ObjType = objType(Chain, "Probe+Circle", &Shape.ty, &.{ @ptrCast(&vt), null }, null);
+    };
+    const chain: Circle.Chain = .{ .base = .{ .own = .{ .name = str("circle") } }, .own = .{ .r = 2, .next = null } };
+    const c = objNew(&Circle.ty, chain);
+    drop(chain);
+    try expectText("circle", dup(Shape.name(c)));
+    try std.testing.expectEqual(@as(f64, 12), objVt(*const Shape.VT, c, 0).area(c));
+    try std.testing.expect(objIs(c, &Shape.ty) and objIs(c, &Circle.ty));
+    const s = try objCast(c, &Shape.ty);
+    drop(s);
+    try expectText("Probe+Circle", anyText(c));
+    // (a cycle through an object field: freed by the collector when functions can be in cycles)
+    objStore(c, &objPart(*Circle.Part, &.{ Shape.Part, Circle.Part }, c).next, dup(c));
+    drop(c);
+    _ = collect();
+    _ = before;
 }
 
 test "decimal does what .NET does" {

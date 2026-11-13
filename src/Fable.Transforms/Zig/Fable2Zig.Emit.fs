@@ -6,107 +6,6 @@ open System.Text
 open System.Text.RegularExpressions
 open Fable.Transforms.Zig.IR
 
-let zigKeywords =
-    set
-        [
-            "addrspace"
-            "align"
-            "allowzero"
-            "and"
-            "anyframe"
-            "anytype"
-            "asm"
-            "break"
-            "callconv"
-            "catch"
-            "comptime"
-            "const"
-            "continue"
-            "defer"
-            "else"
-            "enum"
-            "errdefer"
-            "error"
-            "export"
-            "extern"
-            "fn"
-            "for"
-            "if"
-            "inline"
-            "linksection"
-            "noalias"
-            "noinline"
-            "nosuspend"
-            "opaque"
-            "or"
-            "orelse"
-            "packed"
-            "pub"
-            "resume"
-            "return"
-            "struct"
-            "suspend"
-            "switch"
-            "test"
-            "threadlocal"
-            "try"
-            "union"
-            "unreachable"
-            "var"
-            "volatile"
-            "while"
-            "bool"
-            "void"
-            "type"
-            "true"
-            "false"
-            "null"
-            "undefined"
-            "anyerror"
-            "noreturn"
-            "usize"
-            "isize"
-            "f16"
-            "f32"
-            "f64"
-            "f80"
-            "f128"
-            "c_int"
-            "c_uint"
-            "c_long"
-            "c_char"
-            "comptime_int"
-            "comptime_float"
-            "anyopaque"
-            "std"
-            "main"
-            "fable_rt"
-        ]
-
-/// Zig reserves `i<N>` and `u<N>` for every N.
-let isReservedIdent (s: string) =
-    zigKeywords.Contains s || Regex.IsMatch(s, "^[iu][0-9]+$")
-
-let cleanIdent (s: string) =
-    let s = Regex.Replace(s, "[^A-Za-z0-9_]", "_")
-
-    // (`_` alone is not a name in Zig: F#'s `member _.X` names the object so)
-    if s = "" || s = "_" then
-        "v"
-    elif System.Char.IsDigit s[0] then
-        "_" + s
-    else
-        s
-
-/// The Zig name of a module-level declaration.
-let topIdent (s: string) =
-    let c = cleanIdent s
-
-    if isReservedIdent c then
-        c + "_"
-    else
-        c
-
 /// The Zig name of a field or of a union case.
 let fieldIdent (s: string) =
     let c = cleanIdent s
@@ -226,12 +125,6 @@ let unparen (s: string) =
             s.Substring(1, s.Length - 2)
     else
         s
-
-/// A function or type of this file, or `alias.name` for one that another file declares.
-let callTarget (f: string) =
-    match f.IndexOf '.' with
-    | -1 -> topIdent f
-    | i -> f.Substring(0, i + 1) + topIdent (f.Substring(i + 1))
 
 /// The constant that states what a function borrows, for the calls from other files (which
 /// are compiled without seeing the function). `$` cannot be part of a name that comes from F#.
@@ -920,6 +813,12 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
                 stored
 
         match lv with
+        // (a field of an object: the collector is told through the object's header)
+        | EGet(EEmit(m, [ o ], TPtr _), PField _, _) when
+            isManaged (typeOf lv)
+            && m.StartsWith("fable_rt.objPart(", System.StringComparison.Ordinal)
+            ->
+            L $"fable_rt.objStore(%s{ex em o}, &%s{place}, %s{value});"
         // (a field of a reference record: the collector is told, a cycle may be closed here)
         | EGet(owner, PField f, _) when
             isManaged (typeOf lv)
@@ -1802,6 +1701,89 @@ let emitFile (state: FileState) : string =
             emitFunction out rootNames adapters fns fn
         with ZigError(msg, None) ->
             raise (ZigError(msg, fn.Range))
+
+    // the classes that take part in inheritance: the type of each, with its tables of virtual
+    // members (function values of the functions that implement them)
+    for d in state.Objs do
+        let tables =
+            d.Tables
+            |> List.mapi (fun i t ->
+                match t with
+                | Some(vtTy, entries) ->
+                    let name = topIdent $"%s{d.TypeName}_vt%d{i}"
+
+                    let inits =
+                        entries
+                        |> List.map (fun (slot, target, fnTy) ->
+                            let key = target + "<>"
+
+                            let adapter =
+                                match adapters.TryGetValue key with
+                                | true, a -> a
+                                | _ ->
+                                    let a =
+                                        {
+                                            Name = $"@\"%s{target}$fn%d{adapters.Count}\""
+                                            Target = target
+                                            TypeArgs = []
+                                            NCaptures = 0
+                                            CaptureTys = []
+                                            FnTy = fnTy
+                                            Gens = []
+                                        }
+
+                                    adapters[key] <- a
+                                    a
+
+                            $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{adapterRef adapter}.code }}"
+                        )
+                        |> String.concat ", "
+
+                    out.AppendLine($"const %s{name}: %s{zigType vtTy} = .{{ %s{inits} }};")
+                    |> ignore
+
+                    "&" + name
+                | None -> "null"
+            )
+            |> String.concat ", "
+
+        let parent =
+            match d.Parent with
+            | Some p -> "&" + callTarget p
+            | None -> "null"
+
+        // (the class's ToString, as the code of a function value)
+        let toString =
+            match d.ToString with
+            | Some target ->
+                let fnTy = TFn([ TPrim "fable_rt.Obj"; tVoid ], tStr)
+                let key = target + "<>"
+
+                let adapter =
+                    match adapters.TryGetValue key with
+                    | true, a -> a
+                    | _ ->
+                        let a =
+                            {
+                                Name = $"@\"%s{target}$fn%d{adapters.Count}\""
+                                Target = target
+                                TypeArgs = []
+                                NCaptures = 0
+                                CaptureTys = []
+                                FnTy = fnTy
+                                Gens = []
+                            }
+
+                        adapters[key] <- a
+                        a
+
+                $"%s{adapterRef adapter}.code"
+            | None -> "null"
+
+        out.AppendLine(
+            $"pub const %s{topIdent d.TypeName}: fable_rt.ObjType = fable_rt.objType(%s{zigType d.Chain}, \"%s{d.DotnetName}\", %s{parent}, &.{{ %s{tables} }}, %s{toString});"
+        )
+        |> ignore
 
     for a in adapters.Values do
         emitAdapter out fns a

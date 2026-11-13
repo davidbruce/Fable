@@ -215,7 +215,8 @@ let private settleCyclic (state: FileState) =
 
         match t with
         | TFn _
-        | TPrim "fable_rt.Exn" -> [], true
+        | TPrim "fable_rt.Exn"
+        | TPrim "fable_rt.Obj" -> [], true
         | TEnt(e, args) ->
             let own =
                 if isCell e then
@@ -319,7 +320,8 @@ let private settleCycles (state: FileState) =
     let rec reachesOpaque (t: Ty) : bool =
         match t with
         | TFn _
-        | TPrim "fable_rt.Exn" -> true
+        | TPrim "fable_rt.Exn"
+        | TPrim "fable_rt.Obj" -> true
         | TEnt(e, args) ->
             List.exists reachesOpaque args
             || (if e.Kind = KHeapUnion || e.Kind = KRefRecord then
@@ -345,6 +347,21 @@ let private settleCycles (state: FileState) =
 
                     if not (freeGens [ fieldTy ]).IsEmpty then
                         generic <- true
+        // (a new object: every field of its chain can be assigned)
+        | EEmit(m, [ chain ], TPrim "fable_rt.Obj") when
+            m.StartsWith("fable_rt.objNew(", System.StringComparison.Ordinal)
+            ->
+            let rec fieldsOf (t: Ty) =
+                match t with
+                | TEnt(e, _) when e.Name.EndsWith("__chain", System.StringComparison.Ordinal) ->
+                    caseFields t "" |> List.collect (snd >> fieldsOf)
+                | TEnt(e, _) when e.Name.EndsWith("__part", System.StringComparison.Ordinal) ->
+                    caseFields t "" |> List.map snd
+                | _ -> []
+
+            for fieldTy in fieldsOf (typeOf chain) do
+                if reachesOpaque fieldTy then
+                    holds <- true
         // (a new array is a cell whose items can be assigned)
         | EEmit(_, _, TEnt({ Name = "fable_rt.Array" }, [ item ]))
         | ERt(_, _, TEnt({ Name = "fable_rt.Array" }, [ item ])) ->
@@ -416,6 +433,7 @@ let private dotnetExceptions =
         "ArithmeticException"
         "NullReferenceException"
         "AggregateException"
+        "InvalidCastException"
     ]
     |> List.map (fun name -> "System." + name, "fable_rt." + name)
     |> List.append
@@ -700,6 +718,49 @@ let private refEnt (state: FileState) : Ent =
         state.Ents[refName] <- e
         e
 
+/// A class that takes part in inheritance: its objects are `fable_rt.Obj` (see the runtime).
+type ObjInfo =
+    {
+        Ref: Fable.EntityRef
+        FullName: string
+        /// `Circle`, or `alias.Circle` for a class another file declares
+        Prefix: string
+        /// how many classes are above it (0: it derives from System.Object)
+        Depth: int
+        Parent: ObjInfo option
+        /// the struct of the fields the class itself declares
+        Part: Ent
+        /// the struct of the fields of the whole chain: `base` (the parent's chain) and `own`
+        Chain: Ent
+        /// the virtual members it introduces: compiled name and the type of the function value
+        Slots: (string * Ty) list
+        /// the struct of function values that holds the members above
+        Table: Ent option
+        IsAbstract: bool
+        IsLocal: bool
+    }
+
+let private tObj = TPrim "fable_rt.Obj"
+
+let private isClassEntity (ent: Fable.Entity) =
+    not (
+        ent.IsFSharpRecord
+        || ent.IsFSharpUnion
+        || ent.IsInterface
+        || ent.IsFSharpModule
+        || ent.IsFSharpExceptionDeclaration
+        || ent.IsValueType
+    )
+
+/// .NET's name of a type: `Probe+Circle` for a class in module `Probe`.
+let rec private dotnetTypeName (com: Compiler) (ent: Fable.Entity) : string =
+    match ent.DeclaringEntity with
+    | Some d ->
+        match com.TryGetEntity d with
+        | Some outer -> dotnetTypeName com outer + "+" + ent.CompiledName
+        | None -> ent.FullName
+    | None -> ent.FullName
+
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
     | Fable.Unit -> tVoid
@@ -766,6 +827,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, _) when dotnetExceptions.ContainsKey ent.FullName -> tExn
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
+    | Fable.DeclaredType(ent, _) when (objInfo ctx r ent).IsSome -> tObj
     // an async computation: the record of the library's Async.fs; the builder has no state
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsync`1" ->
         TEnt(libRecordEnt ctx "Async" "AsyncOf_1", [ mapType ctx r item ])
@@ -972,6 +1034,178 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
 
 /// The F# `exception` declaration behind an entity reference, if it is one. Its values have
 /// the type `exn`; the declaration says what fields they have.
+/// What is known of a class that takes part in inheritance: one that is abstract, derives from
+/// a class, has virtual members, or that a class of the project derives from. (None for every
+/// other type.)
+and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : ObjInfo option =
+    match ctx.State.ObjInfos.TryGetValue entRef.FullName with
+    | true, o when isNull o -> None
+    | true, o -> Some(o :?> ObjInfo)
+    | _ ->
+        let found =
+            match entRef.Path with
+            | Fable.SourcePath _ ->
+                match ctx.Com.TryGetEntity entRef with
+                | Some ent when isClassEntity ent ->
+                    let derives =
+                        match ent.BaseType with
+                        | Some bt -> bt.Entity.FullName <> "System.Object"
+                        | None -> false
+
+                    // (a generic class is still a plain counted cell unless it shows that it
+                    // takes part in inheritance)
+                    if
+                        ent.GenericParameters.IsEmpty
+                        || ent.IsAbstractClass
+                        || derives
+                        || ent.MembersFunctionsAndValues |> Seq.exists (fun m -> m.IsDispatchSlot)
+                    then
+                        Some ent
+                    else
+                        None
+                | _ -> None
+            | _ -> None
+
+        match found with
+        | None ->
+            ctx.State.ObjInfos[entRef.FullName] <- null
+            None
+        | Some ent ->
+            if not ent.GenericParameters.IsEmpty then
+                fail
+                    r
+                    "the Zig target does not support generic classes that take part in inheritance yet (%s)"
+                    entRef.FullName
+
+            let parent =
+                match ent.BaseType with
+                | Some bt when bt.Entity.FullName <> "System.Object" ->
+                    match objInfo ctx r bt.Entity with
+                    | Some p -> Some p
+                    | None -> fail r "the Zig target does not support deriving from %s yet" bt.Entity.FullName
+                | _ -> None
+
+            let name, isLocal =
+                match FSharp2Fable.Util.entityIdent ctx.Com entRef with
+                | Fable.IdentExpr id -> id.Name, true
+                | Fable.Import(imp, _, _) -> importAlias ctx imp.Path + "." + imp.Selector, false
+                | _ -> fail r "the Zig target cannot reference the type %s" entRef.FullName
+
+            let synth (suffix: string) : Ent =
+                {
+                    Name = name + "__" + suffix
+                    Ref =
+                        {
+                            FullName = entRef.FullName + "$" + suffix
+                            Path = entRef.Path
+                        }
+                    Kind = KRecord
+                    TypeParams = []
+                    Cases = []
+                    MutableFields = []
+                    Managed = false
+                    Cyclic = false
+                    ReachesOpaque = false
+                    Copyable = true
+                    IsLocal = isLocal
+                    Hooks = None
+                }
+
+            let part = synth "part"
+            let chain = synth "chain"
+
+            // (a property is there as itself and as its accessors: the accessors are the slots)
+            let dispatch =
+                ent.MembersFunctionsAndValues
+                |> Seq.filter (fun m -> m.IsDispatchSlot && not m.IsProperty)
+                |> List.ofSeq
+
+            let table =
+                if dispatch.IsEmpty then
+                    None
+                else
+                    Some(synth "vt")
+
+            let info =
+                {
+                    Ref = entRef
+                    FullName = entRef.FullName
+                    Prefix = name
+                    Depth =
+                        match parent with
+                        | Some p -> p.Depth + 1
+                        | None -> 0
+                    Parent = parent
+                    Part = part
+                    Chain = chain
+                    Slots = []
+                    Table = table
+                    IsAbstract = ent.IsAbstractClass
+                    IsLocal = isLocal
+                }
+
+            // (registered before its fields are mapped: they may mention the class)
+            ctx.State.ObjInfos[entRef.FullName] <- box info
+
+            let fields =
+                ent.FSharpFields |> List.map (fun f -> f.Name, mapType ctx r f.FieldType)
+
+            part.Cases <- [ "", fields ]
+            part.MutableFields <- fields |> List.map fst
+
+            chain.Cases <-
+                [
+                    "",
+                    (match parent with
+                     | Some p -> [ "base", TEnt(p.Chain, []) ]
+                     | None -> [])
+                    @ [ "own", TEnt(part, []) ]
+                ]
+
+            let slots =
+                dispatch
+                |> List.map (fun m ->
+                    let ps =
+                        m.CurriedParameterGroups
+                        |> List.concat
+                        |> List.map (fun p -> mapType ctx r p.Type)
+
+                    let ps =
+                        if ps.IsEmpty then
+                            [ tVoid ]
+                        else
+                            ps
+
+                    m.CompiledName, TFn(tObj :: ps, mapType ctx r m.ReturnParameter.Type)
+                )
+
+            if (slots |> List.map fst |> List.distinct).Length <> slots.Length then
+                fail r "the Zig target does not support overloaded virtual members yet (%s)" entRef.FullName
+
+            match table with
+            | Some vt -> vt.Cases <- [ "", slots ]
+            | None -> ()
+
+            let info = { info with Slots = slots }
+            ctx.State.ObjInfos[entRef.FullName] <- box info
+
+            for e in [ Some part; Some chain; table ] |> List.choose id do
+                ctx.State.Ents[e.Ref.FullName] <- e
+
+                if isLocal then
+                    ctx.State.LocalEnts.Add e
+
+            if ctx.State.EntDepth = 0 then
+                settleManaged ctx.State
+
+            Some info
+
+/// The class of an object, if its type is one that takes part in inheritance.
+and objOfType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : ObjInfo option =
+    match t with
+    | Fable.DeclaredType(e, _) -> objInfo ctx r e
+    | _ -> None
+
 and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent option =
     match ctx.State.Ents.TryGetValue entRef.FullName with
     | true, e when e.Kind = KExn -> Some e
@@ -1955,10 +2189,140 @@ let private isInterfaceType (com: Compiler) (t: Fable.Type) : bool =
 /// A class's constructor as a function that makes the object: the fields are computed in
 /// order, as locals, and the object is made of them at the end. (`this` cannot be used before
 /// all its fields are there.)
-let private constructorBody
+/// The class and its ancestors, the class first.
+let rec private ancestors (o: ObjInfo) : ObjInfo list =
+    o
+    :: (
+        match o.Parent with
+        | Some p -> ancestors p
+        | None -> []
+    )
+
+let private chainType (o: ObjInfo) : Fable.Type = Fable.DeclaredType(o.Chain.Ref, [])
+
+/// The Zig name of a class's type (`Circle__type`).
+let private objTypeName (o: ObjInfo) : string = callTarget (o.Prefix + "__type")
+
+/// The structs of fields of a class and the classes above it, the root's first, as Zig text.
+let private partNames (o: ObjInfo) : string =
+    ancestors o
+    |> List.rev
+    |> List.map (fun k -> callTarget k.Part.Name)
+    |> String.concat ", "
+
+/// The class of the chain that declares a field.
+let private fieldOwner (o: ObjInfo) (field: string) : ObjInfo option =
+    ancestors o
+    |> List.tryFind (fun k -> caseFields (TEnt(k.Part, [])) "" |> List.exists (fun (f, _) -> f = field))
+
+/// The class that introduced a virtual member, and the type of its function value.
+let private virtualSlot (o: ObjInfo) (slot: string) : (ObjInfo * Ty) option =
+    ancestors o
+    |> List.tryPick (fun k ->
+        k.Slots
+        |> List.tryFind (fun (s, _) -> s = slot)
+        |> Option.map (fun (_, ty) -> k, ty)
+    )
+
+/// Does the class itself implement the virtual member (`override`, or `default` in the class that
+/// introduces it)?
+let private classImplements (com: Compiler) (k: ObjInfo) (slot: string) : bool =
+    match com.TryGetEntity k.Ref with
+    | Some ent ->
+        ent.MembersFunctionsAndValues
+        |> Seq.exists (fun m ->
+            m.IsOverrideOrExplicitInterfaceImplementation
+            && not m.IsDispatchSlot
+            && m.CompiledName = slot
+        )
+    | None -> false
+
+/// The function that implements a virtual member for objects of class `o`: the one of the most
+/// derived class of its chain that has one.
+let private implementationOf (com: Compiler) (r: SourceLocation option) (o: ObjInfo) (slot: string) : string =
+    match ancestors o |> List.tryFind (fun k -> classImplements com k slot) with
+    | Some k -> implName k.Prefix slot
+    | None -> fail r "the Zig target finds no implementation of %s for %s" slot o.FullName
+
+/// The compiled name of the member a call goes to.
+let private slotName (com: Compiler) (call: Fable.CallInfo) (fieldName: string) : string =
+    match call.MemberRef |> Option.bind com.TryGetMember with
+    | Some m -> m.CompiledName
+    | None -> fieldName.Substring(fieldName.LastIndexOf '.' + 1)
+
+let private isConstructorCall (com: Compiler) (call: Fable.CallInfo) : bool =
+    match call.MemberRef |> Option.bind com.TryGetMember with
+    | Some m -> m.IsConstructor
+    | None -> false
+
+/// The prefix of the functions of a class's members: for an object, of the class of its chain
+/// that implements `iface` when one is given.
+let private classPrefixWith
+    (com: Compiler)
+    (objOf: Fable.EntityRef -> ObjInfo option)
+    (entName: Fable.EntityRef -> string)
     (classRef: Fable.EntityRef)
-    (genArgs: Fable.Type list)
+    (iface: string option)
+    : string
+    =
+    match objOf classRef with
+    | Some o ->
+        match iface with
+        | Some i ->
+            ancestors o
+            |> List.tryFind (fun k ->
+                match com.TryGetEntity k.Ref with
+                | Some ent -> ent.DeclaredInterfaces |> Seq.exists (fun d -> d.Entity.FullName = i)
+                | None -> false
+            )
+            |> Option.defaultValue o
+            |> fun k -> k.Prefix
+        | None -> o.Prefix
+    | None -> entName classRef
+
+let private classPrefix
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (classRef: Fable.EntityRef)
+    (iface: string option)
+    : string
+    =
+    classPrefixWith ctx.Com (objInfo ctx r) (fun c -> (entOf ctx r c).Name) classRef iface
+
+/// What the file emits for a class that takes part in inheritance that it declares.
+let private objDecl (com: Compiler) (r: SourceLocation option) (o: ObjInfo) (dotnetName: string) : ObjDecl =
+    let classes = ancestors o |> List.rev
+
+    let tables =
+        classes
+        |> List.map (fun level ->
+            match level.Table with
+            | Some vt when not o.IsAbstract ->
+                let entries =
+                    level.Slots
+                    |> List.map (fun (slot, slotTy) -> slot, implementationOf com r o slot, slotTy)
+
+                Some(TEnt(vt, []), entries)
+            | _ -> None
+        )
+
+    {
+        TypeName = o.Prefix + "__type"
+        Chain = TEnt(o.Chain, [])
+        DotnetName = dotnetName
+        Parent = o.Parent |> Option.map (fun p -> p.Prefix + "__type")
+        Tables = tables
+        ToString =
+            ancestors o
+            |> List.tryFind (fun k -> classImplements com k "ToString")
+            |> Option.map (fun k -> k.Prefix + "__ToString")
+    }
+
+/// A constructor as a function that computes the fields in order and ends with `finish` of
+/// their values.
+let private constructorBodyWith
     (fieldNames: string list)
+    (finish: Fable.Expr list -> Fable.Expr)
     (body: Fable.Expr)
     : Fable.Expr
     =
@@ -2007,7 +2371,7 @@ let private constructorBody
                         )
                 )
 
-            Fable.Value(Fable.NewRecord(values, classRef, genArgs), None)
+            finish values
         | stmt :: rest ->
             match stmt with
             | Fable.Sequential xs -> build (xs @ rest)
@@ -2026,6 +2390,52 @@ let private constructorBody
             | other -> Fable.Sequential [ fieldsOf other; build rest ]
 
     build [ body ]
+
+let private constructorBody
+    (classRef: Fable.EntityRef)
+    (genArgs: Fable.Type list)
+    (fieldNames: string list)
+    (body: Fable.Expr)
+    : Fable.Expr
+    =
+    constructorBodyWith fieldNames (fun values -> Fable.Value(Fable.NewRecord(values, classRef, genArgs), None)) body
+
+/// The constructor of a class that takes part in inheritance: the chain of its fields, the
+/// parent's (which its constructor computes, first) and its own.
+let private objConstructorBody (o: ObjInfo) (baseCall: Fable.Expr option) (body: Fable.Expr) : Fable.Expr =
+    let fields = caseFields (TEnt(o.Part, [])) "" |> List.map fst
+
+    let baseId (t: Fable.Type) : Fable.Ident =
+        {
+            Name = "base_chain"
+            Type = t
+            IsMutable = false
+            IsThisArgument = false
+            IsCompilerGenerated = true
+            Range = None
+            IsInlineIfLambda = false
+        }
+
+    let finish (values: Fable.Expr list) =
+        let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, []), None)
+
+        let chain =
+            match o.Parent with
+            | Some p -> [ Fable.IdentExpr(baseId (chainType p)); own ]
+            | None -> [ own ]
+
+        Fable.Value(Fable.NewRecord(chain, o.Chain.Ref, []), None)
+
+    let inner = constructorBodyWith fields finish body
+
+    match o.Parent, baseCall with
+    | Some p, Some(Fable.Call(callee, info, _, r)) ->
+        Fable.Let(baseId (chainType p), Fable.Call(callee, info, chainType p, r), inner)
+    | Some _, _ ->
+        raise (
+            ZigError($"the Zig target does not support this call of the base constructor of %s{o.FullName} yet", None)
+        )
+    | None, _ -> inner
 
 /// A module-level value, of this file or (`alias.name`) of another.
 let private globalVar (name: string) (ty: Ty) (isMutable: bool) : Expr =
@@ -2112,6 +2522,134 @@ let private forInLoop (enumerator: string) (rest: Fable.Expr) : (Fable.Expr * Fa
 
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
+    // ---- objects of classes that take part in inheritance ----
+    // `base`: the object itself, seen as its parent class
+    | Fable.Value(Fable.BaseValue(Some id, _), _) -> lw ctx (Fable.IdentExpr id)
+    // `Circle 1.0`: the constructor computes the chain of fields; the object is made of it
+    | Fable.Call(callee, info, Fable.DeclaredType(cls, _), r) when
+        isConstructorCall ctx.Com info && (objInfo ctx r cls).IsSome
+        ->
+        let o = (objInfo ctx r cls).Value
+
+        if o.IsAbstract then
+            fail r "the abstract class %s cannot be made" o.FullName
+
+        bindArgs
+            ctx
+            [ lw ctx (Fable.Call(callee, info, chainType o, r)) ]
+            (fun xs -> EEmit($"fable_rt.objNew(&%s{objTypeName o}, $0)", xs, tObj))
+    // `base.Describe()`: the implementation its parent class has, called directly
+    | Fable.Call(Fable.Get(Fable.Value(Fable.BaseValue(Some id, baseTy), _), Fable.FieldGet field, _, _), call, t, r) when
+        (objOfType ctx r baseTy).IsSome
+        ->
+        let o = (objOfType ctx r baseTy).Value
+        let slot = slotName ctx.Com call field.Name
+        let target = implementationOf ctx.Com r o slot
+
+        let args =
+            match call.Args with
+            | [] -> [ EUnit ]
+            | given -> given |> List.map (lw ctx)
+
+        bindArgs ctx (lw ctx (Fable.IdentExpr id) :: args) (fun xs -> ECall(target, [], xs, mapType ctx r t))
+    // `shape.Area()`: through the table of the class that introduced the member
+    | Fable.Call(Fable.Get(x, Fable.FieldGet field, _, _), call, t, r) when
+        (match objOfType ctx r x.Type with
+         | Some o -> (virtualSlot o (slotName ctx.Com call field.Name)).IsSome
+         | None -> false)
+        ->
+        let o = (objOfType ctx r x.Type).Value
+        let slot = slotName ctx.Com call field.Name
+        let level, slotTy = (virtualSlot o slot).Value
+
+        let args =
+            match call.Args with
+            | [] -> [ EUnit ]
+            | given -> given |> List.map (lw ctx)
+
+        let table = TPtr(TEnt(level.Table.Value, []), true)
+
+        bindArgs
+            ctx
+            (lw ctx x :: args)
+            (fun xs ->
+                let fn =
+                    EGet(EEmit($"fable_rt.objVt($R, $0, %d{level.Depth})", [ xs.Head ], table), PField slot, slotTy)
+
+                ECallClo(fn, xs, mapType ctx r t)
+            )
+    // an abstract property read: its getter, through the table
+    | Fable.Get(x, Fable.FieldGet field, t, r) when
+        (match objOfType ctx r x.Type with
+         | Some o -> (virtualSlot o ("get_" + field.Name.Substring(field.Name.LastIndexOf '.' + 1))).IsSome
+         | None -> false)
+        ->
+        let o = (objOfType ctx r x.Type).Value
+        let slot = "get_" + field.Name.Substring(field.Name.LastIndexOf '.' + 1)
+        let level, slotTy = (virtualSlot o slot).Value
+        let table = TPtr(TEnt(level.Table.Value, []), true)
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                let fn =
+                    EGet(EEmit($"fable_rt.objVt($R, $0, %d{level.Depth})", [ xs.Head ], table), PField slot, slotTy)
+
+                ECallClo(fn, [ xs.Head; EUnit ], mapType ctx r t)
+            )
+    // a field of an object: in the part of the chain of the class that declares it
+    | Fable.Get(x, Fable.FieldGet field, _, r) when
+        (match objOfType ctx r x.Type with
+         | Some o -> (fieldOwner o field.Name).IsSome
+         | None -> false)
+        ->
+        let level = (fieldOwner (objOfType ctx r x.Type).Value field.Name).Value
+        let part = TEnt(level.Part, [])
+        let fty = caseFields part "" |> List.find (fun (f, _) -> f = field.Name) |> snd
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                EGet(
+                    EEmit($"fable_rt.objPart($R, &[_]type{{ %s{partNames level} }}, $0)", xs, TPtr(part, false)),
+                    PField field.Name,
+                    fty
+                )
+            )
+    | Fable.Set(x, Fable.FieldSet name, _, value, r) when
+        (match objOfType ctx r x.Type with
+         | Some o -> (fieldOwner o name).IsSome
+         | None -> false)
+        ->
+        let level = (fieldOwner (objOfType ctx r x.Type).Value name).Value
+        let part = TEnt(level.Part, [])
+        let fty = caseFields part "" |> List.find (fun (f, _) -> f = name) |> snd
+
+        bindArgs
+            ctx
+            [ lw ctx x; lw ctx value ]
+            (fun xs ->
+                let place =
+                    EGet(
+                        EEmit(
+                            $"fable_rt.objPart($R, &[_]type{{ %s{partNames level} }}, $0)",
+                            [ xs[0] ],
+                            TPtr(part, false)
+                        ),
+                        PField name,
+                        fty
+                    )
+
+                EStore(place, xs[1])
+            )
+    // `x :? Circle`
+    | Fable.Test(x, Fable.TypeTest(Fable.DeclaredType(cls, _)), r) when
+        (objInfo ctx r cls).IsSome && (objOfType ctx r x.Type).IsSome
+        ->
+        let o = (objInfo ctx r cls).Value
+        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.objIs($0, &%s{objTypeName o})", xs, tBool))
     | Fable.Value(kind, r) ->
         match kind with
         | Fable.UnitConstant -> EUnit
@@ -2685,8 +3223,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         match inner.Type with
         | Fable.DeclaredType(typeRef, genArgs) ->
-            let ent = entOf ctx r typeRef
-            let target = implName ent.Name (iface + "." + imp.Selector)
+            let target =
+                implName (classPrefix ctx r typeRef (Some iface)) (iface + "." + imp.Selector)
 
             let args =
                 match info.Args |> List.filter (fun a -> not (isUnit a.Type)) with
@@ -2781,7 +3319,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let typeName, typeArgs =
             match x.Type with
             | Fable.DeclaredType(classRef, genArgs) ->
-                (entOf ctx e.Range classRef).Name, genArgs |> List.map (mapType ctx e.Range)
+                classPrefix ctx e.Range classRef (Some ifaceRef.FullName), genArgs |> List.map (mapType ctx e.Range)
             | other -> fail e.Range "the Zig target cannot make an interface of a value of this type yet (%A)" other
 
         bindArgs
@@ -3845,6 +4383,17 @@ and dotnetCall
     | "Microsoft.FSharp.Core.Operators", "NaNSingle", [] -> ELit("std.math.nan(f32)", TPrim "f32")
     | "Microsoft.FSharp.Core.Operators", "Infinity", [] -> ELit("std.math.inf(f64)", TPrim "f64")
     | "Microsoft.FSharp.Core.Operators", "InfinitySingle", [] -> ELit("std.math.inf(f32)", TPrim "f32")
+    // `x :?> Circle`: an object of that class, or InvalidCastException
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ Uncast x ] when
+        (objOfType ctx r t).IsSome && (objOfType ctx r x.Type).IsSome
+        ->
+        let o = (objOfType ctx r t).Value
+        let source = (objOfType ctx r x.Type).Value
+
+        if ancestors source |> List.exists (fun k -> k.FullName = o.FullName) then
+            lw ctx x
+        else
+            rt $"fable_rt.objCast($0, &%s{objTypeName o})" [ x ] tObj
     // (a cast that changes nothing here: an exception of a known class is an `exn`)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ x ] when
         mapType ctx r x.Type = mapType ctx r t
@@ -4696,6 +5245,8 @@ and dotnetCall
         | Fable.List _ -> pure' "fable_rt.toText($0)" [ x ] tStr
         | Fable.DeclaredType(ent, _) when ent.FullName = mapName || ent.FullName = setName ->
             pure' "fable_rt.toText($0)" [ x ] tStr
+        // (an object: its class's ToString, or .NET's name of its class)
+        | Fable.DeclaredType _ when (objOfType ctx r x.Type).IsSome -> rt "fable_rt.objText($0)" [ x ] tStr
         | Fable.Char ->
             bindArgs
                 ctx
@@ -5512,6 +6063,58 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         entOf (newCtx c.Name) None c.Entity |> ignore
                     with ZigError(msg, r) ->
                         report r msg
+                | Some ent when
+                    not (ent.IsFSharpExceptionDeclaration || ent.IsFSharpModule)
+                    && (try
+                            (objInfo (newCtx c.Name) None c.Entity).IsSome
+                        with ZigError(msg, r) ->
+                            report r msg
+                            false)
+                    ->
+                    // a class that takes part in inheritance: its constructor computes its
+                    // chain of fields; its type and tables of virtual members are emitted
+                    let o = (objInfo (newCtx c.Name) None c.Entity).Value
+
+                    try
+                        match c.Constructor with
+                        | Some ctor -> attached.Add { ctor with Body = objConstructorBody o c.BaseCall ctor.Body }
+                        | None -> ()
+
+                        state.Objs.Add(objDecl com None o (dotnetTypeName com ent))
+                    with ZigError(msg, r) ->
+                        report r msg
+
+                    // what it overrides, its `default` members, and what it implements
+                    attached.AddRange(
+                        c.AttachedMembers
+                        |> List.choose (fun m ->
+                            let info = com.TryGetMember m.MemberRef
+
+                            let compiled =
+                                match info with
+                                | Some info -> info.CompiledName
+                                | None -> m.Name
+
+                            if m.Name = "ToString" then
+                                Some { m with Name = c.Name + "__ToString" }
+                            elif
+                                compiled.Contains "."
+                                || (
+                                    match info with
+                                    | Some info ->
+                                        info.IsOverrideOrExplicitInterfaceImplementation || info.IsDispatchSlot
+                                    | None -> false
+                                )
+                            then
+                                Some { m with Name = implName c.Name compiled }
+                            else
+                                report
+                                    m.Body.Range
+                                    $"the Zig target does not support this kind of member yet (%s{c.Name}.%s{m.Name})"
+
+                                None
+                        )
+                    )
                 | Some ent when not (ent.IsFSharpExceptionDeclaration || ent.IsFSharpModule) ->
                     try
                         entOf (newCtx c.Name) None c.Entity |> ignore

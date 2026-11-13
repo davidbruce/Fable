@@ -32,6 +32,8 @@
     <Compile Include="Weak.fs" />
     <Compile Include="Resources.fs" />
     <Compile Include="Pointers.fs" />
+    <Compile Include="Shapes.fs" />
+    <Compile Include="Inheritance.fs" />
     <Compile Include="QuickTest.fs" />
   </ItemGroup>
   <ItemGroup>
