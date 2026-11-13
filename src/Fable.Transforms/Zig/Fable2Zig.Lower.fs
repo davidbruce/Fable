@@ -1164,6 +1164,22 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsync`1" ->
         TEnt(libRecordEnt ctx "Async" "AsyncOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, []) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsyncBuilder" -> tVoid
+    // (.NET's cancellation: records of the library's Async.fs; a registration is what disposes it)
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.CancellationTokenSource" ->
+        TEnt(libRecordEnt ctx "Async" "CancellationSource", [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.CancellationToken" ->
+        TEnt(libRecordEnt ctx "Async" "CancellationTokenOf", [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.CancellationTokenRegistration" ->
+        mapType
+            ctx
+            r
+            (Fable.DeclaredType(
+                {
+                    FullName = "System.IDisposable"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                []
+            ))
     // a task and what the builder makes of `task { }`: records of the library's Task.fs; the
     // builder has no state
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Threading.Tasks.Task`1" ->
@@ -1782,7 +1798,29 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
         let fields =
             match name with
             | "AsyncOf_1" -> [ "fable_async", TFn([ contTy () ], tVoid) ]
-            | "Cont_1" -> [ "ok", TFn([ TGen "T" ], tVoid); "fail", TFn([ tExn ], tVoid) ]
+            | "Cont_1" ->
+                [
+                    "ok", TFn([ TGen "T" ], tVoid)
+                    "fail", TFn([ tExn ], tVoid)
+                    "cancel", TFn([ tExn ], tVoid)
+                    "token", TEnt(libRecordEnt ctx "Async" "CancellationTokenOf", [])
+                    "handOver", TOpt(TEnt(libRecordEnt ctx "Async" "HandOver", []))
+                ]
+            | "HandOver" -> [ "handedOver", tBool ]
+            | "Timer" ->
+                [
+                    "due", TPrim "i64"
+                    "order", tI32
+                    "action", TFn([ tVoid ], tVoid)
+                    "live", tBool
+                ]
+            | "CancellationSource" ->
+                [
+                    "cancelled", tBool
+                    "handlers", TEnt(netEnt ctx.State "ResizeArray", [ TOpt(TFn([ tVoid ], tVoid)) ])
+                    "disposed", tBool
+                ]
+            | "CancellationTokenOf" -> [ "source", TEnt(libRecordEnt ctx "Async" "CancellationSource", []) ]
             | "TaskOf_1" -> [ "fable_task", TEnt(resultEnt ctx.State, [ TGen "T"; tExn ]) ]
             | "TaskCode_1" -> [ "code", TFn([ tVoid ], TGen "T") ]
             | "StackOf_1" -> [ "items", TEnt(netEnt ctx.State "ResizeArray", [ TGen "T" ]) ]
@@ -1815,6 +1853,9 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "StackOf_1" -> [ "items" ]
             | "QueueOf_1" -> [ "items"; "head" ]
             | "EventOf_1" -> [ "handlers" ]
+            | "CancellationSource" -> [ "cancelled"; "handlers"; "disposed" ]
+            | "HandOver" -> [ "handedOver" ]
+            | "Timer" -> [ "live" ]
             | _ -> []
 
         let e =
@@ -3908,6 +3949,43 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 ctx.Vars[id.Name] <- v
                 ELet(v, rhs, lw ctx body)
 
+    // (`ExceptionDispatchInfo.Capture(e).Throw()`, as F# rethrows in an `async` handler, then a
+    // placeholder value never reached: the rethrow, of the sequence's type)
+    | Fable.Sequential es when
+        es
+        |> List.exists (fun x ->
+            match x with
+            | Fable.Call(Fable.Import(imp, _, _), _, _, _) ->
+                imp.Selector = "Throw"
+                && imp.Path =
+                    Replacements.DotnetPrefix
+                    + "System.Runtime.ExceptionServices.ExceptionDispatchInfo"
+            | _ -> false
+        )
+        ->
+        let isThrow (x: Fable.Expr) =
+            match x with
+            | Fable.Call(Fable.Import(imp, _, _), _, _, _) ->
+                imp.Selector = "Throw"
+                && imp.Path =
+                    Replacements.DotnetPrefix
+                    + "System.Runtime.ExceptionServices.ExceptionDispatchInfo"
+            | _ -> false
+
+        let before = es |> List.takeWhile (isThrow >> not)
+
+        let thrown =
+            match es |> List.find isThrow with
+            | Fable.Call(_, info, _, _) ->
+                match info.ThisArg with
+                | Some edi -> edi
+                | None -> fail e.Range "internal: ExceptionDispatchInfo.Throw without its object"
+            | _ -> fail e.Range "internal: not a call"
+
+        let raiseIr =
+            bindArgs ctx [ lw ctx thrown ] (fun xs -> ERaise(xs.Head, mapType ctx e.Range e.Type))
+
+        before |> List.rev |> List.fold (fun acc s -> ESeq(lwStmt ctx s, acc)) raiseIr
     | Fable.Sequential es ->
         match List.rev es with
         | [] -> EUnit
@@ -4108,6 +4186,21 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             )
         )
 
+    // (`Dispose` of a cancellation source, as `use` calls it: the library's Async.fs)
+    | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
+        imp.Selector = "Dispose"
+        && imp.Path = Replacements.DotnetPrefix + "System.IDisposable"
+        && (
+            match info.ThisArg with
+            | Some(Unboxed inner) ->
+                match inner.Type with
+                | Fable.DeclaredType(e, _) -> e.FullName = "System.Threading.CancellationTokenSource"
+                | _ -> false
+            | _ -> false
+        )
+        ->
+        let (Unboxed inner) = info.ThisArg.Value
+        libraryCall ctx r "Async" "sourceDispose" (Fable.CallInfo.Create(args = [ inner ])) [ inner ] t
     // a member of an interface called on a value whose type is known: the type's own function
     | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
         imp.Path.StartsWith(Replacements.DotnetPrefix, System.StringComparison.Ordinal)
@@ -4937,6 +5030,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ctx.Vars[id.Name] <- iv
         bindArgs ctx [ lw ctx start; lw ctx limit ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, lwStmt ctx body))
 
+    // (a cancellation source given as an `IDisposable`: what the library's Async.fs makes of it)
+    | Fable.TypeCast(x, Fable.DeclaredType(target, _)) when
+        target.FullName = "System.IDisposable"
+        && (
+            match x.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = "System.Threading.CancellationTokenSource"
+            | _ -> false
+        )
+        ->
+        libraryCall ctx e.Range "Async" "sourceAsDisposable" (Fable.CallInfo.Create(args = [ x ])) [ x ] e.Type
     // `x :> obj` and `box x`: an object holds it
     | Fable.TypeCast(x, Fable.Any) when x.Type <> Fable.Any -> boxed ctx x
     // `o :?> T` of an `obj`
@@ -7069,12 +7172,44 @@ and libraryCall
             | _ -> lw ctx arg
         | _ -> lw ctx arg
 
-    let args =
-        match args |> List.filter (fun arg -> not (isUnit arg.Type)) with
-        | [] -> [ EUnit ]
-        | given -> given |> List.map lowerArg
+    // (a unit argument is not given to the library function, but what computes it runs, in its
+    // place: `async { return raise e }` raises)
+    let isPlainUnit (arg: Fable.Expr) =
+        match arg with
+        | Fable.Value(Fable.UnitConstant, _)
+        | Fable.IdentExpr _ -> true
+        | _ -> false
 
-    bindArgs ctx args (fun xs -> ECall(target, typeArgs, xs, mapType ctx r t))
+    let kept = args |> List.filter (fun arg -> not (isUnit arg.Type && isPlainUnit arg))
+
+    let lowered = kept |> List.map lowerArg
+
+    bindArgs
+        ctx
+        lowered
+        (fun xs ->
+            let given =
+                List.zip kept xs
+                |> List.filter (fun (arg, _) -> not (isUnit arg.Type))
+                |> List.map snd
+
+            let effects =
+                List.zip kept xs
+                |> List.filter (fun (arg, _) -> isUnit arg.Type)
+                |> List.map snd
+
+            let call =
+                ECall(
+                    target,
+                    typeArgs,
+                    (match given with
+                     | [] -> [ EUnit ]
+                     | _ -> given),
+                    mapType ctx r t
+                )
+
+            List.foldBack (fun effect acc -> ESeq(effect, acc)) effects call
+        )
 
 /// A statement: its value, if it has one, is not used.
 and asStmt (ctx: Ctx) (ir: Expr) : Expr =

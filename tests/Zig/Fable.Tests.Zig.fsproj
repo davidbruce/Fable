@@ -64,6 +64,7 @@
     <Compile Include="SudokuTests.fs" />
     <Compile Include="QueueTests.fs" />
     <Compile Include="StackTests.fs" />
+    <Compile Include="AsyncTests.fs" />
     <Compile Include="TypeTests.fs" />
     <Compile Include="ConvertTests.fs" />
     <Compile Include="NonRegressionTests.fs" />

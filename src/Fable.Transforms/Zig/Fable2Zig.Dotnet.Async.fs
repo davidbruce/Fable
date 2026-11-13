@@ -32,7 +32,106 @@ let call
     let decLit = decLit ctx
     let contents = contents r
 
+    let lib fn (xs: Fable.Expr list) =
+        libraryCall
+            ctx
+            r
+            "Async"
+            fn
+            { info with
+                ThisArg = None
+                SignatureArgTypes = []
+            }
+            xs
+            t
+
+    let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]
+
+    let disposable (x: Fable.Expr) =
+        Fable.TypeCast(
+            x,
+            Fable.DeclaredType(
+                {
+                    FullName = "System.IDisposable"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                []
+            )
+        )
+
     match entity, name, args with
+    // ---- cancellation: the library's Async.fs ----
+    | "System.Threading.CancellationTokenSource", ".ctor", [] -> lib "sourceCreate" unitArg
+    | "System.Threading.CancellationTokenSource", ".ctor", [ ms ] when ms.Type <> Fable.Any ->
+        lib "sourceCreateWithDelay" [ ms ]
+    | "System.Threading.CancellationTokenSource", "Cancel", s :: _ -> lib "sourceCancel" [ s ]
+    | "System.Threading.CancellationTokenSource", "CancelAfter", [ s; ms ] -> lib "sourceCancelAfter" [ s; ms ]
+    | "System.Threading.CancellationTokenSource", "get_Token", [ s ] -> lib "sourceToken" [ s ]
+    | "System.Threading.CancellationTokenSource", "get_IsCancellationRequested", [ s ] ->
+        lib "sourceIsCancellationRequested" [ s ]
+    | "System.Threading.CancellationTokenSource", "Dispose", [ s ] -> lib "sourceDispose" [ s ]
+    | "System.Threading.CancellationToken", "get_None", [] -> lib "tokenNone" unitArg
+    | "System.Threading.CancellationToken", "get_IsCancellationRequested", [ tk ] ->
+        lib "tokenIsCancellationRequested" [ tk ]
+    | "System.Threading.CancellationToken", "ThrowIfCancellationRequested", [ tk ] ->
+        lib "tokenThrowIfCancellationRequested" [ tk ]
+    | "System.Threading.CancellationToken", "Register", [ tk; f ] -> lib "tokenRegister" [ tk; f ]
+    | "System.Threading.CancellationTokenRegistration", "Dispose", [ reg ] ->
+        dotnetCall
+            ctx
+            r
+            "System.IDisposable"
+            "Dispose"
+            { info with
+                ThisArg = Some(disposable reg)
+                Args = []
+            }
+            t
+    // ---- the Async module and builder members that take a token, continuations, or a resource
+    | "Microsoft.FSharp.Control.FSharpAsync", "StartWithContinuations", [ c; ok; fail; cancel ] ->
+        lib "startWithContinuations" [ c; ok; fail; cancel ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "StartWithContinuations", [ c; ok; fail; cancel; tk ] ->
+        lib "startWithContinuationsToken" [ c; ok; fail; cancel; tk ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "FromContinuations", [ f ] -> lib "fromContinuations" [ f ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "StartChild", [ c; timeout ] -> lib "startChildWith" [ c; timeout ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "StartChild", c :: _ -> lib "startChild" [ c ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "get_CancellationToken", [] -> lib "cancellationToken" unitArg
+    | "Microsoft.FSharp.Control.FSharpAsync", "TryCancelled", [ c; f ] -> lib "tryCancelled" [ c; f ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "Sequential", [ cs ] -> lib "sequential" [ cs ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "AwaitTask", [ task ] ->
+        libraryCall
+            ctx
+            r
+            "Task"
+            "awaitTask"
+            { info with
+                ThisArg = None
+                SignatureArgTypes = []
+            }
+            [ task ]
+            t
+    | "Microsoft.FSharp.Control.FSharpAsync", "StartAsTask", c :: _ ->
+        libraryCall
+            ctx
+            r
+            "Task"
+            "startAsTask"
+            { info with
+                ThisArg = None
+                SignatureArgTypes = []
+            }
+            [ c ]
+            t
+    | "Microsoft.FSharp.Control.FSharpAsync", "RunSynchronously", [ c; _; tk ] when
+        tk.Type <> Fable.Option(Fable.Any, false)
+        ->
+        lib "runSynchronouslyToken" [ c; tk ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "RunSynchronously", c :: _ -> lib "runSynchronously" [ c ]
+    | "Microsoft.FSharp.Control.FSharpAsync", ("StartImmediate" | "Start"), [ c; tk ] ->
+        lib "startImmediateToken" [ c; tk ]
+    | "Microsoft.FSharp.Control.FSharpAsyncBuilder", "Using", [ _; resource; binder ]
+    | "Microsoft.FSharp.Control.FSharpAsyncBuilder", "Using", [ resource; binder ] ->
+        lib "builderUsing" [ resource; disposable resource; binder ]
     // ---- task: the builder (which has no state) and the members of a task ----
     | "Microsoft.FSharp.Control.TaskBuilderModule", "task", _ -> EUnit
     | ("Microsoft.FSharp.Control.TaskBuilder" | "Microsoft.FSharp.Control.TaskBuilderBase" | "Microsoft.FSharp.Control.TaskBuilderExtensions.LowPriority" | "Microsoft.FSharp.Control.TaskBuilderExtensions.HighPriority" | "Microsoft.FSharp.Control.TaskBuilderExtensions.MediumPriority"),

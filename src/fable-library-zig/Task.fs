@@ -107,3 +107,22 @@ let whenAll<'T> (tasks: SeqOf<TaskOf<'T>>) : TaskOf<'T[]> =
         { fable_task = Ok(Array.ofList (List.map value (Seq.toList tasks))) }
     with e ->
         { fable_task = Error e }
+
+// ---- between tasks and async ----
+
+/// `Async.AwaitTask`: what the task ended with
+let awaitTask<'T> (t: TaskOf<'T>) : Fable.Library.Zig.Async.AsyncOf<'T> =
+    {
+        fable_async =
+            fun k ->
+                match t.fable_task with
+                | Ok v -> k.ok v
+                | Error e -> k.fail e
+    }
+
+/// `Async.StartAsTask`: the computation runs to its end here (one thread)
+let startAsTask<'T> (computation: Fable.Library.Zig.Async.AsyncOf<'T>) : TaskOf<'T> =
+    try
+        { fable_task = Ok(Fable.Library.Zig.Async.runSynchronously computation) }
+    with e ->
+        { fable_task = Error e }

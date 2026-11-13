@@ -402,6 +402,10 @@ let call
     | "System.Random", "Next", [ rnd; min; max ] -> rt "fable_rt.randomNextRange($0, $1, $2)" [ rnd; min; max ] tI32
     | "System.Random", "NextDouble", [ rnd ] -> pure' "fable_rt.randomNextDouble($0)" [ rnd ] tF64
     | "System.Random", "NextBytes", [ rnd; buffer ] -> pure' "fable_rt.randomNextBytes($0, $1)" [ rnd; buffer ] tVoid
+    // (`ExceptionDispatchInfo.Capture(e)`: the exception itself; its `Throw` raises it again)
+    | "System.Runtime.ExceptionServices.ExceptionDispatchInfo", "Capture", [ x ] -> lw ctx x
+    | "System.Runtime.ExceptionServices.ExceptionDispatchInfo", "Throw", [ x ] ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx r t))
     // ---- `System.Guid`: the library's Guid.fs ----
     | "System.Guid", name, args when
         (match name with
