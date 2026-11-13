@@ -1290,7 +1290,6 @@ let ``test use calls Dispose (of an object expression) at the end of the scope``
     res |> equal 10
     cell.Value |> equal 20
 
-#if !FABLE_COMPILER_ZIG // (the Zig target cannot reference the type System.TimeSpan)
 [<Fact>]
 let ``test Unchecked.defaultof works`` () =
     Unchecked.defaultof<int> |> equal 0
@@ -1306,7 +1305,6 @@ let ``test Unchecked.defaultof works`` () =
     let x = ValueType()
     Unchecked.defaultof<ValueType> |> equal x
     x.X |> equal 0
-#endif
 
 [<Fact>]
 let ``test Unchecked.defaultof works with tuples`` () = // See #2491

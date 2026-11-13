@@ -993,7 +993,6 @@ let ``test Type testing with PY primitive types works`` () =
     [| 1; 2 |] :> obj |> test |> equal "Array"
 #endif
 
-#if !FABLE_COMPILER_ZIG // (DateTime)
 [<Fact>]
 let ``test Type test with Date`` () =
     let isDate (x: obj) =
@@ -1003,7 +1002,6 @@ let ``test Type test with Date`` () =
 
     DateTime.Now |> box |> isDate |> equal true
     box 5 |> isDate |> equal false
-#endif
 
 [<Fact>]
 let ``test Type test with Long`` () =

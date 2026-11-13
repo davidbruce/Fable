@@ -167,7 +167,7 @@ let ``test Array.zeroCreate with struct tuple works`` () =
     let xs = Array.zeroCreate<struct (int * string)> 3
     xs.Length |> equal 3
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (a default value of this type)
 [<Fact>]
 let ``test Pattern matching with arrays works`` () =
     match [||] with [||] -> true | _ -> false
@@ -196,7 +196,7 @@ let ``test Can spread a complex expression`` () =
     ParamArrayTest.Add(let ar = [|1;2;3|] in sideEffect ar; ar)
     |> equal 9
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target cannot apply a value of this type (String, TFn)
 [<Fact>]
 let ``test Mapping from values to functions works`` () =
     let a = [| "a"; "b"; "c" |]
@@ -215,14 +215,12 @@ let ``test Mapping from values to functions works`` () =
     a |> Array.mapi f2 |> Array.item 2 <| "x" |> equal "2cx"
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Mapping from typed arrays to non-numeric arrays doesn't coerce values`` ()=
     let xs = map string [|1;2|]
     (box xs.[0]) :? string |> equal true
     let xs2 = Array.map string [|1;2|]
     (box xs2.[1]) :? string |> equal true
-#endif
 
 [<Fact>]
 let ``test Array slice with upper index work`` () =
@@ -539,7 +537,7 @@ let ``test System.Array.IndexOf works with non-primitive types`` () =
     System.Array.IndexOf(myArray, Dog 3, 0, 1) |> equal -1
     System.Array.IndexOf(myArray, Duck 5, 1) |> equal -1
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -552,14 +550,14 @@ let ``test System.Array.BinarySearch works`` () =
     System.Array.BinarySearch(([||]: int[]), 3) |> equal -1
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works with duplicates`` () =
     System.Array.BinarySearch([|2; 2; 2; 2; 2; 2; 2; 2|], 2) |> equal 3
     System.Array.BinarySearch([|1; 2; 2; 2; 2; 3; 4; 5; 6|], 2) |> equal 4
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works with a range`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -571,7 +569,7 @@ let ``test System.Array.BinarySearch works with a range`` () =
     System.Array.BinarySearch(xs, 5, 0, 5) |> equal -6
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target does not support Microsoft.FSharp.Collections.ComparisonIdentity.)
 [<Fact>]
 let ``test System.Array.BinarySearch works with a comparer`` () =
     let desc = ComparisonIdentity.FromFunction(fun (a: int) b -> compare b a)
@@ -600,8 +598,6 @@ let ``test System.Array.BinarySearch passes the array element to the comparer fi
     List.ofSeq calls |> equal [(5, 4); (1, 4); (3, 4)]
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
-#endif
 #if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test System.Array.BinarySearch works with other element types`` () =
@@ -623,7 +619,7 @@ let ``test System.Array.BinarySearch works with other element types`` () =
     System.Array.BinarySearch(unions, Duck 2) |> equal -2
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works with a range and a null comparer`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -631,7 +627,7 @@ let ``test System.Array.BinarySearch works with a range and a null comparer`` ()
     System.Array.BinarySearch(xs, 1, 3, 2, null) |> equal -2
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch works with a single element and a large array`` () =
     System.Array.BinarySearch([|5|], 5) |> equal 0
@@ -664,8 +660,6 @@ let ``test System.Array.BinarySearch works with more element types`` () =
     System.Array.BinarySearch([|None; Some 1; Some 3|], Some 2) |> equal -3
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
-#endif
 #if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test System.Array.BinarySearch with a range passes the array element to the comparer first`` () =
@@ -680,7 +674,7 @@ let ``test System.Array.BinarySearch with a range passes the array element to th
     List.ofSeq calls |> equal [(5, 4); (3, 4)]
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch non-generic overloads work`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -689,7 +683,7 @@ let ``test System.Array.BinarySearch non-generic overloads work`` () =
     System.Array.BinarySearch(xs :> System.Array, 1, 3, box 5) |> equal 2
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.BinarySearch yet)
 [<Fact>]
 let ``test System.Array.BinarySearch with a range checks its arguments`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -1244,7 +1238,7 @@ let ``test Array as IList count has same behaviour`` () =
     ys.Count |> equal 3
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target cannot use a value of this type as a sequence yet (DeclaredType)
 [<Fact>]
 let ``test Array as IList Seq.length has same behaviour`` () =
     let xs = [|1.; 2.; 3.|]
@@ -1349,8 +1343,6 @@ let ``test Casting to System.Array works`` () =
           (4, 'd'); (4, 'e'); (4, 'f') ]
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
-#endif
 #if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test Testing against System.Array works`` () =
@@ -1530,7 +1522,7 @@ let ``test Array.compareWith works`` () = // See #2961
     equal c2 -1
     equal c3 1
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
+#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Array.Resize yet)
 [<Fact>]
 let ``test System.Array.Resize works`` () =
     let mutable xs = [|1; 2; 3; 4; 5|]
