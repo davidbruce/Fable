@@ -2008,6 +2008,13 @@ let emitFile (state: FileState) : string =
     for a in adapters.Values do
         emitAdapter out fns a
 
+    // (a file that uses async: at the end of each test, the work it started and left waiting
+    // is run on, so that it finishes within the test)
+    let asyncAlias =
+        state.Imports
+        |> Seq.tryFind (fun kv -> System.IO.Path.GetFileNameWithoutExtension(kv.Key) = "Async")
+        |> Option.map (fun kv -> kv.Value)
+
     for (name, fn) in state.Tests do
         let quoted = name.Replace("\\", "\\\\").Replace("\"", "\\\"")
 
@@ -2015,8 +2022,13 @@ let emitFile (state: FileState) : string =
             .AppendLine("test \"" + quoted + "\" {")
             .AppendLine("    try fable_rt.testInit(@\"$init\");")
             .AppendLine($"    try fable_rt.testCase(%s{callTarget fn});")
-            .AppendLine("}")
         |> ignore
+
+        match asyncAlias with
+        | Some alias -> out.AppendLine($"    try fable_rt.testCase(%s{alias}.finishPending);") |> ignore
+        | None -> ()
+
+        out.AppendLine("}") |> ignore
 
     // The F# entry point returns the process exit code as an int; Zig's `main` returns a u8.
     // In builds that count cells, a program that ends with cells still allocated says so.

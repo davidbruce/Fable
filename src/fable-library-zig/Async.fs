@@ -274,6 +274,13 @@ let threadSleep (ms: int) : unit =
     if rest > 0L then
         sleepMilliseconds rest
 
+/// What was started and is still waiting, run on (the timers due within ten seconds): what a
+/// test does at its end, so that work it started (`Async.Start` and the others) finishes within
+/// it rather than in a later one
+let finishPending () : unit =
+    let horizon = nowMs () + 10_000L
+    drive (fun () -> earliestDue () > horizon) ignore
+
 /// Run the timers (and what they leave) until `finished` or none is left; whether it finished
 /// (a task waited for, as `.Result` waits: what would complete it runs meanwhile)
 let waitUntil (finished: unit -> bool) : bool =
@@ -784,3 +791,272 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
     )
 
 let returnValue<'T> (value: 'T) : AsyncOf<'T> = builderReturn value
+
+// ---- MailboxProcessor ----
+
+/// `AsyncReplyChannel<'R>`: what replying does
+type ReplyChannelOf<'R> = { reply: 'R -> unit }
+
+let replyChannelReply<'R> (c: ReplyChannelOf<'R>) (value: 'R) : unit = c.reply value
+
+/// A `MailboxProcessor<'Msg>`: its messages, the `Receive` that waits for one (if any), and its
+/// body, which starts with `Start`
+type MailboxOf<'Msg> =
+    {
+        body: MailboxOf<'Msg> -> AsyncOf<unit>
+        queue: ResizeArray<'Msg>
+        mutable waiting: ('Msg -> unit) option
+        mutable started: bool
+        token: CancellationTokenOf
+        errorHandlers: ResizeArray<exn -> unit>
+    }
+
+let mailboxCreate<'Msg> (body: MailboxOf<'Msg> -> AsyncOf<unit>) (token: CancellationTokenOf option) : MailboxOf<'Msg> =
+    {
+        body = body
+        queue = ResizeArray()
+        waiting = None
+        started = false
+        token = defaultArg token (tokenNone ())
+        errorHandlers = ResizeArray()
+    }
+
+/// `mb.Start()`: the body runs as the mailbox's own (from a timer, as .NET runs it on the thread
+/// pool); what it raises goes to the Error event
+let mailboxStart<'Msg> (mb: MailboxOf<'Msg>) : unit =
+    if mb.started then
+        raise (System.InvalidOperationException "The MailboxProcessor has already been started.")
+
+    mb.started <- true
+
+    schedule
+        0
+        (fun () ->
+            start
+                (mb.body mb)
+                {
+                    ok = ignore
+                    fail =
+                        fun e ->
+                            for h in mb.errorHandlers.ToArray() do
+                                h e
+                    cancel = ignore
+                    token = mb.token
+                    handOver = None
+                }
+        )
+    |> ignore
+
+let mailboxStartNew<'Msg>
+    (body: MailboxOf<'Msg> -> AsyncOf<unit>)
+    (token: CancellationTokenOf option)
+    : MailboxOf<'Msg>
+    =
+    let mb = mailboxCreate body token
+    mailboxStart mb
+    mb
+
+/// `mb.Post(msg)`: to the Receive that waits (it goes on from a timer: posting returns at once),
+/// or to the queue
+let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
+    if not mb.token.source.cancelled then
+        match mb.waiting with
+        | Some resume when mb.started ->
+            mb.waiting <- None
+            schedule 0 (fun () -> resume msg) |> ignore
+        | _ -> mb.queue.Add msg
+
+let mailboxQueueLength<'Msg> (mb: MailboxOf<'Msg>) : int = mb.queue.Count
+
+let mailboxAddError<'Msg> (mb: MailboxOf<'Msg>) (handler: exn -> unit) : unit = mb.errorHandlers.Add handler
+
+/// `inbox.TryReceive(timeout)`: the next message, or None when the time is up first (-1: no limit)
+let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncOf<'Msg option> =
+    let timeout = defaultArg timeout -1
+
+    make (fun k ->
+        if mb.queue.Count > 0 then
+            let msg = mb.queue.[0]
+            mb.queue.RemoveAt 0
+            k.ok (Some msg)
+        else
+            let mutable done' = false
+
+            let timer =
+                if timeout >= 0 then
+                    Some(
+                        schedule
+                            timeout
+                            (fun () ->
+                                if not done' then
+                                    done' <- true
+                                    mb.waiting <- None
+                                    k.ok None
+                            )
+                    )
+                else
+                    None
+
+            mb.waiting <-
+                Some(fun msg ->
+                    if not done' then
+                        done' <- true
+
+                        match timer with
+                        | Some t -> t.live <- false
+                        | None -> ()
+
+                        k.ok (Some msg)
+                )
+    )
+
+/// `inbox.Receive([timeout])`: the next message (TimeoutException when the time is up first)
+let mailboxReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncOf<'Msg> =
+    builderBind
+        (mailboxTryReceive mb timeout)
+        (fun m ->
+            match m with
+            | Some msg -> builderReturn msg
+            | None -> make (fun k -> k.fail (System.TimeoutException "The operation has timed out."))
+        )
+
+/// `inbox.Scan(f)`: the first message, in order, that `f` takes (the others stay); waiting for one
+let mailboxScan<'Msg, 'T> (mb: MailboxOf<'Msg>) (f: 'Msg -> AsyncOf<'T> option) : AsyncOf<'T> =
+    let rec look () : AsyncOf<'T> =
+        make (fun k ->
+            let mutable found = None
+            let mutable i = 0
+
+            while found.IsNone && i < mb.queue.Count do
+                match f mb.queue.[i] with
+                | Some c ->
+                    mb.queue.RemoveAt i
+                    found <- Some c
+                | None -> i <- i + 1
+
+            match found with
+            | Some c -> start c k
+            | None ->
+                mb.waiting <-
+                    Some(fun msg ->
+                        mb.queue.Add msg
+                        start (look ()) k
+                    )
+        )
+
+    look ()
+
+/// `mb.PostAndAsyncReply(build)`: the message, made with a reply channel, is posted now (as
+/// FSharp.Core posts it); the computation waits for the reply (each time it runs: the same one)
+let mailboxPostAndAsyncReply<'Msg, 'R> (mb: MailboxOf<'Msg>) (build: ReplyChannelOf<'R> -> 'Msg) : AsyncOf<'R> =
+    let mutable result: 'R option = None
+    let waiters = ResizeArray<'R -> unit>()
+
+    let channel =
+        {
+            reply =
+                fun r ->
+                    if result.IsNone then
+                        result <- Some r
+                        let ws = waiters.ToArray()
+                        waiters.Clear()
+
+                        // (those waiting go on from a timer, as on another thread)
+                        for w in ws do
+                            schedule 0 (fun () -> w r) |> ignore
+        }
+
+    mailboxPost mb (build channel)
+
+    make (fun k ->
+        match result with
+        | Some r -> k.ok r
+        | None -> waiters.Add k.ok
+    )
+
+/// `mb.PostAndReply(build)`: the same, waited for here
+let mailboxPostAndReply<'Msg, 'R> (mb: MailboxOf<'Msg>) (build: ReplyChannelOf<'R> -> 'Msg) : 'R =
+    runSynchronously (mailboxPostAndAsyncReply mb build)
+
+let mailboxPostAndTryAsyncReply<'Msg, 'R>
+    (mb: MailboxOf<'Msg>)
+    (build: ReplyChannelOf<'R> -> 'Msg)
+    (timeout: int option)
+    : AsyncOf<'R option>
+    =
+    builderBind
+        (startChildWith (mailboxPostAndAsyncReply mb build) timeout)
+        (fun child ->
+            make (fun k ->
+                start
+                    child
+                    {
+                        ok = fun r -> k.ok (Some r)
+                        fail =
+                            fun e ->
+                                match e with
+                                | :? System.TimeoutException -> k.ok None
+                                | _ -> k.fail e
+                        cancel = k.cancel
+                        token = k.token
+                        handOver = None
+                    }
+            )
+        )
+
+// ---- Async.AwaitEvent ----
+
+/// `Async.AwaitEvent(e[, cancelAction])`: the next time the event fires (then it is no longer
+/// listened to); cancelled, it stops listening and calls `cancelAction`, or is cancelled when
+/// there is none, as in FSharp.Core
+let awaitEvent<'Del, 'T when 'Del: delegate<'T, unit> and 'Del :> System.Delegate>
+    (source: IEvent<'Del, 'T>)
+    (cancelAction: (unit -> unit) option)
+    : AsyncOf<'T>
+    =
+    make (fun k ->
+        let mutable fired = false
+        let mutable subscription: System.IDisposable option = None
+        let mutable registration: System.IDisposable option = None
+
+        let stop () =
+            fired <- true
+
+            match subscription with
+            | Some d -> d.Dispose()
+            | None -> ()
+
+            match registration with
+            | Some d -> d.Dispose()
+            | None -> ()
+
+        subscription <-
+            Some(
+                source.Subscribe(
+                    { new System.IObserver<'T> with
+                        member _.OnNext v =
+                            if not fired then
+                                stop ()
+                                k.ok v
+
+                        member _.OnError _ = ()
+                        member _.OnCompleted() = ()
+                    }
+                )
+            )
+
+        if not fired then
+            registration <-
+                Some(
+                    tokenRegister
+                        k.token
+                        (fun () ->
+                            if not fired then
+                                stop ()
+
+                                match cancelAction with
+                                | Some f -> f ()
+                                | None -> k.cancel (canceled ())
+                        )
+                )
+    )

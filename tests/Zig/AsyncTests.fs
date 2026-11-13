@@ -959,7 +959,6 @@ let ``test Async.Sleep works correctly with TimeSpan argument`` () =
     } |> Async.StartImmediate
 #endif
 
-#if !FABLE_COMPILER_ZIG // (Async.AwaitEvent)
 [<Fact>]
 let ``test Async.AwaitEvent fires continuation when event is triggered`` () =
     let ev = Event<int>()
@@ -968,9 +967,7 @@ let ``test Async.AwaitEvent fires continuation when event is triggered`` () =
         equal 42 v
     })
     ev.Trigger(42)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (Async.AwaitEvent)
 [<Fact>]
 let ``test Async.AwaitEvent with cancelAction invokes it on cancellation`` () =
     let ev = Event<int>()
@@ -982,7 +979,6 @@ let ``test Async.AwaitEvent with cancelAction invokes it on cancellation`` () =
     }, cts.Token)
     cts.Cancel()
     equal true cancelCalled
-#endif
 
 [<Fact>]
 let ``test FromContinuations unit and generic values`` () =

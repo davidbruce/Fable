@@ -1274,6 +1274,10 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Runtime.CompilerServices.TaskAwaiter" ->
         TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ tVoid ])
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpMailboxProcessor`1" ->
+        TEnt(libRecordEnt ctx "Async" "MailboxOf_1", [ mapType ctx r item ])
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsyncReplyChannel`1" ->
+        TEnt(libRecordEnt ctx "Async" "ReplyChannelOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Threading.Tasks.TaskCompletionSource`1" ->
         TEnt(libRecordEnt ctx "Task" "TaskSourceOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = taskCodeName ->
@@ -1915,6 +1919,14 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "CancellationTokenOf" -> [ "source", TEnt(libRecordEnt ctx "Async" "CancellationSource", []) ]
             | "TaskOf_1" -> [ "fable_task", TOpt(TEnt(resultEnt ctx.State, [ TGen "T"; tExn ])) ]
             | "TaskSourceOf_1" -> [ "task", TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ TGen "T" ]) ]
+            | "ReplyChannelOf_1" -> [ "reply", TFn([ TGen "T" ], tVoid) ]
+            // (its body takes the mailbox itself: what a program sees of it is a cell)
+            | "MailboxOf_1" ->
+                [
+                    "queue", TEnt(netEnt ctx.State "ResizeArray", [ TGen "T" ])
+                    "waiting", TOpt(TFn([ TGen "T" ], tVoid))
+                    "started", tBool
+                ]
             | "TaskCode_1" -> [ "code", TFn([ tVoid ], TGen "T") ]
             | "StackOf_1" -> [ "items", TEnt(netEnt ctx.State "ResizeArray", [ TGen "T" ]) ]
             | "QueueOf_1" ->
@@ -1957,6 +1969,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "Timer" -> [ "live" ]
             | "StopwatchOf" -> [ "elapsed"; "startedAt"; "running" ]
             | "TaskOf_1" -> [ "fable_task" ]
+            | "MailboxOf_1" -> [ "waiting"; "started" ]
             | _ -> []
 
         let e =

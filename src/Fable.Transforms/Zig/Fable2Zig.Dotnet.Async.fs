@@ -98,6 +98,13 @@ let call
     | "Microsoft.FSharp.Control.FSharpAsync", "get_CancellationToken", [] -> lib "cancellationToken" unitArg
     | "Microsoft.FSharp.Control.FSharpAsync", "TryCancelled", [ c; f ] -> lib "tryCancelled" [ c; f ]
     | "Microsoft.FSharp.Control.FSharpAsync", "Sequential", [ cs ] -> lib "sequential" [ cs ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "AwaitEvent", ev :: rest ->
+        let cancelAction =
+            match rest with
+            | [ a ] -> a
+            | _ -> Fable.Value(Fable.NewOption(None, Fable.LambdaType(Fable.Unit, Fable.Unit), false), None)
+
+        lib "awaitEvent" [ ev; cancelAction ]
     | "Microsoft.FSharp.Control.FSharpAsync", "AwaitTask", [ task ] ->
         libraryCall
             ctx
@@ -320,6 +327,103 @@ let call
             }
             [ e ]
             t
+    // ---- MailboxProcessor and its reply channels: the library's Async.fs ----
+    | ("Microsoft.FSharp.Control.FSharpMailboxProcessor`1" | "Microsoft.FSharp.Control.FSharpAsyncReplyChannel`1"),
+      name,
+      args ->
+        // (`mb.Start()` and the others of no arguments are given unit)
+        let args =
+            match args with
+            | [ x; Fable.Value(Fable.UnitConstant, _) ] when name = "Start" || name = "Dispose" -> [ x ]
+            | _ -> args
+
+        let itemOf (x: Fable.Type) =
+            match x with
+            | Fable.DeclaredType(_, [ item ]) -> item
+            | _ -> Fable.Unit
+
+        let msg =
+            match name, args with
+            | (".ctor" | "Start"), body :: _ when
+                (match body.Type with
+                 | Fable.LambdaType _
+                 | Fable.DelegateType _ -> true
+                 | _ -> false)
+                ->
+                itemOf t
+            | _, x :: _ -> itemOf x.Type
+            | _ -> Fable.Unit
+
+        let call fn (typeArgs: Fable.Type list) xs =
+            libraryCall
+                ctx
+                r
+                "Async"
+                fn
+                { info with
+                    GenericArgs = typeArgs
+                    SignatureArgTypes = []
+                    MemberRef = None
+                    ThisArg = None
+                }
+                xs
+                t
+
+        // (an optional argument left out: None)
+        let opt (ty: Fable.Type) (x: Fable.Expr option) =
+            match x with
+            | Some v -> v
+            | None -> Fable.Value(Fable.NewOption(None, ty, false), None)
+
+        let tokenType =
+            Fable.DeclaredType(
+                {
+                    FullName = "System.Threading.CancellationToken"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                []
+            )
+
+        let intType = Fable.Number(Int32, Fable.NumberInfo.Empty)
+
+        // (the reply's type: what the builder's channel replies)
+        let replyOf (build: Fable.Expr) =
+            match build.Type with
+            | Fable.LambdaType(Fable.DeclaredType(_, [ reply ]), _)
+            | Fable.DelegateType([ Fable.DeclaredType(_, [ reply ]) ], _) -> reply
+            | _ -> Fable.Unit
+
+        let isMailboxThis =
+            match args with
+            | x :: _ ->
+                match x.Type with
+                | Fable.DeclaredType(e, _) -> e.FullName = "Microsoft.FSharp.Control.FSharpMailboxProcessor`1"
+                | _ -> false
+            | [] -> false
+
+        match entity, name, args with
+        | _, "Reply", [ c; v ] -> call "replyChannelReply" [ msg ] [ c; v ]
+        | _, ".ctor", body :: rest -> call "mailboxCreate" [ msg ] [ body; opt tokenType (List.tryHead rest) ]
+        | _, "Start", [ mb ] when isMailboxThis -> call "mailboxStart" [ msg ] [ mb ]
+        | _, "Start", body :: rest -> call "mailboxStartNew" [ msg ] [ body; opt tokenType (List.tryHead rest) ]
+        | _, "Post", [ mb; m ] -> call "mailboxPost" [ msg ] [ mb; m ]
+        | _, "get_CurrentQueueLength", [ mb ] -> call "mailboxQueueLength" [ msg ] [ mb ]
+        | _, "Receive", mb :: rest -> call "mailboxReceive" [ msg ] [ mb; opt intType (List.tryHead rest) ]
+        | _, "TryReceive", mb :: rest -> call "mailboxTryReceive" [ msg ] [ mb; opt intType (List.tryHead rest) ]
+        | _, "Scan", mb :: f :: _ ->
+            let result =
+                match f.Type with
+                | Fable.LambdaType(_, Fable.Option(Fable.DeclaredType(_, [ x ]), _)) -> x
+                | _ -> Fable.Unit
+
+            call "mailboxScan" [ msg; result ] [ mb; f ]
+        | _, "PostAndAsyncReply", mb :: build :: _ ->
+            call "mailboxPostAndAsyncReply" [ msg; replyOf build ] [ mb; build ]
+        | _, "PostAndReply", mb :: build :: _ -> call "mailboxPostAndReply" [ msg; replyOf build ] [ mb; build ]
+        | _, "PostAndTryAsyncReply", mb :: build :: rest ->
+            call "mailboxPostAndTryAsyncReply" [ msg; replyOf build ] [ mb; build; opt intType (List.tryHead rest) ]
+        | _, "Dispose", _ -> EUnit
+        | _ -> fail r "the Zig target does not support MailboxProcessor.%s with these arguments yet" name
     // `TaskCompletionSource<'T>`: the library's TaskSourceOf
     | "System.Threading.Tasks.TaskCompletionSource`1", name, args ->
         let item =
