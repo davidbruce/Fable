@@ -318,6 +318,15 @@ conversions (a value that does not fit raises `OverflowException` with .NET's me
 `BigInteger.Parse`, comparison, equality, hashing, `string`, `%A`, `List.sum`. A bigint is
 never part of a cycle.
 
+`decimal` is a value of the runtime (`NetDecimal`): a whole number below 2^96 and a scale of
+0 to 28, as .NET's. Results keep .NET's scale (`1.0m * 1.000m` is `1.0000`), division gives as
+many digits as fit, results are rounded to fit with a tie to the even digit, and a result too
+large raises `OverflowException`. Conversions from floats keep 15 significant digits (7 for
+`float32`). Formatting (`string`, `%M`, `%f`, `%A`, `ToString("F2")`) rounds a tie away from
+zero, as .NET's formatting does. Values that hold decimals are compared by value (`1.0m =
+1.00m`), also inside records and tuples. `x.ToString("N2")` works for every number type with
+.NET's standard formats; custom patterns (`"0.00"`) do not yet.
+
 `open Checked`: `+`, `-`, `*`, unary `-` of whole numbers and the conversions raise
 `OverflowException` where the result does not fit, as on .NET.
 

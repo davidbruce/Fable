@@ -487,11 +487,12 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
         return true;
     }
     if (comptime isBigInt(T)) return a.value.eql(b.value);
+    if (comptime isDecimal(T)) return decCompare(a, b) == 0;
     // (.NET's mutable collections are equal only to themselves)
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity")) return a == b;
     // (an array is equal to another with equal items, as F#'s `=` has it)
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or eql(a.items, b.items);
-    if (comptime !isManaged(T)) return std.meta.eql(a, b);
+    if (comptime !isManaged(T) and !holdsDecimal(T)) return std.meta.eql(a, b);
     if (comptime isFunc(T)) @compileError("function values cannot be compared");
     if (T == Exn) return a == b;
     if (T == String) return strEql(a, b);
@@ -1931,6 +1932,428 @@ pub fn bigParse(s: String) Raised!BigInt {
 }
 
 // ---------------------------------------------------------------------------------------------
+// decimal: .NET's System.Decimal, a value: a whole number below 2^96 and a scale of 0 to 28
+// (the number of digits after the point). Results are rounded to fit, a tie to the even digit,
+// as .NET does; a result too large raises OverflowException.
+// ---------------------------------------------------------------------------------------------
+
+pub const NetDecimal = struct {
+    pub const fable_decimal = {};
+    /// the value times 10^scale; its magnitude is below 2^96
+    m: i128 = 0,
+    scale: u8 = 0,
+};
+
+const dec_max: u256 = (1 << 96) - 1;
+
+fn isDecimal(comptime T: type) bool {
+    return T == NetDecimal;
+}
+
+/// Does a value that holds no cell hold a decimal (so that it is compared by value, not bits)?
+fn holdsDecimal(comptime T: type) bool {
+    if (T == NetDecimal) return true;
+    switch (@typeInfo(T)) {
+        .optional => |o| return holdsDecimal(o.child),
+        .@"struct" => |s| {
+            inline for (s.field_types) |F| {
+                if (holdsDecimal(F)) return true;
+            }
+            return false;
+        },
+        .@"union" => |u| {
+            inline for (u.field_types) |F| {
+                if (holdsDecimal(F)) return true;
+            }
+            return false;
+        },
+        .array => |a| return holdsDecimal(a.child),
+        else => return false,
+    }
+}
+
+fn decOverflow() Raised {
+    return raise(OverflowException, str("Value was either too large or too small for a Decimal."));
+}
+
+fn pow10(n: u32) u256 {
+    var r: u256 = 1;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) r *= 10;
+    return r;
+}
+
+/// m / 10^k rounded to the nearest; a tie goes to the even number, or away from zero
+fn divRound(m: u256, k: u32, even: bool) u256 {
+    if (k == 0) return m;
+    if (k > 76) return 0;
+    const p = pow10(k);
+    var q = m / p;
+    const r = m % p;
+    const half = p / 2;
+    if (r > half or (r == half and (!even or q & 1 == 1))) q += 1;
+    return q;
+}
+
+fn decMake(negative: bool, mag: u256, scale: u32) NetDecimal {
+    const m: i128 = @intCast(mag);
+    return .{ .m = if (negative) -m else m, .scale = @intCast(scale) };
+}
+
+/// The decimal of a sign, a magnitude and a scale of any size: digits are dropped from the end,
+/// rounding, until it fits.
+fn decFit(negative: bool, mag: u256, scale: u32) Raised!NetDecimal {
+    var k: u32 = if (scale > 28) scale - 28 else 0;
+    while (true) : (k += 1) {
+        const q = divRound(mag, k, true);
+        if (q <= dec_max) {
+            if (k > scale) return decOverflow();
+            return decMake(negative, q, scale - k);
+        }
+        if (k >= scale) return decOverflow();
+    }
+}
+
+fn decMag(d: NetDecimal) u256 {
+    return @intCast(@abs(d.m));
+}
+
+/// both values at the larger scale, signed
+fn decAligned(a: NetDecimal, b: NetDecimal) struct { i256, i256, u32 } {
+    const s: u32 = @max(a.scale, b.scale);
+    const x: i256 = @as(i256, a.m) * @as(i256, @intCast(pow10(s - a.scale)));
+    const y: i256 = @as(i256, b.m) * @as(i256, @intCast(pow10(s - b.scale)));
+    return .{ x, y, s };
+}
+
+/// a decimal literal
+pub fn decLit(comptime m: i128, comptime scale: u8) NetDecimal {
+    return .{ .m = m, .scale = scale };
+}
+
+pub fn decAdd(a: NetDecimal, b: NetDecimal) Raised!NetDecimal {
+    const x, const y, const s = decAligned(a, b);
+    const sum = x + y;
+    return decFit(sum < 0, @intCast(@abs(sum)), s);
+}
+
+pub fn decSub(a: NetDecimal, b: NetDecimal) Raised!NetDecimal {
+    return decAdd(a, .{ .m = -b.m, .scale = b.scale });
+}
+
+pub fn decMul(a: NetDecimal, b: NetDecimal) Raised!NetDecimal {
+    return decFit((a.m < 0) != (b.m < 0), decMag(a) * decMag(b), @as(u32, a.scale) + b.scale);
+}
+
+pub fn decDiv(a: NetDecimal, b: NetDecimal) Raised!NetDecimal {
+    if (b.m == 0) return raise(DivideByZeroException, str("Attempted to divide by zero."));
+    const negative = (a.m < 0) != (b.m < 0);
+    var num = decMag(a);
+    const den = decMag(b);
+    var scale: i32 = @as(i32, a.scale) - @as(i32, b.scale);
+    if (scale < 0) {
+        num *= pow10(@intCast(-scale));
+        scale = 0;
+    }
+    var q = num / den;
+    var r = num % den;
+    if (q > dec_max) return decOverflow();
+    // (as many digits as fit)
+    while (r != 0 and scale < 28) {
+        const next = q * 10 + (r * 10) / den;
+        if (next > dec_max) break;
+        q = next;
+        r = (r * 10) % den;
+        scale += 1;
+    }
+    if (r != 0 and (2 * r > den or (2 * r == den and q & 1 == 1))) {
+        q += 1;
+        if (q > dec_max) return decFit(negative, q, @intCast(scale));
+    }
+    return decMake(negative, q, @intCast(scale));
+}
+
+/// `a % b`: what is left after a whole number of `b`, with the sign of `a`
+pub fn decRem(a: NetDecimal, b: NetDecimal) Raised!NetDecimal {
+    if (b.m == 0) return raise(DivideByZeroException, str("Attempted to divide by zero."));
+    const x, const y, const s = decAligned(a, b);
+    const r = @rem(x, y);
+    return decFit(r < 0, @intCast(@abs(r)), s);
+}
+
+pub fn decNeg(a: NetDecimal) NetDecimal {
+    return .{ .m = -a.m, .scale = a.scale };
+}
+
+pub fn decAbs(a: NetDecimal) NetDecimal {
+    return .{ .m = @intCast(@abs(a.m)), .scale = a.scale };
+}
+
+pub fn decSign(a: NetDecimal) i32 {
+    return if (a.m > 0) 1 else if (a.m < 0) -1 else 0;
+}
+
+pub fn decCompare(a: NetDecimal, b: NetDecimal) i32 {
+    const x, const y, _ = decAligned(a, b);
+    return if (x < y) -1 else if (x > y) 1 else 0;
+}
+
+fn decNormal(a: NetDecimal) NetDecimal {
+    var d = a;
+    while (d.scale > 0 and @rem(d.m, 10) == 0) {
+        d.m = @divTrunc(d.m, 10);
+        d.scale -= 1;
+    }
+    if (d.m == 0) d.scale = 0;
+    return d;
+}
+
+fn decHash(a: NetDecimal) i32 {
+    const d = decNormal(a);
+    const u: u128 = @bitCast(d.m);
+    return @bitCast(@as(u32, @truncate(u)) ^ @as(u32, @truncate(u >> 32)) ^ @as(u32, @truncate(u >> 64)) ^ (@as(u32, d.scale) << 24));
+}
+
+/// `decimal x` of a whole number
+pub fn decOf(x: anytype) Raised!NetDecimal {
+    const T = @TypeOf(x);
+    if (comptime @typeInfo(T) == .float or @typeInfo(T) == .comptime_float) return decOfFloat(x);
+    if (@abs(@as(i256, x)) > dec_max) return decOverflow();
+    return .{ .m = @intCast(x) };
+}
+
+/// `decimal x` of a float: rounded to 15 significant digits (7 for a float32), as .NET does
+fn decOfFloat(x: anytype) Raised!NetDecimal {
+    const f: f64 = x;
+    if (std.math.isNan(f) or std.math.isInf(f) or @abs(f) >= 7.9228162514264338e28) return decOverflow();
+    if (f == 0) return .{};
+    var d = Decimal.exact(@abs(f));
+    d.round(if (@TypeOf(x) == f32) 7 else 15);
+    var mag: u256 = 0;
+    for (d.digits[0..d.len]) |c| mag = mag * 10 + c;
+    const exp: i32 = d.point - @as(i32, @intCast(d.len));
+    var r: NetDecimal = undefined;
+    if (exp >= 0) {
+        r = try decFit(false, mag * pow10(@intCast(exp)), 0);
+    } else {
+        r = try decFit(false, mag, @intCast(-exp));
+    }
+    r = decNormal(r);
+    if (f < 0) r.m = -r.m;
+    return r;
+}
+
+/// `int x` of a decimal: the whole part; one that does not fit raises
+pub fn decToInt(comptime T: type, a: NetDecimal) Raised!T {
+    const w = @divTrunc(a.m, @as(i128, @intCast(pow10(a.scale))));
+    if (w < std.math.minInt(T) or w > std.math.maxInt(T)) return raise(OverflowException, str("Value was either too large or too small for " ++ netIntName(T) ++ "."));
+    return @intCast(w);
+}
+
+pub fn decToFloat(comptime T: type, a: NetDecimal) T {
+    var buf: [40]u8 = undefined;
+    const text = decAscii(a, &buf);
+    return std.fmt.parseFloat(T, text) catch unreachable;
+}
+
+/// `Math.Round(d, digits)`: a tie to the even digit, or away from zero
+pub fn decRound(a: NetDecimal, digits: i32, even: bool) NetDecimal {
+    if (digits < 0 or a.scale <= digits) return a;
+    const k: u32 = a.scale - @as(u32, @intCast(digits));
+    return decMake(a.m < 0, divRound(decMag(a), k, even), @intCast(digits));
+}
+
+/// `floor`, `ceil` (`up`) and `truncate` (neither)
+pub fn decWhole(a: NetDecimal, comptime how: enum { down, up, toward_zero }) NetDecimal {
+    const p = pow10(a.scale);
+    var q = decMag(a) / p;
+    const exact = decMag(a) % p == 0;
+    if (!exact) switch (how) {
+        .down => if (a.m < 0) {
+            q += 1;
+        },
+        .up => if (a.m > 0) {
+            q += 1;
+        },
+        .toward_zero => {},
+    };
+    return decMake(a.m < 0, q, 0);
+}
+
+/// The text of a decimal, as `ToString()` writes it: every digit of its scale.
+fn decAscii(a: NetDecimal, out: []u8) []const u8 {
+    var digits: [40]u8 = undefined;
+    const ds = std.fmt.bufPrint(&digits, "{d}", .{@abs(a.m)}) catch unreachable;
+    var n: usize = 0;
+    if (a.m < 0) {
+        out[n] = '-';
+        n += 1;
+    }
+    if (ds.len <= a.scale) {
+        out[n] = '0';
+        n += 1;
+        if (a.scale > 0) {
+            out[n] = '.';
+            n += 1;
+            var z = a.scale - ds.len;
+            while (z > 0) : (z -= 1) {
+                out[n] = '0';
+                n += 1;
+            }
+            @memcpy(out[n .. n + ds.len], ds);
+            n += ds.len;
+        }
+    } else {
+        const whole = ds.len - a.scale;
+        @memcpy(out[n .. n + whole], ds[0..whole]);
+        n += whole;
+        if (a.scale > 0) {
+            out[n] = '.';
+            n += 1;
+            @memcpy(out[n .. n + a.scale], ds[whole..]);
+            n += a.scale;
+        }
+    }
+    return out[0..n];
+}
+
+pub fn decText(a: NetDecimal) String {
+    var buf: [40]u8 = undefined;
+    const t = decAscii(a, &buf);
+    const s, const u = strNew(t.len);
+    for (t, u) |c, *o| o.* = c;
+    return s;
+}
+
+/// the digits of a decimal for .NET's formats: 0.d0 d1 ... x 10^point
+fn decDigits(a: NetDecimal) Decimal {
+    var d: Decimal = .{};
+    if (a.m == 0) return d;
+    const text = std.fmt.bufPrint(&d.digits, "{d}", .{@abs(a.m)}) catch unreachable;
+    for (d.digits[0..text.len]) |*c| c.* -= '0';
+    d.len = text.len;
+    d.point = @as(i32, @intCast(text.len)) - a.scale;
+    // (without the zeros at the end)
+    while (d.len > 0 and d.digits[d.len - 1] == 0) d.len -= 1;
+    return d;
+}
+
+/// The text of a decimal for an F# format specifier (`%M`, `%f`, `%g`, `string d`).
+fn decSpecText(comptime spec: Spec, a: NetDecimal, out: []u8) []const u8 {
+    switch (spec.kind) {
+        'f', 'F', 'e', 'E' => {
+            const precision: i32 = @min(spec.precision orelse 6, 80);
+            var t: Text = .{ .buf = out };
+            if (a.m < 0) t.put('-') else if (spec.plus) t.put('+') else if (spec.space) t.put(' ');
+            var d = decDigits(a);
+            if (spec.kind == 'f' or spec.kind == 'F') {
+                d.roundTo(d.point + precision, false);
+                var i: i32 = @min(d.point, 1) - 1;
+                while (i < d.point) : (i += 1) t.put(d.digit(i));
+                if (precision > 0) {
+                    t.put('.');
+                    var k: i32 = 0;
+                    while (k < precision) : (k += 1) t.put(d.digit(d.point + k));
+                }
+            } else {
+                d.roundTo(precision + 1, false);
+                t.put(d.digit(0));
+                if (precision > 0) {
+                    t.put('.');
+                    var k: i32 = 1;
+                    while (k <= precision) : (k += 1) t.put(d.digit(k));
+                }
+                t.exponent(spec.kind, d.point - 1, 3);
+            }
+            return out[0..t.len];
+        },
+        'g', 'G' => {
+            var t: Text = .{ .buf = out };
+            if (a.m < 0) t.put('-') else if (spec.plus) t.put('+') else if (spec.space) t.put(' ');
+            var d = decDigits(a);
+            if (spec.precision) |p| d.roundTo(@max(p, 1), false);
+            if (d.len == 0) t.put('0') else t.general(&d, 29, if (spec.kind == 'g') 'e' else 'E');
+            return out[0..t.len];
+        },
+        else => {
+            if (spec.plus and a.m >= 0) {
+                out[0] = '+';
+                return out[0 .. 1 + decAscii(a, out[1..]).len];
+            }
+            return decAscii(a, out);
+        },
+    }
+}
+
+/// `Decimal.Parse s` (`fsharp`: F#'s `decimal s`, which also reads an exponent)
+pub fn decParse(s: String, comptime fsharp: bool) Raised!NetDecimal {
+    if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
+    return decRead(trimmed(s), fsharp) catch |e| switch (e) {
+        error.Format => badFormat(s),
+        error.Raised => error.Raised,
+    };
+}
+
+fn decRead(u: []const u16, comptime fsharp: bool) (error{Format} || Raised)!NetDecimal {
+    var i: usize = 0;
+    var negative = false;
+    if (i < u.len and (u[i] == '-' or u[i] == '+')) {
+        negative = u[i] == '-';
+        i += 1;
+    }
+    var mag: u256 = 0;
+    var significant: u32 = 0;
+    var exp: i32 = 0;
+    var any = false;
+    var seen_point = false;
+    while (i < u.len) : (i += 1) {
+        const c = u[i];
+        if (c >= '0' and c <= '9') {
+            any = true;
+            if (significant < 60) {
+                mag = mag * 10 + (c - '0');
+                if (mag != 0) significant += 1;
+                if (seen_point) exp -= 1;
+            } else {
+                if (!seen_point) exp += 1;
+            }
+        } else if (c == '.' and !seen_point) {
+            seen_point = true;
+        } else if (c == ',' and !fsharp and !seen_point and any) {
+            // (a group separator)
+        } else break;
+    }
+    if (!any) return error.Format;
+    if (fsharp and i < u.len and (u[i] == 'e' or u[i] == 'E')) {
+        i += 1;
+        var eneg = false;
+        if (i < u.len and (u[i] == '-' or u[i] == '+')) {
+            eneg = u[i] == '-';
+            i += 1;
+        }
+        var e: i32 = 0;
+        var digits = false;
+        while (i < u.len and u[i] >= '0' and u[i] <= '9') : (i += 1) {
+            e = @min(e * 10 + @as(i32, u[i] - '0'), 10000);
+            digits = true;
+        }
+        if (!digits) return error.Format;
+        exp += if (eneg) -e else e;
+    }
+    if (i != u.len) return error.Format;
+    // (zero keeps the digits written after its point)
+    if (mag == 0) return .{ .scale = if (exp < 0) @intCast(@min(-exp, 28)) else 0 };
+    if (exp >= 0) {
+        if (exp > 29) return decOverflow();
+        const big = mag * pow10(@intCast(exp));
+        if (big > dec_max) return decOverflow();
+        return decMake(negative, big, 0);
+    }
+    if (-exp > 76) return .{};
+    return decFit(negative, mag, @intCast(-exp));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Weak references
 //
 // `WeakReference<'T>` points at a cell without keeping it alive. It holds a handle, shared by
@@ -2548,6 +2971,7 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
     const T = @TypeOf(a);
     if (T == String) return strCompare(a, b);
     if (comptime isBigInt(T)) return bigCompare(a, b);
+    if (comptime isDecimal(T)) return decCompare(a, b);
     if (T == bool) return @as(i32, @intFromBool(a)) - @as(i32, @intFromBool(b));
     if (T == void) return 0;
     if (T == Exn) @compileError("fable: exceptions cannot be compared");
@@ -2657,6 +3081,7 @@ pub fn hash(x: anytype) i32 {
         return @bitCast(h);
     }
     if (T == Exn) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
+    if (comptime isDecimal(T)) return decHash(x);
     if (comptime isFunc(T)) @compileError("fable: function values cannot be hashed");
     switch (@typeInfo(T)) {
         .void => return 0,
@@ -3433,6 +3858,7 @@ fn floatText(comptime spec: Spec, value: anytype, out: []u8) []const u8 {
 
 fn pieceOf(comptime spec: Spec, value: anytype, scratch: *[scratch_len]u8) Piece {
     const T = @TypeOf(value);
+    if (comptime isDecimal(T)) return .{ .ascii = if (spec.net.len != 0) netText(spec.net, value, scratch) else decSpecText(spec, value, scratch) };
     if (T == String) {
         // (only `%O` shows that a string is null)
         if (value == null and spec.kind == 'O') return .{ .ascii = "<null>" };
@@ -3642,7 +4068,8 @@ fn fraction(t: *Text, d: *const Decimal, places: i32) void {
 /// standard formats: D, X, B, N, F, E, G, R, P and C with an optional precision.
 fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
     const T = @TypeOf(value);
-    const whole = @typeInfo(T) == .int;
+    const isDec = comptime isDecimal(T);
+    const whole = !isDec and @typeInfo(T) == .int;
     const letter = fmt[0];
     const given: ?i32 = comptime if (fmt.len > 1) (std.fmt.parseInt(i32, fmt[1..], 10) catch @compileError("fable: the format " ++ fmt)) else null;
     var t: Text = .{ .buf = out };
@@ -3661,15 +4088,19 @@ fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
         for (text) |c| t.put(c);
         return out[0..t.len];
     }
-    if (!whole) {
+    // (`G` of a decimal: every digit of its scale)
+    if (isDec and (letter == 'G' or letter == 'g') and given == null) return decAscii(value, out);
+    if (!whole and !isDec) {
         if (std.math.isNan(value)) return "NaN";
         if (std.math.isInf(value)) return if (value > 0) "Infinity" else "-Infinity";
     }
 
-    const negative = if (whole) value < 0 else std.math.signbit(value);
-    const shortest = !whole and (letter == 'R' or letter == 'r' or ((letter == 'G' or letter == 'g') and (given orelse 0) == 0));
+    const negative = if (isDec) value.m < 0 else if (whole) value < 0 else std.math.signbit(value);
+    const shortest = !whole and !isDec and (letter == 'R' or letter == 'r' or ((letter == 'G' or letter == 'g') and (given orelse 0) == 0));
     var d: Decimal = .{};
-    if (whole) {
+    if (isDec) {
+        d = decDigits(value);
+    } else if (whole) {
         if (value != 0) {
             const text = std.fmt.bufPrint(&d.digits, "{d}", .{@abs(@as(i128, value))}) catch unreachable;
             for (d.digits[0..text.len]) |*c| c.* -= '0';
@@ -3682,7 +4113,8 @@ fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
         d = Decimal.exact(@abs(@as(f64, value)));
     }
     // (a whole number has no exact half to decide: .NET rounds its digits half up)
-    const even = !whole;
+    // (and neither does .NET's formatting of a decimal)
+    const even = !whole and !isDec;
 
     switch (letter) {
         'D', 'd' => {
@@ -3936,6 +4368,13 @@ pub const Shower = struct {
             defer allocator.free(d);
             return b.word(d);
         }
+        if (comptime isDecimal(T)) {
+            var buf: [41]u8 = undefined;
+            const t = decAscii(x, &buf);
+            buf[t.len] = 'M';
+            const copy = b.arena.dupe(u8, buf[0 .. t.len + 1]) catch @panic("fable: out of memory");
+            return b.word(copy);
+        }
         if (T == Exn) return x.type.show(b, x, prec, depth);
         if (comptime isFunc(T)) return b.word("<fun>");
         switch (@typeInfo(T)) {
@@ -4155,6 +4594,10 @@ fn writeNet(out: *TextBuilder, x: anytype) void {
         const d = bigDigits(x);
         defer allocator.free(d);
         return out.addAscii(d);
+    }
+    if (comptime isDecimal(T)) {
+        var buf: [40]u8 = undefined;
+        return out.addAscii(decAscii(x, &buf));
     }
     if (T == u16) return out.addOne(x);
     if (T == Exn) {
@@ -5090,6 +5533,7 @@ fn addOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
 /// the zero a sum starts from
 fn zeroOf(comptime T: type) T {
     if (comptime isBigInt(T)) return bigOf(@as(i32, 0));
+    if (comptime isDecimal(T)) return .{};
     return 0;
 }
 
@@ -5110,7 +5554,10 @@ pub fn listSumBy(comptime R: type, f: anytype, xs: anytype) Raised!R {
             drop(total);
             return e;
         };
-        total = addOf(total, v);
+        total = accumulate(total, v) catch |e| {
+            drop(v);
+            return e;
+        };
         drop(v);
     }
     return total;
@@ -5122,28 +5569,54 @@ fn emptyInput(comptime what: []const u8) Raised {
 
 /// `List.average xs`
 pub fn listAverage(xs: anytype) Raised!@TypeOf(xs.Cons.Head) {
-    var total: @TypeOf(xs.Cons.Head) = 0;
+    var total = zeroOf(@TypeOf(xs.Cons.Head));
     var n: usize = 0;
     var rest = xs;
     while (rest == .Cons) : (rest = rest.Cons.Tail) {
-        total += rest.Cons.Head;
+        total = try accumulate(total, rest.Cons.Head);
         n += 1;
     }
     if (n == 0) return emptyInput("sequence");
+    return averageOf(total, n);
+}
+
+/// `total + x` of a sum that may raise (a decimal's)
+fn accumulate(total: anytype, x: @TypeOf(total)) Raised!@TypeOf(total) {
+    if (comptime isDecimal(@TypeOf(total))) return decAdd(total, x);
+    return addOf(total, x);
+}
+
+fn averageOf(total: anytype, n: usize) Raised!@TypeOf(total) {
+    if (comptime isDecimal(@TypeOf(total))) return decDiv(total, .{ .m = @intCast(n) });
     return total / @as(@TypeOf(total), @floatFromInt(n));
+}
+
+/// `List.sum xs` of decimals, which can raise
+pub fn listSumDec(xs: anytype) Raised!NetDecimal {
+    var total: NetDecimal = .{};
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) total = try decAdd(total, rest.Cons.Head);
+    return total;
+}
+
+/// `Array.sum a` of decimals
+pub fn arraySumDec(a: anytype) Raised!NetDecimal {
+    var total: NetDecimal = .{};
+    for (a.items) |x| total = try decAdd(total, x);
+    return total;
 }
 
 /// `List.averageBy f xs`
 pub fn listAverageBy(comptime R: type, f: anytype, xs: anytype) Raised!R {
-    var total: R = 0;
+    var total = zeroOf(R);
     var n: usize = 0;
     var rest = xs;
     while (rest == .Cons) : (rest = rest.Cons.Tail) {
-        total += try f.code(f.env, dup(rest.Cons.Head));
+        total = try accumulate(total, try f.code(f.env, dup(rest.Cons.Head)));
         n += 1;
     }
     if (n == 0) return emptyInput("sequence");
-    return total / @as(R, @floatFromInt(n));
+    return averageOf(total, n);
 }
 
 /// `Array.sum a`
@@ -5156,9 +5629,9 @@ pub fn arraySum(a: anytype) ItemOf(@TypeOf(a)) {
 /// `Array.average a`
 pub fn arrayAverage(a: anytype) Raised!ItemOf(@TypeOf(a)) {
     if (a.items.len == 0) return raise(ArgumentException, str("The input array was empty. (Parameter 'array')"));
-    var total: ItemOf(@TypeOf(a)) = 0;
-    for (a.items) |x| total += x;
-    return total / @as(ItemOf(@TypeOf(a)), @floatFromInt(a.items.len));
+    var total = zeroOf(ItemOf(@TypeOf(a)));
+    for (a.items) |x| total = try accumulate(total, x);
+    return averageOf(total, a.items.len);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6196,6 +6669,77 @@ test "weak references see their target go" {
     drop(w2);
     try std.testing.expectEqual(@as(usize, 0), thread.weak.count());
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "decimal does what .NET does" {
+    const D = struct {
+        fn p(comptime text: []const u8) NetDecimal {
+            return decParse(str(text), true) catch unreachable;
+        }
+        fn is(expected: []const u8, d: NetDecimal) !void {
+            var buf: [40]u8 = undefined;
+            try std.testing.expectEqualStrings(expected, decAscii(d, &buf));
+        }
+    };
+    const p = D.p;
+    try D.is("1.10", p("1.10"));
+    try D.is("0.3333333333333333333333333333", try decDiv(p("1"), p("3")));
+    try D.is("0.6666666666666666666666666667", try decDiv(p("2"), p("3")));
+    try D.is("0.25", try decDiv(p("1"), p("4")));
+    try D.is("5", try decDiv(p("10"), p("2")));
+    try D.is("1.00", try decDiv(p("1.00"), p("1")));
+    try D.is("1.0000", try decMul(p("1.000"), p("1.0")));
+    try D.is("0.30", try decAdd(p("0.1"), p("0.20")));
+    try D.is("0.0000000000000000000000000000", try decMul(p("1e-28"), p("0.5")));
+    try D.is("0.0000000000000000000000000002", try decMul(p("3e-28"), p("0.5")));
+    try D.is("33.333333333333333333333333333", try decDiv(p("100"), p("3")));
+    try D.is("0.1428571428571428571428571429", try decDiv(p("1"), p("7")));
+    try D.is("10.000", try decSub(p("12.345"), p("2.345")));
+    try D.is("1", try decRem(p("7"), p("3")));
+    try D.is("-1.5", try decRem(p("-7.5"), p("2")));
+    try D.is("1.358024679135802467913580237", try decMul(p("1.23456789012345678901234567"), p("1.1")));
+    try D.is("20", try decDiv(p("10"), p("0.5")));
+    try D.is("0.125", try decDiv(p("1"), p("8")));
+    try D.is("2.00", try decDiv(p("4.00"), p("2")));
+    try D.is("2.5", try decDiv(p("5"), p("2.0")));
+    try D.is("0", try decDiv(p("0"), p("5.00")));
+    try D.is("1.0000000000000000000000000001", try decAdd(p("1e-28"), p("1")));
+    try D.is("79228162514264337593543950334", try decSub(p("79228162514264337593543950335"), p("0.5")));
+    try D.is("79228162514264337593543950334", try decAdd(p("79228162514264337593543950334"), p("0.5")));
+    try D.is("79.22816251426433759354395030", try decMul(p("7.92281625142643375935439503"), p("10")));
+    try expectRaised(OverflowException, "Value was either too large or too small for a Decimal.", decAdd(p("79228162514264337593543950335"), p("1")));
+    try expectRaised(DivideByZeroException, "Attempted to divide by zero.", decDiv(p("1"), p("0")));
+    try expectRaised(OverflowException, "Value was either too large or too small for an Int32.", decToInt(i32, p("1e20")));
+    try expectRaised(OverflowException, "Value was either too large or too small for an unsigned byte.", decToInt(u8, p("300")));
+    try D.is("0.1", try decOf(@as(f64, 0.1)));
+    try D.is("0.333333333333333", try decOf(@as(f64, 1.0 / 3.0)));
+    try D.is("123456789.123457", try decOf(@as(f64, 123456789.123456789)));
+    try D.is("0", try decOf(@as(f64, 1e-30)));
+    try D.is("2.5", try decOf(@as(f32, 2.5)));
+    try D.is("10000000000000000000000000000", try decOf(@as(f64, 1e28)));
+    try D.is("0.0000000000000000000123456789", try decOf(@as(f64, 1.23456789e-20)));
+    try D.is("-1234567890123460000", try decOf(@as(f64, -1234567890123456789.0)));
+    try expectRaised(OverflowException, "Value was either too large or too small for a Decimal.", decOf(@as(f64, 1e29)));
+    try std.testing.expectEqual(@as(i32, -2), try decToInt(i32, p("-2.7")));
+    try std.testing.expectEqual(@as(f64, 1.1), decToFloat(f64, p("1.1")));
+    try std.testing.expectEqual(@as(f64, 7.922816251426434e28), decToFloat(f64, p("79228162514264337593543950335")));
+    try D.is("2", decRound(p("2.5"), 0, true));
+    try D.is("-2", decRound(p("-2.5"), 0, true));
+    try D.is("3", decRound(p("2.5"), 0, false));
+    try D.is("2.34", decRound(p("2.345"), 2, true));
+    try D.is("1.00", decRound(p("1.005"), 2, true));
+    try D.is("-2", decWhole(p("-1.5"), .down));
+    try D.is("2", decWhole(p("1.2"), .up));
+    try D.is("-1", decWhole(p("-1.7"), .toward_zero));
+    try std.testing.expect(eql(p("1.0"), p("1.00")) and compare(p("2"), p("10")) == -1 and hash(p("1.0")) == hash(p("1.00")));
+    try D.is("1000.5", try decParse(str("1,000.5"), false));
+    try expectRaised(FormatException, "The input string '1e3' was not in a correct format.", decParse(str("1e3"), false));
+    try D.is("1000", p("1e3"));
+    try D.is("0.1234567890123456789012345679", p("0.123456789012345678901234567890123"));
+    try expectRaised(OverflowException, "Value was either too large or too small for a Decimal.", decParse(str("99999999999999999999999999999"), false));
+    try expectRaised(FormatException, "The input string '1.5x' was not in a correct format.", decParse(str("1.5x"), false));
+    try D.is("0.000", p("-0.000"));
+    try expectText("2.35|1,234.50|1.500000|1.57|1.5|1.10|  2.25|1.10M", format(.{ arg(.{ .net = "F2" }, p("2.345")), "|", arg(.{ .net = "N2" }, p("1234.5")), "|", arg(.{ .kind = 'f' }, p("1.5")), "|", arg(.{ .kind = 'f', .precision = 2 }, p("1.567")), "|", arg(.{ .kind = 'g' }, p("1.5")), "|", p("1.10"), "|", arg(.{ .kind = 'M', .width = 6 }, p("2.25")), "|", anyText(p("1.10")) }));
 }
 
 test "bigint does what .NET does" {

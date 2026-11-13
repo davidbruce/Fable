@@ -396,7 +396,7 @@ let rec ex (em: Em) (e: Expr) : string =
         | "shr", [ x; y ] -> $"(%s{x} >> %s{shiftCount y})"
         // (values that hold cells are compared through them)
         | "eql", [ x; y ] ->
-            if isManaged argT then
+            if isManaged argT || holdsDecimal argT then
                 $"fable_rt.eql(%s{x}, %s{y})"
             else
                 $"std.meta.eql(%s{x}, %s{y})"

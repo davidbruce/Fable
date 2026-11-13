@@ -110,6 +110,24 @@ let rec isManaged (t: Ty) =
     | TPrim "fable_rt.String" -> true
     | _ -> false
 
+/// Does a value hold a decimal (which is compared by value: 1.0m = 1.00m)?
+let holdsDecimal (t: Ty) : bool =
+    let seen = HashSet<string>()
+
+    let rec go (t: Ty) =
+        match t with
+        | TPrim "fable_rt.NetDecimal" -> true
+        | TOpt t
+        | TArr(t, _) -> go t
+        | TTuple ts -> List.exists go ts
+        | TEnt(e, args) ->
+            List.exists go args
+            || (seen.Add e.Name
+                && e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> go)))
+        | _ -> false
+
+    go t
+
 /// The same question for the declaration of a type, whatever its parameters stand for.
 let rec isManagedDecl (t: Ty) =
     match t with

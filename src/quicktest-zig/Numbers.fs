@@ -199,6 +199,73 @@ let run () : int =
              + "|"
              + string (List.sum [ 1I; 2I; 3I ]))
         + check (hash 5I = hash 5I && max 3I 4I = 4I && 2I < 3I && sign -4I = -1)
+        // decimal
+        + same
+            "3.0476818181818181818181818182|2.345|2|5|1.5|1.5|1|false|true"
+            (let x, y = 2.345m, 1.10m in
+
+             sprintf
+                 "%s|%s|%d|%M|%M|%M|%d|%b|%b"
+                 (string (x * y + 1.5m - x / y % y))
+                 (string x)
+                 (int x)
+                 (decimal 5)
+                 (decimal 1.5)
+                 (decimal "1.5")
+                 (compare x 1m)
+                 (x = 2m)
+                 (x < 3m))
+        + same
+            "2.345|-2.345|2.345000|12|2|2|2.34|1|2.35|2.345 2.35|1,234.50"
+            (let x = 2.345m in
+
+             sprintf
+                 "%M|%M|%f|%M|%M|%M|%M|%d|%s|%s|%s"
+                 (abs -x)
+                 (-x)
+                 (float x)
+                 (System.Decimal.Parse "12")
+                 (round x)
+                 (floor x)
+                 (System.Math.Round(x, 2))
+                 (sign x)
+                 (x.ToString("F2"))
+                 (sprintf "%M %.2f" x x)
+                 ((1234.5m).ToString("N2")))
+        + same
+            "2.345|3.5|1.5|79228162514264337593543950335|0.3333333333333333333333333333|[1.5M; 2M]"
+            (sprintf
+                "%M|%M|%M|%M|%s|%A"
+                (max 2.345m 1m)
+                (List.sum [ 1m; 2.5m ])
+                (List.average [ 1m; 2m ])
+                System.Decimal.MaxValue
+                (string (1m / 3m))
+                [ 1.5m; 2m ])
+        + same
+            "Overflow: Value was either too large or too small for a Decimal."
+            (raised (fun () -> string (System.Decimal.MaxValue + 1m)))
+        + same "Arithmetic: Attempted to divide by zero." (raised (fun () -> string (1m / 0m)))
+        + same "Overflow: Value was either too large or too small for an Int32." (raised (fun () -> string (int 1e20m)))
+        + same
+            "Format: The input string '1.5x' was not in a correct format."
+            (raised (fun () -> string (System.Decimal.Parse "1.5x")))
+        + check (
+            1.0m = 1.00m
+            && hash 1.0m = hash 1.00m
+            && Some 1.0m = Some 1.00m
+            && (1.0m, "a") = (1.00m, "a")
+            && Array.sum [| 1.5m; 2m |] = 3.5m
+        )
+        + same
+            "3.14|42|0x2A|1.500"
+            ((3.14159).ToString("F2")
+             + "|"
+             + (42).ToString("D")
+             + "|0x"
+             + (42).ToString("X")
+             + "|"
+             + (1.5).ToString("F3"))
         // `open Checked`
         + same
             "Overflow: Arithmetic operation resulted in an overflow."

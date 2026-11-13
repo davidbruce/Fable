@@ -723,7 +723,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         | Float32 -> TPrim "f32"
         | Float64 -> TPrim "f64"
         | BigInt -> TPrim "fable_rt.BigInt"
-        | Decimal -> fail r "the Zig target does not support decimal yet"
+        | Decimal -> TPrim "fable_rt.NetDecimal"
     | Fable.String -> tStr
     // (a unit argument stays, as `void`: a function value has one shape whatever its type
     // parameters stand for)
@@ -2126,6 +2126,23 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.NumberConstant(Fable.NumberValue.BigInt x, _) ->
             ctx.State.UsesRuntime <- true
             EEmit("fable_rt.bigLit(\"" + string x + "\")", [], TPrim "fable_rt.BigInt")
+        | Fable.NumberConstant(Fable.NumberValue.Decimal x, _) ->
+            ctx.State.UsesRuntime <- true
+            let bits = System.Decimal.GetBits x
+            let scale = (bits[3] >>> 16) &&& 0xFF
+
+            let m =
+                (bigint (uint32 bits[2]) <<< 64)
+                + (bigint (uint32 bits[1]) <<< 32)
+                + bigint (uint32 bits[0])
+
+            let m =
+                if bits[3] < 0 then
+                    -m
+                else
+                    m
+
+            ELit($"fable_rt.decLit(%s{string m}, %d{scale})", TPrim "fable_rt.NetDecimal")
         | Fable.NumberConstant(v, _) -> ELit(numberLit r v)
         | Fable.CharConstant c -> ELit(string<int>(int c), TPrim "u16")
         | Fable.StringConstant text -> ELit(stringLiteral text, tStr)
@@ -3320,7 +3337,8 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                     | 'c', Fable.Char -> 'c'
                     | ('d' | 'i'), Fable.Number _ when isWhole -> 'd'
                     | ('u' | 'x' | 'X' | 'o'), Fable.Number _ when isWhole -> letter
-                    | ('f' | 'F' | 'e' | 'E' | 'g' | 'G'), Fable.Number((Float32 | Float64), _) -> letter
+                    | ('f' | 'F' | 'e' | 'E' | 'g' | 'G'), Fable.Number((Float32 | Float64 | Decimal), _) -> letter
+                    | 'M', Fable.Number(Decimal, _) -> 'M'
                     | 'A', _ -> 'A'
                     | _, (Fable.String | Fable.Char | Fable.Boolean | Fable.Number _) ->
                         fail r "the Zig target does not support the format %%%c for this type of value yet" letter
@@ -3771,6 +3789,16 @@ and dotnetCall
         | _ -> false
 
     let tBig = TPrim "fable_rt.BigInt"
+    let tDec = TPrim "fable_rt.NetDecimal"
+
+    let isDec (x: Fable.Expr) =
+        match x.Type with
+        | Fable.Number(Decimal, _) -> true
+        | _ -> false
+
+    let decLit (m: string) (scale: int) =
+        ctx.State.UsesRuntime <- true
+        ELit($"fable_rt.decLit(%s{m}, %d{scale})", tDec)
 
     let isBig (x: Fable.Expr) =
         match x.Type with
@@ -3871,6 +3899,8 @@ and dotnetCall
         let ty = mapType ctx r t
 
         match name, args with
+        | "Sum", [ _ ] when ty = TPrim "fable_rt.NetDecimal" ->
+            bindArgs ctx [ listIr ] (fun xs -> ERt("fable_rt.listSumDec($0)", xs, ty))
         | "Sum", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.listSum($0)", xs, ty))
         | "Average", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> ERt("fable_rt.listAverage($0)", xs, ty))
         | "SumBy", [ f; _ ] ->
@@ -4607,6 +4637,34 @@ and dotnetCall
                 (values |> Seq.map (lw ctx) |> List.ofSeq)
                 (fun xs -> EEmit($"fable_rt.format(.{{ %s{texts} }})", xs, tStr))
     // `string x`
+    // `x.ToString("N2")` of a number: one of .NET's standard formats
+    | _, "ToString", [ x; Fable.Value(Fable.StringConstant net, _) ] when
+        (match x.Type with
+         | Fable.Number _ -> true
+         | _ -> false)
+        ->
+        if not (System.Text.RegularExpressions.Regex.IsMatch(net, "^[DdXxBbNnFfEeGgRrPpCc][0-9]{0,2}$")) then
+            fail r "the Zig target does not support the .NET format `%s` yet" net
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                EEmit(
+                    $"fable_rt.format(.{{ fable_rt.arg(.{{ .net = \"%s{net}\" }}, %s{typedArg ctx r x 0}) }})",
+                    xs,
+                    tStr
+                )
+            )
+    | _, "ToString", [ x ] when
+        entity <> "Microsoft.FSharp.Core.Operators"
+        && (
+            match x.Type with
+            | Fable.Number _ -> true
+            | _ -> false
+        )
+        ->
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
     | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when (ownToString ctx x.Type).IsSome ->
         bindArgs ctx [ lw ctx x ] (fun xs -> ECall((ownToString ctx x.Type).Value, [], xs @ [ EUnit ], tStr))
     | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when x.Type <> unByref x.Type ->
@@ -4733,6 +4791,100 @@ and dotnetCall
         bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 0, mapType ctx r t))
     | "Microsoft.FSharp.Core.Operators", "Snd", [ x ] ->
         bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 1, mapType ctx r t))
+    // ---- decimal: a value of the runtime (`fable_rt.NetDecimal`) ----
+    | ("Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions" | "System.Decimal"),
+      ("MakeDecimal" | ".ctor"),
+      [ lo; mid; hi; negative; scale ] ->
+        match lo, mid, hi, negative, scale with
+        | Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 lo, _), _),
+          Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 mid, _), _),
+          Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 hi, _), _),
+          Fable.Value(Fable.BoolConstant negative, _),
+          Fable.Value(Fable.NumberConstant(Fable.NumberValue.UInt8 scale, _), _) ->
+            let m =
+                (bigint (uint32 hi) <<< 64) + (bigint (uint32 mid) <<< 32) + bigint (uint32 lo)
+
+            let m =
+                if negative then
+                    -m
+                else
+                    m
+
+            decLit (string m) (int scale)
+        | _ -> fail r "the Zig target needs the parts of a decimal to be constants"
+    | "System.Decimal", ("get_Zero" | "get_One" | "get_MinusOne" | "get_MaxValue" | "get_MinValue"), [] ->
+        match name with
+        | "get_Zero" -> decLit "0" 0
+        | "get_One" -> decLit "1" 0
+        | "get_MinusOne" -> decLit "-1" 0
+        | "get_MaxValue" -> decLit "79228162514264337593543950335" 0
+        | _ -> decLit "-79228162514264337593543950335" 0
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators" | "System.Convert"),
+      "ToDecimal",
+      [ x ] ->
+        match x.Type with
+        | Fable.String -> rt "fable_rt.decParse($0, true)" [ x ] tDec
+        | _ when isDec x -> lw ctx x
+        | _ -> rt $"fable_rt.decOf(%s{typedArg ctx r x 0})" [ x ] tDec
+    | "System.Decimal", (".ctor" | "op_Implicit" | "op_Explicit"), [ x ] when not (isDec x) ->
+        rt $"fable_rt.decOf(%s{typedArg ctx r x 0})" [ x ] tDec
+    | "System.Decimal", "Parse", [ x ] -> rt "fable_rt.decParse($0, false)" [ x ] tDec
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked" | "System.Decimal"),
+      ("op_Addition" | "op_Subtraction" | "op_Multiply" | "op_Division" | "op_Modulus" | "Add" | "Subtract" | "Multiply" | "Divide" | "Remainder"),
+      [ a; b ] when isDec a ->
+        let f =
+            match name with
+            | "op_Addition"
+            | "Add" -> "decAdd"
+            | "op_Subtraction"
+            | "Subtract" -> "decSub"
+            | "op_Multiply"
+            | "Multiply" -> "decMul"
+            | "op_Division"
+            | "Divide" -> "decDiv"
+            | _ -> "decRem"
+
+        rt $"fable_rt.%s{f}($0, $1)" [ a; b ] tDec
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked" | "System.Decimal"),
+      ("op_UnaryNegation" | "Negate"),
+      [ a ] when isDec a -> pure' "fable_rt.decNeg($0)" [ a ] tDec
+    | ("Microsoft.FSharp.Core.Operators" | "System.Decimal"), "op_UnaryPlus", [ a ] when isDec a -> lw ctx a
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math" | "System.Decimal"), "Abs", [ a ] when isDec a ->
+        pure' "fable_rt.decAbs($0)" [ a ] tDec
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math" | "System.Decimal"), "Sign", [ a ] when isDec a ->
+        pure' "fable_rt.decSign($0)" [ a ] tI32
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math" | "System.Decimal"), "Round", [ a ] when isDec a ->
+        pure' "fable_rt.decRound($0, 0, true)" [ a ] tDec
+    | ("System.Math" | "System.Decimal"), "Round", [ a; digits ] when isDec a && isInt digits ->
+        pure' "fable_rt.decRound($0, $1, true)" [ a; digits ] tDec
+    | ("Microsoft.FSharp.Core.Operators" | "System.Math" | "System.Decimal"), ("Floor" | "Ceiling" | "Truncate"), [ a ] when
+        isDec a
+        ->
+        let how =
+            match name with
+            | "Floor" -> "down"
+            | "Ceiling" -> "up"
+            | _ -> "toward_zero"
+
+        pure' $"fable_rt.decWhole($0, .%s{how})" [ a ] tDec
+    | "System.Decimal", "Compare", [ a; b ] -> pure' "fable_rt.decCompare($0, $1)" [ a; b ] tI32
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked" | "System.Decimal" | "System.Convert"),
+      _,
+      [ x ] when
+        isDec x
+        && (name.StartsWith("To", System.StringComparison.Ordinal) || name = "op_Explicit")
+        && name <> "ToString"
+        && name <> "ToDecimal"
+        ->
+        let ty = mapType ctx r t
+
+        if isFloatTy ty then
+            pure' $"fable_rt.decToFloat(%s{zigTypeOf ty}, $0)" [ x ] ty
+        elif intBits ty > 0 then
+            rt $"fable_rt.decToInt(%s{zigTypeOf ty}, $0)" [ x ] ty
+        else
+            fail r "the Zig target cannot convert a decimal to %A yet" t
+
     // ---- bigint: a counted cell of the runtime (`fable_rt.BigInt`) ----
     | "Microsoft.FSharp.Core.NumericLiterals.NumericLiteralI", ("FromZero" | "FromOne"), ([] | [ _ ]) ->
         pure'
@@ -4949,6 +5101,8 @@ and dotnetCall
                 )
             )
     // sums and averages: the runtime adds with `+` of the item type
+    | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] when mapType ctx r t = TPrim "fable_rt.NetDecimal" ->
+        rt "fable_rt.listSumDec($0)" [ xs ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] -> pure' "fable_rt.listSum($0)" [ xs ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ListModule", "SumBy", [ f; xs ] ->
         rt "fable_rt.listSumBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
@@ -4956,6 +5110,8 @@ and dotnetCall
         rt "fable_rt.listAverage($0)" [ xs ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ListModule", "AverageBy", [ f; xs ] ->
         rt "fable_rt.listAverageBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] when mapType ctx r t = TPrim "fable_rt.NetDecimal" ->
+        rt "fable_rt.arraySumDec($0)" [ a ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] -> pure' "fable_rt.arraySum($0)" [ a ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ArrayModule", "Average", [ a ] ->
         rt "fable_rt.arrayAverage($0)" [ a ] (mapType ctx r t)
