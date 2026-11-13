@@ -412,6 +412,43 @@ let call
             entRef.FullName = "System.Span`1" || entRef.FullName = "System.ReadOnlySpan`1"
             ->
             pure' "fable_rt.spanEmpty($R)" [] (mapType ctx r t)
+        // (a struct: each field's default, as .NET zeroes it)
+        | Fable.DeclaredType(entRef, genArgs) when
+            (match ctx.Com.TryGetEntity entRef with
+             | Some ent ->
+                 ent.IsValueType
+                 && not ent.IsFSharpUnion
+                 && (ent.FSharpFields
+                     |> List.filter (fun f -> not f.IsStatic)
+                     |> List.forall (fun f -> hasDefault f.FieldType))
+             | None -> false)
+            && entRef.FullName <> "System.Guid"
+            ->
+            let ent = ctx.Com.GetEntity entRef
+
+            let sub =
+                if ent.GenericParameters.Length = genArgs.Length then
+                    List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) genArgs
+                    |> Map.ofList
+                else
+                    Map.empty
+
+            let defaults =
+                ent.FSharpFields
+                |> List.filter (fun f -> not f.IsStatic)
+                |> List.map (fun f ->
+                    let ft = substFableType sub f.FieldType
+
+                    dotnetCall
+                        ctx
+                        r
+                        "Microsoft.FSharp.Core.Operators.Unchecked"
+                        "DefaultOf"
+                        { info with GenericArgs = [ ft ] }
+                        ft
+                )
+
+            ECon(mapType ctx r t, "", defaults, None)
         | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.Guid" ->
             libraryCall
                 ctx
@@ -708,9 +745,31 @@ let call
             shapeCall "fable_rt.toText" "fable_rt.toTextShape" false
         // (a `Uri`: the library's Uri.fs writes it)
         | Fable.DeclaredType(e, []) when e.FullName = "System.Uri" ->
-            libraryCall ctx r "Uri" "toString" { info with ThisArg = None } [ x ] t
+            libraryCall
+                ctx
+                r
+                "Uri"
+                "toString"
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                [ x ]
+                t
         | Fable.DeclaredType(e, []) when e.FullName = "System.Guid" ->
-            libraryCall ctx r "Guid" "toString" { info with ThisArg = None } [ x ] t
+            libraryCall
+                ctx
+                r
+                "Guid"
+                "toString"
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                [ x ]
+                t
         // (an object: its class's ToString, or .NET's name of its class)
         | Fable.DeclaredType _ when (objOfType ctx r x.Type).IsSome -> rt "fable_rt.objText($0)" [ x ] tStr
         | Fable.Char ->

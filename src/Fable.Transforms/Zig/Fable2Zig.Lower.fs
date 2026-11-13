@@ -1208,8 +1208,14 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
 
         TEnt(
             anonEnt ctx.State (members |> List.map (fun (_, n, _, _) -> n) |> Array.ofList),
+            // (functions in the signatures as values have them: uncurried)
             members
-            |> List.map (fun (_, _, args, ret) -> TFn(args |> List.map (mapType ctx r), mapType ctx r ret))
+            |> List.map (fun (_, _, args, ret) ->
+                TFn(
+                    args |> List.map (FableTransforms.uncurryType >> mapType ctx r),
+                    mapType ctx r (FableTransforms.uncurryType ret)
+                )
+            )
         )
     | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapTypeArg ctx r))
     | Fable.Any -> tAny
@@ -1437,7 +1443,12 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                         "",
                         allInterfaceMembers ctx.Com ent Map.empty
                         |> List.map (fun (_, name, args, ret) ->
-                            name, TFn(args |> List.map (mapType ctx r), mapType ctx r ret)
+                            // (functions in the signatures as values have them: uncurried)
+                            name,
+                            TFn(
+                                args |> List.map (FableTransforms.uncurryType >> mapType ctx r),
+                                mapType ctx r (FableTransforms.uncurryType ret)
+                            )
                         )
                     ]
                 elif ent.IsFSharpUnion then
@@ -4771,14 +4782,23 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 else
                     args
 
+            // (whether a value is given by its address, and whether the callee may change it
+            // through it: `byref`, as the `this` of a struct with mutable fields, or `inref`)
             let wantsAddress =
                 if c.ArgTypes.Length = allArgs.Length then
                     List.map2
-                        (fun (p: Fable.Type) (a: Fable.Expr) -> isByref p && not (isByref a.Type))
+                        (fun (p: Fable.Type) (a: Fable.Expr) ->
+                            if isByref p && not (isByref a.Type) then
+                                match mapType ctx r p with
+                                | TPtr(_, isConst) -> Some isConst
+                                | _ -> Some true
+                            else
+                                None
+                        )
                         c.ArgTypes
                         allArgs
                 else
-                    allArgs |> List.map (fun _ -> false)
+                    allArgs |> List.map (fun _ -> None)
 
             bindArgs
                 ctx
@@ -4791,13 +4811,13 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         List.map2
                             (fun x want ->
                                 match x, want with
-                                | EVar v, true -> EAddr(EVar v, true)
+                                | EVar v, Some isConst -> EAddr(EVar v, isConst)
                                 | EAddr _, _
-                                | _, false -> x
-                                | _ ->
+                                | _, None -> x
+                                | _, Some isConst ->
                                     let v = ctx.State.NewVar("inref", typeOf x, VLocal, false)
                                     temps.Add((v, x))
-                                    EAddr(EVar v, true)
+                                    EAddr(EVar v, isConst)
                             )
                             xs
                             wantsAddress
