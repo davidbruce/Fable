@@ -51,6 +51,9 @@ type Ctx =
         /// the `let mutable` variables that a function inside the function assigns or reads:
         /// each is a ref cell, as F# makes it on .NET
         Boxed: HashSet<string>
+        /// inside a `for ... in` loop: the enumerator's name, and the variable that holds the
+        /// item of this round
+        Enumerators: Dictionary<string, Var>
         /// inside a `with` handler: the exception it caught (for `reraise ()`)
         CaughtExn: Var option
     }
@@ -474,6 +477,43 @@ let private arrayEnt (state: FileState) : Ent =
         state.UsesRuntime <- true
         e
 
+/// .NET's mutable collections, cells of the runtime library whose contents can be assigned:
+/// `List<T>` (ResizeArray), `Dictionary<K, V>`, `HashSet<T>`.
+let private netEnt (state: FileState) (name: string) : Ent =
+    let key = "$net:" + name
+
+    match state.Ents.TryGetValue key with
+    | true, e -> e
+    | _ ->
+        let typeParams, fields =
+            match name with
+            | "Dictionary" -> [ "K"; "V" ], [ "key", TGen "K"; "value", TGen "V" ]
+            | "HashSet" -> [ "T" ], [ "key", TGen "T" ]
+            | _ -> [ "T" ], [ "items", TGen "T" ]
+
+        let e =
+            {
+                Name = "fable_rt." + name
+                Ref =
+                    {
+                        FullName = "System.Collections.Generic." + name
+                        Path = Fable.CoreAssemblyName "System.Runtime"
+                    }
+                Kind = KRefRecord
+                TypeParams = typeParams
+                Cases = [ "", fields ]
+                MutableFields = fields |> List.map fst
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = false
+                Copyable = true
+                IsLocal = false
+            }
+
+        state.Ents[key] <- e
+        state.UsesRuntime <- true
+        e
+
 let private isArrayTy (t: Ty) =
     match t with
     | TEnt({ Name = "fable_rt.Array" }, _) -> true
@@ -537,11 +577,19 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Tuple(ts, _) -> TTuple(ts |> List.map (mapType ctx r))
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
+    | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
     | Fable.Array(t, _) -> TEnt(arrayEnt ctx.State, [ mapType ctx r t ])
+    | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Collections.Generic.Dictionary`2" ->
+        TEnt(netEnt ctx.State "Dictionary", [ mapType ctx r k; mapType ctx r v ])
+    | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Collections.Generic.HashSet`1" ->
+        TEnt(netEnt ctx.State "HashSet", [ mapType ctx r t ])
     | Fable.GenericParam(name = name) -> TGen name
     | Fable.DeclaredType(ent, _) when dotnetExceptions.ContainsKey ent.FullName -> tExn
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
+    // (an entry of a map, as a `for ... in` loop over the map gives it: a pair here)
+    | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Collections.Generic.KeyValuePair`2" ->
+        TTuple [ mapType ctx r k; mapType ctx r v ]
     // (what `Map.keys` and `Map.values` give: a list here, which is what they hold, in order)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.ICollection`1" ->
         TEnt(listEnt ctx.State, [ mapType ctx r item ])
@@ -1386,6 +1434,41 @@ let rec private neverNull (e: Fable.Expr) : bool =
             && (imp.Selector = "op_Addition" || imp.Selector = "ToString"))
     | _ -> false
 
+/// The item type of `IEnumerator<T>`.
+let private enumeratorItem (t: Fable.Type) : Fable.Type =
+    match t with
+    | Fable.DeclaredType(_, [ item ]) -> item
+    | _ -> Fable.Any
+
+/// What Fable makes of `for x in s do body` after `let enumerator = s.GetEnumerator()`:
+/// `try (while enumerator.MoveNext() do body) finally enumerator.Dispose()`, perhaps followed
+/// by more code. The body of the loop, and what follows the loop.
+let private forInLoop (enumerator: string) (rest: Fable.Expr) : (Fable.Expr * Fable.Expr option) option =
+    let isMoveNext (c: Fable.Expr) =
+        match c with
+        | Fable.Call(Fable.Import(imp, _, _), info, _, _) when imp.Selector = "MoveNext" ->
+            match info.ThisArg with
+            | Some(Fable.IdentExpr e) -> e.Name = enumerator
+            | _ -> false
+        | _ -> false
+
+    let rec loopOf (e: Fable.Expr) =
+        match e with
+        | Fable.WhileLoop(c, body, _) when isMoveNext c -> Some body
+        | Fable.TryCatch(body, None, Some _, _) -> loopOf body
+        | _ -> None
+
+    match rest with
+    | Fable.Sequential(first :: next) when (loopOf first).IsSome ->
+        Some(
+            (loopOf first).Value,
+            (if next.IsEmpty then
+                 None
+             else
+                 Some(Fable.Sequential next))
+        )
+    | _ -> loopOf rest |> Option.map (fun body -> body, None)
+
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
     | Fable.Value(kind, r) ->
@@ -1546,6 +1629,74 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     // a function with several arguments that is used one argument at a time
     | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
+
+    // `for x in source do body`: Fable gives an enumerator and a `while` over `MoveNext`. Here
+    // it is a loop of the source's own: down a list, along a string by index. A set or a map is
+    // walked as the list of what it holds, in order.
+    | Fable.Let(enumerator, Fable.Call(Fable.Import(getEnum, _, _), getInfo, _, r), rest) when
+        getEnum.Selector = "GetEnumerator"
+        && getInfo.ThisArg.IsSome
+        && (forInSource ctx getInfo.ThisArg.Value).IsSome
+        && (forInLoop enumerator.Name rest).IsSome
+        ->
+        let loopBody, finalizer = (forInLoop enumerator.Name rest).Value
+        let source, kind = (forInSource ctx getInfo.ThisArg.Value).Value
+        // (the item type is the source's: an enumerator of a .NET collection has a type of its own)
+        let itemTy =
+            match kind with
+            | "string" -> TPrim "u16"
+            | _ -> itemOf source
+
+        let cur = ctx.State.NewVar("item", itemTy, VLocal, false)
+        ctx.Enumerators[enumerator.Name] <- cur
+
+        let loop =
+            match kind with
+            | "list" ->
+                let listTy = typeOf source
+                let restV = ctx.State.NewVar("rest", listTy, VLocal, true)
+
+                ELet(
+                    restV,
+                    source,
+                    EWhile(
+                        EPrim("not", [ ETest(EVar restV, "Empty", listTy) ], tBool),
+                        ELet(
+                            cur,
+                            EGet(EVar restV, PCase("Cons", "Head"), itemTy),
+                            ESeq(EAssign(restV, EGet(EVar restV, PCase("Cons", "Tail"), listTy)), lwStmt ctx loopBody)
+                        )
+                    )
+                )
+            | _ ->
+                // a string, by index
+                let s = ctx.State.NewVar("text", tStr, VLocal, false)
+                let i = ctx.State.NewVar("i", tI32, VLocal, true)
+                ctx.State.UsesRuntime <- true
+
+                ELet(
+                    s,
+                    source,
+                    ELet(
+                        i,
+                        ELit("0", tI32),
+                        EWhile(
+                            EPrim("lt", [ EVar i; EEmit("fable_rt.strLength($0)", [ EVar s ], tI32) ], tBool),
+                            ELet(
+                                cur,
+                                EEmit("fable_rt.unitsOf($0)[@intCast($1)]", [ EVar s; EVar i ], itemTy),
+                                ESeq(EAssign(i, EPrim("add", [ EVar i; ELit("1", tI32) ], tI32)), lwStmt ctx loopBody)
+                            )
+                        )
+                    )
+                )
+
+        let after =
+            match finalizer with
+            | Some next -> lw ctx next
+            | None -> EUnit
+
+        ESeq(loop, after)
 
     // A `let mutable` that a function inside this one uses is a ref cell, which the function
     // and its surroundings share: that is what F# makes of it on .NET.
@@ -2114,6 +2265,8 @@ and checkShowable (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : unit =
                 not (dotnetExceptions.ContainsKey entRef.FullName)
                 && entRef.FullName <> mapName
                 && entRef.FullName <> setName
+                && entRef.FullName <> "System.Collections.Generic.Dictionary`2"
+                && entRef.FullName <> "System.Collections.Generic.HashSet`1"
                 && seen.Add entRef.FullName
             then
                 match ctx.Com.TryGetEntity entRef with
@@ -2596,6 +2749,26 @@ and dotnetCall
         mapType ctx r x.Type = mapType ctx r t
         ->
         lw ctx x
+    // ---- the entry of a map ----
+    | "System.Collections.Generic.KeyValuePair`2", ("get_Key" | "get_Value"), [ kv ] ->
+        bindArgs
+            ctx
+            [ lw ctx kv ]
+            (fun xs ->
+                EGet(
+                    xs.Head,
+                    PItem(
+                        if name = "get_Key" then
+                            0
+                        else
+                            1
+                    ),
+                    mapType ctx r t
+                )
+            )
+    // ---- the item of this round of a `for ... in` loop ----
+    | _, "get_Current", [ Fable.IdentExpr e ] when ctx.Enumerators.ContainsKey e.Name -> EVar ctx.Enumerators[e.Name]
+
     // ---- arrays ----
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetArray", [ a; i ]
     | "Microsoft.FSharp.Collections.ArrayModule", "Get", [ a; i ] ->
@@ -2652,6 +2825,87 @@ and dotnetCall
     | "Microsoft.FSharp.Collections.ArrayModule", "Exists", [ f; a ] -> rt "fable_rt.arrayExists($0, $1)" [ f; a ] tBool
     | "Microsoft.FSharp.Collections.ArrayModule", "ForAll", [ f; a ] -> rt "fable_rt.arrayForall($0, $1)" [ f; a ] tBool
 
+    // ---- .NET's mutable collections ----
+    | "System.Collections.Generic.List`1", ".ctor", ([] | [ _ ]) when
+        (match args with
+         | [ Uncast x ] -> (listItem x.Type).IsSome
+         | [ n ] -> isInt n
+         | _ -> true)
+        ->
+        let ty = mapType ctx r t
+
+        match args with
+        | [ Uncast x ] when (listItem x.Type).IsSome -> pure' "fable_rt.raOfList($R, $0)" [ x ] ty
+        | [ n ] -> bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.raNew($R)" [] ty)
+        | _ -> pure' "fable_rt.raNew($R)" [] ty
+    | "System.Collections.Generic.List`1", _, r0 :: rest ->
+        match name, rest with
+        | "Add", [ x ] -> pure' "fable_rt.raAdd($0, $1)" [ r0; x ] tVoid
+        | "AddRange", [ Uncast xs ] when (listItem xs.Type).IsSome ->
+            pure' "fable_rt.raAddList($0, $1)" [ r0; xs ] tVoid
+        | "get_Item", [ i ] -> rt "fable_rt.raGet($0, $1)" [ r0; i ] (mapType ctx r t)
+        | "set_Item", [ i; x ] -> rt "fable_rt.raSet($0, $1, $2)" [ r0; i; x ] tVoid
+        | "get_Count", [] -> pure' "fable_rt.raCount($0)" [ r0 ] tI32
+        | "Insert", [ i; x ] -> rt "fable_rt.raInsert($0, $1, $2)" [ r0; i; x ] tVoid
+        | "RemoveAt", [ i ] -> rt "fable_rt.raRemoveAt($0, $1)" [ r0; i ] tVoid
+        | "Remove", [ x ] -> pure' "fable_rt.raRemove($0, $1)" [ r0; x ] tBool
+        | "Contains", [ x ] -> pure' "fable_rt.raContains($0, $1)" [ r0; x ] tBool
+        | "IndexOf", [ x ] -> pure' "fable_rt.raIndexOf($0, $1)" [ r0; x ] tI32
+        | "Clear", [] -> pure' "fable_rt.raClear($0)" [ r0 ] tVoid
+        | "Reverse", [] -> pure' "fable_rt.raReverse($0)" [ r0 ] tVoid
+        | "Sort", [] -> pure' "fable_rt.raSort($0)" [ r0 ] tVoid
+        | "ToArray", [] -> pure' "fable_rt.raToArray($0)" [ r0 ] (mapType ctx r t)
+        | _ -> fail r "the Zig target does not support ResizeArray.%s yet" name
+    | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"), ".ctor", [] ->
+        pure' "fable_rt.htNew($R)" [] (mapType ctx r t)
+    | "System.Collections.Generic.HashSet`1", ".ctor", [ Uncast xs ] when (listItem xs.Type).IsSome ->
+        pure' "fable_rt.setOfList($R, $0)" [ xs ] (mapType ctx r t)
+    | "System.Collections.Generic.Dictionary`2", _, d :: rest ->
+        match name, rest with
+        | "Add", [ k; v ] -> rt "fable_rt.dictAdd($0, $1, $2)" [ d; k; v ] tVoid
+        | "set_Item", [ k; v ] -> pure' "fable_rt.dictSet($0, $1, $2)" [ d; k; v ] tVoid
+        | "get_Item", [ k ] -> rt "fable_rt.dictGet($0, $1)" [ d; k ] (mapType ctx r t)
+        | "ContainsKey", [ k ] -> pure' "fable_rt.dictContainsKey($0, $1)" [ d; k ] tBool
+        | "ContainsValue", [ v ] -> pure' "fable_rt.dictContainsValue($0, $1)" [ d; v ] tBool
+        | "Remove", [ k ] -> pure' "fable_rt.htRemove($0, $1)" [ d; k ] tBool
+        | "get_Count", [] -> pure' "fable_rt.htCount($0)" [ d ] tI32
+        | "Clear", [] -> pure' "fable_rt.htClear($0)" [ d ] tVoid
+        | "get_Keys", [] -> pure' "fable_rt.dictKeys($0)" [ d ] (mapType ctx r t)
+        | "get_Values", [] -> pure' "fable_rt.dictValues($0)" [ d ] (mapType ctx r t)
+        | "TryGetValue", [ k; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+            ctx.Vars.ContainsKey out.Name
+            ->
+            let outVar = ctx.Vars[out.Name]
+            let tmp = ctx.State.NewVar("found", TOpt outVar.Ty, VLocal, false)
+            ctx.State.UsesRuntime <- true
+
+            bindArgs
+                ctx
+                [ lw ctx d; lw ctx k ]
+                (fun xs ->
+                    ELet(
+                        tmp,
+                        EEmit("fable_rt.dictTryGet($0, $1)", xs, TOpt outVar.Ty),
+                        EIf(
+                            EPrim("not", [ ETest(EVar tmp, "None", TOpt outVar.Ty) ], tBool),
+                            ESeq(EAssign(outVar, EGet(EVar tmp, PSome, outVar.Ty)), ELit("true", tBool)),
+                            ELit("false", tBool),
+                            tBool
+                        )
+                    )
+                )
+        | _ -> fail r "the Zig target does not support Dictionary.%s yet" name
+    | "System.Collections.Generic.HashSet`1", _, h :: rest ->
+        match name, rest with
+        | "Add", [ x ] -> pure' "fable_rt.setAdd($0, $1)" [ h; x ] tBool
+        | "Contains", [ x ] -> pure' "fable_rt.dictContainsKey($0, $1)" [ h; x ] tBool
+        | "Remove", [ x ] -> pure' "fable_rt.htRemove($0, $1)" [ h; x ] tBool
+        | "get_Count", [] -> pure' "fable_rt.htCount($0)" [ h ] tI32
+        | "Clear", [] -> pure' "fable_rt.htClear($0)" [ h ] tVoid
+        | "UnionWith", [ Uncast xs ] when (listItem xs.Type).IsSome ->
+            pure' "fable_rt.setUnionList($0, $1)" [ h; xs ] tVoid
+        | _ -> fail r "the Zig target does not support HashSet.%s yet" name
+
     // ---- chars: each code unit to what .NET maps it to (there is no current culture) ----
     | "System.Char", ("ToUpper" | "ToUpperInvariant"), [ c ] -> pure' "fable_rt.unicode.toUpper($0)" [ c ] tChar
     | "System.Char", ("ToLower" | "ToLowerInvariant"), [ c ] -> pure' "fable_rt.unicode.toLower($0)" [ c ] tChar
@@ -2661,6 +2915,13 @@ and dotnetCall
     // calls are `ERt`. The `String` module takes a null string for an empty one.)
     | "Microsoft.FSharp.Core.Operators.Unchecked", "DefaultOf", [] when t = Fable.String ->
         ELit("@as(fable_rt.String, null)", tStr)
+    | "Microsoft.FSharp.Core.Operators.Unchecked", "DefaultOf", [] ->
+        match t with
+        | Fable.Number _
+        | Fable.Char -> ELit("0", mapType ctx r t)
+        | Fable.Boolean -> ELit("false", tBool)
+        | Fable.Option(inner, _) -> ECon(mapType ctx r t, "None", [], None)
+        | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String -> pure' "($0 == null)" [ x ] tBool
     | "System.String", "get_Length", [ s ] when neverNull s -> pure' "fable_rt.strLength($0)" [ s ] tI32
     | "System.String", "get_Length", [ s ] -> rt "fable_rt.strLen($0)" [ s ] tI32
@@ -3053,6 +3314,66 @@ and dotnetCall
         | Some(file, fn) -> libraryCall ctx r file fn info args t
         | None -> fail r "the Zig target does not support %s.%s yet" entity name
 
+/// The item type of a cell type of one type argument.
+and itemOf (x: Expr) : Ty =
+    match typeOf x with
+    | TEnt(_, [ item ]) -> item
+    | _ -> fail None "internal: not a collection"
+
+/// What a `for ... in` loop walks, lowered: a list (of a list, a set, or a map's entries) or
+/// a string. None for a source that is walked some other way.
+and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
+    let (Uncast inner) = source
+
+    match inner.Type with
+    | Fable.List _ -> Some(lw ctx inner, "list")
+    | Fable.DeclaredType(ent, _) when ent.FullName = "System.Collections.Generic.ICollection`1" ->
+        Some(lw ctx inner, "list")
+    | Fable.String -> Some(lw ctx inner, "string")
+    | Fable.Array(_, Fable.ResizeArray) ->
+        Some(
+            bindArgs
+                ctx
+                [ lw ctx inner ]
+                (fun xs -> EEmit("fable_rt.raToList($0)", xs, TEnt(listEnt ctx.State, [ itemOf xs.Head ]))),
+            "list"
+        )
+    | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Collections.Generic.Dictionary`2" ->
+        let pairTy = TTuple [ mapType ctx None k; mapType ctx None v ]
+
+        Some(
+            bindArgs
+                ctx
+                [ lw ctx inner ]
+                (fun xs -> EEmit("fable_rt.dictToList($0)", xs, TEnt(listEnt ctx.State, [ pairTy ]))),
+            "list"
+        )
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.HashSet`1" ->
+        Some(
+            bindArgs
+                ctx
+                [ lw ctx inner ]
+                (fun xs -> EEmit("fable_rt.setToList($0)", xs, TEnt(listEnt ctx.State, [ mapType ctx None item ]))),
+            "list"
+        )
+    | Fable.DeclaredType(ent, genArgs) when ent.FullName = mapName || ent.FullName = setName ->
+        let file =
+            if ent.FullName = mapName then
+                "Map"
+            else
+                "Set"
+
+        let info = Fable.CallInfo.Create(args = [ inner ], genArgs = genArgs)
+
+        let listTy =
+            match genArgs with
+            | [ k; v ] -> Fable.List(Fable.Tuple([ k; v ], false))
+            | [ item ] -> Fable.List item
+            | _ -> Fable.Any
+
+        Some(libraryCall ctx None file "toList" info [ inner ] listTy, "list")
+    | _ -> None
+
 /// A call of a function of the part of the runtime library that is written in F# (`List.fs`,
 /// ...). Its type parameters are found by name, from the signature of the FSharp.Core
 /// function it stands for, and given in the order of their names: that is the order in which
@@ -3230,6 +3551,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             Reserved = reserved
             DecisionTargets = []
             Boxed = HashSet()
+            Enumerators = Dictionary()
             CaughtExn = None
         }
 

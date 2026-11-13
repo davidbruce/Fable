@@ -349,3 +349,4 @@ let main _ =
     + Order.run ()
     + Numbers.run ()
     + Maps.run ()
+    + Loops.run ()

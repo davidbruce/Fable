@@ -151,8 +151,9 @@ fn movedOut(_: void, h: *sgc.Hdr) void {
 
 pub inline fn free(c: anytype) void {
     if (track) thread.stats.frees += 1;
-    // (an array's items are a block of their own)
+    // (the blocks a cell holds besides itself: an array's items, a dictionary's entries)
     if (comptime @hasDecl(@TypeOf(c.*), "fable_array")) allocator.free(c.items);
+    if (comptime @hasDecl(@TypeOf(c.*), "fable_free")) @TypeOf(c.*).fable_free(c);
     allocator.destroy(c);
 }
 
@@ -435,6 +436,8 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
         }
         return true;
     }
+    // (.NET's mutable collections are equal only to themselves)
+    if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity")) return a == b;
     // (an array is equal to another with equal items, as F#'s `=` has it)
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or eql(a.items, b.items);
     if (comptime !isManaged(T)) return std.meta.eql(a, b);
@@ -670,7 +673,7 @@ pub inline fn arraySet(a: anytype, i: i32, value: ItemOf(@TypeOf(a))) Raised!voi
     arrayPut(a, @intCast(i), dup(value));
 }
 
-fn arrayPut(a: anytype, i: usize, value: ItemOf(@TypeOf(a))) void {
+fn arrayPut(a: anytype, i: usize, value: @typeInfo(@TypeOf(a.items)).pointer.child) void {
     const old = a.items[i];
     a.items[i] = value;
     if (gcOf(a)) |h| {
@@ -857,6 +860,506 @@ pub fn arrayForall(f: anytype, a: anytype) Raised!bool {
         if (!try f.code(f.env, dup(a.items[i]))) return false;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// .NET's mutable collections: List<T> (F#'s ResizeArray), Dictionary<K, V>, HashSet<T>
+//
+// Counted cells like an array, equal only to themselves as on .NET. A dictionary and a hash
+// set are .NET's own design (buckets that chain into an array of entries, and a list of the
+// entries that were freed), so that they hold their entries in the order .NET does and a loop
+// over them sees what it sees on .NET.
+// ---------------------------------------------------------------------------------------------
+
+/// `seq [a; b; c; d; ...]`: how `%A` writes a .NET collection (four items, then `...`).
+fn showSeq(b: *Shower, items: []const *Layout, more: bool) *Layout {
+    var all: std.ArrayList(*Layout) = .empty;
+    all.appendSlice(b.arena, items) catch @panic("fable: out of memory");
+    if (more) all.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+    const list = if (all.items.len == 0)
+        b.word("[]")
+    else
+        b.tight(b.tight(b.ascii(false, "[", true), b.separated(all.items, ";")), b.ascii(true, "]", false));
+    return b.join(b.word("seq"), list, .{ .breakable = 2 });
+}
+
+fn outOfRange() Raised {
+    return raise(ArgumentOutOfRangeException, str("Index was out of range. Must be non-negative and less than the size of the collection. (Parameter 'index')"));
+}
+
+/// F#'s `ResizeArray<T>`: .NET's `List<T>`.
+pub fn ResizeArray(comptime T: type) type {
+    return *struct {
+        const Self = @This();
+        pub const fable_identity = {};
+        pub const fable_cyclic = holdsCyclic(T);
+        @"$rc": u32 = 1,
+        @"$gc": GcHdr(fable_cyclic) = undefined,
+        /// the items, in a block of `capacity`
+        items: []T = &.{},
+        capacity: usize = 0,
+
+        pub fn fable_free(c: *Self) void {
+            if (c.capacity != 0) allocator.free(c.items.ptr[0..c.capacity]);
+        }
+
+        pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
+            var items: [4]*Layout = undefined;
+            const n = @min(x.items.len, 4);
+            for (x.items[0..n], 0..) |item, i| items[i] = b.show(item, .bracket_if_tuple, depth - 1);
+            return showSeq(b, items[0..n], x.items.len > 4);
+        }
+    };
+}
+
+fn rItem(comptime R: type) type {
+    return @typeInfo(@FieldType(@typeInfo(R).pointer.child, "items")).pointer.child;
+}
+
+pub fn raNew(comptime R: type) R {
+    const C = @typeInfo(R).pointer.child;
+    if (comptime hasGc(C)) gcTick();
+    const c = allocator.create(C) catch @panic("fable: out of memory");
+    c.* = .{};
+    if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
+    if (track) thread.stats.allocs += 1;
+    return c;
+}
+
+fn raGrow(r: anytype, need: usize) void {
+    if (need <= r.capacity) return;
+    const cap = @max(need, @max(4, r.capacity * 2));
+    const T = rItem(@TypeOf(r));
+    const block = allocator.alloc(T, cap) catch @panic("fable: out of memory");
+    @memcpy(block[0..r.items.len], r.items);
+    if (r.capacity != 0) allocator.free(r.items.ptr[0..r.capacity]);
+    r.items = block[0..r.items.len];
+    r.capacity = cap;
+}
+
+/// `r.Add x`
+pub fn raAdd(r: anytype, x: rItem(@TypeOf(r))) void {
+    raGrow(r, r.items.len + 1);
+    r.items.len += 1;
+    r.items[r.items.len - 1] = undefined;
+    // (put in place as an assignment of the array would be, for the collector)
+    const n = r.items.len - 1;
+    r.items[n] = dup(x);
+    if (gcOf(r)) |h| eachHdr(r.items[n], h, stored) else touch(r.items[n]);
+}
+
+/// `ResizeArray xs` of a list
+pub fn raOfList(comptime R: type, xs: List(rItem(R))) R {
+    const r = raNew(R);
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) raAdd(r, rest.Cons.Head);
+    return r;
+}
+
+/// `r.AddRange xs` of a list
+pub fn raAddList(r: anytype, xs: List(rItem(@TypeOf(r)))) void {
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) raAdd(r, rest.Cons.Head);
+}
+
+pub inline fn raCount(r: anytype) i32 {
+    return @intCast(r.items.len);
+}
+
+/// `r.[i]`
+pub fn raGet(r: anytype, i: i32) Raised!rItem(@TypeOf(r)) {
+    if (i < 0 or i >= r.items.len) return outOfRange();
+    return dup(r.items[@intCast(i)]);
+}
+
+/// `r.[i] <- x`
+pub fn raSet(r: anytype, i: i32, x: rItem(@TypeOf(r))) Raised!void {
+    if (i < 0 or i >= r.items.len) return outOfRange();
+    arrayPut(r, @intCast(i), dup(x));
+}
+
+/// `r.Insert(i, x)`
+pub fn raInsert(r: anytype, i: i32, x: rItem(@TypeOf(r))) Raised!void {
+    if (i < 0 or i > r.items.len) return raise(ArgumentOutOfRangeException, str("Index must be within the bounds of the List. (Parameter 'index')"));
+    raGrow(r, r.items.len + 1);
+    const at: usize = @intCast(i);
+    r.items.len += 1;
+    std.mem.copyBackwards(rItem(@TypeOf(r)), r.items[at + 1 ..], r.items[at .. r.items.len - 1]);
+    r.items[at] = dup(x);
+    if (gcOf(r)) |h| eachHdr(r.items[at], h, stored) else touch(r.items[at]);
+}
+
+fn raTake(r: anytype, at: usize) void {
+    const old = r.items[at];
+    std.mem.copyForwards(rItem(@TypeOf(r)), r.items[at .. r.items.len - 1], r.items[at + 1 ..]);
+    r.items.len -= 1;
+    if (gcOf(r)) |h| eachHdr(old, h, unstored);
+    drop(old);
+}
+
+/// `r.RemoveAt i`
+pub fn raRemoveAt(r: anytype, i: i32) Raised!void {
+    if (i < 0 or i >= r.items.len) return outOfRange();
+    raTake(r, @intCast(i));
+}
+
+/// `r.IndexOf x`
+pub fn raIndexOf(r: anytype, x: rItem(@TypeOf(r))) i32 {
+    for (r.items, 0..) |item, i| {
+        if (eql(item, x)) return @intCast(i);
+    }
+    return -1;
+}
+
+pub fn raContains(r: anytype, x: rItem(@TypeOf(r))) bool {
+    return raIndexOf(r, x) >= 0;
+}
+
+/// `r.Remove x`: the first item equal to x, if there is one.
+pub fn raRemove(r: anytype, x: rItem(@TypeOf(r))) bool {
+    const i = raIndexOf(r, x);
+    if (i < 0) return false;
+    raTake(r, @intCast(i));
+    return true;
+}
+
+/// `r.Clear()`
+pub fn raClear(r: anytype) void {
+    while (r.items.len != 0) raTake(r, r.items.len - 1);
+}
+
+/// `r.Reverse()`
+pub fn raReverse(r: anytype) void {
+    std.mem.reverse(rItem(@TypeOf(r)), r.items);
+}
+
+/// `r.Sort()`: by `compare`. (Equal items stay in their order; on .NET their order is not
+/// promised, and for F# values two equal items cannot be told apart.)
+pub fn raSort(r: anytype) void {
+    const T = rItem(@TypeOf(r));
+    std.sort.insertion(T, r.items, {}, struct {
+        fn lt(_: void, a: T, b: T) bool {
+            return compare(a, b) < 0;
+        }
+    }.lt);
+}
+
+/// `r.ToArray()`
+pub fn raToArray(r: anytype) Array(rItem(@TypeOf(r))) {
+    const A = Array(rItem(@TypeOf(r)));
+    const items = arrayItems(A, r.items.len);
+    for (items, r.items) |*to, item| to.* = dup(item);
+    return arrayFrom(A, items);
+}
+
+/// What a loop over it walks: its items now, as a list.
+pub fn raToList(r: anytype) List(rItem(@TypeOf(r))) {
+    return listOf(rItem(@TypeOf(r)), r.items);
+}
+
+/// The text `string x` and `{x}` give for a key or a value: unquoted, as .NET's ToString.
+fn showPlain(b: *Shower, x: anytype, depth: i32) *Layout {
+    const T = @TypeOf(x);
+    if (T == String) return b.leaf(false, b.arena.dupe(u16, unitsOf(x)) catch @panic("fable: out of memory"), false);
+    if (T == u16) return b.leaf(false, b.arena.dupe(u16, &.{x}) catch @panic("fable: out of memory"), false);
+    switch (@typeInfo(T)) {
+        .int, .float, .bool => {
+            var scratch: [scratch_len]u8 align(2) = undefined;
+            const piece = pieceOf(.{}, x, &scratch);
+            return b.ascii(false, piece.ascii, false);
+        },
+        else => return b.show(x, .bracket_if_tuple, depth),
+    }
+}
+
+/// .NET's `Dictionary<K, V>` (`hashed = true` and V = void: `HashSet<K>`).
+pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type {
+    return *struct {
+        const Self = @This();
+        pub const fable_identity = {};
+        pub const fable_cyclic = holdsCyclic(K) or holdsCyclic(V);
+        pub const Entry = struct { hash: i32, next: i32, kv: ?struct { key: K, value: V } };
+        @"$rc": u32 = 1,
+        @"$gc": GcHdr(fable_cyclic) = undefined,
+        /// the entries made so far, in a block of `capacity`; a freed one holds null
+        entries: []Entry = &.{},
+        capacity: usize = 0,
+        /// for each bucket: the first entry of its chain, plus one (0: none)
+        buckets: []i32 = &.{},
+        free_list: i32 = -1,
+        free_count: i32 = 0,
+
+        pub fn fable_free(c: *Self) void {
+            if (c.capacity != 0) {
+                allocator.free(c.entries.ptr[0..c.capacity]);
+                allocator.free(c.buckets);
+            }
+        }
+
+        pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
+            var items: [4]*Layout = undefined;
+            var n: usize = 0;
+            var more = false;
+            for (x.entries) |e| {
+                const kv = e.kv orelse continue;
+                if (n == 4) {
+                    more = true;
+                    break;
+                }
+                items[n] = if (is_set)
+                    b.show(kv.key, .bracket_if_tuple, depth - 1)
+                else
+                    b.tight(b.tight(b.ascii(false, "[", true), b.join(b.tight(showPlain(b, kv.key, depth - 1), b.ascii(true, ",", false)), showPlain(b, kv.value, depth - 1), .unbreakable)), b.ascii(true, "]", false));
+                n += 1;
+            }
+            return showSeq(b, items[0..n], more);
+        }
+    };
+}
+
+pub fn Dictionary(comptime K: type, comptime V: type) type {
+    return HashTable(K, V, false);
+}
+
+pub fn HashSet(comptime K: type) type {
+    return HashTable(K, void, true);
+}
+
+fn KeyOf(comptime D: type) type {
+    const Entry = @typeInfo(D).pointer.child.Entry;
+    return @FieldType(@typeInfo(@FieldType(Entry, "kv")).optional.child, "key");
+}
+
+fn ValueOf(comptime D: type) type {
+    const Entry = @typeInfo(D).pointer.child.Entry;
+    return @FieldType(@typeInfo(@FieldType(Entry, "kv")).optional.child, "value");
+}
+
+pub fn htNew(comptime D: type) D {
+    const C = @typeInfo(D).pointer.child;
+    if (comptime hasGc(C)) gcTick();
+    const c = allocator.create(C) catch @panic("fable: out of memory");
+    c.* = .{};
+    if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
+    if (track) thread.stats.allocs += 1;
+    return c;
+}
+
+/// (.NET's sizes: primes, so that the buckets spread)
+fn htNextSize(min: usize) usize {
+    const primes = [_]usize{ 3, 7, 11, 17, 23, 29, 37, 47, 59, 71, 89, 107, 131, 163, 197, 239, 293, 353, 431, 521, 631, 761, 919, 1103, 1327, 1597, 1931, 2333, 2801, 3371, 4049, 4861, 5839, 7013, 8419, 10103, 12143, 14591, 17519, 21023, 25229, 30293, 36353, 43627, 52361, 62851, 75431, 90523, 108631, 130363, 156437, 187751, 225307, 270371, 324449, 389357, 467237, 560689, 672827, 807403, 968897, 1162687, 1395263, 1674319, 2009191, 2411033, 2893249, 3471899, 4166287, 4999559, 5999471, 7199369 };
+    for (primes) |p| {
+        if (p >= min) return p;
+    }
+    var n = min | 1;
+    while (true) : (n += 2) {
+        var i: usize = 3;
+        while (i * i <= n and n % i != 0) i += 2;
+        if (i * i > n) return n;
+    }
+}
+
+fn htBucket(d: anytype, h: i32) usize {
+    return @as(u32, @bitCast(h)) % @as(u32, @intCast(d.buckets.len));
+}
+
+fn htResize(d: anytype, size: usize) void {
+    const C = @TypeOf(d.*);
+    const block = allocator.alloc(C.Entry, size) catch @panic("fable: out of memory");
+    @memcpy(block[0..d.entries.len], d.entries);
+    if (d.capacity != 0) {
+        allocator.free(d.entries.ptr[0..d.capacity]);
+        allocator.free(d.buckets);
+    }
+    d.entries = block[0..d.entries.len];
+    d.capacity = size;
+    d.buckets = allocator.alloc(i32, size) catch @panic("fable: out of memory");
+    @memset(d.buckets, 0);
+    for (d.entries, 0..) |*e, i| {
+        if (e.kv == null) continue;
+        const bucket = htBucket(d, e.hash);
+        e.next = d.buckets[bucket] - 1;
+        d.buckets[bucket] = @intCast(i + 1);
+    }
+}
+
+fn htFind(d: anytype, key: KeyOf(@TypeOf(d))) ?usize {
+    if (d.buckets.len == 0) return null;
+    const h = hash(key);
+    var i = d.buckets[htBucket(d, h)] - 1;
+    while (i >= 0) {
+        const e = &d.entries[@intCast(i)];
+        if (e.hash == h and eql(e.kv.?.key, key)) return @intCast(i);
+        i = e.next;
+    }
+    return null;
+}
+
+/// Put an entry in: false (and nothing changed) if the key is there and `replace` is false.
+fn htPut(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d)), replace: bool) bool {
+    if (htFind(d, key)) |i| {
+        if (!replace) return false;
+        const e = &d.entries[i];
+        const old = e.kv.?.value;
+        e.kv.?.value = dup(value);
+        if (gcOf(d)) |h| {
+            eachHdr(old, h, unstored);
+            eachHdr(e.kv.?.value, h, stored);
+        } else touch(e.kv.?.value);
+        drop(old);
+        return true;
+    }
+    if (d.buckets.len == 0) htResize(d, htNextSize(0));
+    const h = hash(key);
+    var at: usize = undefined;
+    if (d.free_count > 0) {
+        at = @intCast(d.free_list);
+        d.free_list = -3 - d.entries[at].next;
+        d.free_count -= 1;
+    } else {
+        if (d.entries.len == d.capacity) htResize(d, htNextSize(d.capacity * 2));
+        at = d.entries.len;
+        d.entries.len += 1;
+    }
+    const bucket = htBucket(d, h);
+    d.entries[at] = .{ .hash = h, .next = d.buckets[bucket] - 1, .kv = .{ .key = dup(key), .value = dup(value) } };
+    d.buckets[bucket] = @intCast(at + 1);
+    if (gcOf(d)) |hdr| eachHdr(d.entries[at].kv.?, hdr, stored) else touch(d.entries[at].kv.?);
+    return true;
+}
+
+/// `d.Add(k, v)`
+pub fn dictAdd(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) Raised!void {
+    if (!htPut(d, key, value, false)) {
+        return raise(ArgumentException, format(.{ "An item with the same key has already been added. Key: ", arg(.{ .kind = 'O' }, key) }));
+    }
+}
+
+/// `d.[k] <- v`
+pub fn dictSet(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) void {
+    _ = htPut(d, key, value, true);
+}
+
+/// `d.[k]`
+pub fn dictGet(d: anytype, key: KeyOf(@TypeOf(d))) Raised!ValueOf(@TypeOf(d)) {
+    const i = htFind(d, key) orelse return raise(KeyNotFoundException, format(.{ "The given key '", arg(.{ .kind = 'O' }, key), "' was not present in the dictionary." }));
+    return dup(d.entries[i].kv.?.value);
+}
+
+/// `d.TryGetValue(k, &v)`: the value, or null.
+pub fn dictTryGet(d: anytype, key: KeyOf(@TypeOf(d))) ?ValueOf(@TypeOf(d)) {
+    const i = htFind(d, key) orelse return null;
+    return dup(d.entries[i].kv.?.value);
+}
+
+pub fn dictContainsKey(d: anytype, key: KeyOf(@TypeOf(d))) bool {
+    return htFind(d, key) != null;
+}
+
+pub fn dictContainsValue(d: anytype, value: ValueOf(@TypeOf(d))) bool {
+    for (d.entries) |e| {
+        if (e.kv) |kv| {
+            if (eql(kv.value, value)) return true;
+        }
+    }
+    return false;
+}
+
+/// `d.Remove k`
+pub fn htRemove(d: anytype, key: KeyOf(@TypeOf(d))) bool {
+    if (d.buckets.len == 0) return false;
+    const h = hash(key);
+    const bucket = htBucket(d, h);
+    var last: i32 = -1;
+    var i = d.buckets[bucket] - 1;
+    while (i >= 0) {
+        const e = &d.entries[@intCast(i)];
+        if (e.hash == h and eql(e.kv.?.key, key)) {
+            if (last < 0) d.buckets[bucket] = e.next + 1 else d.entries[@intCast(last)].next = e.next;
+            const old = e.kv.?;
+            e.kv = null;
+            e.next = -3 - d.free_list;
+            d.free_list = i;
+            d.free_count += 1;
+            if (gcOf(d)) |hdr| eachHdr(old, hdr, unstored);
+            drop(old);
+            return true;
+        }
+        last = i;
+        i = e.next;
+    }
+    return false;
+}
+
+pub fn htCount(d: anytype) i32 {
+    return @as(i32, @intCast(d.entries.len)) - d.free_count;
+}
+
+/// `d.Clear()`
+pub fn htClear(d: anytype) void {
+    for (d.entries) |*e| {
+        if (e.kv) |kv| {
+            e.kv = null;
+            if (gcOf(d)) |hdr| eachHdr(kv, hdr, unstored);
+            drop(kv);
+        }
+    }
+    d.entries.len = 0;
+    @memset(d.buckets, 0);
+    d.free_list = -1;
+    d.free_count = 0;
+}
+
+/// What a loop over a dictionary walks: its entries, as pairs, in .NET's order.
+pub fn dictToList(d: anytype) List(struct { KeyOf(@TypeOf(d)), ValueOf(@TypeOf(d)) }) {
+    const P = struct { KeyOf(@TypeOf(d)), ValueOf(@TypeOf(d)) };
+    var items: std.ArrayList(P) = .empty;
+    defer items.deinit(allocator);
+    for (d.entries) |e| {
+        if (e.kv) |kv| items.append(allocator, .{ kv.key, kv.value }) catch @panic("fable: out of memory");
+    }
+    return listOf(P, items.items);
+}
+
+pub fn dictKeys(d: anytype) List(KeyOf(@TypeOf(d))) {
+    var items: std.ArrayList(KeyOf(@TypeOf(d))) = .empty;
+    defer items.deinit(allocator);
+    for (d.entries) |e| {
+        if (e.kv) |kv| items.append(allocator, kv.key) catch @panic("fable: out of memory");
+    }
+    return listOf(KeyOf(@TypeOf(d)), items.items);
+}
+
+pub fn dictValues(d: anytype) List(ValueOf(@TypeOf(d))) {
+    var items: std.ArrayList(ValueOf(@TypeOf(d))) = .empty;
+    defer items.deinit(allocator);
+    for (d.entries) |e| {
+        if (e.kv) |kv| items.append(allocator, kv.value) catch @panic("fable: out of memory");
+    }
+    return listOf(ValueOf(@TypeOf(d)), items.items);
+}
+
+/// `h.Add x`: false if it was there.
+pub fn setAdd(h: anytype, x: KeyOf(@TypeOf(h))) bool {
+    return htPut(h, x, {}, false);
+}
+
+/// `HashSet xs` of a list
+pub fn setOfList(comptime H: type, xs: List(KeyOf(H))) H {
+    const h = htNew(H);
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) _ = setAdd(h, rest.Cons.Head);
+    return h;
+}
+
+/// `h.UnionWith xs` of a list
+pub fn setUnionList(h: anytype, xs: List(KeyOf(@TypeOf(h)))) void {
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) _ = setAdd(h, rest.Cons.Head);
+}
+
+pub fn setToList(h: anytype) List(KeyOf(@TypeOf(h))) {
+    return dictKeys(h);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1507,6 +2010,7 @@ pub fn hash(x: anytype) i32 {
         .optional => return if (x) |v| hashWith(1, hash(v)) else 0,
         .pointer => |p| {
             var h: i32 = 17;
+            if (comptime p.size != .slice and @hasDecl(p.child, "fable_identity")) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
             if (comptime p.size == .slice) {
                 for (x) |item| h = hashWith(h, hash(item));
                 return h;
@@ -2765,6 +3269,7 @@ pub const Shower = struct {
             .float => return b.number(x),
             .optional => return if (x) |v| b.case("Some", .{v}, prec, depth) else b.word("None"),
             .pointer => |ptr| {
+                if (comptime @hasDecl(ptr.child, "fable_identity")) return ptr.child.fable_show(b, x, depth);
                 if (comptime @hasDecl(ptr.child, "fable_array")) {
                     if (x.items.len == 0) return b.word("[||]");
                     var items: std.ArrayList(*Layout) = .empty;
@@ -4527,6 +5032,43 @@ test "numbers: what .NET raises and returns" {
     try expectRaised(FormatException, "The input string 'abc' was not in a correct format.", parseFloat(f64, str("abc")));
     try expectRaised(FormatException, "The input string 'inf' was not in a correct format.", parseFloat(f64, str("inf")));
     try std.testing.expect(try parseBool(str("True")) and !try parseBool(str("false")));
+}
+
+test ".NET's collections: ResizeArray, Dictionary, HashSet" {
+    const before = thread.stats;
+    const R = ResizeArray(i32);
+    const r = raOfList(R, listOf(i32, &.{ 3, 1, 2 }));
+    defer drop(r);
+    raAdd(r, 5);
+    try expectAny("seq [3; 1; 2; 5]", r);
+    try expectRaised(ArgumentOutOfRangeException, "Index was out of range. Must be non-negative and less than the size of the collection. (Parameter 'index')", raGet(r, 9));
+    try expectRaised(ArgumentOutOfRangeException, "Index must be within the bounds of the List. (Parameter 'index')", raInsert(r, 9, 1));
+    try raInsert(r, 0, 9);
+    try raRemoveAt(r, 1);
+    raSort(r);
+    try expectAny("seq [1; 2; 5; 9]", r);
+    try std.testing.expect(!raContains(r, 3) and raIndexOf(r, 5) == 2 and !raRemove(r, 3));
+    const D = Dictionary(i32, String);
+    const d = htNew(D);
+    defer drop(d);
+    try dictAdd(d, 2, str("b"));
+    try dictAdd(d, 1, str("a"));
+    dictSet(d, 3, str("c"));
+    dictSet(d, 2, str("B"));
+    try expectAny("seq [[2, B]; [1, a]; [3, c]]", d);
+    try expectRaised(ArgumentException, "An item with the same key has already been added. Key: 1", dictAdd(d, 1, str("x")));
+    try expectRaised(KeyNotFoundException, "The given key '9' was not present in the dictionary.", dictGet(d, 9));
+    try std.testing.expect(htRemove(d, 2));
+    dictSet(d, 7, str("g"));
+    try expectAny("seq [[7, g]; [1, a]; [3, c]]", d);
+    try std.testing.expectEqual(@as(i32, 3), htCount(d));
+    const h = setOfList(HashSet(i32), listOf(i32, &.{ 3, 1, 3 }));
+    defer drop(h);
+    try std.testing.expect(setAdd(h, 4) and !setAdd(h, 1));
+    try expectAny("seq [3; 1; 4]", h);
+    for (0..1000) |i| dictSet(d, @intCast(i), str("n"));
+    try std.testing.expectEqual(@as(i32, 1000), htCount(d));
+    _ = before;
 }
 
 test "conv follows .NET" {

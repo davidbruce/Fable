@@ -22,6 +22,7 @@
     <Compile Include="Order.fs" />
     <Compile Include="Numbers.fs" />
     <Compile Include="Maps.fs" />
+    <Compile Include="Loops.fs" />
     <Compile Include="QuickTest.fs" />
   </ItemGroup>
   <ItemGroup>

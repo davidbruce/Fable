@@ -286,6 +286,23 @@ only the empty array can be made that way; use `Array.create` or `Array.init`), 
 more than one dimension, the rest of the `Array` module, and reading an item without a
 reference of its own where the array is only looked at.
 
+## .NET's collections, and loops over collections
+
+`ResizeArray`, `Dictionary` and `HashSet` are cells of the runtime library, equal only to
+themselves as on .NET. A dictionary and a hash set are .NET's own design (buckets that chain
+into an array of entries, and a list of freed entries that the next ones reuse), so they hold
+their entries in the order .NET does: a loop over a dictionary and `%A` of it (`seq [[1, a];
+...]`, four entries then `...`) give what .NET gives. Keys are hashed with `fable_rt.hash`
+and compared with `=`. What they raise, and the messages, are .NET's. Like an array, each
+can close a cycle, and tells the collector what it holds.
+
+`for x in s do` is a loop of the source's own: down a list, along a string by index; a set,
+a map (its entries are pairs: `kv.Key`, `kv.Value`), a ResizeArray, a dictionary and a hash
+set are walked as the list of what they hold when the loop starts. (On .NET changing a .NET
+collection inside a loop over it raises; here the loop goes on over what it started with.)
+
+Not yet: `dict`, `Stack`, `Queue`, `SortedDictionary`, LINQ, and the rarer members.
+
 ## Cycles
 
 Reference counting alone never frees a structure that reaches itself. The cycle collector
