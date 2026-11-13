@@ -131,6 +131,34 @@ let call
 
         ctx.State.UsesRuntime <- true
         bindArgs ctx [ lw ctx sep; listIr ] (fun xs -> EEmit("fable_rt.joinList($0, $1)", xs, tStr))
+    // (a pattern known only when the program runs: its arguments as objects)
+    | "System.String", "Format", pattern :: values when
+        (match pattern with
+         | Fable.Value(Fable.StringConstant _, _) -> false
+         | _ -> pattern.Type = Fable.String)
+        ->
+        let objs =
+            match values with
+            | [ arr ] when arr.Type = Fable.Array(Fable.Any, Fable.MutableArray) -> arr
+            | _ ->
+                Fable.Value(
+                    Fable.NewArray(
+                        Fable.ArrayValues(
+                            values
+                            |> List.map (fun v ->
+                                if v.Type = Fable.Any then
+                                    v
+                                else
+                                    Fable.TypeCast(v, Fable.Any)
+                            )
+                        ),
+                        Fable.Any,
+                        Fable.MutableArray
+                    ),
+                    r
+                )
+
+        rt "fable_rt.strFormatObjs($0, $1)" [ pattern; objs ] tStr
     | "System.String", "Format", (Fable.Value(Fable.StringConstant fmt, _)) :: values ->
         compositeFormat ctx r fmt values t
     // (a culture changes nothing here: formatting is the invariant culture's)

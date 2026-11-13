@@ -307,6 +307,24 @@ let describe (n: int) : string =
     | Refused(code, reason) -> $"refused {code}: {reason}"
     | e -> "other: " + e.Message
 
+/// `String.Format` with a pattern known only when the program runs
+let runtimeFormat () : int =
+    let pattern = String.replicate 1 "{0} + {1,4}|{1,-4}| = {{{2}}}"
+    let text = System.String.Format(pattern, 1, "ab", 3.5)
+
+    let outOfRange =
+        try
+            System.String.Format(String.replicate 1 "{3}", 1) |> ignore
+            ""
+        with :? System.FormatException as e ->
+            e.Message
+
+    check (text = "1 +   ab|ab  | = {3.5}")
+    + check (
+        outOfRange =
+            "Index (zero based) must be greater than or equal to zero and less than the size of the argument list."
+    )
+
 let messages () : int =
     let caught =
         try
@@ -391,6 +409,7 @@ let run () : int =
         + conversions ()
         + showShapes ()
         + messages ()
+        + runtimeFormat ()
 
     printfn "strings: %d failed, %s, %5.2f|%-4d|" failed ("héllo " + "😀") 3.14159 42
     eprintfn "strings: this line goes to standard error (%s)" "ok"

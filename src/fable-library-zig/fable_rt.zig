@@ -2067,6 +2067,76 @@ pub fn unbox(comptime T: type, o: Any) Raised!T {
 }
 
 /// `o.ToString()` (null raises) and `string o` (null is "")
+/// `String.Format(pattern, args)` with a pattern known only when the program runs: `{i}` and
+/// `{i,width}` of the objects' text, `{{` and `}}`. (A `:format` part is refused: the objects'
+/// types are not known here.) It borrows both.
+pub fn strFormatObjs(pattern: String, args: Array(Any)) Raised!String {
+    const p = unitsOf(pattern);
+    const items = args.items;
+    var b: TextBuilder = .{};
+    errdefer b.deinit();
+    var i: usize = 0;
+    while (i < p.len) {
+        const c = p[i];
+        if (c == '}') {
+            if (i + 1 < p.len and p[i + 1] == '}') {
+                b.addOne('}');
+                i += 2;
+                continue;
+            }
+            return raise(FormatException, str("Input string was not in a correct format."));
+        }
+        if (c != '{') {
+            b.addOne(c);
+            i += 1;
+            continue;
+        }
+        if (i + 1 < p.len and p[i + 1] == '{') {
+            b.addOne('{');
+            i += 2;
+            continue;
+        }
+        // `{index[,width][:format]}`
+        i += 1;
+        var index: usize = 0;
+        var digits: usize = 0;
+        while (i < p.len and p[i] >= '0' and p[i] <= '9') : (i += 1) {
+            index = index * 10 + (p[i] - '0');
+            digits += 1;
+        }
+        var width: i64 = 0;
+        if (i < p.len and p[i] == ',') {
+            i += 1;
+            while (i < p.len and p[i] == ' ') i += 1;
+            var negative = false;
+            if (i < p.len and p[i] == '-') {
+                negative = true;
+                i += 1;
+            }
+            while (i < p.len and p[i] >= '0' and p[i] <= '9') : (i += 1) width = width * 10 + (p[i] - '0');
+            if (negative) width = -width;
+        }
+        if (i < p.len and p[i] == ':') {
+            return raise(NotSupportedException, str("The Zig target does not support a format in a String.Format pattern known only when the program runs."));
+        }
+        if (digits == 0 or i >= p.len or p[i] != '}') {
+            return raise(FormatException, str("Input string was not in a correct format."));
+        }
+        i += 1;
+        if (index >= items.len) {
+            return raise(FormatException, str("Index (zero based) must be greater than or equal to zero and less than the size of the argument list."));
+        }
+        const text = try anyToString(items[index], true);
+        defer drop(text);
+        const t = unitsOf(text);
+        const pad: usize = if (@abs(width) > t.len) @intCast(@abs(width) - t.len) else 0;
+        if (width > 0) for (0..pad) |_| b.addOne(' ');
+        b.add(t);
+        if (width < 0) for (0..pad) |_| b.addOne(' ');
+    }
+    return b.finish();
+}
+
 pub fn anyToString(o: Any, comptime null_is_empty: bool) Raised!String {
     const p = o orelse return if (null_is_empty) str("") else nullRef();
     return objText(p);
