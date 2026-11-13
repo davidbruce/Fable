@@ -366,6 +366,10 @@ let call
         | Fable.Any -> ELit("@as(fable_rt.Any, null)", tAny)
         | Fable.Option(inner, _)
         | Fable.Nullable(inner, _) -> ECon(mapType ctx r t, "None", [], None)
+        | Fable.DeclaredType(entRef, [ _ ]) when
+            entRef.FullName = "System.Span`1" || entRef.FullName = "System.ReadOnlySpan`1"
+            ->
+            pure' "fable_rt.spanEmpty($R)" [] (mapType ctx r t)
         // (a union of one case without fields has one value, which stands for it; null on
         // .NET, where nothing but a test for null tells them apart)
         | Fable.DeclaredType(entRef, []) when

@@ -44,15 +44,21 @@ let rec private cleanup (e: Expr) : Expr =
     | ELet(v, rhs, body) ->
         let body' = cleanup body
 
-        if
-            isPure rhs
-            && not ((fv body').Contains v.Id)
-            && not (isManaged v.Ty)
-            && v.Kind <> VUse
-        then
-            body'
-        else
-            ELet(v, cleanup rhs, body')
+        // A slice does not own the array or string backing it: hoist bindings from the slice's
+        // initializer out to the enclosing scope so the owner outlives the slice.
+        match v.Ty, cleanup rhs with
+        | TSlice _, ELet(innerV, innerRhs, innerBody) -> cleanup (ELet(innerV, innerRhs, ELet(v, innerBody, body')))
+        | TSlice _, ESeq(first, rest) -> cleanup (ESeq(first, ELet(v, rest, body')))
+        | _, rhs' ->
+            if
+                isPure rhs'
+                && not ((fv body').Contains v.Id)
+                && not (isManaged v.Ty)
+                && v.Kind <> VUse
+            then
+                body'
+            else
+                ELet(v, rhs', body')
     | ESeq(a, b) ->
         match cleanup a with
         | EUnit -> cleanup b

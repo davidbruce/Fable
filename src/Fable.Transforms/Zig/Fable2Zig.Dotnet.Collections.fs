@@ -320,7 +320,9 @@ let call
         rt "fable_rt.lazyForce($0)" [ l ] (mapType ctx r t)
     | "System.Lazy`1", "get_IsValueCreated", [ l ] -> pure' "fable_rt.lazyIsCreated($0)" [ l ] tBool
 
-    // ---- spans: slices of the arrays they view ----
+    // ---- spans: slices of the arrays or string units they view ----
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), (".ctor" | "get_Empty"), [] ->
+        pure' "fable_rt.spanEmpty($R)" [] (mapType ctx r t)
     | ("System.Span`1" | "System.ReadOnlySpan`1"), ".ctor", [ a ] when
         (match a.Type with
          | Fable.Array _ -> true
@@ -331,6 +333,7 @@ let call
         rt "fable_rt.spanSlice($0.items, $1, $2)" [ a; start; n ] (mapType ctx r t)
     | ("System.Span`1" | "System.ReadOnlySpan`1"), "get_Length", [ sp ] ->
         pure' "@as(i32, @intCast($0.len))" [ sp ] tI32
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "get_IsEmpty", [ sp ] -> pure' "($0.len == 0)" [ sp ] tBool
     | ("System.Span`1" | "System.ReadOnlySpan`1"), "get_Item", [ sp; i ] ->
         // (the item's place: a byref, which is read here, or kept by a byref variable)
         let item =
@@ -347,11 +350,37 @@ let call
         rt "fable_rt.spanSlice($0, $1, null)" [ sp; start ] (mapType ctx r t)
     | ("System.Span`1" | "System.ReadOnlySpan`1"), "Slice", [ sp; start; n ] ->
         rt "fable_rt.spanSlice($0, $1, $2)" [ sp; start; n ] (mapType ctx r t)
-    | "System.Span`1", "op_Implicit", [ sp ] -> lw ctx sp
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "op_Implicit", [ x ] ->
+        match x.Type with
+        | Fable.Array _ -> pure' "$0.items" [ x ] (mapType ctx r t)
+        | Fable.String -> pure' "fable_rt.unitsOf($0)" [ x ] (mapType ctx r t)
+        | _ -> lw ctx x
     | ("System.Span`1" | "System.ReadOnlySpan`1"), "ToArray", [ sp ] ->
-        pure' "fable_rt.arrayOf($R, .{})" [] (mapType ctx r t) |> ignore
-        fail r "the Zig target does not support Span.ToArray yet"
-    | "System.Span`1", "Fill", [ sp; x ] -> pure' "@memset($0, $1)" [ sp; x ] tVoid
+        pure' "fable_rt.spanToArray($R, $0)" [ sp ] (mapType ctx r t)
+    | "System.Span`1", "Fill", [ sp; x ] -> pure' "fable_rt.spanFill($0, $1)" [ sp; x ] tVoid
+    | "System.Span`1", "Clear", [ sp ] -> rt "fable_rt.spanClear($0)" [ sp ] tVoid
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "CopyTo", [ sp; dst ] ->
+        rt "fable_rt.spanCopyTo($0, $1)" [ sp; dst ] tVoid
+    | ("System.Span`1" | "System.ReadOnlySpan`1"), "TryCopyTo", [ sp; dst ] ->
+        pure' "fable_rt.spanTryCopyTo($0, $1)" [ sp; dst ] tBool
+    | "System.MemoryExtensions", "AsSpan", [ x ] ->
+        match x.Type with
+        | Fable.Array _ -> pure' "$0.items" [ x ] (mapType ctx r t)
+        | Fable.String -> pure' "fable_rt.unitsOf($0)" [ x ] (mapType ctx r t)
+        | _ -> fail r "the Zig target only supports AsSpan on arrays and strings"
+    | "System.MemoryExtensions", "AsSpan", [ x; start ] ->
+        match x.Type with
+        | Fable.Array _ -> rt "fable_rt.spanSlice($0.items, $1, null)" [ x; start ] (mapType ctx r t)
+        | Fable.String -> rt "fable_rt.spanSlice(fable_rt.unitsOf($0), $1, null)" [ x; start ] (mapType ctx r t)
+        | _ -> fail r "the Zig target only supports AsSpan on arrays and strings"
+    | "System.MemoryExtensions", "AsSpan", [ x; start; n ] ->
+        match x.Type with
+        | Fable.Array _ -> rt "fable_rt.spanSlice($0.items, $1, $2)" [ x; start; n ] (mapType ctx r t)
+        | Fable.String -> rt "fable_rt.spanSlice(fable_rt.unitsOf($0), $1, $2)" [ x; start; n ] (mapType ctx r t)
+        | _ -> fail r "the Zig target only supports AsSpan on arrays and strings"
+    | "System.MemoryExtensions", "Fill", [ sp; x ] -> pure' "fable_rt.spanFill($0, $1)" [ sp; x ] tVoid
+    | "System.MemoryExtensions", "Reverse", [ sp ] -> pure' "fable_rt.spanReverse($0)" [ sp ] tVoid
+    | "System.MemoryExtensions", "SequenceEqual", [ a; b ] -> pure' "fable_rt.eql($0, $1)" [ a; b ] tBool
 
     // ---- weak references ----
     | "System.WeakReference`1", ".ctor", [ target ] -> pure' "fable_rt.weakNew($R, $0)" [ target ] (mapType ctx r t)

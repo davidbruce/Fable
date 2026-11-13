@@ -1581,8 +1581,22 @@ pub fn arenaLeave(a: Arena) void {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Spans: `Span<'T>` and `ReadOnlySpan<'T>` are Zig slices of what they view (an array's items)
+// Spans: `Span<'T>` and `ReadOnlySpan<'T>` are Zig slices of what they view (an array's items
+// or a string's code units). Managed elements keep accurate reference counts on writes.
 // ---------------------------------------------------------------------------------------------
+
+fn SpanElem(comptime S: type) type {
+    const child = @typeInfo(S).pointer.child;
+    return if (@typeInfo(child) == .array) @typeInfo(child).array.child else child;
+}
+
+pub fn spanEmpty(comptime S: type) S {
+    const Child = @typeInfo(S).pointer.child;
+    const Empty = struct {
+        var items: [0]Child = .{};
+    };
+    return &Empty.items;
+}
 
 /// `s.[i]`: where the item is (F# reads it, or assigns through it)
 pub inline fn spanRef(s: anytype, i: i32) Raised!@TypeOf(&s[0]) {
@@ -1591,9 +1605,9 @@ pub inline fn spanRef(s: anytype, i: i32) Raised!@TypeOf(&s[0]) {
 }
 
 /// `s.[i] <- x`
-pub inline fn spanSet(s: anytype, i: i32, x: @typeInfo(@TypeOf(s)).pointer.child) Raised!void {
+pub inline fn spanSet(s: anytype, i: i32, x: SpanElem(@TypeOf(s))) Raised!void {
     if (i < 0 or i >= s.len) return indexOutside();
-    s[@intCast(i)] = x;
+    store(&s[@intCast(i)], dup(x));
 }
 
 /// `s.Slice(start)` and `s.Slice(start, length)`
@@ -1603,6 +1617,66 @@ pub fn spanSlice(s: anytype, start: i32, length: ?i32) Raised!@TypeOf(s) {
         return raise(ArgumentOutOfRangeException, str("Specified argument was out of the range of valid values."));
     }
     return s[@intCast(start)..][0..@intCast(n)];
+}
+
+/// `s.Fill(x)`
+pub fn spanFill(s: anytype, x: SpanElem(@TypeOf(s))) void {
+    for (s) |*slot| store(slot, dup(x));
+}
+
+/// `s.Clear()`
+pub fn spanClear(s: anytype) Raised!void {
+    const Elem = SpanElem(@TypeOf(s));
+    if (comptime arrays.hasZero(Elem)) {
+        const z = comptime std.mem.zeroes(Elem);
+        for (s) |*slot| store(slot, z);
+    } else if (s.len != 0) {
+        return raise(NotSupportedException, str("Span.Clear of a type without a null value"));
+    }
+}
+
+/// `s.TryCopyTo(dst)`: handles overlapping slices and keeps reference counts accurate.
+pub fn spanTryCopyTo(src: anytype, dst: anytype) bool {
+    if (src.len > dst.len) return false;
+    const src_addr = @intFromPtr(src.ptr);
+    const dst_addr = @intFromPtr(dst.ptr);
+    const Elem = SpanElem(@TypeOf(dst));
+    if (dst_addr > src_addr and dst_addr - src_addr < src.len * @sizeOf(Elem)) {
+        var i = src.len;
+        while (i > 0) {
+            i -= 1;
+            store(&dst[i], dup(src[i]));
+        }
+    } else {
+        for (src, 0..) |item, i| store(&dst[i], dup(item));
+    }
+    return true;
+}
+
+/// `s.CopyTo(dst)`
+pub fn spanCopyTo(src: anytype, dst: anytype) Raised!void {
+    if (!spanTryCopyTo(src, dst)) {
+        return raise(ArgumentException, str("Destination is too short. (Parameter 'destination')"));
+    }
+}
+
+/// `s.ToArray()`
+pub fn spanToArray(comptime A: type, s: anytype) A {
+    const items = arrays.arrayItems(A, s.len);
+    for (items, s) |*to, item| to.* = dup(item);
+    return arrays.arrayFrom(A, items);
+}
+
+/// `MemoryExtensions.Reverse(s)`
+pub fn spanReverse(s: anytype) void {
+    const Elem = SpanElem(@TypeOf(s));
+    var i: usize = 0;
+    var j = s.len;
+    while (i + 1 < j) {
+        j -= 1;
+        std.mem.swap(Elem, &s[i], &s[j]);
+        i += 1;
+    }
 }
 
 pub const bigint = @import("fable_bigint.zig");
@@ -7092,4 +7166,44 @@ test "TypeShape formats voption, struct tuple, u16_num, and recursive unions" {
     try expectText("Leaf (ValueSome 65us)", anyTextShape(tree_shape, t1));
     try expectText("Leaf ValueNone", anyTextShape(tree_shape, t3));
     try expectText("Pair (struct (Some 9, true), ())", anyTextShape(tree_shape, t2));
+}
+
+test "managed span operations maintain reference counts" {
+    const start_stats = thread.stats;
+    {
+        const arr = arrays.arrayOf(Array(String), .{ str("a"), str("b"), str("c") });
+        defer drop(arr);
+        const sp = arr.items;
+
+        const dyn1 = strConcat(str("d"), str("1"));
+        defer drop(dyn1);
+        try spanSet(sp, 1, dyn1);
+        try std.testing.expect(strEql(sp[1], str("d1")));
+
+        const dyn2 = strConcat(str("f"), str("2"));
+        defer drop(dyn2);
+        spanFill(sp[0..2], dyn2);
+        try std.testing.expect(strEql(sp[0], str("f2")));
+        try std.testing.expect(strEql(sp[1], str("f2")));
+        try std.testing.expect(strEql(sp[2], str("c")));
+
+        const copied = spanToArray(Array(String), sp[1..]);
+        defer drop(copied);
+        try std.testing.expectEqual(@as(usize, 2), copied.items.len);
+        try std.testing.expect(strEql(copied.items[0], str("f2")));
+        try std.testing.expect(strEql(copied.items[1], str("c")));
+
+        // Overlapping forward & backward CopyTo
+        const s_hi = strConcat(str("h"), str("i"));
+        defer drop(s_hi);
+        try spanSet(sp, 0, s_hi);
+        try spanCopyTo(sp[0..2], sp[1..3]);
+        try std.testing.expect(strEql(sp[0], str("hi")));
+        try std.testing.expect(strEql(sp[1], str("hi")));
+        try std.testing.expect(strEql(sp[2], str("f2")));
+
+        try spanClear(sp);
+        try std.testing.expect(sp[0] == null and sp[1] == null and sp[2] == null);
+    }
+    try std.testing.expectEqual(start_stats.allocs - start_stats.frees, thread.stats.allocs - thread.stats.frees);
 }

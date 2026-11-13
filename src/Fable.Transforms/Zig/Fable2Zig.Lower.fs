@@ -1105,14 +1105,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TPtr(mapType ctx r t, isIn)
     // a span: a slice of what it views
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Span`1" || ent.FullName = "System.ReadOnlySpan`1" ->
-        let item = mapType ctx r t
-
-        if isManaged item then
-            fail
-                r
-                "the Zig target does not support spans of values that are counted (strings, records with references, ...) yet"
-
-        TSlice(item, ent.FullName = "System.ReadOnlySpan`1")
+        TSlice(mapType ctx r t, ent.FullName = "System.ReadOnlySpan`1")
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Text.StringBuilder" ->
         TEnt(netEnt ctx.State "StringBuilder", [])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Random" -> TEnt(netEnt ctx.State "Random", [])
@@ -2622,6 +2615,21 @@ let readByref (e: Fable.Expr) : Fable.Expr =
         Fable.TypeCast(e, inner)
     | _ -> e
 
+/// Pull a pointer (`byref`) out of a dereference or variable, keeping any enclosing bindings.
+let rec tryAddress (ir: Expr) : Expr option =
+    match ir with
+    | EDeref(p, _) -> Some p
+    | _ when
+        (match typeOf ir with
+         | TPtr _ -> true
+         | _ -> false)
+        ->
+        Some ir
+    | EVar v -> Some(EAddr(EVar v, not v.FMutable))
+    | ELet(v, rhs, body) -> tryAddress body |> Option.map (fun b -> ELet(v, rhs, b))
+    | ESeq(s, body) -> tryAddress body |> Option.map (fun b -> ESeq(s, b))
+    | _ -> None
+
 /// The expression under the casts and unboxing that F# puts around `x` in `use x = ...`.
 let rec (|Unboxed|) (e: Fable.Expr) : Fable.Expr =
     match e with
@@ -3702,15 +3710,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
          | _ -> false)
         ->
         let place =
-            bindArgs
-                ctx
-                [ lw ctx value ]
-                (fun xs ->
-                    match xs.Head with
-                    | EDeref(p, _) -> p
-                    | EVar x -> EAddr(EVar x, not x.FMutable)
-                    | _ -> fail id.Range "the Zig target cannot take the address of this yet"
-                )
+            match tryAddress (lw ctx value) with
+            | Some p -> p
+            | None -> fail id.Range "the Zig target cannot take the address of this yet"
 
         // (the address of what cannot be assigned, as F# takes to copy a struct record with
         // some fields changed, only reads)
@@ -3784,11 +3786,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | UnaryNot -> bindArgs ctx [ ir ] (fun xs -> EPrim("not", xs, ty))
             | UnaryNotBitwise -> bindArgs ctx [ ir ] (fun xs -> EPrim("bnot", xs, ty))
             | UnaryAddressOf ->
-                match ir with
+                match tryAddress ir with
                 // (a byref passed on is the pointer it is)
-                | EDeref(p, _) -> p
-                | EVar v -> EAddr(EVar v, not v.FMutable)
-                | _ -> fail r "the Zig target can only take the address of a variable (`&x`)"
+                | Some p -> p
+                | None -> fail r "the Zig target can only take the address of a variable (`&x`)"
         | Fable.Binary(op, a, b) ->
             let name =
                 match op with
@@ -4616,6 +4617,21 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 match t with
                 | Fable.DeclaredType(ent, _) -> ent.FullName = "Microsoft.FSharp.Core.byref`2"
                 | _ -> false
+
+            let args =
+                if c.ArgTypes.Length = allArgs.Length then
+                    List.map3
+                        (fun (p: Fable.Type) (a: Fable.Expr) (argIr: Expr) ->
+                            if isByref p && isByref a.Type then
+                                defaultArg (tryAddress argIr) argIr
+                            else
+                                argIr
+                        )
+                        c.ArgTypes
+                        allArgs
+                        args
+                else
+                    args
 
             let wantsAddress =
                 if c.ArgTypes.Length = allArgs.Length then
