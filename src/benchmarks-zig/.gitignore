@@ -1,0 +1,7 @@
+*/bin/
+*/obj/
+*/fable_modules/
+*/*.zig
+*/bench-zig
+*/bench-zig.o
+bench-zig*
