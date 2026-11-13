@@ -15,6 +15,13 @@ pub fn nowUtcTicks() i64 {
     return unix_epoch_ticks + @as(i64, @intCast(@divFloor(ns, 100)));
 }
 
+/// The monotonic clock, in nanoseconds (`Stopwatch.GetTimestamp()`, whose frequency is 10^9)
+pub fn monotonicNs() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
+}
+
 /// Sleep the thread for `ms` milliseconds (`Async.Sleep` when nothing else is ready)
 pub fn sleepMilliseconds(ms: i64) void {
     if (ms <= 0) return;

@@ -1332,7 +1332,6 @@ let ``test invalidArg formats the message like .NET`` () =
         invalidArg "arg" "This is invalid"
     )
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.ArgumentException.get_ParamName yet)
 [<Fact>]
 let ``test invalidArg raises ArgumentException`` () =
     let caught =
@@ -1342,17 +1341,13 @@ let ``test invalidArg raises ArgumentException`` () =
         | :? System.ArgumentException as e -> e.Message
         | e -> "Unexpected exception: " + e.Message
     caught |> equal "This is invalid (Parameter 'arg')"
-#endif
 
-#if !FABLE_COMPILER_ZIG // (ArgumentException.ParamName)
 let private paramName (f: unit -> unit) =
     try
         f ()
         "no exception"
     with :? System.ArgumentException as e -> e.ParamName
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.ArgumentException.get_ParamName yet)
-#endif
 [<Fact>]
 let ``test ArgumentException.ParamName works`` () =
     paramName (fun () -> invalidArg "x" "m") |> equal "x"
@@ -1368,15 +1363,12 @@ let ``test ArgumentException.ParamName works`` () =
     System.ArgumentOutOfRangeException("x").ParamName |> equal "x"
     System.ArgumentOutOfRangeException("x", "m").ParamName |> equal "x"
     System.ArgumentOutOfRangeException().ParamName |> isNull |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a declaration excluded above)
 [<Fact>]
 let ``test ArgumentException.ParamName of FSharp.Core errors works`` () =
     paramName (fun () -> List.head ([]: int list) |> ignore) |> equal "list"
     paramName (fun () -> List.take -1 [ 1 ] |> ignore) |> equal "count"
     paramName (fun () -> List.reduce (+) ([]: int list) |> ignore) |> equal "list"
-#endif
 
 [<Fact>]
 let ``test invalidOp raises InvalidOperationException`` () =
@@ -1680,19 +1672,12 @@ let ``test unicode chars in identifiers are preserved`` () =
     x.Replace("+", ".") |> equal "Fable.Tests.Zig.MiscTests.Æøå"
 #endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Diagnostics.Stopwatch.get_Frequency yet)
-#if !FABLE_COMPILER_ZIG // (System.Diagnostics.Stopwatch)
-#if !FABLE_COMPILER_ZIG // (System.Diagnostics.Stopwatch)
 [<Fact>]
 let ``test System.Diagnostics.Stopwatch.Frequency works`` () =
     let x = System.Diagnostics.Stopwatch.Frequency
     x > 1000000L |> equal true
-#endif
-#endif
-#endif
 
 
-#if !FABLE_COMPILER_ZIG // (System.Diagnostics.Stopwatch)
 let ``test System.Diagnostics.Stopwatch.GetTimestamp works`` () =
     let freq = double System.Diagnostics.Stopwatch.Frequency
     let start = System.Diagnostics.Stopwatch.GetTimestamp()
@@ -1700,7 +1685,6 @@ let ``test System.Diagnostics.Stopwatch.GetTimestamp works`` () =
     let stop = System.Diagnostics.Stopwatch.GetTimestamp()
     let elapsedMs = (double (stop - start)) * 1000.0 / freq
     elapsedMs > 0 |> equal true
-#endif
 
 [<Fact>]
 let ``test Module mutable values work`` () =

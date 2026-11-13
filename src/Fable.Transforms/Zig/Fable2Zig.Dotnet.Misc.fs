@@ -543,6 +543,68 @@ let call
                 Args = args
             }
             t
+    // ---- `System.Diagnostics.Stopwatch` and `Thread.Sleep`: the library's Stopwatch.fs ----
+    | ("System.Diagnostics.Stopwatch" | "System.Threading.Thread"), name, args ->
+        let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]
+
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "Stopwatch"
+                fn
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                xs
+                t
+
+        let lowerFirst (n: string) =
+            n.Substring(0, 1).ToLowerInvariant() + n.Substring 1
+
+        match name, args with
+        | "Sleep", [ ms ] when ms.Type = Fable.Number(Int32, Fable.NumberInfo.Empty) -> call "sleep" [ ms ]
+        | "Sleep", [ span ] ->
+            // (`Thread.Sleep(timeSpan)`: its whole milliseconds)
+            let ms =
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = "get_TotalMilliseconds"
+                            Path = Replacements.DotnetPrefix + "System.TimeSpan"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    Fable.CallInfo.Create(thisArg = span),
+                    Fable.Number(Float64, Fable.NumberInfo.Empty),
+                    r
+                )
+
+            call "sleep" [ Fable.TypeCast(ms, Fable.Number(Int32, Fable.NumberInfo.Empty)) ]
+        | ".ctor", [] -> call "create" unitArg
+        | ("StartNew" | "GetTimestamp" | "get_Frequency" | "get_IsHighResolution"), [] ->
+            let n =
+                if name.StartsWith("get_", System.StringComparison.Ordinal) then
+                    name.Substring 4
+                else
+                    name
+
+            call (lowerFirst n) unitArg
+        | "GetElapsedTime", [ start ] -> call "getElapsedTimeSince" [ start ]
+        | "GetElapsedTime", [ start; finish ] -> call "getElapsedTime" [ start; finish ]
+        | ("Start" | "Stop" | "Reset" | "Restart"), [ w ] -> call (lowerFirst name) [ w ]
+        | ("get_IsRunning" | "get_Elapsed" | "get_ElapsedMilliseconds" | "get_ElapsedTicks"), [ w ] ->
+            call (lowerFirst (name.Substring 4)) [ w ]
+        | _ ->
+            fail
+                r
+                "the Zig target does not support %s.%s with these arguments yet"
+                (entity.Substring(entity.LastIndexOf '.' + 1))
+                name
     // ---- `System.DateOnly` and `System.TimeOnly`: the library's DateOnly.fs ----
     | ("System.DateOnly" | "System.TimeOnly" as typ), name, args ->
         let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]

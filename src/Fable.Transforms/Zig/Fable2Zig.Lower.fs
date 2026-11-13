@@ -1222,6 +1222,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         let file, record = libraryValueTypes[ent.FullName]
         TEnt(libRecordEnt ctx file record, [])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Diagnostics.Stopwatch" ->
+        TEnt(libRecordEnt ctx "Stopwatch" "StopwatchOf", [])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Queue`1" ->
@@ -1905,6 +1907,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "DateOnlyOf" -> [ "dayNumber", TPrim "i32" ]
             | "DateTimeOffsetOf" -> [ "utcTicks", TPrim "i64"; "offsetMinutes", TPrim "i32" ]
             | "TimeOnlyOf" -> [ "timeTicks", TPrim "i64" ]
+            | "StopwatchOf" -> [ "elapsed", TPrim "i64"; "startedAt", TPrim "i64"; "running", tBool ]
             | "GuidOf" -> [ "a", TPrim "u32"; "b", tI32; "c", tI32; "rest", TPrim "u64" ]
             | "UriOf" ->
                 [
@@ -1928,6 +1931,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "CancellationSource" -> [ "cancelled"; "handlers"; "disposed" ]
             | "HandOver" -> [ "handedOver" ]
             | "Timer" -> [ "live" ]
+            | "StopwatchOf" -> [ "elapsed"; "startedAt"; "running" ]
             | _ -> []
 
         let e =
@@ -5557,6 +5561,33 @@ and matchLocation (ctx: Ctx) (r: SourceLocation option) : Expr list =
 and raiseDotnet (ctx: Ctx) (r: SourceLocation option) (fullName: string) (message: Expr) (t: Fable.Type) : Expr =
     bindArgsIn true ctx [ message ] (fun xs -> ERaise(EExnNew(dotnetExnEnt ctx fullName, xs), mapType ctx r t))
 
+/// Raise an ArgumentException (or one of its classes) about the parameter `parameter`: its message
+/// names it, and so does its `ParamName`
+and raiseArgument
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (fullName: string)
+    (message: Expr)
+    (parameter: Fable.Expr)
+    (t: Fable.Type)
+    : Expr
+    =
+    bindArgsIn
+        true
+        ctx
+        [ withParameter ctx message parameter; lw ctx parameter ]
+        (fun xs ->
+            withParamName
+                ctx
+                (EExnNew(dotnetExnEnt ctx fullName, [ xs.Head ]))
+                xs.[1]
+                (fun e -> ERaise(e, mapType ctx r t))
+        )
+
+/// The exception `made` with its `ParamName` (bound first: what is bound is given up after)
+and withParamName (ctx: Ctx) (made: Expr) (name: Expr) (k: Expr -> Expr) : Expr =
+    bindArgs ctx [ made; name ] (fun ys -> k (EEmit("fable_rt.exnWithParam($0, $1)", ys, tExn)))
+
 /// "message (Parameter 'name')", as .NET puts the name of a parameter into a message
 and withParameter (ctx: Ctx) (message: Expr) (parameter: Fable.Expr) : Expr =
     bindArgs
@@ -6754,10 +6785,10 @@ and dotnetCall
     | "Microsoft.FSharp.Core.Operators", "InvalidOp", [ msg ] ->
         raiseDotnet ctx r "System.InvalidOperationException" (lw ctx msg) t
     | "Microsoft.FSharp.Core.Operators", "InvalidArg", [ arg; msg ] ->
-        raiseDotnet ctx r "System.ArgumentException" (withParameter ctx (lw ctx msg) arg) t
+        raiseArgument ctx r "System.ArgumentException" (lw ctx msg) arg t
     | "Microsoft.FSharp.Core.Operators", "NullArg", [ arg ] ->
         let message = ELit(stringLiteral "Value cannot be null.", tStr)
-        raiseDotnet ctx r "System.ArgumentNullException" (withParameter ctx message arg) t
+        raiseArgument ctx r "System.ArgumentNullException" message arg t
     // `System.Exception("...")` and the other classes: a new exception with that message
     // `Exception(message, inner)`: the exception, with the one inside it
     | cls, ".ctor", [ message; inner ] when
@@ -6806,7 +6837,43 @@ and dotnetCall
             | _, [ message ] -> lw ctx message
             | _ -> fail r "the Zig target does not support this way of making a %s yet" cls
 
-        bindArgsIn true ctx [ message ] (fun xs -> EExnNew(dotnetExnEnt ctx cls, xs))
+        // (the parameter an ArgumentException is about, its `ParamName`)
+        let parameter =
+            match cls, args with
+            | ("System.ArgumentNullException" | "System.ArgumentOutOfRangeException"), parameter :: _ -> Some parameter
+            | "System.ArgumentException", [ _; parameter ] -> Some parameter
+            | _ -> None
+
+        match parameter with
+        | Some p ->
+            bindArgsIn
+                true
+                ctx
+                [ message; lw ctx p ]
+                (fun xs -> withParamName ctx (EExnNew(dotnetExnEnt ctx cls, [ xs.Head ])) xs.[1] id)
+        | None -> bindArgsIn true ctx [ message ] (fun xs -> EExnNew(dotnetExnEnt ctx cls, xs))
+    // `ArgumentException(message, parameter, inner)`
+    | "System.ArgumentException", ".ctor", [ message; parameter; inner ] when
+        message.Type = Fable.String && parameter.Type = Fable.String
+        ->
+        bindArgsIn
+            true
+            ctx
+            [ withParameter ctx (lw ctx message) parameter; lw ctx parameter; lw ctx inner ]
+            (fun xs ->
+                let made = EExnNew(dotnetExnEnt ctx "System.ArgumentException", [ xs.Head ])
+
+                withParamName
+                    ctx
+                    made
+                    xs.[1]
+                    (fun named ->
+                        bindArgs ctx [ named; xs.[2] ] (fun ys -> EEmit("fable_rt.exnWithInner($0, $1)", ys, tExn))
+                    )
+            )
+    | ("System.ArgumentException" | "System.ArgumentNullException" | "System.ArgumentOutOfRangeException"),
+      "get_ParamName",
+      [ x ] -> bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnParamName($0)", xs, tStr))
     // `Failure msg` in a pattern: the message, if the exception is a failure
     | "Microsoft.FSharp.Core.Operators", "FailurePattern", [ x ] ->
         let failure = failureEnt ctx

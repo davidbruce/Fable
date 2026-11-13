@@ -3254,7 +3254,20 @@ pub fn nullArgCheck(name: String, x: anytype) Raised!@TypeOf(x) {
 }
 
 pub fn argRange(comptime param: []const u8, comptime text: []const u8) Raised {
-    return raise(ArgumentOutOfRangeException, str(text ++ " (Parameter '" ++ param ++ "')"));
+    throw(ArgumentOutOfRangeException.new(.{ .Message = str(text ++ " (Parameter '" ++ param ++ "')"), .ParamName = str(param) }));
+    return error.Raised;
+}
+
+/// `e` with the name of the parameter it is about (an ArgumentException's `ParamName`)
+pub fn exnWithParam(e: Exn, name: String) Exn {
+    if (e.type.set_param) |f| f(e, name);
+    return dup(e);
+}
+
+/// `e.ParamName`: null when it has none
+pub fn exnParamName(e: Exn) String {
+    if (e.type.param) |f| return f(e);
+    return null;
 }
 
 pub fn argNegative(comptime param: []const u8, value: i32) Raised {
@@ -5458,6 +5471,9 @@ pub const ExnType = struct {
     /// a .NET exception's `InnerException`
     set_inner: ?*const fn (Exn, Exn) void = null,
     inner: ?*const fn (Exn) ?Exn = null,
+    /// an ArgumentException's `ParamName`
+    set_param: ?*const fn (Exn, String) void = null,
+    param: ?*const fn (Exn) String = null,
 };
 
 pub const ExnHeader = struct {
@@ -5511,6 +5527,8 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
             .hash = if (Payload == Described or @hasField(Payload, "fable_message")) null else payloadHash,
             .set_inner = setInner,
             .inner = innerOf,
+            .set_param = setParam,
+            .param = paramOf,
         };
 
         /// (a class deriving from System.Exception: the message its base constructor was given)
@@ -5548,6 +5566,18 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
                 if (p.InnerException) |old| drop(old);
                 p.InnerException = dup(within);
             }
+        }
+
+        pub fn setParam(e: Exn, param_name: String) void {
+            if (Payload == Described) {
+                const p: *Payload = @constCast(of(e));
+                drop(p.ParamName);
+                p.ParamName = dup(param_name);
+            }
+        }
+
+        pub fn paramOf(e: Exn) String {
+            return if (Payload == Described) dup(of(e).ParamName) else null;
         }
 
         pub fn innerOf(e: Exn) ?Exn {
@@ -5630,7 +5660,7 @@ pub fn MayRaise(comptime T: type, comptime callees: anytype) type {
 }
 
 /// What a .NET exception class holds: its message.
-pub const Described = struct { Message: String, InnerException: ?Exn = null };
+pub const Described = struct { Message: String, InnerException: ?Exn = null, ParamName: String = null };
 
 /// What `failwith` raises: .NET's `System.Exception` with a message. (Every exception is a
 /// `System.Exception`, so a test for that class is not a test at all; this is the test for
