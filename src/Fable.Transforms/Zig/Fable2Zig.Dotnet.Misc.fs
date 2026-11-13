@@ -406,6 +406,18 @@ let call
     | "System.Runtime.ExceptionServices.ExceptionDispatchInfo", "Capture", [ x ] -> lw ctx x
     | "System.Runtime.ExceptionServices.ExceptionDispatchInfo", "Throw", [ x ] ->
         bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx r t))
+    // (`type C() as this`: F#'s checks that the object is made before it is used)
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "CheckThis", [ x ] -> lw ctx x
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "FailInit", _ ->
+        raiseDotnet
+            ctx
+            r
+            "System.InvalidOperationException"
+            (ELit(
+                "fable_rt.str(\"The initialization of an object or value resulted in an object or value being accessed recursively before it was fully initialized.\")",
+                tStr
+            ))
+            t
     // ---- `System.Guid`: the library's Guid.fs ----
     | "System.Guid", name, args when
         (match name with

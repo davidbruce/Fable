@@ -85,6 +85,19 @@ type Person(name: string) =
         with get () = friend
         and set (v: Person option) = friend <- v
 
+/// `as this`: the object reached through its own self reference
+type SelfAware(v: int) as this =
+    let mutable n = v
+    let next () = this.Value + 1
+    member _.Value = n
+    member _.Next() = next ()
+    member _.Bump() = n <- next ()
+
+let selfAware () : int =
+    let s = SelfAware(3)
+    s.Bump()
+    s.Next()
+
 let total (s: IShape) : float =
     s.Area() + s.Scale(2.0, 3.0) + float s.Name.Length
 
@@ -154,6 +167,7 @@ let run () : int =
         + same "2|seq [\"closed b\"; \"closed a\"]" (string usedN + "|" + sprintf "%A" log)
         + same "hello, bob|hello, eve|2" (greeting + "|" + string greeter.Count)
         + same "qq" pair
+        + check (selfAware () = 5)
 
     printfn "classes: %d" failed
 

@@ -495,6 +495,29 @@ let listEnt (state: FileState) : Ent =
 
 let refName = "Microsoft.FSharp.Core.FSharpRef`1"
 
+/// Is `refT` the type of the self reference F# gives a class of `type C() as this`: a field of
+/// type `C ref` in C, null until the object is made?
+let isSelfRefType (owner: Fable.Type) (refT: Fable.Type) =
+    match owner, refT with
+    | Fable.DeclaredType(c, _), Fable.DeclaredType(r, [ Fable.DeclaredType(c2, _) ]) ->
+        r.FullName = refName && c.FullName = c2.FullName
+    | _ -> false
+
+/// The self reference as it is kept here: a `C option ref` (None until the object is made)
+let selfRefType (refT: Fable.Type) =
+    match refT with
+    | Fable.DeclaredType(r, [ c ]) -> Fable.DeclaredType(r, [ Fable.Option(c, false) ])
+    | t -> t
+
+/// The type a field of the entity `owner` is kept as
+let fieldTypeIn (owner: Fable.EntityRef) (f: Fable.Field) : Fable.Type =
+    let ownerT = Fable.DeclaredType(owner, [])
+
+    if isSelfRefType ownerT f.FieldType then
+        selfRefType f.FieldType
+    else
+        f.FieldType
+
 /// The .NET exception classes that the runtime library declares: each holds a message.
 let dotnetExceptions =
     [
@@ -1478,7 +1501,9 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                     [
                         "",
                         (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
-                        |> List.map (fun f -> f.Name, mapType ctx r (FableTransforms.uncurryType f.FieldType))
+                        |> List.map (fun f ->
+                            f.Name, mapType ctx r (FableTransforms.uncurryType (fieldTypeIn entRef f))
+                        )
                     ]
         with _ ->
             ctx.State.EntDepth <- ctx.State.EntDepth - 1
@@ -1616,7 +1641,7 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
 
             let fields =
                 (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
-                |> List.map (fun f -> f.Name, mapType ctx r (FableTransforms.uncurryType f.FieldType))
+                |> List.map (fun f -> f.Name, mapType ctx r (FableTransforms.uncurryType (fieldTypeIn entRef f)))
 
             part.Cases <- [ "", fields ]
             part.MutableFields <- fields |> List.map fst
@@ -3051,6 +3076,8 @@ let constructorBodyWith
         }
 
     let set = Dictionary<string, Fable.Ident>()
+    /// the field of the self reference, when the constructor fills it with the object
+    let mutable selfField: (string * Fable.Type) option = None
 
     let rec usesThis (e: Fable.Expr) =
         match e with
@@ -3086,7 +3113,52 @@ let constructorBodyWith
                         )
                 )
 
-            finish values
+            match selfField with
+            | None -> finish values
+            | Some(name, refT) ->
+                // the object, then its self reference filled with it
+                let made = finish values
+
+                match made.Type with
+                // (a class in a hierarchy: its constructor gives the chain of fields, and where the
+                // object is made of it, the self reference is filled; see the constructor call)
+                | Fable.DeclaredType(e, _) when e.FullName.EndsWith("$chain", System.StringComparison.Ordinal) -> made
+                | _ ->
+
+                    let obj = AST.makeTypedIdent made.Type "made"
+
+                    let optT =
+                        match refT with
+                        | Fable.DeclaredType(_, [ o ]) -> o
+                        | _ -> raise (ZigError("internal: a self reference", None))
+
+                    let fieldInfo: Fable.FieldInfo =
+                        {
+                            Name = name
+                            FieldType = Some refT
+                            IsMutable = true
+                            MaybeCalculated = false
+                            Tags = []
+                        }
+
+                    let cell =
+                        Fable.Get(Fable.IdentExpr obj, Fable.GetKind.FieldGet fieldInfo, refT, None)
+
+                    Fable.Let(
+                        obj,
+                        made,
+                        Fable.Sequential
+                            [
+                                Fable.Set(
+                                    cell,
+                                    Fable.FieldSet "contents",
+                                    optT,
+                                    Fable.Value(Fable.NewOption(Some(Fable.IdentExpr obj), made.Type, false), None),
+                                    None
+                                )
+                                Fable.IdentExpr obj
+                            ]
+                    )
         | stmt :: rest ->
             match stmt with
             | Fable.Sequential xs -> build (xs @ rest)
@@ -3095,6 +3167,30 @@ let constructorBodyWith
             | Fable.Call(Fable.Import(imp, _, _), _, _, _) when
                 imp.Selector = ".ctor" && imp.Path.EndsWith "System.Object"
                 ->
+                build rest
+            // (`type C() as this`: the self reference starts empty)
+            | Fable.Set(Fable.Value(Fable.ThisValue owner, _), Fable.FieldSet name, t, _, _) when isSelfRefType owner t ->
+                let kept = selfRefType t
+
+                let empty =
+                    match kept with
+                    | Fable.DeclaredType(refEntRef, [ Fable.Option(c, _) as optT ]) ->
+                        Fable.Value(
+                            Fable.NewRecord([ Fable.Value(Fable.NewOption(None, c, false), None) ], refEntRef, [ optT ]),
+                            None
+                        )
+                    | _ -> raise (ZigError("internal: a self reference", None))
+
+                let id = fieldIdent name kept
+                set[name] <- id
+                Fable.Let(id, empty, build rest)
+            // (and is filled with the object once it is made: see `finish`)
+            | Fable.Set(Fable.Get(Fable.Value(Fable.ThisValue owner, _), Fable.FieldGet fi, refT, _),
+                        Fable.FieldSet "contents",
+                        _,
+                        Fable.Value(Fable.ThisValue _, _),
+                        _) when isSelfRefType owner refT ->
+                selfField <- Some(fi.Name, selfRefType refT)
                 build rest
             | Fable.Set(Fable.Value(Fable.ThisValue _, _), Fable.FieldSet name, t, value, _) ->
                 let id = fieldIdent name t
@@ -3282,10 +3378,72 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         if o.IsAbstract then
             fail r "the abstract class %s cannot be made" o.FullName
 
-        bindArgs
-            ctx
-            [ lw ctx (Fable.Call(callee, info, chainType o, r)) ]
-            (fun xs -> EEmit($"fable_rt.objNew(&%s{objTypeName o}, $0)", xs, tObj))
+        let made =
+            bindArgs
+                ctx
+                [ lw ctx (Fable.Call(callee, info, chainType o, r)) ]
+                (fun xs -> EEmit($"fable_rt.objNew(&%s{objTypeName o}, $0)", xs, tObj))
+
+        // (`type C() as this`, here or in a class above: its self reference is the object)
+        let selfFields =
+            let rec levels (o: ObjInfo) =
+                o
+                :: (
+                    match o.Parent with
+                    | Some p -> levels p
+                    | None -> []
+                )
+
+            levels o
+            |> List.collect (fun level ->
+                match ctx.Com.TryGetEntity level.Ref with
+                | Some ent ->
+                    ent.FSharpFields
+                    |> List.filter (fun f ->
+                        not f.IsStatic && isSelfRefType (Fable.DeclaredType(level.Ref, [])) f.FieldType
+                    )
+                    |> List.map (fun f -> f.Name, selfRefType f.FieldType)
+                | None -> []
+            )
+
+        if selfFields.IsEmpty then
+            made
+        else
+            let objT = Fable.DeclaredType(cls, [])
+            let objId = AST.makeTypedIdent objT "made"
+            let v = ctx.State.NewVar("made", tObj, VLocal, false)
+            ctx.Vars[objId.Name] <- v
+
+            let fills =
+                selfFields
+                |> List.map (fun (name, refT) ->
+                    let optT, itemT =
+                        match refT with
+                        | Fable.DeclaredType(_, [ Fable.Option(c, _) as o ]) -> o, c
+                        | _ -> fail r "internal: a self reference"
+
+                    let fieldInfo: Fable.FieldInfo =
+                        {
+                            Name = name
+                            FieldType = Some refT
+                            IsMutable = true
+                            MaybeCalculated = false
+                            Tags = []
+                        }
+
+                    Fable.Set(
+                        Fable.Get(Fable.IdentExpr objId, Fable.GetKind.FieldGet fieldInfo, refT, r),
+                        Fable.FieldSet "contents",
+                        optT,
+                        Fable.Value(
+                            Fable.NewOption(Some(Fable.TypeCast(Fable.IdentExpr objId, itemT)), itemT, false),
+                            r
+                        ),
+                        r
+                    )
+                )
+
+            ELet(v, made, ESeq(lwStmt ctx (Fable.Sequential fills), EVar v))
     // `base.Describe()`: the implementation its parent class has, called directly
     | Fable.Call(Fable.Get(Fable.Value(Fable.BaseValue(Some id, baseTy), _), Fable.FieldGet field, _, _), call, t, r) when
         (objOfType ctx r baseTy).IsSome
@@ -4266,6 +4424,52 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let ty = mapType ctx r t
         bindArgs ctx [ lw ctx x ] (fun xs -> EExnGet(xs.Head, ent, info.Name, ty))
 
+    // (`type C() as this`: the object read through its self reference; before the constructor
+    // made it, the error .NET gives)
+    | Fable.Get(Fable.Get(x, Fable.FieldGet fi, refT, r1), Fable.FieldGet ci, t, r) when
+        ci.Name = "contents" && isSelfRefType x.Type refT
+        ->
+        let kept = selfRefType refT
+
+        let optT =
+            match kept with
+            | Fable.DeclaredType(_, [ o ]) -> o
+            | _ -> fail r "internal: a self reference"
+
+        let cell = Fable.Get(x, Fable.FieldGet { fi with FieldType = Some kept }, kept, r1)
+
+        let v = AST.makeTypedIdent optT "self"
+
+        let failInit =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "FailInit"
+                        Path =
+                            Replacements.DotnetPrefix
+                            + "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(),
+                t,
+                r
+            )
+
+        lw
+            ctx
+            (Fable.Let(
+                v,
+                Fable.Get(cell, Fable.FieldGet { ci with FieldType = Some optT }, optT, r),
+                Fable.IfThenElse(
+                    Fable.Test(Fable.IdentExpr v, Fable.OptionTest true, r),
+                    Fable.Get(Fable.IdentExpr v, Fable.OptionValue, t, r),
+                    failInit,
+                    r
+                )
+            ))
     // a member of an interface: a field of its struct of function values (a property is read
     // by calling its getter)
     | Fable.Get(x, Fable.FieldGet info, t, r) when isInterfaceType ctx.Com x.Type ->
