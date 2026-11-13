@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <Compile Include="Global.fs" />
+    <Compile Include="List.fs" />
   </ItemGroup>
 
   <ItemGroup>

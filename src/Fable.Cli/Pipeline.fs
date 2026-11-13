@@ -601,8 +601,18 @@ module Zig =
             member _.MakeImportPath(path) =
                 let projDir = IO.Path.GetDirectoryName(cliArgs.ProjectFile)
 
+                let dirOf (file: string) =
+                    Path.normalizeFullPath (IO.Path.GetDirectoryName(file))
+
+                // (the library itself is compiled with `.` as its directory)
+                let sameDir = IO.Path.GetDirectoryName(path) = "." || dirOf sourcePath = dirOf path
+
                 let path =
-                    Imports.getImportPath pathResolver sourcePath targetPath projDir cliArgs.OutDir path
+                    // (a file of the runtime library that uses another: they stay side by side)
+                    if sameDir && not (path.EndsWith(".fs", StringComparison.Ordinal)) then
+                        "./" + IO.Path.GetFileName(path)
+                    else
+                        Imports.getImportPath pathResolver sourcePath targetPath projDir cliArgs.OutDir path
 
                 if
                     path.EndsWith(".fs", StringComparison.Ordinal)

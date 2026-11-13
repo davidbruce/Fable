@@ -221,6 +221,25 @@ itself and a `ref` cell. Its equality is still structural, as in F#.
 - Nothing is remembered about what such a field holds, and such reads are not moved to the
   start of their branch: they happen where the program does them.
 
+## The library
+
+The runtime library has two parts. `fable_rt.zig` (with `fable_sgc.zig` and
+`fable_unicode.zig`) is written by hand: cells, counts, the collector, strings, formatting,
+arrays. The rest is F#, in `src/fable-library-zig/*.fs`, compiled by this target like any
+program (`./build.sh fable-library --zig`) and copied next to the hand-written part. `List.fs`
+is F#'s `List` module: `map` is three lines of F#, becomes a loop through tail calls modulo
+cons, borrows its list, and raises what FSharp.Core raises because it says `invalidArg` where
+FSharp.Core does.
+
+A call of `List.map` in a program is kept under its .NET name by `Replacements.fs`, and the
+lowering sends it to `m_List.map` (`libraryFunction` in `Fable2Zig.Lower.fs` lists what the
+library has). It is then a call between files like any other: what the function borrows and
+whether it raises is settled when the Zig is compiled. The type arguments are found by name
+from the signature of the FSharp.Core function and given in the order of the names, so a
+library function declares its type parameters, with FSharp.Core's names, in that order
+(`fold<'State, 'T>`). A library function is named as FSharp.Core compiles it, with a small
+first letter (`mapIndexed` for `List.mapi`).
+
 ## Arrays
 
 An array is a counted cell that holds its items, with an identity as on .NET: two names for

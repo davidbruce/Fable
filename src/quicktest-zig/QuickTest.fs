@@ -345,3 +345,4 @@ let main _ =
     + Arrays.run ()
     + Members.run ()
     + Values.run ()
+    + Lists.run ()

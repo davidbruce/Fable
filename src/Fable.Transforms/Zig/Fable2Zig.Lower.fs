@@ -1148,6 +1148,32 @@ let rec private (|Uncast|) (e: Fable.Expr) : Fable.Expr =
     | Fable.TypeCast(Uncast inner, _) -> inner
     | _ -> e
 
+/// The functions of FSharp.Core that the part of the runtime library written in F# has: the
+/// file, and the name there (the name FSharp.Core compiles the function to).
+let private libraryFunction (entity: string) (name: string) : (string * string) option =
+    let has (names: string) =
+        names.Split([| ' '; '\n' |], System.StringSplitOptions.RemoveEmptyEntries)
+        |> Array.contains name
+
+    // (the library names its functions as FSharp.Core compiles them, with a small first letter:
+    // a name like `Map` is one that Fable would not leave alone)
+    let small (s: string) =
+        s.Substring(0, 1).ToLowerInvariant() + s.Substring(1)
+
+    match entity with
+    | "Microsoft.FSharp.Collections.ListModule" when
+        has
+            "Length Head Tail TryHead Last TryLast TryItem Item Singleton Reverse Append Concat Map MapIndexed Map2
+             Iterate IterateIndexed Fold FoldBack Reduce Filter Choose Collect Exists ForAll Contains TryFind Find
+             TryFindIndex FindIndex TryPick Pick Initialize Replicate Zip Unzip Take Truncate Skip TakeWhile SkipWhile
+             Partition Indexed Pairwise Distinct ExactlyOne OfArray ToArray"
+        ->
+        Some("List", small name)
+    | "Microsoft.FSharp.Collections.FSharpList`1" when name = "get_Item" -> Some("List", "getItem")
+    | "Microsoft.FSharp.Collections.FSharpList`1" when name = "get_Length" -> Some("List", "length")
+    | "Microsoft.FSharp.Core.Operators" when name = "op_Append" -> Some("List", "append")
+    | _ -> None
+
 /// A module-level value, of this file or (`alias.name`) of another.
 let private globalVar (name: string) (ty: Ty) (isMutable: bool) : Expr =
     EVar
@@ -2361,12 +2387,10 @@ and dotnetCall
     | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
       ("get_IsEmpty" | "IsEmpty"),
       x :: _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ETest(xs.Head, "Empty", typeOf xs.Head))
-    | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
-      ("get_Head" | "Head"),
-      x :: _ -> bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PCase("Cons", "Head"), mapType ctx r t))
-    | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
-      ("get_Tail" | "Tail"),
-      x :: _ -> bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PCase("Cons", "Tail"), mapType ctx r t))
+    | "Microsoft.FSharp.Collections.FSharpList`1", "get_Head", x :: _ ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PCase("Cons", "Head"), mapType ctx r t))
+    | "Microsoft.FSharp.Collections.FSharpList`1", "get_Tail", x :: _ ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PCase("Cons", "Tail"), mapType ctx r t))
     // structural equality of records, unions, tuples and options: plain values, compared
     // field by field
     | "Microsoft.FSharp.Core.Operators", "op_Equality", [ a; b ] ->
@@ -2695,7 +2719,85 @@ and dotnetCall
                 else
                     fail r "the Zig target does not support %s.%s yet" entity name
             )
-    | _ -> fail r "the Zig target does not support %s.%s yet" entity name
+    | _ ->
+        match libraryFunction entity name with
+        | Some(file, fn) -> libraryCall ctx r file fn info args t
+        | None -> fail r "the Zig target does not support %s.%s yet" entity name
+
+/// A call of a function of the part of the runtime library that is written in F# (`List.fs`,
+/// ...). Its type parameters are found by name, from the signature of the FSharp.Core
+/// function it stands for, and given in the order of their names: that is the order in which
+/// the library declares them.
+and libraryCall
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (file: string)
+    (fn: string)
+    (info: Fable.CallInfo)
+    (args: Fable.Expr list)
+    (t: Fable.Type)
+    : Expr
+    =
+    let found = Dictionary<string, Fable.Type>()
+
+    // (where FSharp.Core takes a sequence and is given a list, the library takes the list)
+    let args =
+        args
+        |> List.map (fun arg ->
+            match arg with
+            | Uncast inner when
+                (match arg.Type, inner.Type with
+                 | Fable.DeclaredType(seq, _), Fable.List _ ->
+                     seq.FullName = "System.Collections.Generic.IEnumerable`1"
+                 | _ -> false)
+                ->
+                inner
+            | _ -> arg
+        )
+
+    if info.SignatureArgTypes.Length = args.Length then
+        List.iter2
+            (fun (pattern: Fable.Type) (arg: Fable.Expr) ->
+                match pattern, arg.Type with
+                | Fable.DeclaredType(seq, [ item ]), Fable.List actual when
+                    seq.FullName = "System.Collections.Generic.IEnumerable`1"
+                    ->
+                    unify found item actual
+                | _ -> unify found pattern arg.Type
+            )
+            info.SignatureArgTypes
+            args
+
+    if found.Count <> info.GenericArgs.Length then
+        // (a type parameter that no argument mentions: only one of them can be told)
+        match info.GenericArgs with
+        | [ only ] when found.Count = 0 -> found["T"] <- only
+        | _ -> fail r "the Zig target cannot tell the type arguments of this call of %s yet" fn
+
+    let typeArgs =
+        found
+        |> Seq.sortWith (fun a b -> System.String.CompareOrdinal(a.Key, b.Key))
+        |> Seq.map (fun kv -> mapType ctx r kv.Value)
+        |> List.ofSeq
+
+    // (inside the library file itself the function is one of the file's own)
+    let own =
+        System.IO.Path.GetFileNameWithoutExtension(ctx.Com.CurrentFile) = file
+        && ctx.Members.ContainsKey fn
+
+    let target =
+        if own then
+            fn
+        else
+            importAlias ctx (Fable.Transforms.AST.getLibPath ctx.Com file) + "." + fn
+
+    // (a property is read with a unit argument that the library function does not take)
+    let args =
+        match args |> List.filter (fun arg -> not (isUnit arg.Type)) with
+        | [] -> [ EUnit ]
+        | given -> given |> List.map (lw ctx)
+
+    bindArgs ctx args (fun xs -> ECall(target, typeArgs, xs, mapType ctx r t))
 
 /// A statement: its value, if it has one, is not used.
 and asStmt (ctx: Ctx) (ir: Expr) : Expr =

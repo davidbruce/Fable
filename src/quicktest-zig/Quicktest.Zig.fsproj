@@ -18,6 +18,7 @@
     <Compile Include="Arrays.fs" />
     <Compile Include="Members.fs" />
     <Compile Include="Values.fs" />
+    <Compile Include="Lists.fs" />
     <Compile Include="QuickTest.fs" />
   </ItemGroup>
   <ItemGroup>
