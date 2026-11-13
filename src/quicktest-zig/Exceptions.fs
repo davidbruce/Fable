@@ -319,7 +319,18 @@ let run () : int =
     let before = liveCells ()
 
     let failed =
-        expect -16 (caughtDeep ())
+        expect
+            1
+            (if
+                 ParseError(1, 2) = ParseError(1, 2)
+                 && ParseError(1, 2) <> ParseError(1, 3)
+                 && hash (ParseError(1, 2)) = hash (ParseError(1, 2))
+                 && Plain = Plain
+             then
+                 1
+             else
+                 0)
+        + expect -16 (caughtDeep ())
         + expect 79 (framesDropWhatTheyOwn ())
         + expect 611 (handlerSelection ())
         + expect 70 (reraises ())

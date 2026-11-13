@@ -599,6 +599,11 @@ structural equality of exceptions, arithmetic that is `Checked`, and other .NET 
 those above. An exception that reaches the entry point is printed with its name and message,
 and the program exits with 134, as on .NET on Unix.
 
+Exceptions declared with F#'s `exception` are equal when their fields are, and hash so, as on
+.NET; .NET's classes are equal only to themselves. An incomplete match raises
+`MatchFailureException` with the file, line and column of the match (`MatchFailureException(file,
+line, column)` matches it, and `%A` shows them). `Path.GetFileName` works.
+
 ## Strings
 
 A `string` is what it is on .NET: immutable UTF-16, or null. `s.Length` and `s.[i]` count and

@@ -510,6 +510,13 @@ let faults () : int =
     + same "red|green" (colour 0 + "|" + colour 1)
     + same "MatchFailure: The match cases were incomplete" (raised (fun () -> colour 2))
     + same
+        "Text.fs 474 10|MatchFailureException\n  (\"Text.fs\",\n   474, 10)"
+        (try
+            colour 2
+         with MatchFailureException(file, line, column) as e ->
+             let name = System.IO.Path.GetFileName file
+             sprintf "%s %d %d|%s" name line column ((sprintf "%A" e).Replace(file, name)))
+    + same
         "MatchFailure: The match cases were incomplete"
         (raised (fun () ->
             let (Some v) =

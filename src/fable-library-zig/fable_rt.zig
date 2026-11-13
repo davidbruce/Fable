@@ -494,7 +494,8 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or eql(a.items, b.items);
     if (comptime !isManaged(T) and !holdsDecimal(T)) return std.meta.eql(a, b);
     if (comptime isFunc(T)) @compileError("function values cannot be compared");
-    if (T == Exn or T == Obj) return a == b;
+    if (T == Obj) return a == b;
+    if (T == Exn) return a == b or (a.type == b.type and if (a.type.eql) |f| f(a, b) else false);
     if (T == String) return strEql(a, b);
     switch (@typeInfo(T)) {
         .pointer => |p| {
@@ -3306,6 +3307,9 @@ pub fn hash(x: anytype) i32 {
         for (unitsOf(x)) |c| h = (h *% 33) ^ c;
         return @bitCast(h);
     }
+    if (T == Exn) {
+        if (x.type.hash) |f| return f(x);
+    }
     if (T == Exn or T == Obj) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
     if (comptime isDecimal(T)) return decHash(x);
     if (comptime isFunc(T)) @compileError("fable: function values cannot be hashed");
@@ -5118,6 +5122,18 @@ pub fn strIndexOfIgnoreCase(s: String, value: String) Raised!i32 {
     return -1;
 }
 
+/// `Path.GetFileName path`: what follows the last directory separator (`/`, and `\\` on Windows).
+pub fn pathFileName(path: String) String {
+    const u = unitsOf(path);
+    var i = u.len;
+    while (i > 0) : (i -= 1) {
+        const c = u[i - 1];
+        if (c == '/' or (builtin.os.tag == .windows and c == '\\')) break;
+    }
+    if (path == null) return null;
+    return strSlice(path, i, u.len - i);
+}
+
 /// `Char.GetNumericValue c`: the value of a digit, -1 for anything else. (Digits of every
 /// script; .NET also knows fractions and roman numerals, which give -1 here.)
 pub fn charNumericValue(c: u16) f64 {
@@ -5226,6 +5242,9 @@ pub const ExnType = struct {
     parent: ?*const ExnType = null,
     /// the exception as `%A` writes it
     show: *const fn (*Shower, Exn, Prec, i32) *Layout,
+    /// F#'s `exception` declarations are equal when their fields are (null: only to itself)
+    eql: ?*const fn (Exn, Exn) bool = null,
+    hash: ?*const fn (Exn) i32 = null,
 };
 
 pub const ExnHeader = struct {
@@ -5243,6 +5262,9 @@ pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
     return ExnUnder(name, Payload, null, true);
 }
 
+/// F#'s `MatchFailureException`: the file, line and column of the match, and a fixed message.
+pub const MatchFailureException = ExnUnder("Microsoft.FSharp.Core.MatchFailureException", struct { Data0: String, Data1: i32, Data2: i32 }, null, true);
+
 /// A .NET exception class with a message, derived from `Parent` (or from `System.Exception`).
 fn Class(comptime name: []const u8, comptime Parent: ?type) type {
     return ExnUnder(name, Described, if (Parent) |P| &P.info else null, false);
@@ -5259,15 +5281,32 @@ fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime parent: 
             "payload",
         );
 
+        const is_match_failure = std.mem.eql(u8, name, "Microsoft.FSharp.Core.MatchFailureException");
+
         pub const info: ExnType = .{
             .name = name,
             .destroy = destroy,
-            .message = if (Payload == Described) message else null,
+            .message = if (Payload == Described) message else if (is_match_failure) matchMessage else null,
             .parent = parent,
             .show = show,
+            .eql = if (Payload == Described) null else payloadEql,
+            .hash = if (Payload == Described) null else payloadHash,
         };
 
+        fn matchMessage(_: Exn) String {
+            return str("The match cases were incomplete");
+        }
+
+        fn payloadEql(a: Exn, b: Exn) bool {
+            return eql(of(a).*, of(b).*);
+        }
+
+        fn payloadHash(e: Exn) i32 {
+            return hash(of(e).*);
+        }
+
         fn show(b: *Shower, e: Exn, prec: Prec, depth: i32) *Layout {
+            if (comptime is_match_failure) return b.case("MatchFailureException", of(e), prec, depth);
             if (Payload != Described) return b.case(name, of(e), prec, depth);
             // a .NET exception: its class and its message
             const text = unitsOf(of(e).Message);
@@ -5367,7 +5406,6 @@ pub const IndexOutOfRangeException = Class("System.IndexOutOfRangeException", Sy
 pub const NullReferenceException = Class("System.NullReferenceException", SystemException);
 pub const FormatException = Class("System.FormatException", SystemException);
 pub const KeyNotFoundException = Class("System.Collections.Generic.KeyNotFoundException", SystemException);
-pub const MatchFailureException = Class("Microsoft.FSharp.Core.MatchFailureException", null);
 pub const AggregateException = Class("System.AggregateException", null);
 pub const InvalidCastException = Class("System.InvalidCastException", null);
 

@@ -462,7 +462,11 @@ let private dotnetExnEntIn (state: FileState) (fullName: string) : Ent =
                     }
                 Kind = KExn
                 TypeParams = []
-                Cases = [ "", [ "Message", tStr ] ]
+                Cases =
+                    if fullName = "Microsoft.FSharp.Core.MatchFailureException" then
+                        [ "", [ "Data0", tStr; "Data1", tI32; "Data2", tI32 ] ]
+                    else
+                        [ "", [ "Message", tStr ] ]
                 MutableFields = []
                 Managed = false
                 Cyclic = false
@@ -2686,9 +2690,15 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.StringConstant text -> ELit(stringLiteral text, tStr)
         // (what a match without a case raises, when F# writes it out: its file, line and column
         // are not kept, its message is)
-        | Fable.NewRecord(_, entRef, _) when entRef.FullName = "Microsoft.FSharp.Core.MatchFailureException" ->
-            let message = ELit(stringLiteral "The match cases were incomplete", tStr)
-            EExnNew(dotnetExnEnt ctx entRef.FullName, [ message ])
+        | Fable.NewRecord(values, entRef, _) when entRef.FullName = "Microsoft.FSharp.Core.MatchFailureException" ->
+            match values with
+            | [ _; _; _ ] ->
+                bindArgsIn
+                    true
+                    ctx
+                    (values |> List.map (lw ctx))
+                    (fun xs -> EExnNew(dotnetExnEnt ctx entRef.FullName, xs))
+            | _ -> EExnNew(dotnetExnEnt ctx entRef.FullName, matchLocation ctx r)
         | Fable.NewRecord(values, entRef, _) when (tryExnEnt ctx r entRef).IsSome ->
             let ent = (tryExnEnt ctx r entRef).Value
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> EExnNew(ent, xs))
@@ -2817,10 +2827,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.Extended(Fable.Throw(Some(Fable.Value(Fable.StringConstant text, _)), t), r) when
         text.StartsWith("Match failure", System.StringComparison.Ordinal)
         ->
-        let message = ELit(stringLiteral "The match cases were incomplete", tStr)
-
         let failure =
-            EExnNew(dotnetExnEnt ctx "Microsoft.FSharp.Core.MatchFailureException", [ message ])
+            EExnNew(dotnetExnEnt ctx "Microsoft.FSharp.Core.MatchFailureException", matchLocation ctx r)
 
         // (Fable gives the raise no type: where it stands, nothing is expected of it)
         ERaise(
@@ -3672,6 +3680,26 @@ and dotnetExnEnt (ctx: Ctx) (fullName: string) : Ent = dotnetExnEntIn ctx.State 
 
 and failureEnt (ctx: Ctx) : Ent = dotnetExnEnt ctx "System.Exception"
 
+/// What a `MatchFailureException` holds: the file, line and column of the match, as .NET has
+/// them.
+and matchLocation (ctx: Ctx) (r: SourceLocation option) : Expr list =
+    let file, line, column =
+        match r with
+        | Some r ->
+            let file =
+                match r.identifierName with
+                | Some n when n.Contains ";file:" -> n.Substring(n.IndexOf ";file:" + 6)
+                | _ -> ctx.Com.CurrentFile
+
+            file, r.start.line, r.start.column
+        | None -> ctx.Com.CurrentFile, 0, 0
+
+    [
+        ELit(stringLiteral file, tStr)
+        ELit(string line, tI32)
+        ELit(string column, tI32)
+    ]
+
 /// Raise a .NET exception of the given class with the given message.
 and raiseDotnet (ctx: Ctx) (r: SourceLocation option) (fullName: string) (message: Expr) (t: Fable.Type) : Expr =
     bindArgsIn true ctx [ message ] (fun xs -> ERaise(EExnNew(dotnetExnEnt ctx fullName, xs), mapType ctx r t))
@@ -3883,9 +3911,7 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                     | _, other -> fail r "the Zig target cannot turn a value of this type into text yet (%A)" other
 
                 if kind = 'A' then
-                    if width > 0 || precision.IsSome || flags.Trim('+') <> "" then
-                        fail r "the Zig target does not support a width or flags on %%A yet"
-
+                    // (F# ignores a width, flags and a precision on %A)
                     match value.Type with
                     // (a number of 16 bits without a sign and a char are the same type in Zig; at
                     // the top the compiler can tell them apart, inside a value it cannot)
@@ -5328,6 +5354,7 @@ and dotnetCall
                     TOpt tStr
                 )
             )
+    | "System.IO.Path", "GetFileName", [ path ] -> pure' "fable_rt.pathFileName($0)" [ path ] tStr
     | "System.Exception", "get_Message", x :: _ ->
         bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnMessage($0)", xs, tStr))
     | "Microsoft.FSharp.Core.Operators", "Raise", [ x ] ->
