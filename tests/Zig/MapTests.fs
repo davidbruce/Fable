@@ -8,7 +8,6 @@ open Fable.Tests.Util.Testing
 type R = { i: int; s: string }
 type R2 = { kv: KeyValuePair<string,int> }
 
-#if !FABLE_COMPILER_ZIG // (custom equality through obj is not supported by the Zig target yet)
 [<CustomEquality; CustomComparison>]
 type R3 =
     { Bar: string
@@ -23,7 +22,6 @@ type R3 =
         match other with
         | :? R3 as x -> this.Bar = x.Bar
         | _ -> false
-#endif
 
 type R4 =
     { Bar: string
@@ -334,7 +332,6 @@ let ``test Map.change works`` () =
     m |> Map.change "c" (Option.map (fun v -> v + 1)) |> equal m
     m |> Map.change "b" (Option.map (fun v -> v + 1)) |> equal m2
 
-#if !FABLE_COMPILER_ZIG // (custom equality and IComparable are not supported by the Zig target yet)
 [<Fact>]
 let ``test Map works with keys with custom comparison`` () =
     Map.empty
@@ -350,7 +347,6 @@ let ``test Map works with keys with custom comparison`` () =
     |> equal 1
 
 // Note: This compiles to GetEnumerator()/MoveNext()/Current, not __iter__
-#endif
 [<Fact>]
 let ``test Map iteration with KeyValue yields key-value pairs`` () =
     let myMap = Map [ "foo", 1; "bar", 2; "baz", 3 ]

@@ -18,9 +18,7 @@ let jsConstructorIs (s: string) (ar: 'T[]) = true
 
 type ExceptFoo = { Bar:string }
 
-#if !FABLE_COMPILER_ZIG // (obj is not supported by the Zig target yet)
 let f (x:obj) (y:obj) (z:obj) = (string x) + (string y) + (string z)
-#endif
 
 let map f ar = Array.map f ar
 
@@ -604,9 +602,11 @@ let ``test System.Array.BinarySearch passes the array element to the comparer fi
     calls.Clear()
     System.Array.BinarySearch(xs, 4, logging) |> equal -3
     List.ofSeq calls |> equal [(5, 4); (1, 4); (3, 4)]
+#endif
 
 #if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 #endif
+#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test System.Array.BinarySearch works with other element types`` () =
     let strings = [|"apple"; "banana"; "cherry"|]
@@ -666,9 +666,11 @@ let ``test System.Array.BinarySearch works with more element types`` () =
     System.Array.BinarySearch([|1I; 5I; 10I|], 11I) |> equal -4
     System.Array.BinarySearch([|None; Some 1; Some 3|], Some 1) |> equal 1
     System.Array.BinarySearch([|None; Some 1; Some 3|], Some 2) |> equal -3
+#endif
 
 #if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 #endif
+#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test System.Array.BinarySearch with a range passes the array element to the comparer first`` () =
     let xs = [|1; 3; 5; 7; 9|]
@@ -1247,8 +1249,6 @@ let ``test Array as IList indexer has same behaviour`` () =
     ys.[0] + ys.[2]
     |> equal 0.
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
-#endif
 [<Fact>]
 let ``test Array as IList count has same behaviour`` () =
     let xs = [|1.; 2.; 3.|]
@@ -1359,9 +1359,11 @@ let ``test Casting to System.Array works`` () =
           (2, 'b'); (2, 'c'); (2, 'd'); (2, 'e'); (2, 'f'); (3, 'a'); (3, 'b');
           (3, 'c'); (3, 'd'); (3, 'e'); (3, 'f'); (4, 'a'); (4, 'b'); (4, 'c');
           (4, 'd'); (4, 'e'); (4, 'f') ]
+#endif
 
 #if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 #endif
+#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparers, System.Array, obj)
 [<Fact>]
 let ``test Testing against System.Array works`` () =
     let xs = box [|1;2;3;4|]
@@ -1394,13 +1396,11 @@ let ``test Array.splitInto works`` () =
    [|1..5|] |> Array.splitInto 4 |> equal [| [|1..2|]; [|3|]; [|4|]; [|5|] |]
    [|1..4|] |> Array.splitInto 20 |> equal [| [|1|]; [|2|]; [|3|]; [|4|] |]
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.exactlyOne works`` () =
     [|1.|] |> Array.exactlyOne |> equal 1.
     (try Array.exactlyOne [|1.;2.|] |> ignore; false with | _ -> true) |> equal true
     (try Array.exactlyOne [||] |> ignore; false with | _ -> true) |> equal true
-#endif
 
 [<Fact>]
 let ``test Array.tryExactlyOne works`` () =
@@ -1560,16 +1560,13 @@ let ``test System.Array.Resize works`` () =
     xs |> equal [||]
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomShuffle works`` () =
     let xs = [|1; 2; 3; 4; 5|]
     let shuffled = Array.randomShuffle xs
     Array.sort shuffled |> equal xs
     Array.length shuffled |> equal 5
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomShuffleWith works`` () =
     let xs = [|1; 2; 3; 4; 5|]
@@ -1577,35 +1574,27 @@ let ``test Array.randomShuffleWith works`` () =
     let shuffled = Array.randomShuffleWith rng xs
     Array.sort shuffled |> equal xs
     Array.length shuffled |> equal 5
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomShuffleBy works`` () =
     let shuffled = Array.randomShuffleBy (fun () -> 0.0) [|1; 2; 3; 4; 5|]
     Array.sort shuffled |> equal [|1; 2; 3; 4; 5|]
     throwsAnyError (fun () -> Array.randomShuffleBy (fun () -> 1.0) [|1; 2|] |> ignore)
     throwsAnyError (fun () -> Array.randomShuffleBy (fun () -> -0.1) [|1; 2|] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomShuffleInPlace works`` () =
     let xs = [|1; 2; 3; 4; 5|]
     Array.randomShuffleInPlace xs
     Array.sort xs |> equal [|1; 2; 3; 4; 5|]
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomShuffleInPlaceWith works`` () =
     let xs = [|1; 2; 3; 4; 5|]
     let rng = System.Random(42)
     Array.randomShuffleInPlaceWith rng xs
     Array.sort xs |> equal [|1; 2; 3; 4; 5|]
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomShuffleInPlaceBy works`` () =
     let xs = [|1; 2; 3; 4; 5|]
@@ -1613,36 +1602,28 @@ let ``test Array.randomShuffleInPlaceBy works`` () =
     Array.sort xs |> equal [|1; 2; 3; 4; 5|]
     throwsAnyError (fun () -> Array.randomShuffleInPlaceBy (fun () -> 1.0) [|1; 2|])
     throwsAnyError (fun () -> Array.randomShuffleInPlaceBy (fun () -> -0.1) [|1; 2|])
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomChoice works`` () =
     let xs = [|1; 2; 3; 4; 5|]
     let x = Array.randomChoice xs
     Array.contains x xs |> equal true
     throwsAnyError (fun () -> Array.randomChoice<int> [||] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomChoiceWith works`` () =
     let xs = [|10; 20; 30|]
     let rng = System.Random(42)
     let x = Array.randomChoiceWith rng xs
     Array.contains x xs |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomChoiceBy works`` () =
     let x = Array.randomChoiceBy (fun () -> 0.0) [|42; 99; 7|]
     x |> equal 42
     throwsAnyError (fun () -> Array.randomChoiceBy (fun () -> 1.0) [|1|] |> ignore)
     throwsAnyError (fun () -> Array.randomChoiceBy (fun () -> 0.5) [||] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomChoices works`` () =
     let xs = [|1; 2; 3|]
@@ -1652,9 +1633,7 @@ let ``test Array.randomChoices works`` () =
     Array.randomChoices 0 xs |> equal [||]
     throwsAnyError (fun () -> Array.randomChoices -1 xs |> ignore)
     throwsAnyError (fun () -> Array.randomChoices 1 [||] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomChoicesWith works`` () =
     let xs = [|10; 20; 30|]
@@ -1662,17 +1641,13 @@ let ``test Array.randomChoicesWith works`` () =
     let choices = Array.randomChoicesWith rng 4 xs
     Array.length choices |> equal 4
     choices |> Array.forall (fun x -> Array.contains x xs) |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomChoicesBy works`` () =
     let choices = Array.randomChoicesBy (fun () -> 0.5) 3 [|10; 20; 30|]
     Array.length choices |> equal 3
     choices |> Array.forall (fun x -> x = 20) |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomSample works`` () =
     let xs = [|1; 2; 3; 4; 5|]
@@ -1685,9 +1660,7 @@ let ``test Array.randomSample works`` () =
     throwsAnyError (fun () -> Array.randomSample -1 xs |> ignore)
     throwsAnyError (fun () -> Array.randomSample 6 xs |> ignore)
     throwsAnyError (fun () -> Array.randomSample 1 [||] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomSampleWith works`` () =
     let xs = [|1; 2; 3; 4; 5|]
@@ -1696,9 +1669,7 @@ let ``test Array.randomSampleWith works`` () =
     Array.length sample |> equal 3
     sample |> Array.forall (fun x -> Array.contains x xs) |> equal true
     Array.distinct sample |> Array.length |> equal 3
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomSampleBy works`` () =
     let sample = Array.randomSampleBy (fun () -> 0.0) 3 [|1; 2; 3; 4; 5|]
@@ -1706,9 +1677,7 @@ let ``test Array.randomSampleBy works`` () =
     Array.distinct sample |> Array.length |> equal 3
     throwsAnyError (fun () -> Array.randomSampleBy (fun () -> 1.0) 1 [|1; 2|] |> ignore)
     throwsAnyError (fun () -> Array.randomSampleBy (fun () -> -0.1) 1 [|1; 2|] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomShuffleBy matches FSharp.Core`` () =
     Array.randomShuffleBy (fun () -> 0.0) [|0 .. 4|] |> equal [|0; 1; 2; 3; 4|]
@@ -1722,9 +1691,7 @@ let ``test Array.randomShuffleBy matches FSharp.Core`` () =
         float ((calls * 37) % 100) / 100.0
     Array.randomShuffleBy next [|0 .. 9|] |> equal [|3; 7; 2; 6; 9; 0; 8; 4; 5; 1|]
     calls |> equal 9
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array.randomSampleBy matches FSharp.Core`` () =
     Array.randomSampleBy (fun () -> 0.0) 3 [|0 .. 4|] |> equal [|0; 4; 3|]
@@ -1738,9 +1705,7 @@ let ``test Array.randomSampleBy matches FSharp.Core`` () =
         values[calls - 1]
     Array.randomSampleBy next 2 [|0 .. 21|] |> equal [|0; 11|]
     calls |> equal 3
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array random functions draw from the given Random`` () =
     let rng = System.Random(42)
@@ -1755,9 +1720,7 @@ let ``test Array random functions draw from the given Random`` () =
     let reference = System.Random(42)
     for _ in 1 .. 3 do reference.NextDouble() |> ignore
     rng.Next() |> equal (reference.Next())
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, Array.BinarySearch with comparers, DateTime, or obj, box and null)
 [<Fact>]
 let ``test Array random functions give FSharp.Core's error messages`` () =
     let message = "randomizer returned NaN, should be in range [0.0, 1.0)."
@@ -1767,7 +1730,6 @@ let ``test Array random functions give FSharp.Core's error messages`` () =
     throwsErrorContaining message (fun () -> Array.randomSampleBy (fun () -> nan) 1 [|1; 2|])
     throwsErrorContaining "The input array was empty." (fun () -> Array.randomChoiceWith (System.Random(1)) ([||]: int[]))
     throwsErrorContaining "The input must be non-negative.\ncount = -1" (fun () -> Array.randomSampleBy (fun () -> 0.0) -1 [|1|])
-#endif
 
 [<Fact>]
 let ``test Int64 arrays roundtrip through their backing storage`` () =

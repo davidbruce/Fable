@@ -752,3 +752,228 @@ let compareWith<'T> (comparer: 'T -> 'T -> int) (array1: 'T[]) (array2: 'T[]) : 
         1
     else
         0
+
+// ---- the random functions (F# 9): FSharp.Core's algorithms, so that with a seeded `Random`
+// they give what .NET gives ----
+
+/// What the randomizer gives, which must be in [0, 1) (NaN is not)
+let randomized (randomizer: unit -> float) : float =
+    let value = randomizer ()
+
+    if not (value >= 0.0 && value < 1.0) then
+        raise (
+            System.ArgumentOutOfRangeException(
+                "randomizer",
+                "The index is outside the legal range.\nrandomizer returned "
+                + string value
+                + ", should be in range [0.0, 1.0)."
+            )
+        )
+
+    value
+
+let negativeCount (count: int) =
+    invalidArg "count" ("The input must be non-negative.\ncount = " + string count)
+
+/// (`emptyText`: what the module says of an empty input)
+let private choiceIndex (next: int -> int) (emptyText: string) (length: int) : int =
+    if length = 0 then
+        invalidArg "source" emptyText
+
+    next length
+
+let private shuffleInPlace (next: int -> int -> int) (array: 'T[]) : unit =
+    let n = array.Length
+
+    for i in 0 .. n - 2 do
+        let j = next i n
+
+        if j <> i then
+            let t = array.[i]
+            array.[i] <- array.[j]
+            array.[j] <- t
+
+/// (how many a sample keeps in a pool, below which it draws from a copy of the input)
+let sampleSetSize (count: int) : int =
+    if count > 5 then
+        21 + pown 4 (int (ceil (System.Math.Log(float (count * 3), 4.0))))
+    else
+        21
+
+let private sampleOf (next: int -> int -> int) (count: int) (source: 'T[]) : 'T[] =
+    let n = source.Length
+
+    if count < 0 then
+        negativeCount count
+
+    if count > n then
+        invalidArg "count" "The input sequence has an insufficient number of elements."
+
+    let setSize = sampleSetSize count
+
+    if count = 0 then
+        [||]
+    elif n <= setSize then
+        let pool = Array.copy source
+        let result = Array.create count source.[0]
+
+        for i in 0 .. count - 1 do
+            let j = next 0 (n - i)
+            result.[i] <- pool.[j]
+            pool.[j] <- pool.[n - i - 1]
+
+        result
+    else
+        let selected = System.Collections.Generic.HashSet<int>()
+        let result = Array.create count source.[0]
+
+        for i in 0 .. count - 1 do
+            let mutable j = next 0 n
+
+            while not (selected.Add j) do
+                j <- next 0 n
+
+            result.[i] <- source.[j]
+
+        result
+
+let private withRandom (random: System.Random) : int -> int -> int = fun lo hi -> random.Next(lo, hi)
+
+let private byRandomizer (randomizer: unit -> float) : int -> int -> int =
+    fun lo hi -> int (float (hi - lo) * randomized randomizer + float lo)
+
+let randomShuffleInPlaceWith<'T> (random: System.Random) (source: 'T[]) : unit =
+    shuffleInPlace (withRandom random) source
+
+let randomShuffleInPlaceBy<'T> (randomizer: unit -> float) (source: 'T[]) : unit =
+    shuffleInPlace (byRandomizer randomizer) source
+
+let randomShuffleInPlace<'T> (source: 'T[]) : unit =
+    randomShuffleInPlaceWith System.Random.Shared source
+
+let randomShuffleWith<'T> (random: System.Random) (source: 'T[]) : 'T[] =
+    let result = Array.copy source
+    randomShuffleInPlaceWith random result
+    result
+
+let randomShuffleBy<'T> (randomizer: unit -> float) (source: 'T[]) : 'T[] =
+    let result = Array.copy source
+    randomShuffleInPlaceBy randomizer result
+    result
+
+let randomShuffle<'T> (source: 'T[]) : 'T[] =
+    randomShuffleWith System.Random.Shared source
+
+/// (the index of one item, and its text for an empty input: `randomChoice` of the List and Seq
+/// modules uses them too)
+let randomIndexWith (random: System.Random) (emptyText: string) (length: int) : int =
+    choiceIndex (fun n -> random.Next n) emptyText length
+
+let randomIndexBy (randomizer: unit -> float) (emptyText: string) (length: int) : int =
+    choiceIndex (fun n -> int (float n * randomized randomizer)) emptyText length
+
+let randomChoiceWith<'T> (random: System.Random) (source: 'T[]) : 'T =
+    source.[randomIndexWith random "The input array was empty." source.Length]
+
+let randomChoiceBy<'T> (randomizer: unit -> float) (source: 'T[]) : 'T =
+    source.[randomIndexBy randomizer "The input array was empty." source.Length]
+
+let randomChoice<'T> (source: 'T[]) : 'T =
+    randomChoiceWith System.Random.Shared source
+
+let randomChoicesWith<'T> (random: System.Random) (count: int) (source: 'T[]) : 'T[] =
+    if count < 0 then
+        negativeCount count
+
+    if source.Length = 0 then
+        invalidArg "source" "The input sequence was empty."
+
+    Array.init count (fun _ -> source.[random.Next source.Length])
+
+let randomChoicesBy<'T> (randomizer: unit -> float) (count: int) (source: 'T[]) : 'T[] =
+    if count < 0 then
+        negativeCount count
+
+    if source.Length = 0 then
+        invalidArg "source" "The input sequence was empty."
+
+    Array.init count (fun _ -> source.[int (float source.Length * randomized randomizer)])
+
+let randomChoices<'T> (count: int) (source: 'T[]) : 'T[] =
+    randomChoicesWith System.Random.Shared count source
+
+let randomSampleWith<'T> (random: System.Random) (count: int) (source: 'T[]) : 'T[] =
+    sampleOf (withRandom random) count source
+
+let randomSampleBy<'T> (randomizer: unit -> float) (count: int) (source: 'T[]) : 'T[] =
+    sampleOf (fun lo hi -> int (float (hi - lo) * randomized randomizer + float lo)) count source
+
+let randomSample<'T> (count: int) (source: 'T[]) : 'T[] =
+    randomSampleWith System.Random.Shared count source
+
+// ---- the random functions of the List module (they are here, where Array is: List.fs
+// cannot use Array.fs, which uses it) ----
+
+let private listRandomized (randomizer: unit -> float) : float =
+    let value = randomizer ()
+
+    if not (value >= 0.0 && value < 1.0) then
+        raise (
+            System.ArgumentOutOfRangeException(
+                "randomizer",
+                "The index is outside the legal range.\nrandomizer returned "
+                + string value
+                + ", should be in range [0.0, 1.0)."
+            )
+        )
+
+    value
+
+let private listEmptySource () =
+    invalidArg "source" "The input sequence was empty."
+
+let listRandomShuffleWith<'T> (random: System.Random) (source: 'T list) : 'T list =
+    randomShuffleWith random (Array.ofList source) |> Array.toList
+
+let listRandomShuffleBy<'T> (randomizer: unit -> float) (source: 'T list) : 'T list =
+    randomShuffleBy randomizer (Array.ofList source) |> Array.toList
+
+let listRandomShuffle<'T> (source: 'T list) : 'T list =
+    listRandomShuffleWith System.Random.Shared source
+
+let listRandomChoiceWith<'T> (random: System.Random) (source: 'T list) : 'T =
+    let n = List.length source
+
+    if n = 0 then
+        listEmptySource ()
+
+    List.item (random.Next n) source
+
+let listRandomChoiceBy<'T> (randomizer: unit -> float) (source: 'T list) : 'T =
+    let n = List.length source
+
+    if n = 0 then
+        listEmptySource ()
+
+    List.item (int (float n * listRandomized randomizer)) source
+
+let listRandomChoice<'T> (source: 'T list) : 'T =
+    listRandomChoiceWith System.Random.Shared source
+
+let listRandomChoicesWith<'T> (random: System.Random) (count: int) (source: 'T list) : 'T list =
+    randomChoicesWith random count (Array.ofList source) |> Array.toList
+
+let listRandomChoicesBy<'T> (randomizer: unit -> float) (count: int) (source: 'T list) : 'T list =
+    randomChoicesBy randomizer count (Array.ofList source) |> Array.toList
+
+let listRandomChoices<'T> (count: int) (source: 'T list) : 'T list =
+    listRandomChoicesWith System.Random.Shared count source
+
+let listRandomSampleWith<'T> (random: System.Random) (count: int) (source: 'T list) : 'T list =
+    randomSampleWith random count (Array.ofList source) |> Array.toList
+
+let listRandomSampleBy<'T> (randomizer: unit -> float) (count: int) (source: 'T list) : 'T list =
+    randomSampleBy randomizer count (Array.ofList source) |> Array.toList
+
+let listRandomSample<'T> (count: int) (source: 'T list) : 'T list =
+    listRandomSampleWith System.Random.Shared count source

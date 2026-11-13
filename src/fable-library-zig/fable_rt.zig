@@ -2921,6 +2921,16 @@ pub fn nullableValue(n: anytype) Raised!@typeInfo(@TypeOf(n)).optional.child {
     return dup(v);
 }
 
+/// `Option.toObj o` (of a type that has null here: a string, `obj`)
+pub fn optToObj(o: anytype) @typeInfo(@TypeOf(o)).optional.child {
+    return if (o) |v| dup(v) else null;
+}
+
+/// `Option.ofObj x`
+pub fn optOfObj(x: anytype) ?@TypeOf(x) {
+    return if (x == null) null else dup(x);
+}
+
 fn objEql(a: Obj, b: Obj) bool {
     if (a == b) return true;
     if (a.type.equals) |f| return f(a, b);

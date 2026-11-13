@@ -185,7 +185,6 @@ let ``test List.choose works`` () =
     result.Head + result.Tail.Head
     |> equal 7
 
-#if !FABLE_COMPILER_ZIG // (needs obj values, which the Zig target does not have)
 [<Fact>]
 let ``test List.exactlyOne works`` () =
     let xs = [1.;]
@@ -197,7 +196,6 @@ let ``test List.exactlyOne works`` () =
 
     let xs3 = []
     (try List.exactlyOne xs3 |> ignore; false with | _ -> true) |> equal true
-#endif
 
 [<Fact>]
 let ``test List.tryExactlyOne works`` () =
@@ -1162,16 +1160,13 @@ let ``test Array.removeManyAt works`` () =
     throwsAnyError (fun () -> Array.removeManyAt -1 2 [|1|] |> ignore)
     throwsAnyError (fun () -> Array.removeManyAt 2 2 [|1|] |> ignore)
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomShuffle works`` () =
     let xs = [1; 2; 3; 4; 5]
     let shuffled = List.randomShuffle xs
     List.sort shuffled |> equal xs
     List.length shuffled |> equal 5
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomShuffleWith works`` () =
     let xs = [1; 2; 3; 4; 5]
@@ -1179,45 +1174,35 @@ let ``test List.randomShuffleWith works`` () =
     let shuffled = List.randomShuffleWith rng xs
     List.sort shuffled |> equal xs
     List.length shuffled |> equal 5
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomShuffleBy works`` () =
     let shuffled = List.randomShuffleBy (fun () -> 0.0) [1; 2; 3; 4; 5]
     List.sort shuffled |> equal [1; 2; 3; 4; 5]
     throwsAnyError (fun () -> List.randomShuffleBy (fun () -> 1.0) [1; 2] |> ignore)
     throwsAnyError (fun () -> List.randomShuffleBy (fun () -> -0.1) [1; 2] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomChoice works`` () =
     let xs = [1; 2; 3; 4; 5]
     let x = List.randomChoice xs
     List.contains x xs |> equal true
     throwsAnyError (fun () -> List.randomChoice<int> [] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomChoiceWith works`` () =
     let xs = [10; 20; 30]
     let rng = System.Random(42)
     let x = List.randomChoiceWith rng xs
     List.contains x xs |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomChoiceBy works`` () =
     let x = List.randomChoiceBy (fun () -> 0.0) [42; 99; 7]
     x |> equal 42
     throwsAnyError (fun () -> List.randomChoiceBy (fun () -> 1.0) [1] |> ignore)
     throwsAnyError (fun () -> List.randomChoiceBy (fun () -> 0.5) [] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomChoices works`` () =
     let xs = [1; 2; 3]
@@ -1227,9 +1212,7 @@ let ``test List.randomChoices works`` () =
     List.randomChoices 0 xs |> equal []
     throwsAnyError (fun () -> List.randomChoices -1 xs |> ignore)
     throwsAnyError (fun () -> List.randomChoices 1 [] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomChoicesWith works`` () =
     let xs = [10; 20; 30]
@@ -1237,17 +1220,13 @@ let ``test List.randomChoicesWith works`` () =
     let choices = List.randomChoicesWith rng 4 xs
     List.length choices |> equal 4
     choices |> List.forall (fun x -> List.contains x xs) |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomChoicesBy works`` () =
     let choices = List.randomChoicesBy (fun () -> 0.5) 3 [10; 20; 30]
     List.length choices |> equal 3
     choices |> List.forall (fun x -> x = 20) |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomSample works`` () =
     let xs = [1; 2; 3; 4; 5]
@@ -1260,9 +1239,7 @@ let ``test List.randomSample works`` () =
     throwsAnyError (fun () -> List.randomSample -1 xs |> ignore)
     throwsAnyError (fun () -> List.randomSample 6 xs |> ignore)
     throwsAnyError (fun () -> List.randomSample 1 [] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomSampleWith works`` () =
     let xs = [1; 2; 3; 4; 5]
@@ -1271,9 +1248,7 @@ let ``test List.randomSampleWith works`` () =
     List.length sample |> equal 3
     sample |> List.forall (fun x -> List.contains x xs) |> equal true
     List.distinct sample |> List.length |> equal 3
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List.randomSampleBy works`` () =
     let sample = List.randomSampleBy (fun () -> 0.0) 3 [1; 2; 3; 4; 5]
@@ -1281,16 +1256,13 @@ let ``test List.randomSampleBy works`` () =
     List.distinct sample |> List.length |> equal 3
     throwsAnyError (fun () -> List.randomSampleBy (fun () -> 1.0) 1 [1; 2] |> ignore)
     throwsAnyError (fun () -> List.randomSampleBy (fun () -> -0.1) 1 [1; 2] |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Random is not supported by the Zig target yet)
 [<Fact>]
 let ``test List random functions match FSharp.Core`` () =
     List.randomShuffleBy (fun () -> 0.999) [0 .. 4] |> equal [4; 0; 1; 2; 3]
     List.randomSampleBy (fun () -> 0.0) 3 [0 .. 4] |> equal [0; 4; 3]
     throwsErrorContaining "randomizer returned NaN, should be in range [0.0, 1.0)." (fun () -> List.randomChoiceBy (fun () -> nan) [1; 2])
     throwsErrorContaining "The input sequence was empty." (fun () -> List.randomChoiceWith (System.Random(1)) ([]: int list))
-#endif
 
 [<Fact>]
 let ``test List.collect works II`` () =
@@ -1339,7 +1311,6 @@ let ``test List.take and List.splitAt raise InvalidOperationException when the l
 let ``test List.skip raises ArgumentOutOfRangeException when the list is too short`` () =
     raisedExceptionType (fun () -> List.skip 5 [1]) |> equal "ArgumentOutOfRangeException"
 
-#if !FABLE_COMPILER_ZIG // (needs obj values, which the Zig target does not have)
 [<Fact>]
 let ``test List functions walking two lists raise ArgumentException when the lengths differ`` () =
     let xs = [1; 2]
@@ -1355,9 +1326,7 @@ let ``test List functions walking two lists raise ArgumentException when the len
     raisedExceptionType (fun () -> List.zip ([]: int list) [1]) |> equal "ArgumentException"
     raisedExceptionType (fun () -> List.forall2 (fun _ _ -> true) xs ys) |> equal "ArgumentException"
     raisedExceptionType (fun () -> List.forall2 (fun _ _ -> false) [1] []) |> equal "ArgumentException"
-#endif
 
-#if !FABLE_COMPILER_ZIG // (needs obj values, which the Zig target does not have)
 [<Fact>]
 let ``test List.map3 and List.zip3 raise ArgumentException when the lengths differ`` () =
     let add3 x y z = x + y + z
@@ -1365,7 +1334,6 @@ let ``test List.map3 and List.zip3 raise ArgumentException when the lengths diff
     raisedExceptionType (fun () -> List.map3 add3 [1; 2; 3] [1; 2; 3] [1; 2]) |> equal "ArgumentException"
     raisedExceptionType (fun () -> List.zip3 [1] [] [1]) |> equal "ArgumentException"
     raisedExceptionType (fun () -> List.zip3 [1; 2] [1; 2] [1; 2; 3]) |> equal "ArgumentException"
-#endif
 
 [<Fact>]
 let ``test List functions walking lists in step call back on the common prefix before raising`` () =

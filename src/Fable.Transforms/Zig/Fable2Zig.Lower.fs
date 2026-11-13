@@ -2244,6 +2244,9 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
              InsertManyAt RemoveManyAt"
         ->
         Some("List", small name)
+    // (the List module's random functions are in Array.fs, which can use both)
+    | "Microsoft.FSharp.Collections.ListModule" when name.StartsWith("Random", System.StringComparison.Ordinal) ->
+        Some("Array", "list" + name)
     // (a value option is an option here: its module is the same functions)
     | "Microsoft.FSharp.Collections.FSharpList`1" when name = "GetSlice" -> Some("List", "getSlice")
     | "Microsoft.FSharp.Collections.FSharpList`1" when name = "Cons" -> Some("List", "cons")
@@ -2254,6 +2257,8 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
     | "Microsoft.FSharp.Collections.SetModule" when name = "IntersectMany" -> Some("Set", "intersectMany")
     | "Microsoft.FSharp.Collections.ArrayModule" when name = "OfSeq" -> Some("Seq", "toArray")
     | "Microsoft.FSharp.Collections.SeqModule" when name = "Tail" -> Some("Seq", "tail")
+    | "Microsoft.FSharp.Collections.SeqModule" when name.StartsWith("Random", System.StringComparison.Ordinal) ->
+        Some("Seq", small name)
     // (what `while`, `try ... finally` and `try ... with` in `seq { }` are)
     | "Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers" when
         name = "EnumerateWhile"
@@ -2334,7 +2339,7 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
              SkipWhile SplitAt ChunkBySize Windowed Pairwise AllPairs Except CopyTo InsertAt InsertManyAt RemoveAt
              RemoveManyAt UpdateAt Where Tail TryExactlyOne TryFindIndexBack FindIndexBack FindBack ReduceBack ScanBack
              MapFold MapFoldBack Map3 MapIndexed2 IterateIndexed2 FoldBack2 Zip3 Unzip3 Transpose SplitInto Permute
-             CompareWith"
+             CompareWith RandomShuffle RandomShuffleWith RandomShuffleBy RandomChoice RandomChoiceWith RandomChoiceBy RandomChoices RandomChoicesWith RandomChoicesBy RandomSample RandomSampleWith RandomSampleBy RandomShuffleInPlace RandomShuffleInPlaceWith RandomShuffleInPlaceBy"
         ->
         Some(
             "Array",
@@ -6896,6 +6901,22 @@ and dotnetCall
                     tBool
                 )
             )
+    // `Option.toObj` and `Option.ofObj`: of a type that has null here
+    | ("Microsoft.FSharp.Core.OptionModule" | "Microsoft.FSharp.Core.ValueOption"), ("ToObj" | "OfObj"), [ x ] when
+        (match
+            (if name = "ToObj" then
+                 t
+             else
+                 x.Type)
+         with
+         | Fable.String
+         | Fable.Any -> true
+         | _ -> false)
+        ->
+        if name = "ToObj" then
+            pure' "fable_rt.optToObj($0)" [ x ] (mapType ctx r t)
+        else
+            pure' "fable_rt.optOfObj($0)" [ x ] (mapType ctx r t)
     // ---- System.Random ----
     | "System.Random", ".ctor", [] -> pure' "fable_rt.randomUnseeded()" [] (mapType ctx r t)
     | "System.Random", ".ctor", [ seed ] -> pure' "fable_rt.randomNew($0)" [ seed ] (mapType ctx r t)

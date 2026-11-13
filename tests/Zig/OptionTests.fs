@@ -301,23 +301,19 @@ let ``test Option.flatten works`` () =
     Option.flatten o2 |> equal None
     Option.flatten o3 |> equal None
 
-#if !FABLE_COMPILER_ZIG // (needs obj or null, which the Zig target does not have yet)
 [<Fact>]
 let ``test Option.toObj works`` () =
     let o1: string option = Some "foo"
     let o2: string option = None
     Option.toObj o1 |> equal "foo"
     Option.toObj o2 |> equal null
-#endif
 
-#if !FABLE_COMPILER_ZIG // (needs obj or null, which the Zig target does not have yet)
 [<Fact>]
 let ``test Option.ofObj works`` () =
     let o1: string = "foo"
     let o2: string = null
     Option.ofObj o1 |> equal (Some "foo")
     Option.ofObj o2 |> equal None
-#endif
 
 [<Fact>]
 let ``test ValueOption.ofOption works`` () =
@@ -352,7 +348,6 @@ let ``test Different ways of providing None to a union case should be equal`` ()
     let value = None
     equal true ((OptTest None) = (value |> OptTest))
 
-#if !FABLE_COMPILER_ZIG // (needs obj or null, which the Zig target does not have yet)
 [<Fact>]
 let ``test Different ways of providing None to a function should be equal`` () =
     let f x = x
@@ -362,7 +357,6 @@ let ``test Different ways of providing None to a function should be equal`` () =
     equal true (f2 None)
     equal true (f2 value)
     equal false (Some 5 |> f2)
-#endif
 
 [<Fact>]
 let ``test Accessing an option value gives correct expression type`` () =
@@ -384,7 +378,6 @@ let ``test Mixing refs and options works`` () =
     getter 5
     equal 7 res.Value
 
-#if !FABLE_COMPILER_ZIG // (needs obj or null, which the Zig target does not have yet)
 [<Fact>]
 let ``test Generic options work`` () =
     let x1 = makeSome ()
@@ -419,7 +412,6 @@ let ``test Generic options work`` () =
     |> equal true
     x4.Value = 5 |> equal true
     Option.get x4 = 5 |> equal true
-#endif
 
 [<Fact>]
 let ``test Nested options work`` () =
@@ -461,14 +453,11 @@ let ``test Option.map ignore generates Some ()`` () =
     let myOtherSome = mySome |> Option.map (ignore)
     equal mySome myOtherSome
 
-#if !FABLE_COMPILER_ZIG // (needs obj or null, which the Zig target does not have yet)
 [<Fact>]
 let ``test Some (box null) |> Option.isSome evals to true`` () =
     Some (box null) |> Option.isSome |> equal true
     Some (null) |> Option.isSome |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (needs obj or null, which the Zig target does not have yet)
 [<Fact>]
 let ``test Nullable works`` () =
     let x = Nullable 5
@@ -479,4 +468,3 @@ let ``test Nullable works`` () =
     y.HasValue |> equal false
     let errorThrown = try y.Value |> ignore; false with _ -> true
     equal true errorThrown
-#endif

@@ -1169,3 +1169,117 @@ let updateAt<'T> (index: int) (value: 'T) (source: SeqOf<'T>) : SeqOf<'T> =
         )
         (fun () -> [])
         source
+
+// ---- the random functions (F# 9): through an array, as FSharp.Core does ----
+
+module RandomArray = Fable.Library.Zig.Array
+
+let randomShuffleWith<'T> (random: System.Random) (source: SeqOf<'T>) : SeqOf<'T> =
+    ofArray (RandomArray.randomShuffleWith random (toArray source))
+
+let randomShuffleBy<'T> (randomizer: unit -> float) (source: SeqOf<'T>) : SeqOf<'T> =
+    ofArray (RandomArray.randomShuffleBy randomizer (toArray source))
+
+let randomShuffle<'T> (source: SeqOf<'T>) : SeqOf<'T> =
+    randomShuffleWith System.Random.Shared source
+
+let randomChoiceWith<'T> (random: System.Random) (source: SeqOf<'T>) : 'T =
+    let a = toArray source
+    a.[RandomArray.randomIndexWith random "The input sequence was empty." a.Length]
+
+let randomChoiceBy<'T> (randomizer: unit -> float) (source: SeqOf<'T>) : 'T =
+    let a = toArray source
+    a.[RandomArray.randomIndexBy randomizer "The input sequence was empty." a.Length]
+
+let randomChoice<'T> (source: SeqOf<'T>) : 'T =
+    randomChoiceWith System.Random.Shared source
+
+/// `count` draws, made anew on each walk (the input is checked at once, as .NET does)
+let private choices<'T> (draw: int -> int) (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
+    if count < 0 then
+        RandomArray.negativeCount count
+
+    let a = toArray source
+
+    if a.Length = 0 then
+        invalidArg "source" "The input sequence was empty."
+
+    make (fun () ->
+        let mutable i = 0
+
+        walker
+        <| fun () ->
+            if i < count then
+                i <- i + 1
+                Some a.[draw a.Length]
+            else
+                None
+    )
+
+let randomChoicesWith<'T> (random: System.Random) (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
+    choices (fun n -> random.Next n) count source
+
+let randomChoicesBy<'T> (randomizer: unit -> float) (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
+    choices (fun n -> int (float n * RandomArray.randomized randomizer)) count source
+
+let randomChoices<'T> (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
+    randomChoicesWith System.Random.Shared count source
+
+/// A sample drawn on each walk, as FSharp.Core's: the input is read and checked at once, and
+/// what the draws keep (the pool they take from, or the indexes taken) is kept from one walk to
+/// the next
+let private sample<'T> (next: int -> int -> int) (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
+    let a = toArray source
+    let n = a.Length
+
+    if count < 0 then
+        RandomArray.negativeCount count
+
+    if count > n then
+        invalidArg "count" "The input sequence has an insufficient number of elements."
+
+    if n <= RandomArray.sampleSetSize count then
+        let pool = Array.copy a
+
+        make (fun () ->
+            let mutable i = 0
+
+            walker
+            <| fun () ->
+                if i < count then
+                    let j = next 0 (n - i)
+                    let x = pool.[j]
+                    pool.[j] <- pool.[n - i - 1]
+                    i <- i + 1
+                    Some x
+                else
+                    None
+        )
+    else
+        let selected = System.Collections.Generic.HashSet<int>()
+
+        make (fun () ->
+            let mutable i = 0
+
+            walker
+            <| fun () ->
+                if i < count then
+                    let mutable j = next 0 n
+
+                    while not (selected.Add j) do
+                        j <- next 0 n
+
+                    i <- i + 1
+                    Some a.[j]
+                else
+                    None
+        )
+
+let randomSampleWith<'T> (random: System.Random) (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
+    sample (fun lo hi -> random.Next(lo, hi)) count source
+
+let randomSampleBy<'T> (randomizer: unit -> float) (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
+    sample (fun lo hi -> int (float (hi - lo) * RandomArray.randomized randomizer + float lo)) count source
+
+let randomSample<'T> (count: int) (source: SeqOf<'T>) : SeqOf<'T> =
+    randomSampleWith System.Random.Shared count source

@@ -155,8 +155,6 @@ let ``test Seq.average works with custom types`` () =
     seq {MyNumber 1; MyNumber 2; MyNumber 3}
     |> Seq.average |> equal (MyNumber 2)
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
-#endif
 #if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: sums through a type's own +, a Seq.empty whose item type F# leaves open)
 [<Fact>]
 let ``test Seq.averageBy works with custom types`` () =
@@ -566,8 +564,6 @@ let ``test Seq.sum with non numeric types works`` () =
     let p2 = {x=2; y=20}
     [p1; p2] |> Seq.sum |> (=) {x=3;y=30} |> equal true
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
-#endif
 #if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: sums through a type's own +, a Seq.empty whose item type F# leaves open)
 [<Fact>]
 let ``test Seq.sumBy with non numeric types works`` () =
@@ -591,8 +587,6 @@ let ``test Seq.sum with non numeric types works II`` () =
     seq {MyNumber 1; MyNumber 2; MyNumber 3}
     |> Seq.sum |> equal (MyNumber 6)
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
-#endif
 [<Fact>]
 let ``test Seq.sumBy with non numeric types works II`` () =
     seq {{ MyNumber = MyNumber 5 }; { MyNumber = MyNumber 4 }; { MyNumber = MyNumber 3 }}
@@ -1266,16 +1260,13 @@ let ``test Seq.removeManyAt works`` () =
     throwsAnyError (fun () -> Seq.removeManyAt -1 2 [1] |> Seq.toList |> ignore)
     throwsAnyError (fun () -> Seq.removeManyAt 2 2 [1] |> Seq.toList |> ignore)
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomShuffle works`` () =
     let xs = seq { 1; 2; 3; 4; 5 }
     let shuffled = Seq.randomShuffle xs |> Seq.toArray
     Array.sort shuffled |> equal [|1; 2; 3; 4; 5|]
     Array.length shuffled |> equal 5
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomShuffleWith works`` () =
     let xs = seq { 1; 2; 3; 4; 5 }
@@ -1283,45 +1274,35 @@ let ``test Seq.randomShuffleWith works`` () =
     let shuffled = Seq.randomShuffleWith rng xs |> Seq.toArray
     Array.sort shuffled |> equal [|1; 2; 3; 4; 5|]
     Array.length shuffled |> equal 5
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomShuffleBy works`` () =
     let shuffled = Seq.randomShuffleBy (fun () -> 0.0) [1; 2; 3; 4; 5] |> Seq.toArray
     Array.sort shuffled |> equal [|1; 2; 3; 4; 5|]
     throwsAnyError (fun () -> Seq.randomShuffleBy (fun () -> 1.0) [1; 2] |> Seq.toArray |> ignore)
     throwsAnyError (fun () -> Seq.randomShuffleBy (fun () -> -0.1) [1; 2] |> Seq.toArray |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomChoice works`` () =
     let xs = seq { 1; 2; 3; 4; 5 }
     let x = Seq.randomChoice xs
     Seq.contains x xs |> equal true
     throwsAnyError (fun () -> Seq.randomChoice<int> Seq.empty |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomChoiceWith works`` () =
     let xs = seq { 10; 20; 30 }
     let rng = System.Random(42)
     let x = Seq.randomChoiceWith rng xs
     Seq.contains x xs |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomChoiceBy works`` () =
     let x = Seq.randomChoiceBy (fun () -> 0.0) [42; 99; 7]
     x |> equal 42
     throwsAnyError (fun () -> Seq.randomChoiceBy (fun () -> 1.0) [1] |> ignore)
     throwsAnyError (fun () -> Seq.randomChoiceBy (fun () -> 0.5) Seq.empty<int> |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomChoices works`` () =
     let xs = seq { 1; 2; 3 }
@@ -1331,9 +1312,7 @@ let ``test Seq.randomChoices works`` () =
     Seq.randomChoices 0 xs |> Seq.toArray |> equal [||]
     throwsAnyError (fun () -> Seq.randomChoices -1 xs |> Seq.toArray |> ignore)
     throwsAnyError (fun () -> Seq.randomChoices 1 Seq.empty<int> |> Seq.toArray |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomChoicesWith works`` () =
     let xs = seq { 10; 20; 30 }
@@ -1341,17 +1320,13 @@ let ``test Seq.randomChoicesWith works`` () =
     let choices = Seq.randomChoicesWith rng 4 xs |> Seq.toArray
     Array.length choices |> equal 4
     choices |> Array.forall (fun x -> Seq.contains x xs) |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomChoicesBy works`` () =
     let choices = Seq.randomChoicesBy (fun () -> 0.5) 3 [10; 20; 30] |> Seq.toArray
     Array.length choices |> equal 3
     choices |> Array.forall (fun x -> x = 20) |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomSample works`` () =
     let xs = seq { 1; 2; 3; 4; 5 }
@@ -1364,9 +1339,7 @@ let ``test Seq.randomSample works`` () =
     throwsAnyError (fun () -> Seq.randomSample -1 xs |> Seq.toArray |> ignore)
     throwsAnyError (fun () -> Seq.randomSample 6 xs |> Seq.toArray |> ignore)
     throwsAnyError (fun () -> Seq.randomSample 1 Seq.empty<int> |> Seq.toArray |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomSampleWith works`` () =
     let xs = seq { 1; 2; 3; 4; 5 }
@@ -1375,9 +1348,7 @@ let ``test Seq.randomSampleWith works`` () =
     Array.length sample |> equal 3
     sample |> Array.forall (fun x -> Seq.contains x xs) |> equal true
     Array.distinct sample |> Array.length |> equal 3
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomSampleBy works`` () =
     let sample = Seq.randomSampleBy (fun () -> 0.0) 3 [1; 2; 3; 4; 5] |> Seq.toArray
@@ -1385,9 +1356,7 @@ let ``test Seq.randomSampleBy works`` () =
     Array.distinct sample |> Array.length |> equal 3
     throwsAnyError (fun () -> Seq.randomSampleBy (fun () -> 1.0) 1 [1; 2] |> Seq.toArray |> ignore)
     throwsAnyError (fun () -> Seq.randomSampleBy (fun () -> -0.1) 1 [1; 2] |> Seq.toArray |> ignore)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.randomChoicesBy draws on enumeration`` () =
     let mutable calls = 0
@@ -1401,7 +1370,6 @@ let ``test Seq.randomChoicesBy draws on enumeration`` () =
     rng.Next() |> equal (System.Random(42).Next())
     ys |> Seq.length |> equal 3
     throwsErrorContaining "The input must be non-negative.\ncount = -1" (fun () -> Seq.randomChoicesWith rng -1 [1])
-#endif
 
 [<Fact>]
 let ``test Seq.reduce and Seq.reduceBack raise ArgumentException on empty input`` () =
