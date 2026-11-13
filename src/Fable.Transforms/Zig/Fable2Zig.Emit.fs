@@ -186,7 +186,11 @@ let freshName (em: Em) (baseName: string) =
 
 let vname (em: Em) (v: Var) =
     match v.Kind with
-    | VGlobal -> topIdent v.Base
+    | VGlobal ->
+        // (`alias.name`: a value of another file)
+        match v.Base.LastIndexOf '.' with
+        | -1 -> topIdent v.Base
+        | dot -> v.Base.Substring(0, dot + 1) + topIdent (v.Base.Substring(dot + 1))
     | _ ->
         match em.Names.TryGetValue v.Id with
         | true, n -> n
@@ -1479,6 +1483,9 @@ let emitFile (state: FileState) : string =
     for (name, _, _) in state.Consts do
         rootNames.Add(topIdent name) |> ignore
 
+    for (name, _, _) in state.Values do
+        rootNames.Add(topIdent name) |> ignore
+
     for fn in state.Fns do
         rootNames.Add(topIdent fn.Name) |> ignore
 
@@ -1619,6 +1626,57 @@ let emitFile (state: FileState) : string =
     if state.Consts.Count > 0 then
         out.AppendLine() |> ignore
 
+    // Module-level values that are computed: each has a place, filled when the program starts
+    // (after the values of the files this one uses) and given up when it ends.
+    for (name, ty, _) in state.Values do
+        out.AppendLine($"pub var %s{topIdent name}: %s{zigType ty} = undefined;")
+        |> ignore
+
+    let aliases = state.Imports.Values |> Seq.sort |> List.ofSeq
+
+    let initCallees =
+        (aliases |> List.map (fun alias -> alias + ".@\"$init\""))
+        @ (state.Values |> Seq.map (fun (_, _, init) -> topIdent init) |> List.ofSeq)
+        |> String.concat ", "
+
+    out
+        .AppendLine("var @\"$ready\": bool = false;")
+        .AppendLine()
+        .AppendLine($"pub fn @\"$init\"() fable_rt.MayRaise(void, .{{ %s{initCallees} }}) {{")
+        .AppendLine("    if (@\"$ready\") return;")
+        .AppendLine("    @\"$ready\" = true;")
+    |> ignore
+
+    for alias in aliases do
+        out.AppendLine(
+            $"    if (comptime fable_rt.isRaised(@TypeOf(%s{alias}.@\"$init\"()))) try %s{alias}.@\"$init\"() else %s{alias}.@\"$init\"();"
+        )
+        |> ignore
+
+    for (name, _, init) in state.Values do
+        let call = topIdent init + "()"
+
+        out.AppendLine(
+            $"    %s{topIdent name} = if (comptime fable_rt.isRaised(@TypeOf(%s{call}))) try %s{call} else %s{call};"
+        )
+        |> ignore
+
+    out
+        .AppendLine("}")
+        .AppendLine()
+        .AppendLine("pub fn @\"$deinit\"() void {")
+        .AppendLine("    if (!@\"$ready\") return;")
+        .AppendLine("    @\"$ready\" = false;")
+    |> ignore
+
+    for (name, _, _) in Seq.rev state.Values do
+        out.AppendLine($"    fable_rt.drop(%s{topIdent name});") |> ignore
+
+    for alias in List.rev aliases do
+        out.AppendLine($"    %s{alias}.@\"$deinit\"();") |> ignore
+
+    out.AppendLine("}").AppendLine() |> ignore
+
     let adapters = Dictionary<string, Adapter>()
     let fns = Dictionary<string, FnInfo>()
 
@@ -1638,7 +1696,13 @@ let emitFile (state: FileState) : string =
     // In builds that count cells, a program that ends with cells still allocated says so.
     for fn in state.Fns do
         if fn.IsEntryPoint then
-            out.AppendLine("pub fn main() u8 {") |> ignore
+            out
+                .AppendLine("pub fn main() u8 {")
+                .AppendLine(
+                    "    if (comptime fable_rt.isRaised(@TypeOf(@\"$init\"()))) (@\"$init\"() catch { fable_rt.uncaught(); return 134; }) else @\"$init\"();"
+                )
+            |> ignore
+
             let call = $"%s{topIdent fn.Name}()"
 
             // (an exception that nothing handled ends the program, as on .NET)
@@ -1656,6 +1720,7 @@ let emitFile (state: FileState) : string =
                 out.AppendLine($"    const code: i32 = %s{guarded};") |> ignore
 
             out
+                .AppendLine("    @\"$deinit\"();")
                 .AppendLine("    if (fable_rt.leaked()) return 70;")
                 .AppendLine("    return @truncate(@as(u32, @bitCast(code)));")
                 .AppendLine("}")

@@ -134,3 +134,14 @@ type Tagged<'T> =
             Mark = "of"
             Item = item
         }
+
+/// (module-level values that another file reads and assigns)
+let primes = [ 2; 3; 5; 7; 11 ]
+let banner = "helpers " + string (sumList (rangeFrom 1 4))
+let mutable hits = 0
+let mutable lastSeen = "nothing"
+
+let visit (who: string) : int =
+    hits <- hits + 1
+    lastSeen <- who + "#" + string hits
+    hits

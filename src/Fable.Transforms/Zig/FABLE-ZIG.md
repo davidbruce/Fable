@@ -55,7 +55,7 @@ Types that are plain values, also when another file declares them:
 with construction, copy-and-update, field access, pattern matching and structural equality.
 A record, union, tuple or option that holds a recursive union is still a plain value; the
 references inside it are counted. Not yet: ordering comparison of anything
-but numbers, chars, booleans and strings, module-level values that are not literals, and the functions of the `List` module (literals, `::`,
+but numbers, chars, booleans and strings, and the functions of the `List` module (literals, `::`,
 patterns, `IsEmpty`, `Head` and `Tail` work).
 
 Members on records and unions are functions whose first argument is the object: properties,
@@ -64,6 +64,17 @@ declares for itself (`static member (+)`), and members of generic types, in the 
 declares the type or in another. A `ToString` that a type overrides is called where .NET
 calls it: by `x.ToString()`, `string x`, `{x}` and `%O` (`%A` does not use it, as on .NET).
 Not yet: other overrides and interface implementations, classes, object expressions.
+
+A module-level value that is not a literal is computed when the program starts: every file
+has an `$init` that first runs those of the files it uses and then fills its own values in
+their order, and `main` calls the one of its file before the entry point (an exception there
+ends the program as an unhandled one). A value has a place of its own for the whole run and
+is given up when the program ends, before the check for cells left behind. A `let mutable`
+at module level can be assigned, from its own file or another; a read of it is a reference
+of its own, because the value may be replaced while the reader still uses it.
+
+A `let mutable` inside a function that a function declared there reads or assigns is a ref
+cell that both share, which is what F# makes of it on .NET.
 
 `[<Emit("...")>]` is supported for Zig text, with `$0`, `$1`, ... standing for the arguments.
 
@@ -450,8 +461,6 @@ Not yet, each of them a compile error and not a different text:
   (they order by culture); `Split`, `Join`, `ToCharArray` and whatever else needs arrays;
   `StringBuilder`; the other functions of `System.Char` (they need Unicode's categories).
 - `string` of an option, a list or a tuple (.NET writes those differently from `%A`).
-- A function that assigns a `let mutable` of the function around it (F# turns the variable
-  into a ref cell; use `ref` for now).
 
 Appending to a string in a loop copies it each time, as on .NET. A program that declares an
 F# exception links the `%A` printer, because any exception may be asked for its message.

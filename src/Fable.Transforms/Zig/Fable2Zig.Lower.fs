@@ -12,6 +12,8 @@ type MemberKind =
     /// a function: its type parameters, the types of its arguments, and its result type
     | MFunction of typeParams: string list * argTypes: Fable.Type list * ret: Fable.Type
     | MConst of Ty
+    /// a module-level value that can be assigned
+    | MValue of Ty
 
 /// A lambda, or a function declared inside another one. It is compiled as a function of the
 /// file that takes the variables it uses from its surroundings as extra, leading parameters,
@@ -46,6 +48,9 @@ type Ctx =
         /// the names of the file's functions, to give the ones made here names of their own
         Reserved: HashSet<string>
         DecisionTargets: (Fable.Ident list * Fable.Expr) list
+        /// the `let mutable` variables that a function inside the function assigns or reads:
+        /// each is a ref cell, as F# makes it on .NET
+        Boxed: HashSet<string>
         /// inside a `with` handler: the exception it caught (for `reraise ()`)
         CaughtExn: Var option
     }
@@ -893,6 +898,15 @@ let private tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
         | _ -> None
     | _ -> None
 
+/// A module-level value of another file: its name there, and whether it can be assigned.
+let private importedValue (ctx: Ctx) (imp: Fable.ImportInfo) : (string * bool) option =
+    match imp.Kind with
+    | Fable.MemberImport memberRef ->
+        match ctx.Com.TryGetMember memberRef with
+        | Some m when m.IsValue -> Some(importAlias ctx imp.Path + "." + imp.Selector, m.IsMutable)
+        | _ -> None
+    | _ -> None
+
 /// What the type parameters of `pattern` stand for, if `actual` is an instance of it.
 let rec private unify (found: Dictionary<string, Fable.Type>) (pattern: Fable.Type) (actual: Fable.Type) : unit =
     let all (ps: Fable.Type list) (xs: Fable.Type list) =
@@ -1134,6 +1148,28 @@ let rec private (|Uncast|) (e: Fable.Expr) : Fable.Expr =
     | Fable.TypeCast(Uncast inner, _) -> inner
     | _ -> e
 
+/// A module-level value, of this file or (`alias.name`) of another.
+let private globalVar (name: string) (ty: Ty) (isMutable: bool) : Expr =
+    EVar
+        {
+            Id = 0
+            Base = name
+            Ty = ty
+            Kind = VGlobal
+            FMutable = isMutable
+        }
+
+/// Is the variable used inside a function that is declared in `e`?
+let private usedInFunction (name: string) (e: Fable.Expr) : bool =
+    let rec go (inside: bool) (e: Fable.Expr) : bool =
+        match e with
+        | Fable.IdentExpr id -> inside && id.Name = name
+        | Fable.Lambda(_, body, _)
+        | Fable.Delegate(_, body, _, _) -> go true body
+        | _ -> getSubExpressions e |> List.exists (go inside)
+
+    go false e
+
 /// A string that is certainly not null: its length needs no test.
 let rec private neverNull (e: Fable.Expr) : bool =
     match e with
@@ -1218,6 +1254,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     // (unit has one value: a variable of that type is never read)
     | Fable.IdentExpr id when isUnit id.Type -> EUnit
 
+    | Fable.IdentExpr id when ctx.Boxed.Contains id.Name && ctx.Vars.ContainsKey id.Name ->
+        EGet(EVar ctx.Vars[id.Name], PField "contents", mapType ctx id.Range id.Type)
+
     | Fable.IdentExpr id ->
         match ctx.Vars.TryGetValue id.Name with
         | true, v -> EVar v
@@ -1232,6 +1271,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         Kind = VGlobal
                         FMutable = false
                     }
+            // (what a module-level value that can be assigned holds now, as a reference of its own)
+            | true, MValue ty ->
+                ctx.State.UsesRuntime <- true
+                EEmit("fable_rt.dup($0)", [ globalVar id.Name ty true ], ty)
             | _ ->
                 match tryCallable ctx e with
                 | Some c -> fnValue ctx id.Range e c id.Type
@@ -1239,6 +1282,19 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     // a function of another file, as a value
     | Fable.Import(_, t, r) when (tryCallable ctx e).IsSome -> fnValue ctx r e (tryCallable ctx e).Value t
+
+    // a module-level value of another file
+    | Fable.Import(imp, t, r) when (importedValue ctx imp).IsSome ->
+        let ty = mapType ctx r t
+        let name, isMutable = (importedValue ctx imp).Value
+
+        if isVoid ty then
+            EUnit
+        elif isMutable then
+            ctx.State.UsesRuntime <- true
+            EEmit("fable_rt.dup($0)", [ globalVar name ty true ], ty)
+        else
+            globalVar name ty false
 
     // A function declared inside this one becomes a function of the file (see `LocalFn`).
     | Fable.Let(id, (Fable.Lambda _ | Fable.Delegate _ as fnExpr), body) when not id.IsMutable ->
@@ -1287,6 +1343,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     // a function with several arguments that is used one argument at a time
     | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
+
+    // A `let mutable` that a function inside this one uses is a ref cell, which the function
+    // and its surroundings share: that is what F# makes of it on .NET.
+    | Fable.Let(id, value, body) when id.IsMutable && not (isUnit id.Type) && usedInFunction id.Name body ->
+        let cellTy = TEnt(refEnt ctx.State, [ mapType ctx id.Range id.Type ])
+        ctx.State.UsesRuntime <- true
+        let v = ctx.State.NewVar(id.Name, cellTy, VLocal, false)
+
+        let rhs =
+            bindArgsIn true ctx [ lw ctx value ] (fun xs -> ECon(cellTy, "", xs, None))
+
+        ctx.Vars[id.Name] <- v
+        ctx.Boxed.Add id.Name |> ignore
+        ELet(v, rhs, lw ctx body)
 
     | Fable.Let(id, value, body) ->
         let rhs = lw ctx value
@@ -1655,10 +1725,34 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | _ -> fail r "the Zig target does not support this kind of assignment yet"
             )
 
+    | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, r) when ctx.Boxed.Contains id.Name ->
+        let cell = EGet(EVar ctx.Vars[id.Name], PField "contents", mapType ctx r id.Type)
+        bindArgs ctx [ lw ctx value ] (fun xs -> EStore(cell, xs.Head))
+
     | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, r) ->
-        match ctx.Vars.TryGetValue id.Name with
-        | true, v -> EAssign(v, lw ctx value)
-        | _ -> fail r "the Zig target does not support assigning to module-level values yet (`%s`)" id.Name
+        match ctx.Vars.TryGetValue id.Name, ctx.Members.TryGetValue id.Name with
+        | (true, v), _ -> EAssign(v, lw ctx value)
+        // (a module-level value: what it held is given up once the new value is in place)
+        | _, (true, MValue ty) ->
+            ctx.State.UsesRuntime <- true
+
+            bindArgs
+                ctx
+                [ lw ctx value ]
+                (fun xs ->
+                    EEmit("fable_rt.store(&$0, fable_rt.dup($1))", [ globalVar id.Name ty true; xs.Head ], tVoid)
+                )
+        | _ -> fail r "the Zig target cannot assign to `%s`" id.Name
+
+    | Fable.Set(Fable.Import(imp, t, _), Fable.ValueSet, _, value, r) when (importedValue ctx imp).IsSome ->
+        let name, _ = (importedValue ctx imp).Value
+        let ty = mapType ctx r t
+        ctx.State.UsesRuntime <- true
+
+        bindArgs
+            ctx
+            [ lw ctx value ]
+            (fun xs -> EEmit("fable_rt.store(&$0, fable_rt.dup($1))", [ globalVar name ty true; xs.Head ], tVoid))
 
     | Fable.WhileLoop(guard, body, r) ->
         let c = lw ctx guard
@@ -2633,6 +2727,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             TypeParams = []
             Reserved = reserved
             DecisionTargets = []
+            Boxed = HashSet()
             CaughtExn = None
         }
 
@@ -2708,7 +2803,13 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             reserved.Add d.Name |> ignore
 
             if info.IsValue then
-                members[d.Name] <- MConst(mapType (newCtx d.Name) d.Body.Range d.Body.Type)
+                let ty = mapType (newCtx d.Name) d.Body.Range d.Body.Type
+
+                members[d.Name] <-
+                    if info.IsMutable then
+                        MValue ty
+                    else
+                        MConst ty
             else
                 members[d.Name] <- MFunction(typeParamsOf info, d.Args |> List.map (fun a -> a.Type), d.Body.Type)
         with ZigError(msg, r) ->
@@ -2723,8 +2824,28 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             if info.IsValue then
                 match members.TryGetValue d.Name, lw ctx d.Body with
                 | (true, MConst ty), ELit(text, _) -> state.Consts.Add((d.Name, ty, text))
-                | (true, MConst _), _ ->
-                    fail d.Body.Range "the Zig target only supports literal module-level values so far (`%s`)" d.Name
+                // A value that is not a literal is computed when the program starts, by a
+                // function of its own, and kept until the program ends.
+                | (true, (MConst ty | MValue ty)), body ->
+                    if not (isVoid ty) then
+                        let init = uniqueName ctx (d.Name + "_init")
+                        state.Values.Add((d.Name, ty, init))
+
+                        state.Fns.Add
+                            {
+                                Name = init
+                                TypeParams = []
+                                Params = []
+                                Modes = []
+                                Ret = ty
+                                Body = body
+                                RetFrom = None
+                                Raises = RNever
+                                Stores = false
+                                IsLocal = false
+                                IsEntryPoint = false
+                                Range = d.Body.Range
+                            }
                 | _ -> () // its type was rejected above
             else
                 let entry = isEntryPoint info

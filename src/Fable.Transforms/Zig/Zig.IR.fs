@@ -589,6 +589,10 @@ type FileState() =
     member val LocalEnts = List<Ent>()
     /// module-level constants: name, type, literal text
     member val Consts = List<string * Ty * string>()
+
+    /// the module-level values that are computed when the program starts: name, type, and the
+    /// function that computes it
+    member val Values = List<string * Ty * string>()
     /// imports of other files: path -> local alias
     member val Imports = Dictionary<string, string>()
     /// the generated code calls the hand-written runtime (`fable_rt.zig`)
