@@ -149,7 +149,6 @@ let ``test Seq.averageBy works`` () =
     Seq.averageBy ((*) 2.) xs
     |> equal 5.
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: sums through a type's own +, a Seq.empty whose item type F# leaves open)
 [<Fact>]
 let ``test Seq.average works with custom types`` () =
     seq {MyNumber 1; MyNumber 2; MyNumber 3}
@@ -160,7 +159,6 @@ let ``test Seq.average works with custom types`` () =
 let ``test Seq.averageBy works with custom types`` () =
     seq {{ MyNumber = MyNumber 5 }; { MyNumber = MyNumber 4 }; { MyNumber = MyNumber 3 }}
     |> Seq.averageBy (fun x -> x.MyNumber) |> equal (MyNumber 4)
-#endif
 #endif
 
 [<Fact>]
@@ -557,7 +555,6 @@ let ``test Seq.sumBy works`` () =
     xs |> Seq.sumBy ((*) 2.)
     |> equal 6.
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: sums through a type's own +, a Seq.empty whose item type F# leaves open)
 [<Fact>]
 let ``test Seq.sum with non numeric types works`` () =
     let p1 = {x=1; y=10}
@@ -571,17 +568,13 @@ let ``test Seq.sumBy with non numeric types works`` () =
     let p2 = {x=2; y=20}
     [p1; p2] |> Seq.sumBy Point.Neg |> (=) {x = -3; y = -30} |> equal true
 #endif
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: sums through a type's own +, a Seq.empty whose item type F# leaves open)
 [<Fact>]
 let ``test Seq.sumBy with numeric projection works`` () =
     let p1 = {x=1; y=10}
     let p2 = {x=2; y=20}
     [p1; p2] |> Seq.sumBy (fun p -> p.y) |> equal 30
-#endif
 
-#if !FABLE_COMPILER_ZIG // (sums through a type's own + are not supported by the Zig target yet)
 [<Fact>]
 let ``test Seq.sum with non numeric types works II`` () =
     seq {MyNumber 1; MyNumber 2; MyNumber 3}
@@ -591,7 +584,6 @@ let ``test Seq.sum with non numeric types works II`` () =
 let ``test Seq.sumBy with non numeric types works II`` () =
     seq {{ MyNumber = MyNumber 5 }; { MyNumber = MyNumber 4 }; { MyNumber = MyNumber 3 }}
     |> Seq.sumBy (fun x -> x.MyNumber) |> equal (MyNumber 12)
-#endif
 
 [<Fact>]
 let ``test Seq.item works`` () =
@@ -664,7 +656,6 @@ let ``test Seq.range works with chars`` () =
     |> Seq.length
     |> equal 0
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.range works with long`` () =
     seq{1L..5L}
@@ -674,9 +665,7 @@ let ``test Seq.range works with long`` () =
     seq{1UL .. 5UL}
     |> Seq.reduce (+)
     |> equal 15UL
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.range step works with long`` () =
     seq{0L..2L..9L}
@@ -686,39 +675,30 @@ let ``test Seq.range step works with long`` () =
     seq{0UL..2UL..9UL}
     |> Seq.reduce (+)
     |> equal 20UL
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.range works with decimal`` () =
     seq{1M .. 50M}
     |> Seq.reduce (+)
     |> equal 1275M
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.range step works with decimal`` () =
     seq {-3M .. -0.4359698987M .. -50M}
     |> Seq.reduce (+)
     |> equal -2843.0340746886M
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.range works with bigint`` () =
     seq{1I..2000I}
     |> Seq.reduce (+)
     |> equal 2001000I
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.range step works with bigint`` () =
     seq {1I .. 10000000000000I .. 20000000000000000I}
     |> Seq.reduce (+)
     |> equal 19990000000000002000I
-#endif
 
 [<Fact>]
 let ``test Seq.reduce works`` () =

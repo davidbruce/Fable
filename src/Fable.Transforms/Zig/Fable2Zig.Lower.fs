@@ -5403,6 +5403,17 @@ and dotnetCall
             match lo.Type with
             | Fable.Number(Int32, _) -> "rangeInt", [ lw ctx lo; one "1"; lw ctx hi ]
             | Fable.Number(Int64, _) -> "rangeInt64", [ lw ctx lo; one "1"; lw ctx hi ]
+            | Fable.Number(UInt64, _) -> "rangeUInt64", [ lw ctx lo; one "1"; lw ctx hi ]
+            | Fable.Number(Decimal, _) -> "rangeDecimal", [ lw ctx lo; one "fable_rt.decLit(1, 0)"; lw ctx hi ]
+            | Fable.Number(BigInt, _) ->
+                "rangeBigInt",
+                [
+                    lw ctx lo
+                    (match step with
+                     | Some s -> lw ctx s
+                     | None -> EEmit("fable_rt.bigOf(@as(i32, 1))", [], mapType ctx r lo.Type))
+                    lw ctx hi
+                ]
             | Fable.Number(Float64, _) -> "rangeFloat", [ lw ctx lo; one "1.0"; lw ctx hi ]
             | Fable.Char when step.IsNone -> "rangeChar", [ lw ctx lo; lw ctx hi ]
             | other -> fail r "the Zig target does not support a range of this type yet (%A)" other

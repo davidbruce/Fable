@@ -423,18 +423,14 @@ let ``test Array.averageBy works`` () =
     Array.averageBy (fun x -> x * 2.) xs
     |> equal 5.
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test Array.average works with custom types`` () =
     [|MyNumber 1; MyNumber 2; MyNumber 3|] |> Array.average |> equal (MyNumber 2)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test Array.averageBy works with custom types`` () =
     [|{ MyNumber = MyNumber 5 }; { MyNumber = MyNumber 4 }; { MyNumber = MyNumber 3 }|]
     |> Array.averageBy (fun x -> x.MyNumber) |> equal (MyNumber 4)
-#endif
 
 [<Fact>]
 let ``test Array.choose with ints works`` () =
@@ -1132,21 +1128,17 @@ let ``test Array.sumBy works`` () =
     xs |> Array.sumBy (fun x -> x * 2.)
     |> equal 6.
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test Array.sum with non numeric types works`` () =
     let p1 = {x=1; y=10}
     let p2 = {x=2; y=20}
     [|p1; p2|] |> Array.sum |> equal {x=3;y=30}
-#endif
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test Array.sumBy with non numeric types works`` () =
     let p1 = {x=1; y=10}
     let p2 = {x=2; y=20}
     [|p1; p2|] |> Array.sumBy Point.Neg |> equal {x = -3; y = -30}
-#endif
 
 [<Fact>]
 let ``test Array.sumBy with numeric projection works`` () =
@@ -1154,18 +1146,14 @@ let ``test Array.sumBy with numeric projection works`` () =
     let p2 = {x=2; y=20}
     [|p1; p2|] |> Array.sumBy (fun p -> p.y) |> equal 30
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test Array.sum with non numeric types works II`` () =
     [|MyNumber 1; MyNumber 2; MyNumber 3|] |> Array.sum |> equal (MyNumber 6)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test Array.sumBy with non numeric types works II`` () =
     [|{ MyNumber = MyNumber 5 }; { MyNumber = MyNumber 4 }; { MyNumber = MyNumber 3 }|]
     |> Array.sumBy (fun x -> x.MyNumber) |> equal (MyNumber 12)
-#endif
 
 [<Fact>]
 let ``test Array.toList works`` () =

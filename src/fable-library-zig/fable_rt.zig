@@ -5015,7 +5015,7 @@ pub fn EnvOf(comptime Captures: type) type {
         captures: Captures,
 
         pub fn destroy(header: *Env) void {
-            const self: *Self = @fieldParentPtr("header", header);
+            const self: *Self = @alignCast(@fieldParentPtr("header", header));
             drop(self.captures);
             free(self);
         }
@@ -5038,7 +5038,7 @@ pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captu
 
 /// What the function value captured, from inside its code.
 pub inline fn captured(comptime Captures: type, env: ?*Env) *const Captures {
-    const e: *EnvOf(Captures) = @fieldParentPtr("header", env.?);
+    const e: *EnvOf(Captures) = @alignCast(@fieldParentPtr("header", env.?));
     return &e.captures;
 }
 
@@ -5185,12 +5185,12 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
 
         /// The fields of an exception of this type.
         pub inline fn of(e: Exn) *const Payload {
-            const c: *Whole = @fieldParentPtr("header", e);
+            const c: *Whole = @alignCast(@fieldParentPtr("header", e));
             return &c.payload;
         }
 
         pub fn destroy(e: Exn) void {
-            const c: *Whole = @fieldParentPtr("header", e);
+            const c: *Whole = @alignCast(@fieldParentPtr("header", e));
             drop(c.payload);
             free(c);
         }

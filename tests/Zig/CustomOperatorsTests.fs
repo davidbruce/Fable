@@ -37,12 +37,10 @@ let ``test Custom operator overloads work`` () =
     x + 2 |> equal { value = 7 }
     3 + x |> equal 10
 
-#if !FABLE_COMPILER_ZIG // (operators that call a member of a user type (SRTP) are not supported by the Zig target yet)
 [<Fact>]
 let ``test Custom operator Exp works`` () =
     let x = { value = 0 }
     x |> exp |> equal { value = 1 }
-#endif
 
 let (+) (x: int) (y: int) = x * y
 

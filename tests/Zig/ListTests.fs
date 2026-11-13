@@ -497,7 +497,6 @@ let ``test List.sumBy works`` () =
     [1; 2] |> List.sumBy (fun x -> x*2)
     |> equal 6
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test List.sum with non numeric types works`` () =
   let p1 = {x=1; y=10}
@@ -511,7 +510,6 @@ let ``test List.sumBy with non numeric types works`` () =
   let p1 = {x=1; y=10}
   let p2 = {x=2; y=20}
   [p1; p2] |> List.sumBy Point.Neg |> (=) {x = -3; y = -30} |> equal true
-#endif
 
 [<Fact>]
 let ``test List.sumBy with numeric projection works`` () =
@@ -519,18 +517,14 @@ let ``test List.sumBy with numeric projection works`` () =
   let p2 = {x=2; y=20}
   [p1; p2] |> List.sumBy (fun p -> p.y) |> equal 30
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test List.sum with non numeric types works II`` () =
     [MyNumber 1; MyNumber 2; MyNumber 3] |> List.sum |> equal (MyNumber 6)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test List.sumBy with non numeric types works II`` () =
     [{ MyNumber = MyNumber 5 }; { MyNumber = MyNumber 4 }; { MyNumber = MyNumber 3 }]
     |> List.sumBy (fun x -> x.MyNumber) |> equal (MyNumber 12)
-#endif
 
 [<Fact>]
 let ``test List.skip works`` () =
@@ -722,18 +716,14 @@ let ``test List.averageBy works`` () =
     |> List.averageBy (fun x -> x * 2.)
     |> equal 5.
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test List.average works with custom types`` () =
         [MyNumber 1; MyNumber 2; MyNumber 3] |> List.average |> equal (MyNumber 2)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
 [<Fact>]
 let ``test List.averageBy works with custom types`` () =
     [{ MyNumber = MyNumber 5 }; { MyNumber = MyNumber 4 }; { MyNumber = MyNumber 3 }]
     |> List.averageBy (fun x -> x.MyNumber) |> equal (MyNumber 4)
-#endif
 
 [<Fact>]
 let ``test List.distinct works`` () =

@@ -694,6 +694,53 @@ let rangeInt64 (start: int64) (step: int64) (stop: int64) : SeqOf<int64> =
                 Some x
     )
 
+let rangeUInt64 (start: uint64) (step: uint64) (stop: uint64) : SeqOf<uint64> =
+    if step = 0UL then
+        invalidArg "step" "The step of a range cannot be zero."
+
+    make (fun () ->
+        let mutable next = start
+        let mutable ended = start > stop
+
+        walker
+        <| fun () ->
+            if ended then
+                None
+            else
+                let x = next
+
+                // (what is left before the end, so that nothing wraps)
+                if stop - x < step then
+                    ended <- true
+                else
+                    next <- x + step
+
+                Some x
+    )
+
+/// (decimal and bigint: no wrapping to fear)
+let private rangeOf (zero: 'T) (start: 'T) (step: 'T) (stop: 'T) (add: 'T -> 'T -> 'T) : SeqOf<'T> =
+    if step = zero then
+        invalidArg "step" "The step of a range cannot be zero."
+
+    make (fun () ->
+        let mutable next = start
+
+        walker
+        <| fun () ->
+            let x = next
+
+            if (step > zero && x > stop) || (step < zero && x < stop) then
+                None
+            else
+                next <- add x step
+                Some x
+    )
+
+let rangeDecimal (start: decimal) (step: decimal) (stop: decimal) : SeqOf<decimal> = rangeOf 0m start step stop (+)
+
+let rangeBigInt (start: bigint) (step: bigint) (stop: bigint) : SeqOf<bigint> = rangeOf 0I start step stop (+)
+
 let rangeChar (start: char) (stop: char) : SeqOf<char> =
     map char (rangeInt (int start) 1 (int stop))
 

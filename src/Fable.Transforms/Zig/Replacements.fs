@@ -94,6 +94,26 @@ let private nativeOp r t (opName: string) (args: Expr list) : Expr option =
     | "Not", [ operand ] -> unOp UnaryNot operand
     | _ -> None
 
+let private gp (name: string) = GenericParam(name, false, [])
+
+/// The types FSharp.Core's `fold` takes, by the names of its type parameters (which say what the
+/// type arguments of a call of it stand for)
+let private foldSignature (moduleName: string) : Type list =
+    let source =
+        match moduleName with
+        | "Microsoft.FSharp.Collections.ListModule" -> List(gp "T")
+        | "Microsoft.FSharp.Collections.ArrayModule" -> Array(gp "T", MutableArray)
+        | _ ->
+            DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEnumerable`1"
+                    Path = CoreAssemblyName "System.Runtime"
+                },
+                [ gp "T" ]
+            )
+
+    [ LambdaType(gp "State", LambdaType(gp "T", gp "State")); gp "State"; source ]
+
 let tryCall (com: ICompiler) (ctx: Context) r t (info: CallInfo) (thisArg: Expr option) (args: Expr list) =
     let native =
         match thisArg with
@@ -125,8 +145,243 @@ let tryCall (com: ICompiler) (ctx: Context) r t (info: CallInfo) (thisArg: Expr 
             else
                 None
 
+        // `exp x` and the other functions of math, of a type that declares them (`static member
+        // Exp`): a call of that member
+        let ownMath =
+            let mathNames =
+                set
+                    [
+                        "Exp"
+                        "Log"
+                        "Log10"
+                        "Sqrt"
+                        "Sin"
+                        "Cos"
+                        "Tan"
+                        "Asin"
+                        "Acos"
+                        "Atan"
+                        "Sinh"
+                        "Cosh"
+                        "Tanh"
+                        "Floor"
+                        "Ceiling"
+                        "Round"
+                        "Truncate"
+                        "Atan2"
+                        "Pow"
+                        "op_Exponentiation"
+                    ]
+
+            let argTypes = args |> List.map (fun a -> a.Type)
+
+            match info.DeclaringEntityFullName, argTypes with
+            | "Microsoft.FSharp.Core.Operators", DeclaredType({ Path = SourcePath _ }, _) :: _ when
+                mathNames.Contains info.CompiledName
+                ->
+                let memberName =
+                    if info.CompiledName = "op_Exponentiation" then
+                        "Pow"
+                    else
+                        info.CompiledName
+
+                match argTypes with
+                | CustomOp com ctx r t memberName args e -> Some e
+                | _ -> None
+            | _ -> None
+
+        // `List.sum` and `sumBy` (of List, Array and Seq) of a type with its own `+` and `Zero`:
+        // a fold with them, as FSharp.Core's inline code is
+        let ownSum =
+            let isOwn (t: Type) =
+                match t with
+                | DeclaredType({ Path = SourcePath _ }, _) -> true
+                | _ -> false
+
+            match info.DeclaringEntityFullName, info.CompiledName, args with
+            | ("Microsoft.FSharp.Collections.ListModule" | "Microsoft.FSharp.Collections.ArrayModule" | "Microsoft.FSharp.Collections.SeqModule" as m),
+              ("Sum" | "SumBy" as name),
+              _ when isOwn t ->
+                let zero =
+                    match [ t ] with
+                    // (a property getter: it takes unit)
+                    | CustomOp com ctx r t "get_Zero" [] (Call(callee, callInfo, ty, cr)) when callInfo.Args.IsEmpty ->
+                        Some(Call(callee, { callInfo with Args = [ Value(UnitConstant, None) ] }, ty, cr))
+                    | CustomOp com ctx r t "get_Zero" [] e -> Some e
+                    | _ -> None
+
+                let acc = makeTypedIdent t "acc"
+
+                let itemType, source, project =
+                    match name, args with
+                    | "Sum", [ xs ] -> t, xs, id
+                    | _, [ f; xs ] ->
+                        let item =
+                            match f.Type with
+                            | LambdaType(a, _) -> a
+                            | DelegateType([ a ], _) -> a
+                            | _ -> Any
+
+                        item, xs, (fun x -> curriedApply r t f [ x ])
+                    | _ -> Any, Value(UnitConstant, None), id
+
+                let x = makeTypedIdent itemType "x"
+
+                match zero, [ t; t ] with
+                | Some zero, CustomOp com ctx r t "op_Addition" [ IdentExpr acc; project (IdentExpr x) ] add ->
+                    let folder = Delegate([ acc; x ], add, None, Tags.empty)
+
+                    let foldInfo =
+                        { info with
+                            CompiledName = "Fold"
+                            GenericArgs = [ itemType; t ]
+                            SignatureArgTypes = foldSignature m
+                        }
+
+                    dotnetCall r t { foldInfo with DeclaringEntityFullName = m } None [ folder; zero; source ]
+                    |> Some
+                | _ -> None
+            | _ -> None
+
+        // `List.average` and `averageBy` (of List, Array and Seq) of a type with its own `+`,
+        // `Zero` and `DivideByInt`: the sum over an array of the items, divided by their count;
+        // none raises as FSharp.Core does
+        let ownAverage =
+            let isOwn (t: Type) =
+                match t with
+                | DeclaredType({ Path = SourcePath _ }, _) -> true
+                | _ -> false
+
+            let dn (entity: string) (name: string) (args: Expr list) (ty: Type) (genArgs: Type list) =
+                let signature =
+                    match name with
+                    | "Fold" -> foldSignature entity
+                    | "Map" -> [ LambdaType(gp "T", gp "U"); Array(gp "T", MutableArray) ]
+                    | _ -> []
+
+                dotnetCall
+                    r
+                    ty
+                    { info with
+                        DeclaringEntityFullName = entity
+                        CompiledName = name
+                        GenericArgs = genArgs
+                        SignatureArgTypes = signature
+                    }
+                    None
+                    args
+
+            match info.DeclaringEntityFullName, info.CompiledName, args with
+            | ("Microsoft.FSharp.Collections.ListModule" | "Microsoft.FSharp.Collections.ArrayModule" | "Microsoft.FSharp.Collections.SeqModule" as m),
+              ("Average" | "AverageBy" as name),
+              _ when isOwn t ->
+                let source, projected =
+                    match name, args with
+                    | "Average", [ xs ] -> xs, None
+                    | _, [ f; xs ] -> xs, Some f
+                    | _ -> Value(UnitConstant, None), None
+
+                let itemType =
+                    match source.Type with
+                    | Array(item, _)
+                    | List item
+                    | DeclaredType(_, [ item ]) -> item
+                    | _ -> Any
+
+                let asArray =
+                    match m with
+                    | "Microsoft.FSharp.Collections.ArrayModule" -> source
+                    | "Microsoft.FSharp.Collections.ListModule" ->
+                        dn
+                            "Microsoft.FSharp.Collections.ArrayModule"
+                            "OfList"
+                            [ source ]
+                            (Array(itemType, MutableArray))
+                            [ itemType ]
+                    | _ ->
+                        dn
+                            "Microsoft.FSharp.Collections.ArrayModule"
+                            "OfSeq"
+                            [ source ]
+                            (Array(itemType, MutableArray))
+                            [ itemType ]
+
+                let values =
+                    match projected with
+                    | Some f ->
+                        dn
+                            "Microsoft.FSharp.Collections.ArrayModule"
+                            "Map"
+                            [ f; asArray ]
+                            (Array(t, MutableArray))
+                            [ itemType; t ]
+                    | None -> asArray
+
+                let arr = makeTypedIdent (Array(t, MutableArray)) "values"
+                let n = makeTypedIdent (Number(Int32, NumberInfo.Empty)) "count"
+                let acc = makeTypedIdent t "acc"
+                let x = makeTypedIdent t "x"
+
+                let zero =
+                    match [ t ] with
+                    | CustomOp com ctx r t "get_Zero" [] (Call(callee, callInfo, ty, cr)) when callInfo.Args.IsEmpty ->
+                        Some(Call(callee, { callInfo with Args = [ Value(UnitConstant, None) ] }, ty, cr))
+                    | CustomOp com ctx r t "get_Zero" [] e -> Some e
+                    | _ -> None
+
+                match zero, [ t; t ] with
+                | Some zero, CustomOp com ctx r t "op_Addition" [ IdentExpr acc; IdentExpr x ] add ->
+                    let sum =
+                        dn
+                            "Microsoft.FSharp.Collections.ArrayModule"
+                            "Fold"
+                            [ Delegate([ acc; x ], add, None, Tags.empty); zero; IdentExpr arr ]
+                            t
+                            [ t; t ]
+
+                    let countType = Number(Int32, NumberInfo.Empty)
+
+                    match [ t; countType ] with
+                    | CustomOp com ctx r t "DivideByInt" [ sum; IdentExpr n ] divided ->
+                        let paramName, text =
+                            if m = "Microsoft.FSharp.Collections.ArrayModule" then
+                                "array", "The input array was empty."
+                            else
+                                "source", "The input sequence was empty."
+
+                        let empty =
+                            dn
+                                "Microsoft.FSharp.Core.Operators"
+                                "InvalidArg"
+                                [ Value(StringConstant paramName, None); Value(StringConstant text, None) ]
+                                t
+                                [ t ]
+
+                        let isEmpty =
+                            Operation(Binary(BinaryEqual, IdentExpr n, makeIntConst 0), Tags.empty, Boolean, r)
+
+                        Let(
+                            arr,
+                            values,
+                            Let(
+                                n,
+                                dn "Microsoft.FSharp.Collections.ArrayModule" "Length" [ IdentExpr arr ] countType [ t ],
+                                IfThenElse(isEmpty, empty, divided, r)
+                            )
+                        )
+                        |> Some
+                    | _ -> None
+                | _ -> None
+            | _ -> None
+
         if own.IsSome then
             own
+        elif ownAverage.IsSome then
+            ownAverage
+        elif ownMath.IsSome then
+            ownMath
+        elif ownSum.IsSome then
+            ownSum
         else
 
             // pipes and composition are applications and lambdas, not library functions
