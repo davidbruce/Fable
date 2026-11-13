@@ -5705,6 +5705,14 @@ pub fn exnInner(e: Exn) Raised!Exn {
     return nullRef();
 }
 
+/// `box e.InnerException`: null when there is none, as on .NET
+pub fn exnInnerBoxed(e: Exn) Any {
+    if (e.type.inner) |f| {
+        if (f(e)) |i| return box(i);
+    }
+    return null;
+}
+
 /// `isNull e.InnerException`
 pub fn exnHasNoInner(e: Exn) bool {
     if (e.type.inner) |f| return f(e) == null;

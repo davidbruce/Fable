@@ -144,6 +144,9 @@ let call
     | _, "Invoke", f :: rest when
         (match f.Type with
          | Fable.DelegateType _ -> true
+         | Fable.DeclaredType(e, _) ->
+             e.FullName.StartsWith("System.Func`", System.StringComparison.Ordinal)
+             || e.FullName.StartsWith("System.Action", System.StringComparison.Ordinal)
          | _ -> false)
         ->
         bindArgs
@@ -406,6 +409,51 @@ let call
     | "System.Runtime.ExceptionServices.ExceptionDispatchInfo", "Capture", [ x ] -> lw ctx x
     | "System.Runtime.ExceptionServices.ExceptionDispatchInfo", "Throw", [ x ] ->
         bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx r t))
+    // (`unbox` between types kept alike, as UMX's `%` between a type and the same type with a
+    // unit of measure: the value itself)
+    | "Microsoft.FSharp.Core.Operators", "Unbox", [ x ] when
+        x.Type <> Fable.Any && mapType ctx r x.Type = mapType ctx r t
+        ->
+        lw ctx x
+    | "Microsoft.FSharp.Core.Operators", "Unbox", [ Fable.TypeCast(x, Fable.Any) ] when
+        x.Type <> Fable.Any && mapType ctx r x.Type = mapType ctx r t
+        ->
+        lw ctx x
+    // (`box e.InnerException`: null when there is none, as on .NET)
+    | "Microsoft.FSharp.Core.Operators", "Box", [ Fable.Call(Fable.Import(imp, _, _), inner, _, _) ] when
+        imp.Selector = "get_InnerException" && inner.ThisArg.IsSome
+        ->
+        ctx.State.UsesRuntime <- true
+        bindArgs ctx [ lw ctx inner.ThisArg.Value ] (fun xs -> EEmit("fable_rt.exnInnerBoxed($0)", xs, tAny))
+    // ---- `Fable.Core.Compiler`: what the compiler knows (each other target's flag is false) ----
+    | "Fable.Core.Compiler", name, [] ->
+        let str (x: string) =
+            lw ctx (Fable.Value(Fable.StringConstant x, r))
+
+        let bool (b: bool) =
+            lw ctx (Fable.Value(Fable.BoolConstant b, r))
+
+        match name with
+        | "version" -> str Literals.VERSION
+        | "majorMinorVersion" ->
+            let m = System.Text.RegularExpressions.Regex.Match(Literals.VERSION, @"^\d+\.\d+")
+
+            lw
+                ctx
+                (Fable.Value(Fable.NumberConstant(Fable.NumberValue.Float64(float m.Value), Fable.NumberInfo.Empty), r))
+        | "debugMode" -> bool ctx.Com.Options.DebugMode
+        | "typedArrays" -> bool ctx.Com.Options.TypedArrays
+        | "extension" -> str ctx.Com.Options.FileExtension
+        | "triggeredByDependency" -> bool ctx.Com.Options.TriggeredByDependency
+        | "isDotnet"
+        | "isJavaScript"
+        | "isTypeScript"
+        | "isPython"
+        | "isDart"
+        | "isRust"
+        | "isPhp"
+        | "isBeam" -> bool false
+        | _ -> fail r "the Zig target does not support Fable.Core.Compiler.%s yet" name
     // (`type C() as this`: F#'s checks that the object is made before it is used)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "CheckThis", [ x ] -> lw ctx x
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "FailInit", _ ->

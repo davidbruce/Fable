@@ -1120,6 +1120,9 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     // (a unit argument stays, as `void`: a function value has one shape whatever its type
     // parameters stand for)
     | Fable.LambdaType(arg, ret) -> TFn([ mapType ctx r arg ], mapType ctx r ret)
+    // (a delegate of no parameters, `delegate of unit -> int`: as a function value here, it takes
+    // the unit)
+    | Fable.DelegateType([], ret) -> TFn([ tVoid ], mapType ctx r ret)
     | Fable.DelegateType(args, ret) -> TFn(args |> List.map (mapType ctx r), mapType ctx r ret)
     | Fable.Tuple(ts, _) -> TTuple(ts |> List.map (mapType ctx r))
     // (`Tuple<'T>`, which F# does not write as a tuple)
@@ -2761,6 +2764,8 @@ let rec tryAddress (ir: Expr) : Expr option =
         ->
         Some ir
     | EVar v -> Some(EAddr(EVar v, not v.FMutable))
+    // (a module-level mutable value, read: its own place)
+    | EEmit("fable_rt.dup($0)", [ EVar v ], _) when v.Kind = VGlobal -> Some(EAddr(EVar v, not v.FMutable))
     | ELet(v, rhs, body) -> tryAddress body |> Option.map (fun b -> ELet(v, rhs, b))
     | ESeq(s, body) -> tryAddress body |> Option.map (fun b -> ESeq(s, b))
     | _ -> None
@@ -3086,6 +3091,26 @@ let constructorBodyWith
 
     let rec fieldsOf (e: Fable.Expr) : Fable.Expr =
         match e with
+        // (the object read through its self reference before it is made: .NET's error)
+        | Fable.Get(Fable.Get(Fable.Value(Fable.ThisValue owner, _), Fable.FieldGet _, refT, _), Fable.FieldGet ci, t, r) when
+            ci.Name = "contents" && isSelfRefType owner refT
+            ->
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "FailInit"
+                        Path =
+                            Replacements.DotnetPrefix
+                            + "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(),
+                t,
+                r
+            )
         | Fable.Get(Fable.Value(Fable.ThisValue _, _), Fable.FieldGet info, t, _) when set.ContainsKey info.Name ->
             Fable.IdentExpr set[info.Name]
         | _ ->
@@ -3825,6 +3850,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         lw ctx body
 
+    // (a delegate of no parameters takes the unit here, as its type says)
+    | Fable.Delegate([], body, name, tags) ->
+        lw ctx (Fable.Delegate([ AST.makeTypedIdent Fable.Unit "unitVar" ], body, name, tags))
     | Fable.Lambda _
     | Fable.Delegate _ ->
         let fn = liftGroup ctx e.Range [ None, "lambda", e ] |> List.head
@@ -4843,6 +4871,101 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
             lowerSeqOfGetEnumerator ctx e.Range item body
         | None -> fail e.Range "the Zig target cannot find GetEnumerator in this object expression"
+    // an object expression whose members use the object itself (`member x.Test i = x.Value - i`):
+    // they read it from a cell, which is filled with it once it is made
+    | Fable.ObjectExpr(members, ifaceType, None) when
+        isInterfaceType ctx.Com ifaceType
+        && members
+           |> List.exists (fun m ->
+               match m.Args with
+               | this :: _ -> liveUse this.Name m.Body
+               | [] -> false
+           )
+        ->
+        let optT = Fable.Option(ifaceType, false)
+
+        let refRef: Fable.EntityRef =
+            {
+                FullName = refName
+                Path = Fable.CoreAssemblyName "FSharp.Core"
+            }
+
+        let cellT = Fable.DeclaredType(refRef, [ optT ])
+        let cell = AST.makeTypedIdent cellT "objectSelf"
+        let obj = AST.makeTypedIdent ifaceType "objectMade"
+
+        // (a ref cell, as F# makes one: `ref x`, `r.Value`, `r.Value <- x`)
+        let refCall
+            (selector: string)
+            (path: string)
+            (thisArg: Fable.Expr option)
+            (args: Fable.Expr list)
+            (t: Fable.Type)
+            =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = selector
+                        Path = Replacements.DotnetPrefix + path
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = thisArg.IsSome))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                { Fable.CallInfo.Create(?thisArg = thisArg, args = args) with GenericArgs = [ optT ] },
+                t,
+                None
+            )
+
+        let self =
+            Fable.Get(
+                refCall "get_Value" refName (Some(Fable.IdentExpr cell)) [ Fable.Value(Fable.UnitConstant, None) ] optT,
+                Fable.OptionValue,
+                ifaceType,
+                None
+            )
+
+        let members =
+            members
+            |> List.map (fun m ->
+                match m.Args with
+                | this :: _ ->
+                    let rec subst (x: Fable.Expr) =
+                        match x with
+                        | Fable.IdentExpr i when i.Name = this.Name -> self
+                        | _ -> AST.visit subst x
+
+                    { m with Body = subst m.Body }
+                | [] -> m
+            )
+
+        lw
+            ctx
+            (Fable.Let(
+                cell,
+                refCall
+                    "Ref"
+                    "Microsoft.FSharp.Core.Operators"
+                    None
+                    [ Fable.Value(Fable.NewOption(None, ifaceType, false), None) ]
+                    cellT,
+                Fable.Let(
+                    obj,
+                    Fable.ObjectExpr(members, ifaceType, None),
+                    Fable.Sequential
+                        [
+                            refCall
+                                "set_Value"
+                                refName
+                                (Some(Fable.IdentExpr cell))
+                                [
+                                    Fable.Value(Fable.NewOption(Some(Fable.IdentExpr obj), ifaceType, false), None)
+                                ]
+                                Fable.Unit
+                            Fable.IdentExpr obj
+                        ]
+                )
+            ))
     | Fable.ObjectExpr(members, ifaceType, None) when isInterfaceType ctx.Com ifaceType ->
         let ifaceTy = mapType ctx e.Range ifaceType
 
@@ -5109,6 +5232,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                             (fun x want ->
                                 match x, want with
                                 | EVar v, Some isConst -> EAddr(EVar v, isConst)
+                                | EEmit("fable_rt.dup($0)", [ EVar v ], _), Some isConst when
+                                    v.Kind = VGlobal && v.FMutable
+                                    ->
+                                    EAddr(EVar v, isConst)
                                 | EAddr _, _
                                 | _, None -> x
                                 | _, Some isConst ->
@@ -5244,6 +5371,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         )
         ->
         libraryCall ctx e.Range "Async" "sourceAsDisposable" (Fable.CallInfo.Create(args = [ x ])) [ x ] e.Type
+    // (`box e.InnerException`: null when there is none)
+    | Fable.TypeCast(Fable.Call(Fable.Import(imp, _, _), info, _, _), Fable.Any) when
+        imp.Selector = "get_InnerException" && info.ThisArg.IsSome
+        ->
+        ctx.State.UsesRuntime <- true
+        bindArgs ctx [ lw ctx info.ThisArg.Value ] (fun xs -> EEmit("fable_rt.exnInnerBoxed($0)", xs, tAny))
     // `x :> obj` and `box x`: an object holds it
     | Fable.TypeCast(x, Fable.Any) when x.Type <> Fable.Any -> boxed ctx x
     // `o :?> T` of an `obj`

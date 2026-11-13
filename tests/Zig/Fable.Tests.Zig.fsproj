@@ -14,6 +14,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageReference Include="xunit.v3.mtp-off" Version="4.0.2" />
+    <PackageReference Include="FSharp.UMX" Version="1.1.0" />
     <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
@@ -65,6 +66,7 @@
     <Compile Include="QueueTests.fs" />
     <Compile Include="StackTests.fs" />
     <Compile Include="AsyncTests.fs" />
+    <Compile Include="MiscTests.fs" />
     <Compile Include="TypeTests.fs" />
     <Compile Include="ConvertTests.fs" />
     <Compile Include="NonRegressionTests.fs" />

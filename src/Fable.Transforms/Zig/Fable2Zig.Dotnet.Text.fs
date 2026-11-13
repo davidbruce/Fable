@@ -433,6 +433,29 @@ let call
         | Fable.Number _
         | Fable.Char -> ELit("0", mapType ctx r t)
         | Fable.Boolean -> ELit("false", tBool)
+        | Fable.Unit -> EUnit
+        // (a struct tuple: each item's default)
+        | Fable.Tuple(items, true) when items |> List.forall hasDefault ->
+            let defaults =
+                items
+                |> List.map (fun it ->
+                    Fable.Call(
+                        Fable.Import(
+                            {
+                                Selector = "DefaultOf"
+                                Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators.Unchecked"
+                                Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                            },
+                            Fable.Any,
+                            None
+                        ),
+                        Fable.CallInfo.Create(genArgs = [ it ]),
+                        it,
+                        r
+                    )
+                )
+
+            lw ctx (Fable.Value(Fable.NewTuple(defaults, true), r))
         | Fable.Any -> ELit("@as(fable_rt.Any, null)", tAny)
         | Fable.Option(inner, _)
         | Fable.Nullable(inner, _) -> ECon(mapType ctx r t, "None", [], None)
@@ -810,5 +833,7 @@ let call
             bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.format(.{{ %s{typedArg ctx r x 0} }})", xs, tStr))
         // (a type parameter: what the type it stands for gives, known when the Zig is compiled)
         | Fable.GenericParam _ -> rt "fable_rt.genericText($0)" [ x ] tStr
+        // (`string ()`: the empty string, as .NET's null)
+        | Fable.Unit -> ESeq(lwStmt ctx x, ELit("fable_rt.str(\"\")", tStr))
         | other -> fail r "the Zig target cannot turn a value of this type into text yet (%A)" other
     | _ -> Unchecked.defaultof<Expr>

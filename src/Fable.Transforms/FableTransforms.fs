@@ -425,7 +425,8 @@ module private Transforms =
 
         let canInlineBinding =
             match value with
-            | Import(i, _, _) -> i.IsCompilerGenerated
+            // (a read of another file's mutable value stays in place, as below)
+            | Import(i, _, _) -> i.IsCompilerGenerated && not (readsMutableValue value)
             | Call(callee, info, _, _) when List.isEmpty info.Args && List.contains "value" info.Tags ->
                 if readsMutableValue callee then
                     canInlineArg com ident.Name value letBody

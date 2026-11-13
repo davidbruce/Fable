@@ -778,6 +778,8 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
         L $"hole.* = .{{ .%s{c} = %s{cell} }};"
         L $"hole = &%s{cell}.%s{fieldIdent (fst fields[holeIdx])};"
         emitTailJump em ind args
+    // (a value that always raises: the raise, and nothing after it, which could not run)
+    | ELet(_, rhs, _) when alwaysRaises rhs -> stmt em ind rhs DDiscard
     | ELet(v, rhs, body) ->
         if not ((fv body).Contains v.Id) then
             if isFlat rhs then
