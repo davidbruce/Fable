@@ -1660,15 +1660,26 @@ let emitFile (state: FileState) : string =
         let fields (fs: (string * Ty) list) =
             fs |> List.map (fun (f, t) -> $"%s{fieldIdent f}: %s{zigType t}")
 
+        // (a type parameter none of the fields mention, a unit of measure, is `_`: Zig refuses
+        // an unused parameter)
+        let fieldText =
+            (e.Cases
+             |> List.collect (fun (_, fs) -> fs |> List.map (snd >> zigType))
+             |> String.concat " ")
+            + hookDecls e ""
+
+        let comptimeParam (g: string) =
+            if fieldText.Contains(genName g) then
+                $"comptime %s{genName g}: type"
+            else
+                "comptime _: type"
+
         // A generic type is a Zig function from its type arguments to the type.
         let opening, closing, ind =
             match e.TypeParams with
             | [] -> (fun (kind: string) -> $"pub const %s{topIdent e.Name} = %s{kind} {{"), "};", ""
             | typeParams ->
-                let comptimeParams =
-                    typeParams
-                    |> List.map (fun g -> $"comptime %s{genName g}: type")
-                    |> String.concat ", "
+                let comptimeParams = typeParams |> List.map comptimeParam |> String.concat ", "
 
                 (fun (kind: string) ->
                     $"pub fn %s{topIdent e.Name}(%s{comptimeParams}) type {{\n    return %s{kind} {{"
@@ -1695,10 +1706,7 @@ let emitFile (state: FileState) : string =
                 out.Append($"pub const %s{topIdent e.Name} = *struct {{ %s{payload} }}")
                 |> ignore
             | typeParams ->
-                let comptimeParams =
-                    typeParams
-                    |> List.map (fun g -> $"comptime %s{genName g}: type")
-                    |> String.concat ", "
+                let comptimeParams = typeParams |> List.map comptimeParam |> String.concat ", "
 
                 out.Append(
                     $"pub fn %s{topIdent e.Name}(%s{comptimeParams}) type {{\n    return *struct {{ %s{payload} }};\n}}"

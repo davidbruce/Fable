@@ -1884,7 +1884,14 @@ pub fn boxType(comptime T: type) *const ObjType {
 }
 
 pub fn comparable(comptime T: type) bool {
-    return !(isFunc(T) or T == Exn or T == Obj or (isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity")));
+    if (isFunc(T) or T == Exn or T == Obj or (isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity"))) return false;
+    // (a value of an interface: a struct of function values)
+    if (@typeInfo(T) == .@"struct") {
+        inline for (@typeInfo(T).@"struct".field_names) |name| {
+            if (comptime isFunc(@FieldType(T, name))) return false;
+        }
+    }
+    return true;
 }
 
 /// `box x` (it borrows `x`). A null string and `None` box to null, as on .NET.

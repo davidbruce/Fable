@@ -2371,6 +2371,8 @@ module Util =
 
     let isAttachMembersEntity (com: Compiler) (ent: FSharpEntity) =
         not (ent.IsFSharpModule || ent.IsInterface)
+        // (Zig: the attribute shapes classes of JavaScript and Python; members stay functions)
+        && com.Options.Language <> Zig
         && (
         // com.Options.Language = Php ||
         com.Options.Language = Rust

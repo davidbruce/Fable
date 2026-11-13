@@ -128,6 +128,22 @@ let interfaceMembers (ent: Fable.Entity) : (string * Fable.Type list * Fable.Typ
     // (a property is there as itself and as its getter)
     |> Seq.filter (fun m -> m.IsDispatchSlot && not (m.IsProperty && not m.IsGetter && not m.IsSetter))
     |> Seq.distinctBy (fun m -> m.CompiledName)
+    // (a generic member, `abstract eval<'a>: ...`, is no field of the struct: a function value
+    // has one type; calls of it are refused)
+    |> Seq.filter (fun m ->
+        let own = ent.GenericParameters |> List.map (fun g -> g.Name) |> set
+
+        let rec foreign (t: Fable.Type) =
+            match t with
+            | Fable.GenericParam(name, _, _) -> not (own.Contains name)
+            | t -> t.Generics |> List.exists foreign
+
+        let types =
+            m.ReturnParameter.Type
+            :: (m.CurriedParameterGroups |> List.concat |> List.map (fun p -> p.Type))
+
+        not (List.exists foreign types)
+    )
     |> Seq.map (fun m ->
         let args =
             match m.CurriedParameterGroups |> List.concat |> List.map (fun p -> p.Type) with
