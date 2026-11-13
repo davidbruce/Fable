@@ -493,6 +493,8 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     // (an array is equal to another with equal items, as F#'s `=` has it)
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or (eql(a.items, b.items) and std.meta.eql(a.shape, b.shape));
     if (comptime !isManaged(T) and !holdsDecimal(T)) return std.meta.eql(a, b);
+    // (a sequence is an object on .NET: equal only to itself, here the same walk and what it holds)
+    if (comptime @typeInfo(T) == .@"struct" and @hasField(T, "fable_seq")) return a.fable_seq.env == b.fable_seq.env and a.fable_seq.code == b.fable_seq.code;
     if (comptime isFunc(T)) @compileError("function values cannot be compared");
     if (T == Obj) return a == b;
     if (T == Exn) return a == b or (a.type == b.type and if (a.type.eql) |f| f(a, b) else false);

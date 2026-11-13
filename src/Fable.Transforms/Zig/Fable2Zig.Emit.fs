@@ -991,6 +991,8 @@ and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
         match e with
         | EUnit -> ()
         | _ when isVoid (typeOf e) -> L(ex em e + ";")
+        // (a local that is only discarded is still used, or Zig would reject it)
+        | EVar _ -> L $"_ = %s{ex em e};"
         | _ when isPure e -> ()
         | _ -> L $"_ = %s{ex em e};"
 

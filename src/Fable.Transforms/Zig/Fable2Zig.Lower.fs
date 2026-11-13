@@ -951,7 +951,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, []) when ent.FullName = "Microsoft.FSharp.Control.TaskBuilder" -> tVoid
     // a sequence: the record of the library's Seq.fs
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.IEnumerable`1" ->
-        TEnt(seqEnt ctx, [ mapType ctx r item ])
+        TEnt(seqEnt ctx, [ mapTypeArg ctx r item ])
     // (an entry of a map, as a `for ... in` loop over the map gives it: a pair here)
     | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Collections.Generic.KeyValuePair`2" ->
         TTuple [ mapType ctx r k; mapType ctx r v ]
@@ -2164,7 +2164,11 @@ let private libraryFunction (entity: string) (name: string) : (string * string) 
         )
     | "Microsoft.FSharp.Collections.SeqModule" when
         has
-            "Empty Singleton Delay OfList OfArray Append Map MapIndexed Filter Where Choose Collect Concat Initialize InitializeInfinite Unfold Take Truncate Skip TakeWhile SkipWhile Zip Indexed Pairwise Iterate IterateIndexed Fold ToList ToArray Length IsEmpty TryHead Head TryLast Last TryItem Item TryFind Find TryPick Pick Exists ForAll Contains Reduce Reverse Sort SortBy SortDescending Distinct Max Min MaxBy MinBy GroupBy CountBy Cache"
+            "Empty Singleton Delay OfList OfArray Append Map MapIndexed Filter Where Choose Collect Concat Initialize InitializeInfinite Unfold Take Truncate Skip TakeWhile SkipWhile Zip Indexed Pairwise Iterate IterateIndexed Fold ToList ToArray Length IsEmpty TryHead Head TryLast Last TryItem Item TryFind Find TryPick Pick Exists ForAll Contains Reduce Reverse Sort SortBy SortDescending Distinct Max Min MaxBy MinBy GroupBy CountBy Cache
+             Map2 Zip3 Scan Replicate DistinctBy Except Windowed ChunkBySize Cast ReadOnly Iterate2 Fold2 Exists2 ForAll2
+             CompareWith TryFindIndex FindIndex TryFindBack FindBack TryFindIndexBack FindIndexBack FoldBack FoldBack2
+             ExactlyOne TryExactlyOne ReduceBack SortByDescending SplitInto Permute MapFold MapFoldBack AllPairs
+             InsertAt InsertManyAt RemoveAt RemoveManyAt UpdateAt Transpose"
         ->
         Some("Seq", small name)
     | "Microsoft.FSharp.Core.Operators" when name = "CreateSequence" -> Some("Seq", "createSequence")
@@ -3485,7 +3489,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         seqRef.FullName = "System.Collections.Generic.IEnumerable`1"
         && not (isSeqType x.Type)
         ->
-        let itemTy = mapType ctx e.Range item
+        let itemTy = mapTypeArg ctx e.Range item
         let seqTy = TEnt(seqEnt ctx, [ itemTy ])
 
         match x.Type with
@@ -6339,6 +6343,45 @@ and libraryCall
                 MemberRef = None
             },
             args
+        // (a sequence of lists or arrays: each is seen as a sequence first)
+        | "Seq", "concat", [ coll; t ], [ source ] when not (isSeqType coll) ->
+            let seqT = Fable.DeclaredType(seqEntRef, [ t ])
+
+            let x: Fable.Ident =
+                {
+                    Name = "part"
+                    Type = coll
+                    IsMutable = false
+                    IsThisArgument = false
+                    IsCompilerGenerated = true
+                    Range = None
+                    IsInlineIfLambda = false
+                }
+
+            let asSeq = Fable.Lambda(x, Fable.TypeCast(Fable.IdentExpr x, seqT), None)
+
+            let mapped =
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = "Map"
+                            Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Collections.SeqModule"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    { Fable.CallInfo.Create(args = [ asSeq; source ]) with GenericArgs = [ coll; seqT ] },
+                    Fable.DeclaredType(seqEntRef, [ seqT ]),
+                    None
+                )
+
+            { info with
+                GenericArgs = [ t ]
+                SignatureArgTypes = []
+                MemberRef = None
+            },
+            [ mapped ]
         | "Seq", "concat", [ _; t ], _ ->
             { info with
                 GenericArgs = [ t ]
@@ -6366,6 +6409,13 @@ and libraryCall
     // (where FSharp.Core takes a sequence and is given a list, the library takes the list; an
     // empty value whose item type F# left open, `obj` on .NET, gets `unit`: nothing can depend
     // on it)
+    // (`Seq.empty` whose type argument Fable gives as `obj`: the result's type says it)
+    let info =
+        match file, fn, info.GenericArgs, t with
+        | "Seq", "empty", [ Fable.Any ], Fable.DeclaredType(_, [ item ]) when item <> Fable.Any ->
+            { info with GenericArgs = [ item ] }
+        | _ -> info
+
     // (a function of one type argument: an untyped `None` given to it is of that type)
     let emptyItem =
         match info.GenericArgs with
