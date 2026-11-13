@@ -1127,6 +1127,18 @@ let isWitnessClass (ctx: Ctx) (entRef: Fable.EntityRef) : bool =
         | None -> false
     | _ -> false
 
+/// .NET's types of regular expressions, as the records of the library's Regex.fs
+let regexTypes =
+    dict
+        [
+            "System.Text.RegularExpressions.Regex", "RegexOf"
+            "System.Text.RegularExpressions.Match", "MatchOf"
+            "System.Text.RegularExpressions.Group", "GroupOf"
+            "System.Text.RegularExpressions.Capture", "GroupOf"
+            "System.Text.RegularExpressions.MatchCollection", "MatchCollectionOf"
+            "System.Text.RegularExpressions.GroupCollection", "GroupCollectionOf"
+        ]
+
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
     | Fable.Unit -> tVoid
@@ -1222,6 +1234,10 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         let file, record = libraryValueTypes[ent.FullName]
         TEnt(libRecordEnt ctx file record, [])
     // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
+    // (.NET's regular expressions: records of the library's Regex.fs)
+    | Fable.Regex -> TEnt(libRecordEnt ctx "Regex" "RegexOf", [])
+    | Fable.DeclaredType(ent, []) when regexTypes.ContainsKey ent.FullName ->
+        TEnt(libRecordEnt ctx "Regex" regexTypes[ent.FullName], [])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Diagnostics.Stopwatch" ->
         TEnt(libRecordEnt ctx "Stopwatch" "StopwatchOf", [])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
@@ -4704,6 +4720,22 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             let v = ctx.State.NewVar("enumerable", mapType ctx e.Range x.Type, VLocal, false)
             ctx.Vars[obj.Name] <- v
             ELet(v, lw ctx x, lowerSeqOfGetEnumerator ctx e.Range item getEnumerator)
+        // (the matches and the groups of a regular expression)
+        | Fable.DeclaredType(coll, []) when
+            coll.FullName = "System.Text.RegularExpressions.MatchCollection"
+            || coll.FullName = "System.Text.RegularExpressions.GroupCollection"
+            ->
+            libraryCall
+                ctx
+                e.Range
+                "Regex"
+                (if coll.FullName.EndsWith("MatchCollection", System.StringComparison.Ordinal) then
+                     "matchesToSeq"
+                 else
+                     "groupsToSeq")
+                (Fable.CallInfo.Create(args = [ x ]))
+                [ x ]
+                e.Type
         // (a string: its chars)
         | Fable.String ->
             let chars = TEnt(arrayEnt ctx.State, [ TPrim "u16" ])
@@ -7292,6 +7324,50 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
         Some(lw ctx inner, "list")
     | Fable.String -> Some(lw ctx inner, "string")
     | t when isSeqType t -> Some(lw ctx inner, "seq")
+    // (the matches and the groups of a regular expression: their sequences)
+    | Fable.DeclaredType(coll, []) when
+        coll.FullName = "System.Text.RegularExpressions.MatchCollection"
+        || coll.FullName = "System.Text.RegularExpressions.GroupCollection"
+        ->
+        let isMatches =
+            coll.FullName.EndsWith("MatchCollection", System.StringComparison.Ordinal)
+
+        let item =
+            Fable.DeclaredType(
+                {
+                    FullName =
+                        (if isMatches then
+                             "System.Text.RegularExpressions.Match"
+                         else
+                             "System.Text.RegularExpressions.Group")
+                    Path = Fable.CoreAssemblyName "System.Text.RegularExpressions"
+                },
+                []
+            )
+
+        let seqType =
+            Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEnumerable`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ item ]
+            )
+
+        Some(
+            libraryCall
+                ctx
+                None
+                "Regex"
+                (if isMatches then
+                     "matchesToSeq"
+                 else
+                     "groupsToSeq")
+                (Fable.CallInfo.Create(args = [ inner ]))
+                [ inner ]
+                seqType,
+            "seq"
+        )
     | Fable.Array(_, Fable.ResizeArray) ->
         Some(
             bindArgs

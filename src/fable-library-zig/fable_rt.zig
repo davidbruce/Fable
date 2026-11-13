@@ -2059,7 +2059,10 @@ pub fn anyToClass(o: Any, ty: *const ObjType) Raised!Obj {
 }
 
 /// `unbox<T> o` and `o :?> T`
-pub fn unbox(comptime T: type, o: Any) Raised!T {
+pub fn unbox(comptime T: type, x: anytype) Raised!T {
+    // (a value that is a `T` already, as the items of a typed sequence that F# sees as objects)
+    if (comptime @TypeOf(x) == T and T != Any) return dup(x);
+    const o: Any = x;
     if (T == Any) return dup(o);
     const p = o orelse {
         if (comptime @typeInfo(T) == .optional) return null;

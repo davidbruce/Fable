@@ -543,6 +543,157 @@ let call
                 Args = args
             }
             t
+    // ---- regular expressions: the library's Regex.fs ----
+    | ("System.Text.RegularExpressions.Regex" | "System.Text.RegularExpressions.Match" | "System.Text.RegularExpressions.Group" | "System.Text.RegularExpressions.Capture" | "System.Text.RegularExpressions.MatchCollection" | "System.Text.RegularExpressions.GroupCollection"),
+      name,
+      args ->
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "Regex"
+                fn
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                xs
+                t
+
+        let typeName (x: Fable.Expr) =
+            match x.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName.Substring(e.FullName.LastIndexOf '.' + 1)
+            | _ -> ""
+
+        let regexType =
+            Fable.DeclaredType(
+                {
+                    FullName = "System.Text.RegularExpressions.Regex"
+                    Path = Fable.CoreAssemblyName "System.Text.RegularExpressions"
+                },
+                []
+            )
+
+        let int32 (x: Fable.Expr) =
+            Fable.TypeCast(x, Fable.Number(Int32, Fable.NumberInfo.Empty))
+
+        let zero =
+            Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 0, Fable.NumberInfo.Empty), None)
+
+        // (a static member's regex: a new one of the pattern and the options)
+        let made (pattern: Fable.Expr) (options: Fable.Expr option) =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = ".ctor"
+                        Path = Replacements.DotnetPrefix + "System.Text.RegularExpressions.Regex"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(
+                    args =
+                        (match options with
+                         | Some o -> [ pattern; o ]
+                         | None -> [ pattern ])
+                ),
+                regexType,
+                r
+            )
+
+        let isString (x: Fable.Expr) = x.Type = Fable.String
+
+        // (a MatchEvaluator: a function of the match)
+        let replaceIn (re: Fable.Expr) (input: Fable.Expr) (rep: Fable.Expr) (rest: Fable.Expr list) =
+            let fn, count =
+                if isString rep then
+                    "replace", "replaceCount"
+                else
+                    "replaceWith", "replaceWithCount"
+
+            match rest with
+            | [] -> call fn [ re; input; rep ]
+            | [ c ] -> call count [ re; input; rep; c ]
+            | [ c; s ] ->
+                call
+                    (fn
+                     + if isString rep then
+                           "From"
+                       else
+                           "From")
+                    [ re; input; rep; c; s ]
+            | _ -> fail r "the Zig target does not support this Regex.Replace yet"
+
+        let isRegex (x: Fable.Expr) =
+            x.Type = Fable.Regex || typeName x = "Regex"
+
+        let isMatch (x: Fable.Expr) = typeName x = "Match"
+
+        match name, args with
+        // Regex
+        | ".ctor", [ p ] -> call "ofPattern" [ p ]
+        | ".ctor", [ p; o ] -> call "create" [ p; int32 o ]
+        | ".ctor", [ p; o; _timeout ] -> call "create" [ p; int32 o ]
+        | "Escape", [ s ] -> call "escape" [ s ]
+        | "Unescape", [ s ] -> call "unescape" [ s ]
+        | "IsMatch", [ re; s ] when isRegex re -> call "isMatch" [ re; s ]
+        | "IsMatch", [ re; s; at ] when isRegex re -> call "isMatchFrom" [ re; s; at ]
+        | "IsMatch", s :: p :: rest -> call "isMatch" [ made p (List.tryHead rest); s ]
+        | "Match", [ re; s ] when isRegex re -> call "matchOf" [ re; s ]
+        | "Match", [ re; s; at ] when isRegex re -> call "matchFrom" [ re; s; at ]
+        | "Match", s :: p :: rest -> call "matchOf" [ made p (List.tryHead rest); s ]
+        | "Matches", [ re; s ] when isRegex re -> call "matches" [ re; s ]
+        | "Matches", [ re; s; at ] when isRegex re -> call "matchesFrom" [ re; s; at ]
+        | "Matches", s :: p :: rest -> call "matches" [ made p (List.tryHead rest); s ]
+        | "Replace", re :: s :: rep :: rest when isRegex re -> replaceIn re s rep rest
+        | "Replace", s :: p :: rep :: rest -> replaceIn (made p (List.tryHead rest)) s rep []
+        | "Split", [ re; s ] when isRegex re -> call "split" [ re; s ]
+        | "Split", [ re; s; c ] when isRegex re -> call "splitCount" [ re; s; c ]
+        | "Split", [ re; s; c; at ] when isRegex re -> call "splitFrom" [ re; s; c; at ]
+        | "Split", s :: p :: rest -> call "split" [ made p (List.tryHead rest); s ]
+        | "get_Options", [ re ] -> call "options" [ re ]
+        | "GetGroupNames", [ re ] -> call "getGroupNames" [ re ]
+        | "GetGroupNumbers", [ re ] -> call "getGroupNumbers" [ re ]
+        | "ToString", [ re ] when isRegex re -> call "toString" [ re ]
+        // Match (also a Group), Group
+        | "get_Groups", [ m ] -> call "groups" [ m ]
+        | "NextMatch", [ m ] -> call "nextMatch" [ m ]
+        | ("get_Success" | "get_Index" | "get_Length" | "get_Value" | "get_Name"), [ g ] ->
+            let field = name.Substring 4
+
+            call
+                ((if isMatch g then
+                      "match"
+                  else
+                      "group")
+                 + field)
+                [ g ]
+        | "ToString", [ g ] ->
+            call
+                (if isMatch g then
+                     "matchValue"
+                 else
+                     "groupToString")
+                [ g ]
+        // the collections
+        | "get_Count", [ c ] ->
+            call
+                (if typeName c = "MatchCollection" then
+                     "matchesCount"
+                 else
+                     "groupsCount")
+                [ c ]
+        | "get_Item", [ c; i ] when typeName c = "MatchCollection" -> call "matchAt" [ c; i ]
+        | "get_Item", [ c; key ] when isString key -> call "groupNamed" [ c; key ]
+        | "get_Item", [ c; i ] -> call "groupAt" [ c; i ]
+        | _ ->
+            fail
+                r
+                "the Zig target does not support %s.%s with these arguments yet"
+                (entity.Substring(entity.LastIndexOf '.' + 1))
+                name
     // ---- `System.Diagnostics.Stopwatch` and `Thread.Sleep`: the library's Stopwatch.fs ----
     | ("System.Diagnostics.Stopwatch" | "System.Threading.Thread"), name, args ->
         let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]

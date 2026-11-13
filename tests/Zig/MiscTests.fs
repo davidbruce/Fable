@@ -535,12 +535,10 @@ let ``test can check compiler version with constant`` () =
 
     equal 41 x
 
-#if !FABLE_COMPILER_ZIG // (Regex)
 [<Fact>]
 let ``test Can check compiler version at runtime`` () =
     Compiler.majorMinorVersion >=  3.0 |> equal true
     Text.RegularExpressions.Regex.IsMatch(Compiler.version, @"^\d+\.\d+") |> equal true
-#endif
 
 [<Fact>]
 let ``test Can access compiler options`` () =

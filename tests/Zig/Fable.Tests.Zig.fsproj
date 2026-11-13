@@ -83,5 +83,6 @@
     <Compile Include="DateOnlyTests.fs" />
     <Compile Include="TimeOnlyTests.fs" />
     <Compile Include="DateTimeOffsetTests.fs" />
+    <Compile Include="RegexTests.fs" />
   </ItemGroup>
 </Project>

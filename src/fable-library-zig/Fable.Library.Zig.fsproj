@@ -26,6 +26,7 @@
     <Compile Include="DateTimeOffset.fs" />
     <Compile Include="Guid.fs" />
     <Compile Include="Stopwatch.fs" />
+    <Compile Include="Regex.fs" />
     <Compile Include="Async.fs" />
     <Compile Include="Task.fs" />
     <Compile Include="Map.fs" />

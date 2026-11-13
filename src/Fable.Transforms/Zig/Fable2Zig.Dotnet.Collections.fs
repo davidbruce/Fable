@@ -118,6 +118,26 @@ let call
                 [ a; i; n; v ]
         | [ i; n; v; c ] -> arrayLib "binarySearchWith" [ a; i; n; v; c ]
         | _ -> fail r "the Zig target does not support this Array.BinarySearch yet"
+    // `Seq.cast<'T> xs` of a collection whose items are `'T` already: the collection as a sequence
+    | "Microsoft.FSharp.Collections.SeqModule", "Cast", [ Uncast source ] when
+        (match t with
+         | Fable.DeclaredType(seqRef, [ item ]) when seqRef.FullName = "System.Collections.Generic.IEnumerable`1" ->
+             match source.Type with
+             | Fable.Array(x, _)
+             | Fable.List x -> x = item
+             | Fable.DeclaredType(e, [ x ]) when e.FullName = "System.Collections.Generic.IEnumerable`1" -> x = item
+             | Fable.DeclaredType(e, []) when e.FullName = "System.Text.RegularExpressions.MatchCollection" ->
+                 (match item with
+                  | Fable.DeclaredType(i, []) -> i.FullName = "System.Text.RegularExpressions.Match"
+                  | _ -> false)
+             | Fable.DeclaredType(e, []) when e.FullName = "System.Text.RegularExpressions.GroupCollection" ->
+                 (match item with
+                  | Fable.DeclaredType(i, []) -> i.FullName = "System.Text.RegularExpressions.Group"
+                  | _ -> false)
+             | _ -> false
+         | _ -> false)
+        ->
+        lw ctx (Fable.TypeCast(source, t))
     | "Microsoft.FSharp.Collections.ComparisonIdentity", "FromFunction", [ f ] -> arrayLib "comparerOfFunction" [ f ]
     | "Microsoft.FSharp.Collections.ComparisonIdentity", "Structural", [] ->
         arrayLib "structuralComparer" [ Fable.Value(Fable.UnitConstant, None) ]

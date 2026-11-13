@@ -963,7 +963,6 @@ let ``test Type testing in pattern matching`` () =
 //     match x with | :? ITest2 -> true | _ -> false
 //     |> equal false
 
-#if !FABLE_COMPILER_ZIG // (Regex)
 [<Fact>]
 let ``test Type testing with PY primitive types works`` () =
     let test (o: obj) =
@@ -991,7 +990,6 @@ let ``test Type testing with PY primitive types works`` () =
 
     [| "A" |] :> obj |> test |> equal "Array"
     [| 1; 2 |] :> obj |> test |> equal "Array"
-#endif
 
 [<Fact>]
 let ``test Type test with Date`` () =
@@ -1111,7 +1109,6 @@ let ``test Statically resolved static calls work`` () =
     showStatic a |> equal "Static: 5"
     showStatic b |> equal "Static: five"
 
-#if !FABLE_COMPILER_ZIG // (Regex)
 [<Fact>]
 let ``test Guid.NewGuid works`` () =
     let g1 = Guid.NewGuid()
@@ -1125,7 +1122,6 @@ let ``test Guid.NewGuid works`` () =
 
     let g3 = Guid.Parse s1
     g1 = g3 |> equal true
-#endif
 
 [<Fact>]
 let ``test Guid.Empty works`` () =
