@@ -7036,11 +7036,59 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         c.FullName = o.FullName && isConstructorCall com call
                         ->
                         Fable.Call(callee, call, chainType o, r)
+                    // (`new(x) = { X = x; ... }` of a class without a base: its fields are the
+                    // whole chain)
+                    | Fable.Value(Fable.NewRecord(values, ent, _), r) when
+                        ent.FullName = o.FullName
+                        && o.Parent.IsNone
+                        && values.Length = (caseFields (TEnt(o.Part, [])) "").Length
+                        ->
+                        let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, []), r)
+                        Fable.Value(Fable.NewRecord([ own ], o.Chain.Ref, []), r)
                     | Fable.Let(id, v, b) -> Fable.Let(id, v, chainTail b)
                     | Fable.LetRec(bs, b) -> Fable.LetRec(bs, chainTail b)
                     | Fable.Sequential xs ->
-                        let rev = List.rev xs
-                        Fable.Sequential(List.rev (chainTail rev.Head :: rev.Tail))
+                        // (`inherit obj()`, which F# puts first, makes nothing here)
+                        let xs =
+                            xs
+                            |> List.filter (fun x ->
+                                match x with
+                                | Fable.Call(Fable.Import(imp, _, _), _, _, _) ->
+                                    not (
+                                        imp.Selector = ".ctor"
+                                        && imp.Path = Replacements.DotnetPrefix + "System.Object"
+                                    )
+                                | _ -> true
+                            )
+
+                        match List.rev xs, o.Parent with
+                        | [ x ], _ -> chainTail x
+                        // (`{ inherit Base(args); Own = x }`: the base's chain, then this class's
+                        // part)
+                        | Fable.Value(Fable.NewRecord(values, ent, _), r) :: Fable.Call(callee,
+                                                                                        call,
+                                                                                        Fable.DeclaredType(baseRef, _),
+                                                                                        cr) :: before,
+                          Some p when
+                            ent.FullName = o.FullName
+                            && baseRef.FullName = p.FullName
+                            && isConstructorCall com call
+                            && values.Length = (caseFields (TEnt(o.Part, [])) "").Length
+                            ->
+                            let baseId = AST.makeTypedIdent (chainType p) "base_chain"
+                            let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, []), r)
+
+                            let made =
+                                Fable.Let(
+                                    baseId,
+                                    Fable.Call(callee, call, chainType p, cr),
+                                    Fable.Value(Fable.NewRecord([ Fable.IdentExpr baseId; own ], o.Chain.Ref, []), r)
+                                )
+
+                            match before with
+                            | [] -> made
+                            | _ -> Fable.Sequential(List.rev before @ [ made ])
+                        | rev, _ -> Fable.Sequential(List.rev (chainTail rev.Head :: rev.Tail))
                     | Fable.IfThenElse(c, a, b, r) -> Fable.IfThenElse(c, chainTail a, chainTail b, r)
                     | Fable.TypeCast(x, _) -> chainTail x
                     | _ ->
