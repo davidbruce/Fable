@@ -346,7 +346,10 @@ large raises `OverflowException`. Conversions from floats keep 15 significant di
 `float32`). Formatting (`string`, `%M`, `%f`, `%A`, `ToString("F2")`) rounds a tie away from
 zero, as .NET's formatting does. Values that hold decimals are compared by value (`1.0m =
 1.00m`), also inside records and tuples. `x.ToString("N2")` works for every number type with
-.NET's standard formats; custom patterns (`"0.00"`) do not yet.
+.NET's standard formats and its custom patterns (`"0.00"`, `"#,##0"`, `"0%"`, sections
+`"0.0;(0.0);zero"`, scaling commas, `"0.00E+0"`, quoted text), with .NET's rounding: a double
+keeps 15 significant digits, then digits are rounded half away from zero (`(1.005).ToString
+"0.00"` is `1.01`, as on .NET). The same holds in `String.Format` and interpolated strings.
 
 `open Checked`: `+`, `-`, `*`, unary `-` of whole numbers and the conversions raise
 `OverflowException` where the result does not fit, as on .NET.

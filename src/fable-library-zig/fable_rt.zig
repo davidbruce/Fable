@@ -4296,7 +4296,262 @@ fn fraction(t: *Text, d: *const Decimal, places: i32) void {
 
 /// A number as .NET's `ToString(format)` writes it in the invariant culture, for the
 /// standard formats: D, X, B, N, F, E, G, R, P and C with an optional precision.
+/// The `n`-th section of a custom format (`positive;negative;zero`), or null.
+fn customSection(fmt: []const u8, n: usize) ?[]const u8 {
+    var start: usize = 0;
+    var k: usize = 0;
+    var i: usize = 0;
+    while (i < fmt.len) : (i += 1) {
+        const c = fmt[i];
+        if (c == '\\') {
+            i += 1;
+        } else if (c == '\'' or c == '"') {
+            i += 1;
+            while (i < fmt.len and fmt[i] != c) i += 1;
+        } else if (c == ';') {
+            if (k == n) return fmt[start..i];
+            k += 1;
+            start = i + 1;
+        }
+    }
+    if (k == n) return fmt[start..];
+    return null;
+}
+
+/// .NET's `FindSection`: the section for a negative number (1) or a zero (2), or the first
+/// when the format has no such section or it is empty.
+fn customFind(fmt: []const u8, n: usize) usize {
+    if (n == 0) return 0;
+    const s = customSection(fmt, n) orelse return 0;
+    return if (s.len == 0) 0 else n;
+}
+
+/// A number in one of .NET's custom formats (`0.00`, `#,##0`, `0%`, `0.0;(0.0);zero`,
+/// `0.00E+0`, quoted text), as .NET's `NumberToStringFormat` writes it: a double keeps 15
+/// significant digits (a float32 7), digits are rounded half away from zero, and digits beyond
+/// the placeholders before the point all go where the first placeholder is.
+fn customText(fmt: []const u8, value: anytype, out: []u8) []const u8 {
+    const T = @TypeOf(value);
+    const is_dec = comptime isDecimal(T);
+    const is_float = comptime !is_dec and @typeInfo(T) == .float;
+    var t: Text = .{ .buf = out };
+    var negative: bool = undefined;
+    var number: Decimal = .{};
+    if (is_dec) {
+        number = decDigits(value);
+        negative = value.m < 0;
+    } else if (is_float) {
+        if (std.math.isNan(value)) return "NaN";
+        if (std.math.isInf(value)) return if (value > 0) "Infinity" else "-Infinity";
+        negative = std.math.signbit(value);
+        number = Decimal.exact(@abs(@as(f64, value)));
+        number.roundTo(if (T == f32) 7 else 15, false);
+    } else {
+        negative = value < 0;
+        if (value != 0) {
+            const text = std.fmt.bufPrint(&number.digits, "{d}", .{@abs(@as(i128, value))}) catch unreachable;
+            for (number.digits[0..text.len]) |*c| c.* -= '0';
+            number.len = text.len;
+            number.point = @intCast(text.len);
+        }
+    }
+    while (number.len > 0 and number.digits[number.len - 1] == 0) number.len -= 1;
+
+    var section: usize = if (number.len == 0) customFind(fmt, 2) else if (negative) customFind(fmt, 1) else 0;
+    while (true) {
+        const sec = customSection(fmt, section).?;
+        // what the section asks for
+        var digit_count: i32 = 0;
+        var decimal_pos: i32 = -1;
+        var first_digit: i32 = std.math.maxInt(i32);
+        var last_digit: i32 = 0;
+        var scientific = false;
+        var thousand_pos: i32 = -1;
+        var thousand_count: i32 = 0;
+        var thousand_seps = false;
+        var scale_adjust: i32 = 0;
+        var i: usize = 0;
+        while (i < sec.len) : (i += 1) {
+            const c = sec[i];
+            switch (c) {
+                '#' => digit_count += 1,
+                '0' => {
+                    if (first_digit == std.math.maxInt(i32)) first_digit = digit_count;
+                    digit_count += 1;
+                    last_digit = digit_count;
+                },
+                '.' => {
+                    if (decimal_pos < 0) decimal_pos = digit_count;
+                },
+                ',' => {
+                    if (digit_count > 0 and decimal_pos < 0) {
+                        if (thousand_pos >= 0) {
+                            if (thousand_pos == digit_count) {
+                                thousand_count += 1;
+                                continue;
+                            }
+                            thousand_seps = true;
+                        }
+                        thousand_pos = digit_count;
+                        thousand_count = 1;
+                    }
+                },
+                '%' => scale_adjust += 2,
+                '\'', '"' => {
+                    i += 1;
+                    while (i < sec.len and sec[i] != c) i += 1;
+                },
+                '\\' => i += 1,
+                'E', 'e' => {
+                    if ((i + 1 < sec.len and sec[i + 1] == '0') or (i + 2 < sec.len and (sec[i + 1] == '+' or sec[i + 1] == '-') and sec[i + 2] == '0')) {
+                        scientific = true;
+                        i += 1;
+                        if (sec[i] == '+' or sec[i] == '-') i += 1;
+                        while (i + 1 < sec.len and sec[i + 1] == '0') i += 1;
+                    }
+                },
+                else => {},
+            }
+        }
+        if (decimal_pos < 0) decimal_pos = digit_count;
+        if (thousand_pos >= 0) {
+            if (thousand_pos == decimal_pos) {
+                scale_adjust -= thousand_count * 3;
+            } else {
+                thousand_seps = true;
+            }
+        }
+
+        var d = number;
+        if (d.len != 0) {
+            d.point += scale_adjust;
+            const pos = if (scientific) digit_count else d.point + digit_count - decimal_pos;
+            d.roundTo(pos, false);
+            while (d.len > 0 and d.digits[d.len - 1] == 0) d.len -= 1;
+            if (d.len == 0) {
+                d.point = 0;
+                if (!is_float) negative = false;
+                const z = customFind(fmt, 2);
+                if (z != section) {
+                    section = z;
+                    continue;
+                }
+            }
+        } else {
+            if (!is_float) negative = false;
+            d.point = 0;
+        }
+
+        const first: i32 = if (first_digit < decimal_pos) decimal_pos - first_digit else 0;
+        const last: i32 = if (last_digit > decimal_pos) decimal_pos - last_digit else 0;
+        var dig_pos: i32 = undefined;
+        var adjust: i32 = undefined;
+        if (scientific) {
+            dig_pos = decimal_pos;
+            adjust = 0;
+        } else {
+            dig_pos = @max(d.point, decimal_pos);
+            adjust = d.point - decimal_pos;
+        }
+        var di: usize = 0;
+        if (negative and section == 0 and d.point != 0) t.put('-');
+        var decimal_written = false;
+        const sep = struct {
+            fn at(seps: bool, pos: i32) bool {
+                return seps and pos > 1 and @mod(pos - 1, 3) == 0;
+            }
+        };
+        var exponent_done = false;
+        i = 0;
+        while (i < sec.len) : (i += 1) {
+            const c = sec[i];
+            switch (c) {
+                '#', '0' => {
+                    var ch: u8 = 0;
+                    if (adjust < 0) {
+                        adjust += 1;
+                        ch = if (dig_pos <= first) '0' else 0;
+                    } else {
+                        while (adjust > 0) : (adjust -= 1) {
+                            if (di < d.len) {
+                                t.put('0' + d.digits[di]);
+                                di += 1;
+                            } else t.put('0');
+                            if (sep.at(thousand_seps, dig_pos)) t.put(',');
+                            dig_pos -= 1;
+                        }
+                        if (di < d.len) {
+                            ch = '0' + d.digits[di];
+                            di += 1;
+                        } else {
+                            ch = if (dig_pos > last) '0' else 0;
+                        }
+                    }
+                    if (ch != 0) {
+                        t.put(ch);
+                        if (sep.at(thousand_seps, dig_pos)) t.put(',');
+                    }
+                    dig_pos -= 1;
+                },
+                '.' => {
+                    if (dig_pos == 0 and !decimal_written and (last < 0 or (decimal_pos < digit_count and di < d.len))) {
+                        t.put('.');
+                        decimal_written = true;
+                    }
+                },
+                ',' => {},
+                '\'', '"' => {
+                    i += 1;
+                    while (i < sec.len and sec[i] != c) : (i += 1) t.put(sec[i]);
+                },
+                '\\' => {
+                    i += 1;
+                    if (i < sec.len) t.put(sec[i]);
+                },
+                'E', 'e' => {
+                    var positive_sign = false;
+                    var zeros: u8 = 0;
+                    if (scientific and !exponent_done and i + 1 < sec.len and (sec[i + 1] == '0' or (i + 2 < sec.len and (sec[i + 1] == '+' or sec[i + 1] == '-') and sec[i + 2] == '0'))) {
+                        var j = i + 1;
+                        if (sec[j] == '+') positive_sign = true;
+                        if (sec[j] == '+' or sec[j] == '-') j += 1;
+                        while (j < sec.len and sec[j] == '0') : (j += 1) zeros += 1;
+                        i = j - 1;
+                        const e: i32 = if (d.len == 0) 0 else d.point - decimal_pos;
+                        t.put(c);
+                        if (e < 0) t.put('-') else if (positive_sign) t.put('+');
+                        var buf: [12]u8 = undefined;
+                        const digits = std.fmt.bufPrint(&buf, "{d}", .{@abs(e)}) catch unreachable;
+                        var pad: i32 = @as(i32, @min(zeros, 10)) - @as(i32, @intCast(digits.len));
+                        while (pad > 0) : (pad -= 1) t.put('0');
+                        for (digits) |x| t.put(x);
+                        exponent_done = true;
+                    } else {
+                        t.put(c);
+                    }
+                },
+                else => t.put(c),
+            }
+        }
+        if (negative and section == 0 and d.point == 0 and t.len > 0) {
+            std.mem.copyBackwards(u8, out[1 .. t.len + 1], out[0..t.len]);
+            out[0] = '-';
+            t.len += 1;
+        }
+        return out[0..t.len];
+    }
+}
+
+fn isStandardFormat(comptime fmt: []const u8) bool {
+    if (fmt.len == 0 or fmt.len > 3 or !std.ascii.isAlphabetic(fmt[0])) return false;
+    for (fmt[1..]) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
 fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
+    if (comptime !isStandardFormat(fmt)) return customText(fmt, value, out);
     const T = @TypeOf(value);
     const isDec = comptime isDecimal(T);
     const whole = !isDec and @typeInfo(T) == .int;

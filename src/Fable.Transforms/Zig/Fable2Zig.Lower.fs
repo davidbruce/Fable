@@ -98,6 +98,22 @@ let private exprKind (e: Fable.Expr) =
     | Fable.Extended _ -> "raise"
     | _ -> "this construct"
 
+/// .NET's standard numeric formats (`N2`); anything else is a custom one (`0.00`).
+let private isStandardNetFormat (net: string) =
+    System.Text.RegularExpressions.Regex.IsMatch(net, "^[A-Za-z][0-9]{0,2}$")
+
+/// A .NET numeric format the runtime knows: a standard one, or a custom one of ASCII text.
+let private checkNetFormat (r: SourceLocation option) (net: string) =
+    if isStandardNetFormat net then
+        if not (System.Text.RegularExpressions.Regex.IsMatch(net, "^[DdXxBbNnFfEeGgRrPpCc][0-9]{0,2}$")) then
+            fail r "the Zig target does not support the .NET format `%s` yet" net
+    elif net |> Seq.exists (fun c -> int c > 127) then
+        fail r "the Zig target does not support a .NET format with characters beyond ASCII yet (`%s`)" net
+
+/// Text inside a Zig string literal.
+let private zigEscape (text: string) =
+    text.Replace("\\", "\\\\").Replace("\"", "\\\"")
+
 /// The function that implements a member of an interface for a type: `Counter__Probe_IShape_Area`
 /// (the compiled name of the implementation is the interface's name and the member's).
 let private implName (typeName: string) (compiledName: string) : string =
@@ -3867,16 +3883,12 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                 let net =
                     match value.Type with
                     | Fable.Number _ when net <> "" ->
-                        let known =
-                            System.Text.RegularExpressions.Regex.IsMatch(net, "^[DdXxBbNnFfEeGgRrPpCc][0-9]{0,2}$")
+                        checkNetFormat r net
 
-                        if not known then
-                            fail r "the Zig target does not support the .NET format `%s` yet" net
-
-                        if "DdXxBb".IndexOf(net[0]) >= 0 && not isWhole then
+                        if isStandardNetFormat net && "DdXxBb".IndexOf(net[0]) >= 0 && not isWhole then
                             fail r "the .NET format `%s` is for whole numbers" net
 
-                        net
+                        zigEscape net
                     | Fable.String
                     | Fable.Char
                     | Fable.Boolean -> ""
@@ -5218,8 +5230,8 @@ and dotnetCall
          | Fable.Number _ -> true
          | _ -> false)
         ->
-        if not (System.Text.RegularExpressions.Regex.IsMatch(net, "^[DdXxBbNnFfEeGgRrPpCc][0-9]{0,2}$")) then
-            fail r "the Zig target does not support the .NET format `%s` yet" net
+        checkNetFormat r net
+        let net = zigEscape net
 
         bindArgs
             ctx
