@@ -521,9 +521,36 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
             return true;
         },
         .@"union" => {
-            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-            switch (a) {
-                inline else => |pa, tag| return eql(pa, @field(b, @tagName(tag))),
+            // (a recursive union is compared along its last field of its own type in a loop,
+            // as `dropHeap` gives it up: a long list does not use the stack)
+            var x = a;
+            var y = b;
+            while (true) {
+                if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+                switch (x) {
+                    inline else => |px, tag| {
+                        const py = @field(y, @tagName(tag));
+                        const P = @TypeOf(px);
+                        const self_field: ?[]const u8 = comptime blk: {
+                            if (!isCellPtr(P)) break :blk null;
+                            var found: ?[]const u8 = null;
+                            const info = @typeInfo(@typeInfo(P).pointer.child).@"struct";
+                            for (info.field_types, info.field_names) |F, name| {
+                                if (F == T) found = name;
+                            }
+                            break :blk found;
+                        };
+                        if (comptime self_field == null) return eql(px, py);
+                        if (px == py) return true;
+                        inline for (@typeInfo(@typeInfo(P).pointer.child).@"struct".field_names) |name| {
+                            if (comptime !isCount(name) and !std.mem.eql(u8, name, self_field.?)) {
+                                if (!eql(@field(px, name), @field(py, name))) return false;
+                            }
+                        }
+                        x = @field(px, self_field.?);
+                        y = @field(py, self_field.?);
+                    },
+                }
             }
         },
         else => comptime unreachable,
@@ -3477,11 +3504,35 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
                     y = y.Cons.Tail;
                 }
             }
-            const ta = @backingInt(std.meta.activeTag(a));
-            const tb = @backingInt(std.meta.activeTag(b));
-            if (ta != tb) return if (ta < tb) -1 else 1;
-            switch (a) {
-                inline else => |pa, tag| return compare(pa, @field(b, @tagName(tag))),
+            // (along a last field of its own type in a loop: a long chain does not use the stack)
+            var x = a;
+            var y = b;
+            while (true) {
+                const ta = @backingInt(std.meta.activeTag(x));
+                const tb = @backingInt(std.meta.activeTag(y));
+                if (ta != tb) return if (ta < tb) -1 else 1;
+                switch (x) {
+                    inline else => |px, tag| {
+                        const py = @field(y, @tagName(tag));
+                        const P = @TypeOf(px);
+                        const last_self: bool = comptime blk: {
+                            if (!isCellPtr(P)) break :blk false;
+                            const info = @typeInfo(@typeInfo(P).pointer.child).@"struct";
+                            break :blk info.field_types.len > 0 and info.field_types[info.field_types.len - 1] == T;
+                        };
+                        if (comptime !last_self) return compare(px, py);
+                        if (px == py) return 0;
+                        const names = @typeInfo(@typeInfo(P).pointer.child).@"struct".field_names;
+                        inline for (names[0 .. names.len - 1]) |name| {
+                            if (comptime !isCount(name)) {
+                                const c = compare(@field(px, name), @field(py, name));
+                                if (c != 0) return c;
+                            }
+                        }
+                        x = @field(px, names[names.len - 1]);
+                        y = @field(py, names[names.len - 1]);
+                    },
+                }
             }
         },
         else => @compileError("fable: values of type " ++ @typeName(T) ++ " cannot be compared"),
@@ -7550,6 +7601,22 @@ test "objects: parts, virtual members, type tests, cycles" {
     drop(c);
     _ = collect();
     _ = before;
+}
+
+test "equality of a long list does not use the stack" {
+    var a: List(i32) = .Empty;
+    var b: List(i32) = .Empty;
+    for (0..1_000_000) |i| {
+        const na = cell(List(i32), .Cons, .{ .Head = @as(i32, @intCast(i)), .Tail = a });
+        a = .{ .Cons = na };
+        const nb = cell(List(i32), .Cons, .{ .Head = @as(i32, @intCast(i)), .Tail = b });
+        b = .{ .Cons = nb };
+    }
+    try std.testing.expect(eql(a, b));
+    const c: List(i32) = .{ .Cons = cell(List(i32), .Cons, .{ .Head = 7, .Tail = b }) };
+    try std.testing.expect(!eql(a, c));
+    drop(a);
+    drop(c);
 }
 
 test "decimal does what .NET does" {

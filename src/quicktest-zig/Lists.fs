@@ -262,7 +262,28 @@ let errors () : int =
 
 let run () : int =
     let before = liveCells ()
-    let failed = basics () + records () + errors ()
+    let big = List.init 1000000 id
+    let other = List.init 1000000 id
+
+    let long =
+        check (
+            big = other
+            && compare
+                big
+                (List.init
+                    1000000
+                    (fun i ->
+                        if i = 999999 then
+                            0
+                        else
+                            i
+                    ))
+                =
+                1
+            && hash big = hash other
+        )
+
+    let failed = basics () + records () + errors () + long
     printfn "lists: %d" failed
 
     failed
