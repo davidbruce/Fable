@@ -5653,6 +5653,9 @@ pub const ExnType = struct {
     /// F#'s `exception` declarations are equal when their fields are (null: only to itself)
     eql: ?*const fn (Exn, Exn) bool = null,
     hash: ?*const fn (Exn) i32 = null,
+    /// a .NET exception's `InnerException`
+    set_inner: ?*const fn (Exn, Exn) void = null,
+    inner: ?*const fn (Exn) ?Exn = null,
 };
 
 pub const ExnHeader = struct {
@@ -5699,6 +5702,8 @@ fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime parent: 
             .show = show,
             .eql = if (Payload == Described) null else payloadEql,
             .hash = if (Payload == Described) null else payloadHash,
+            .set_inner = setInner,
+            .inner = innerOf,
         };
 
         fn matchMessage(_: Exn) String {
@@ -5716,12 +5721,25 @@ fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime parent: 
         fn show(b: *Shower, e: Exn, prec: Prec, depth: i32) *Layout {
             if (comptime is_match_failure) return b.case("MatchFailureException", of(e), prec, depth);
             if (Payload != Described) return b.case(name, of(e), prec, depth);
-            // a .NET exception: its class and its message
-            const text = unitsOf(of(e).Message);
-            const all = b.arena.alloc(u16, name.len + 2 + text.len) catch @panic("fable: out of memory");
-            for (name ++ ": ", all[0 .. name.len + 2]) |c, *to| to.* = c;
-            @memcpy(all[name.len + 2 ..], text);
-            return b.leaf(false, all, false);
+            // a .NET exception: its class and its message (and the exception inside, as
+            // .NET's `ToString` writes it)
+            var t: TextBuilder = .{};
+            exnText(&t, e);
+            const s = t.finish();
+            defer drop(s);
+            return b.leaf(false, b.arena.dupe(u16, unitsOf(s)) catch @panic("fable: out of memory"), false);
+        }
+
+        fn setInner(e: Exn, within: Exn) void {
+            if (Payload == Described) {
+                const p: *Payload = @constCast(of(e));
+                if (p.InnerException) |old| drop(old);
+                p.InnerException = dup(within);
+            }
+        }
+
+        fn innerOf(e: Exn) ?Exn {
+            return if (Payload == Described) of(e).InnerException else null;
         }
 
         fn message(e: Exn) String {
@@ -5791,7 +5809,7 @@ pub fn MayRaise(comptime T: type, comptime callees: anytype) type {
 }
 
 /// What a .NET exception class holds: its message.
-pub const Described = struct { Message: String };
+pub const Described = struct { Message: String, InnerException: ?Exn = null };
 
 /// What `failwith` raises: .NET's `System.Exception` with a message. (Every exception is a
 /// `System.Exception`, so a test for that class is not a test at all; this is the test for
@@ -5815,7 +5833,20 @@ pub const NullReferenceException = Class("System.NullReferenceException", System
 pub const FormatException = Class("System.FormatException", SystemException);
 pub const KeyNotFoundException = Class("System.Collections.Generic.KeyNotFoundException", SystemException);
 pub const AggregateException = Class("System.AggregateException", null);
-pub const InvalidCastException = Class("System.InvalidCastException", null);
+pub const InvalidCastException = Class("System.InvalidCastException", SystemException);
+pub const TimeoutException = Class("System.TimeoutException", SystemException);
+pub const IOException = Class("System.IO.IOException", SystemException);
+pub const FileNotFoundException = Class("System.IO.FileNotFoundException", IOException);
+pub const DirectoryNotFoundException = Class("System.IO.DirectoryNotFoundException", IOException);
+pub const UnauthorizedAccessException = Class("System.UnauthorizedAccessException", SystemException);
+pub const ObjectDisposedException = Class("System.ObjectDisposedException", InvalidOperationException);
+pub const OperationCanceledException = Class("System.OperationCanceledException", SystemException);
+pub const TaskCanceledException = Class("System.Threading.Tasks.TaskCanceledException", OperationCanceledException);
+pub const ApplicationException = Class("System.ApplicationException", null);
+pub const OutOfMemoryException = Class("System.OutOfMemoryException", SystemException);
+pub const NotFiniteNumberException = Class("System.NotFiniteNumberException", ArithmeticException);
+pub const RankException = Class("System.RankException", SystemException);
+pub const ArrayTypeMismatchException = Class("System.ArrayTypeMismatchException", SystemException);
 
 /// Raise an exception of a .NET class with a message.
 pub fn raise(comptime C: type, message: String) Raised {
@@ -5852,6 +5883,42 @@ pub fn rem(comptime T: type, a: T, b: T) Raised!T {
 
 /// `e.Message`: the message an exception was made with; for an F# exception, the exception
 /// as `%A` writes it.
+/// `Exception(message, inner)`: the new exception, with `inner` inside it.
+pub fn exnWithInner(e: Exn, inner_exn: Exn) Exn {
+    if (e.type.set_inner) |f| f(e, inner_exn);
+    return dup(e);
+}
+
+/// `e.InnerException`, which is null for most exceptions.
+pub fn exnInner(e: Exn) Raised!Exn {
+    if (e.type.inner) |f| {
+        if (f(e)) |i| return dup(i);
+    }
+    return nullRef();
+}
+
+/// `isNull e.InnerException`
+pub fn exnHasNoInner(e: Exn) bool {
+    if (e.type.inner) |f| return f(e) == null;
+    return true;
+}
+
+/// `e.ToString()` without the stack trace: its class, its message, and the exceptions inside.
+fn exnText(t: *TextBuilder, e: Exn) void {
+    t.addAscii(e.type.name);
+    t.addAscii(": ");
+    const m = exnMessage(e);
+    defer drop(m);
+    t.add(unitsOf(m));
+    if (e.type.inner) |f| {
+        if (f(e)) |i| {
+            t.addAscii("\n ---> ");
+            exnText(t, i);
+            t.addAscii("\n   --- End of inner exception stack trace ---");
+        }
+    }
+}
+
 pub fn exnMessage(e: Exn) String {
     if (e.type.message) |message| return message(e);
     return anyText(e);

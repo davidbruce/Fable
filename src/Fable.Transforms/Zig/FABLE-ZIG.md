@@ -615,6 +615,13 @@ Exceptions declared with F#'s `exception` are equal when their fields are, and h
 `MatchFailureException` with the file, line and column of the match (`MatchFailureException(file,
 line, column)` matches it, and `%A` shows them). `Path.GetFileName` works.
 
+Thirty .NET exception classes are known, with .NET's parents (`:? IOException` catches a
+`FileNotFoundException`) and the messages .NET gives them when made without one.
+`Exception(message, inner)` keeps the inner exception: `InnerException` gives it (and raises
+`NullReferenceException` when there is none, which `isNull e.InnerException` tests without
+raising), and `%A` writes both as .NET's `ToString` does, without the stack trace. `StackTrace`
+is not supported.
+
 ## Strings
 
 A `string` is what it is on .NET: immutable UTF-16, or null. `s.Length` and `s.[i]` count and

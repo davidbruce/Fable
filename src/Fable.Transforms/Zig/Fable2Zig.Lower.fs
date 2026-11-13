@@ -483,6 +483,15 @@ let private dotnetExceptions =
         "NullReferenceException"
         "AggregateException"
         "InvalidCastException"
+        "TimeoutException"
+        "UnauthorizedAccessException"
+        "ObjectDisposedException"
+        "OperationCanceledException"
+        "ApplicationException"
+        "OutOfMemoryException"
+        "NotFiniteNumberException"
+        "RankException"
+        "ArrayTypeMismatchException"
     ]
     |> List.map (fun name -> "System." + name, "fable_rt." + name)
     |> List.append
@@ -490,8 +499,47 @@ let private dotnetExceptions =
             "System.Exception", "fable_rt.Failure"
             "System.Collections.Generic.KeyNotFoundException", "fable_rt.KeyNotFoundException"
             "Microsoft.FSharp.Core.MatchFailureException", "fable_rt.MatchFailureException"
+            "System.IO.IOException", "fable_rt.IOException"
+            "System.IO.FileNotFoundException", "fable_rt.FileNotFoundException"
+            "System.IO.DirectoryNotFoundException", "fable_rt.DirectoryNotFoundException"
+            "System.Threading.Tasks.TaskCanceledException", "fable_rt.TaskCanceledException"
         ]
     |> Map.ofList
+
+/// The message .NET gives an exception of a class made without one.
+let private defaultExnMessages =
+    Map.ofList
+        [
+            "System.Exception", "Exception of type 'System.Exception' was thrown."
+            "System.SystemException", "System error."
+            "System.ArgumentException", "Value does not fall within the expected range."
+            "System.ArgumentNullException", "Value cannot be null."
+            "System.ArgumentOutOfRangeException", "Specified argument was out of the range of valid values."
+            "System.InvalidOperationException", "Operation is not valid due to the current state of the object."
+            "System.NotSupportedException", "Specified method is not supported."
+            "System.NotImplementedException", "The method or operation is not implemented."
+            "System.IndexOutOfRangeException", "Index was outside the bounds of the array."
+            "System.DivideByZeroException", "Attempted to divide by zero."
+            "System.OverflowException", "Arithmetic operation resulted in an overflow."
+            "System.FormatException", "One of the identified items was in an invalid format."
+            "System.ArithmeticException", "Overflow or underflow in the arithmetic operation."
+            "System.NullReferenceException", "Object reference not set to an instance of an object."
+            "System.AggregateException", "One or more errors occurred."
+            "System.InvalidCastException", "Specified cast is not valid."
+            "System.TimeoutException", "The operation has timed out."
+            "System.UnauthorizedAccessException", "Attempted to perform an unauthorized operation."
+            "System.OperationCanceledException", "The operation was canceled."
+            "System.ApplicationException", "Error in the application."
+            "System.OutOfMemoryException", "Insufficient memory to continue the execution of the program."
+            "System.NotFiniteNumberException", "Number encountered was not a finite quantity."
+            "System.RankException", "Attempted to operate on an array with the incorrect number of dimensions."
+            "System.ArrayTypeMismatchException", "Attempted to access an element as a type incompatible with the array."
+            "System.Collections.Generic.KeyNotFoundException", "The given key was not present in the dictionary."
+            "System.IO.IOException", "I/O error occurred."
+            "System.IO.FileNotFoundException", "Unable to find the specified file."
+            "System.IO.DirectoryNotFoundException", "Attempted to access a path that is not on the disk."
+            "System.Threading.Tasks.TaskCanceledException", "A task was canceled."
+        ]
 
 /// A .NET exception class that the runtime library declares (`System.Exception` is what
 /// `failwith` raises). Its one field is the message.
@@ -4643,6 +4691,20 @@ and dotnetCall
     | "Microsoft.FSharp.Core.Operators", "NaNSingle", [] -> ELit("std.math.nan(f32)", TPrim "f32")
     | "Microsoft.FSharp.Core.Operators", "Infinity", [] -> ELit("std.math.inf(f64)", TPrim "f64")
     | "Microsoft.FSharp.Core.Operators", "InfinitySingle", [] -> ELit("std.math.inf(f32)", TPrim "f32")
+    // `x :? T` where Fable keeps it a call: of an exception class, or of a class of objects
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
+        (match info.GenericArgs with
+         | [ Fable.DeclaredType(cls, _) ] -> (tryExnEnt ctx r cls).IsSome || (objInfo ctx r cls).IsSome
+         | _ -> false)
+        ->
+        match info.GenericArgs with
+        | [ Fable.DeclaredType(cls, _) ] when (tryExnEnt ctx r cls).IsSome ->
+            let ent = (tryExnEnt ctx r cls).Value
+            bindArgs ctx [ lw ctx x ] (fun xs -> EExnTest(xs.Head, ent))
+        | [ Fable.DeclaredType(cls, _) ] ->
+            let o = (objInfo ctx r cls).Value
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.objIs($0, &%s{objTypeName o})", xs, tBool))
+        | _ -> fail r "internal: a type test"
     // `x :?> Circle`: an object of that class, or InvalidCastException
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ Uncast x ] when
         (objOfType ctx r t).IsSome && (objOfType ctx r x.Type).IsSome
@@ -5587,13 +5649,42 @@ and dotnetCall
         let message = ELit(stringLiteral "Value cannot be null.", tStr)
         raiseDotnet ctx r "System.ArgumentNullException" (withParameter ctx message arg) t
     // `System.Exception("...")` and the other classes: a new exception with that message
+    // `Exception(message, inner)`: the exception, with the one inside it
+    | cls, ".ctor", [ message; inner ] when
+        dotnetExceptions.ContainsKey cls
+        && message.Type = Fable.String
+        && (
+            match inner.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = "System.Exception" || dotnetExceptions.ContainsKey e.FullName
+            | _ -> false
+        )
+        ->
+        bindArgsIn
+            true
+            ctx
+            [ lw ctx message ]
+            (fun xs ->
+                let outer = EExnNew(dotnetExnEnt ctx cls, xs)
+                bindArgs ctx [ outer; lw ctx inner ] (fun ys -> EEmit("fable_rt.exnWithInner($0, $1)", ys, tExn))
+            )
     | cls, ".ctor", args when
         dotnetExceptions.ContainsKey cls
         && args |> List.forall (fun a -> a.Type = Fable.String)
         ->
         let message =
             match cls, args with
-            | "System.Exception", [] -> ELit(stringLiteral "Exception of type 'System.Exception' was thrown.", tStr)
+            | "System.ObjectDisposedException", [ objectName ] ->
+                bindArgs
+                    ctx
+                    [ lw ctx objectName ]
+                    (fun xs ->
+                        EEmit(
+                            "fable_rt.format(.{ \"Cannot access a disposed object.\\nObject name: '\", $0, \"'.\" })",
+                            xs,
+                            tStr
+                        )
+                    )
+            | _, [] when defaultExnMessages.ContainsKey cls -> ELit(stringLiteral defaultExnMessages[cls], tStr)
             | "System.ArgumentNullException", [ parameter ] ->
                 withParameter ctx (ELit(stringLiteral "Value cannot be null.", tStr)) parameter
             | "System.ArgumentOutOfRangeException", [ parameter ] ->
@@ -5622,6 +5713,11 @@ and dotnetCall
                 )
             )
     | "System.IO.Path", "GetFileName", [ path ] -> pure' "fable_rt.pathFileName($0)" [ path ] tStr
+    | "System.Exception", "get_InnerException", [ x ] -> rt "fable_rt.exnInner($0)" [ x ] tExn
+    | "Microsoft.FSharp.Core.Operators", "IsNull", [ Fable.Call(Fable.Import(imp, _, _), inner, _, _) ] when
+        imp.Selector = "get_InnerException"
+        ->
+        pure' "fable_rt.exnHasNoInner($0)" [ inner.ThisArg.Value ] tBool
     | "System.Exception", "get_Message", x :: _ ->
         bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnMessage($0)", xs, tStr))
     | "Microsoft.FSharp.Core.Operators", "Raise", [ x ] ->

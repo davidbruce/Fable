@@ -12,6 +12,12 @@ open Fable.Core.Zig
 let liveCells () : int = Counters.liveCells ()
 let counting () : bool = Counters.isCounting ()
 
+let same (expected: string) (actual: string) : int =
+    if actual = expected then
+        0
+    else
+        1
+
 let expect (expected: int) (actual: int) : int =
     if actual = expected then
         0
@@ -318,8 +324,50 @@ let genericRaises () : int =
 let run () : int =
     let before = liveCells ()
 
+    let classes =
+        [
+            System.TimeoutException() :> exn
+            System.IO.FileNotFoundException()
+            System.ObjectDisposedException("thing")
+            System.OperationCanceledException()
+            System.Threading.Tasks.TaskCanceledException()
+            System.ApplicationException()
+            System.InvalidCastException()
+            System.Collections.Generic.KeyNotFoundException()
+            System.InvalidOperationException()
+            System.ArgumentException()
+        ]
+        |> List.map (fun e ->
+            match e with
+            | :? System.IO.IOException -> "io: " + e.Message
+            | :? System.InvalidOperationException -> "invalid: " + e.Message
+            | :? System.OperationCanceledException -> "canceled: " + e.Message
+            | :? System.SystemException -> "system: " + e.Message
+            | _ -> "other: " + e.Message
+        )
+        |> String.concat "|"
+
+    let outer = System.Exception("outer", System.InvalidOperationException("inner"))
+
+    let inner =
+        outer.InnerException.Message
+        + "|"
+        + string (isNull (System.Exception("x").InnerException))
+        + "|"
+        + string (isNull outer.InnerException)
+        + "|"
+        + string (outer.InnerException :? System.InvalidOperationException)
+        + "|"
+        + sprintf "%A" outer
+
     let failed =
-        expect
+        same
+            "system: The operation has timed out.|io: Unable to find the specified file.|invalid: Cannot access a disposed object.\nObject name: 'thing'.|canceled: The operation was canceled.|canceled: A task was canceled.|other: Error in the application.|system: Specified cast is not valid.|system: The given key was not present in the dictionary.|invalid: Operation is not valid due to the current state of the object.|system: Value does not fall within the expected range."
+            classes
+        + same
+            "inner|True|False|True|System.Exception: outer\n ---> System.InvalidOperationException: inner\n   --- End of inner exception stack trace ---"
+            inner
+        + expect
             1
             (if
                  ParseError(1, 2) = ParseError(1, 2)
