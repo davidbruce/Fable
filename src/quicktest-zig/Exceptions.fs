@@ -349,6 +349,18 @@ let run () : int =
 
     let outer = System.Exception("outer", System.InvalidOperationException("inner"))
 
+    let beforeThrowTrace = isNull outer.StackTrace
+
+    let caughtTrace =
+        try
+            failwith "traced"
+            ""
+        with ex ->
+            if isNull ex.StackTrace then
+                ""
+            else
+                ex.StackTrace
+
     let inner =
         outer.InnerException.Message
         + "|"
@@ -392,6 +404,12 @@ let run () : int =
         + expect 93 (asValue ())
         + expect 42 (raisedInLoop ())
         + expect 56 (genericRaises ())
+        + expect
+            1
+            (if beforeThrowTrace && caughtTrace.Length > 0 then
+                 1
+             else
+                 0)
 
     failed
     + (if counting () then

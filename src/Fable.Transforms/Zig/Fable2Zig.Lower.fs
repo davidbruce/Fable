@@ -6132,6 +6132,10 @@ and dotnetCall
         pure' "fable_rt.exnHasNoInner($0)" [ inner.ThisArg.Value ] tBool
     | "System.Exception", "get_Message", x :: _ ->
         bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnMessage($0)", xs, tStr))
+    | "System.Exception", "get_StackTrace", x :: _ ->
+        ctx.State.UsesStackTrace <- true
+
+        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnStackTrace($0)", xs, tStr))
     | "Microsoft.FSharp.Core.Operators", "Raise", [ x ] ->
         bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx r t))
     | "Microsoft.FSharp.Core.Operators", "Reraise", _ ->

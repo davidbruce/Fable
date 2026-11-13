@@ -669,6 +669,9 @@ type FileState() =
     /// what the file's code does that lets a function value be part of a cycle (see
     /// `fable_rt.Cycles`): holds, generic, instantiated
     member val Cycles = (false, false, false) with get, set
+    /// Does this file read an exception's `StackTrace`? (If no file of the program does,
+    /// exceptions capture none.)
+    member val UsesStackTrace = false with get, set
     /// every variable made so far, by id
     member val Vars = Dictionary<int, Var>()
     /// how many type declarations are being mapped (they refer to each other)

@@ -2387,7 +2387,9 @@ const verify_cycles: bool = if (@hasDecl(@import("root"), "fable_verify_cycles")
 ///   depends on a type parameter;
 /// - `instantiated`: a generic function is used with a type argument that can hold a function
 ///   value or an exception.
-pub const Cycles = struct { holds: bool = false, generic: bool = false, instantiated: bool = false };
+/// What a file and the files it uses do, that the runtime adapts to: function values in cycles
+/// (see `functions_in_cycles`), and reading an exception's `StackTrace` (see `stack_traces`).
+pub const Cycles = struct { holds: bool = false, generic: bool = false, instantiated: bool = false, stack_traces: bool = false };
 
 /// A file's own answer joined with those of the files it uses.
 pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
@@ -2396,6 +2398,7 @@ pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
         r.holds = r.holds or u.holds;
         r.generic = r.generic or u.generic;
         r.instantiated = r.instantiated or u.instantiated;
+        if (@hasField(@TypeOf(u), "stack_traces")) r.stack_traces = r.stack_traces or u.stack_traces;
     }
     return r;
 }
@@ -2412,6 +2415,15 @@ pub const functions_in_cycles: bool = blk: {
     if (!@hasDecl(root, "$cycles")) break :blk true;
     const c: Cycles = root.@"$cycles";
     break :blk c.holds or (c.generic and c.instantiated);
+};
+
+/// Does an exception capture the stack where it is thrown? Only when some file of the program
+/// reads `StackTrace`: the capture costs each throw, and the frames make each exception larger.
+/// (Yes when the root file does not say.)
+pub const stack_traces: bool = blk: {
+    if (!@hasDecl(root, "$cycles")) break :blk true;
+    const c: Cycles = root.@"$cycles";
+    break :blk c.stack_traces;
 };
 
 /// The type of a cell's `$gc` field: the collector's header, or nothing.
@@ -5357,6 +5369,10 @@ pub const ExnHeader = struct {
     /// the collector's header of this exception, if what it holds can be part of a cycle
     gc: ?*sgc.Hdr = null,
     type: *const ExnType,
+    trace_len: u8 = 0,
+    trace_thrown: bool = false,
+    trace_skipped: bool = false,
+    trace_addrs: if (stack_traces) [32]usize else void = undefined,
 };
 
 /// F#'s `exn`.
@@ -5477,8 +5493,17 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
 }
 
 /// The exception in flight is `thread.current`.
-pub fn throw(e: Exn) void {
+pub noinline fn throw(e: Exn) void {
     std.debug.assert(thread.current == null);
+    if (stack_traces and !e.trace_thrown) {
+        e.trace_thrown = true;
+        var st = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &e.trace_addrs);
+        if (st.return_addresses.len == 0) {
+            st = std.debug.captureCurrentStackTrace(.{}, &e.trace_addrs);
+        }
+        e.trace_len = @intCast(st.return_addresses.len);
+        e.trace_skipped = st.skipped != .none;
+    }
     thread.current = e;
 }
 
@@ -5616,6 +5641,53 @@ fn exnText(t: *TextBuilder, e: Exn) void {
 pub fn exnMessage(e: Exn) String {
     if (e.type.message) |message| return message(e);
     return anyText(e);
+}
+
+/// `e.StackTrace`: null until the exception is thrown, then the captured frames.
+pub fn exnStackTrace(e: Exn) String {
+    // (with no capture there are no frames to write, and the field that holds them is void)
+    return if (comptime stack_traces) traceText(e) else null;
+}
+
+fn traceText(e: Exn) String {
+    if (!e.trace_thrown) return null;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const st: std.debug.StackTrace = .{
+        .return_addresses = e.trace_addrs[0..e.trace_len],
+        .skipped = if (e.trace_skipped) .unknown else .none,
+    };
+    std.debug.writeStackTrace(&st, .{ .writer = &aw.writer, .mode = .no_color }) catch {};
+    const utf8 = aw.written();
+    if (utf8.len == 0) return str("");
+    var b: TextBuilder = .{};
+    var i: usize = 0;
+    while (i < utf8.len) {
+        const n = std.unicode.utf8ByteSequenceLength(utf8[i]) catch {
+            b.addOne(utf8[i]);
+            i += 1;
+            continue;
+        };
+        if (i + n > utf8.len) {
+            b.addOne(utf8[i]);
+            i += 1;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(utf8[i .. i + n]) catch {
+            b.addOne(utf8[i]);
+            i += 1;
+            continue;
+        };
+        if (cp <= 0xFFFF) {
+            b.addOne(@intCast(cp));
+        } else {
+            const s = cp - 0x10000;
+            b.addOne(@intCast(0xD800 + (s >> 10)));
+            b.addOne(@intCast(0xDC00 + (s & 0x3FF)));
+        }
+        i += n;
+    }
+    return b.finish();
 }
 
 /// The module values of a file with tests, before the first test of it runs.
@@ -7250,4 +7322,22 @@ test "culture string comparison matches .NET InvariantCulture weights" {
     inline for (pairs) |t| {
         try std.testing.expectEqual(@as(i32, t[2]), strCompareCulture(str(t[0]), str(t[1]), false));
     }
+}
+
+test "exception stack trace is null before throw and captured on throw" {
+    const start_stats = thread.stats;
+    {
+        const e0 = Failure.new(.{ .Message = str("unthrown") });
+        defer drop(e0);
+        try std.testing.expect(exnStackTrace(e0) == null);
+
+        throw(dup(e0));
+        const caught = take();
+        defer drop(caught);
+        const trace = exnStackTrace(caught);
+        defer drop(trace);
+        try std.testing.expect(trace != null);
+        try std.testing.expect(unitsOf(trace).len > 0);
+    }
+    try std.testing.expectEqual(start_stats.allocs - start_stats.frees, thread.stats.allocs - thread.stats.frees);
 }
