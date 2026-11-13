@@ -244,14 +244,17 @@ let rec ex (em: Em) (e: Expr) : string =
         // comptime_int: the first is given its type, so that it wraps as on .NET)
         let a =
             match xs with
+            // (a literal shifted by a number known only when the program runs, too)
             | ELit(s, (TPrim p as ty)) :: rest when
                 (intBits ty > 0 || isFloatTy ty)
-                && rest
-                   |> List.forall (
-                       function
-                       | ELit _ -> true
-                       | _ -> false
-                   )
+                && (op = "shl"
+                    || op = "shr"
+                    || rest
+                       |> List.forall (
+                           function
+                           | ELit _ -> true
+                           | _ -> false
+                       ))
                 ->
                 $"@as(%s{p}, %s{s})" :: (rest |> List.map (ex em))
             | _ -> xs |> List.map (ex em)
@@ -1023,10 +1026,45 @@ and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
         match e with
         | EUnit -> ()
         | _ when isVoid (typeOf e) -> L(ex em e + ";")
-        // (a local that is only discarded is still used, or Zig would reject it)
+        // (a local that is only discarded is still used, or Zig would reject it; a mutable one
+        // is used by its assignments, and discarding it as well is an error to Zig)
+        | EVar v when v.FMutable -> ()
         | EVar _ -> L $"_ = %s{ex em e};"
         | _ when isPure e -> ()
         | _ -> L $"_ = %s{ex em e};"
+
+/// A name given to a part of a value (`const Head: T = x.Cons.Head;`) for a pattern whose other
+/// parts were then left out may be read nowhere, which Zig rejects: such lines are removed (they
+/// only read, and the part is borrowed).
+let dropUnreadPaths (body: string) =
+    let decl = Regex(@"^\s*const (\w+): [^=]+ = [\w.\[\]@""]+;\s*$")
+
+    let lines = body.Split('\n')
+    // (what the comments say is not a use)
+    let code = Regex.Replace(body, "//[^\n]*", "")
+
+    let unread =
+        lines
+        |> Array.choose (fun l ->
+            let m = decl.Match l
+
+            if m.Success then
+                let name = m.Groups[1].Value
+                let uses = Regex.Matches(code, $@"(?<![\w.@""])%s{Regex.Escape name}\b").Count
+
+                if uses = 1 then
+                    Some l
+                else
+                    None
+            else
+                None
+        )
+        |> Set.ofArray
+
+    if unread.IsEmpty then
+        body
+    else
+        lines |> Array.filter (fun l -> not (unread.Contains l)) |> String.concat "\n"
 
 /// Zig rejects a parameter that is never used.
 let ensureUsed (names: string list) (body: string) =
@@ -1203,7 +1241,7 @@ let emitFunction
         line em "    " "}"
     | None -> stmt em "    " fn.Body DReturn
 
-    let bodyText = em.Out.ToString()
+    let bodyText = dropUnreadPaths (em.Out.ToString())
 
     // `[<StackArena(bytes)>]`: the function's cells come from a buffer on its stack
     let bodyText =

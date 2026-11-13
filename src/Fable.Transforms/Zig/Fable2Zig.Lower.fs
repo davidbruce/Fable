@@ -855,6 +855,17 @@ let private tObj = TPrim "fable_rt.Obj"
 /// `obj`: an object (of a class, or a boxed value), or null
 let private tAny = TOpt tObj
 
+/// Is `name` read in `e`? (Not by a binding of a read that is itself never read: such
+/// bindings are left out.)
+let rec private liveUse (name: string) (e: Fable.Expr) : bool =
+    match e with
+    | Fable.IdentExpr i -> i.Name = name
+    | Fable.Let(other, (Fable.Get(Fable.IdentExpr _, _, _, _) | Fable.IdentExpr _), body) when
+        not other.IsMutable && not (liveUse other.Name body)
+        ->
+        liveUse name body
+    | _ -> AST.getSubExpressions e |> List.exists (liveUse name)
+
 /// A dictionary: .NET's, or what F#'s `dict` and `readOnlyDict` give
 let private isDictionaryName (name: string) =
     name = "System.Collections.Generic.Dictionary`2"
@@ -960,6 +971,11 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
     | Fable.DeclaredType(ent, _) when (objInfo ctx r ent).IsSome -> tObj
     // an async computation: the record of the library's Async.fs; the builder has no state
+    // (.NET's stack and queue: records of the library's Stack.fs and Queue.fs)
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
+        TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Queue`1" ->
+        TEnt(libRecordEnt ctx "Queue" "QueueOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsync`1" ->
         TEnt(libRecordEnt ctx "Async" "AsyncOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, []) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsyncBuilder" -> tVoid
@@ -3474,6 +3490,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ctx.Vars[id.Name] <- v
         ELet(v, place, lw ctx body)
 
+    // (a part of a value that a pattern names and nothing uses: Zig rejects a constant that is
+    // never read)
+    | Fable.Let(id, (Fable.Get(Fable.IdentExpr _, _, _, _) | Fable.IdentExpr _), body) when
+        not id.IsMutable && not (liveUse id.Name body)
+        ->
+        lw ctx body
     | Fable.Let(id, value, body) ->
         let rhs = lw ctx value
         let ty = mapType ctx id.Range id.Type
@@ -6146,6 +6168,18 @@ and dotnetCall
         | Fable.Boolean -> ELit("false", tBool)
         | Fable.Any -> ELit("@as(fable_rt.Any, null)", tAny)
         | Fable.Option(inner, _) -> ECon(mapType ctx r t, "None", [], None)
+        // (a union of one case without fields has one value, which stands for it; null on
+        // .NET, where nothing but a test for null tells them apart)
+        | Fable.DeclaredType(entRef, []) when
+            (match ctx.Com.TryGetEntity entRef with
+             | Some ent ->
+                 ent.IsFSharpUnion
+                 && ent.UnionCases.Length = 1
+                 && ent.UnionCases.Head.UnionCaseFields.IsEmpty
+             | None -> false)
+            ->
+            let ent = ctx.Com.GetEntity entRef
+            ECon(mapType ctx r t, ent.UnionCases.Head.Name, [], None)
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String || x.Type = Fable.Any ->
         pure' "($0 == null)" [ x ] tBool
@@ -6840,6 +6874,62 @@ and dotnetCall
                     )
             | _ -> pure' macro [ s ] pairTy
         | _ -> fail r "the Zig target does not support Enum.TryParse of this type"
+    // (`(||)` and `(&&)` given as functions: their arguments are values already)
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicOperators", ("op_BooleanOr" | "op_BooleanAnd"), [ a; b ] ->
+        bindArgs
+            ctx
+            [ lw ctx a; lw ctx b ]
+            (fun xs ->
+                EEmit(
+                    (if name = "op_BooleanOr" then
+                         "($0 or $1)"
+                     else
+                         "($0 and $1)"),
+                    xs,
+                    tBool
+                )
+            )
+    // ---- .NET's stack and queue: the library's Stack.fs and Queue.fs ----
+    | ("System.Collections.Generic.Stack`1" | "System.Collections.Generic.Queue`1"), _, _ ->
+        let file =
+            if entity.EndsWith("Stack`1", System.StringComparison.Ordinal) then
+                "Stack"
+            else
+                "Queue"
+
+        let small (n: string) =
+            n.Substring(0, 1).ToLowerInvariant() + n.Substring(1)
+
+        match name, args with
+        | ".ctor", [] -> libraryCall ctx r file "create" info [] t
+        // (a capacity: nothing to do here)
+        | ".ctor", [ n ] when isInt n ->
+            bindArgs ctx [ lwStmt ctx n ] (fun _ -> libraryCall ctx r file "create" { info with Args = [] } [] t)
+        | ".ctor", [ _ ] -> libraryCall ctx r file "ofSeq" info args t
+        | "get_Count", _ -> libraryCall ctx r file "count" info args t
+        // `TryPop(&v)` and the others: the value goes to `v`
+        | ("TryPop" | "TryPeek" | "TryDequeue"),
+          [ q; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+            ctx.Vars.ContainsKey out.Name
+            ->
+            let outVar = ctx.Vars[out.Name]
+
+            let found =
+                libraryCall ctx r file (small name) { info with Args = [] } [ q ] (Fable.Option(out.Type, false))
+
+            let opt = ctx.State.NewVar("found", TOpt outVar.Ty, VLocal, false)
+
+            ELet(
+                opt,
+                found,
+                EIf(
+                    EPrim("not", [ ETest(EVar opt, "None", TOpt outVar.Ty) ], tBool),
+                    ESeq(EAssign(outVar, EGet(EVar opt, PSome, outVar.Ty)), ELit("true", tBool)),
+                    ELit("false", tBool),
+                    tBool
+                )
+            )
+        | _ -> libraryCall ctx r file (small name) info args t
     // ---- tuples: `Tuple(a, b)`, `Tuple.Create`, struct tuples, and the conversions between
     // them (a tuple is a Zig tuple, struct or not) ----
     | ("System.Tuple`1" | "System.Tuple`2" | "System.Tuple`3" | "System.Tuple`4" | "System.Tuple`5" | "System.Tuple`6" | "System.Tuple`7" | "System.ValueTuple`1" | "System.ValueTuple`2" | "System.ValueTuple`3" | "System.ValueTuple`4" | "System.ValueTuple`5" | "System.ValueTuple`6" | "System.ValueTuple`7"),
@@ -7202,6 +7292,18 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
                 (fun xs -> EEmit("fable_rt.setToList($0)", xs, TEnt(listEnt ctx.State, [ mapType ctx None item ]))),
             "list"
         )
+    | Fable.DeclaredType(ent, [ item ]) when
+        ent.FullName = "System.Collections.Generic.Stack`1"
+        || ent.FullName = "System.Collections.Generic.Queue`1"
+        ->
+        let file =
+            if ent.FullName.EndsWith("Stack`1", System.StringComparison.Ordinal) then
+                "Stack"
+            else
+                "Queue"
+
+        let info = Fable.CallInfo.Create(args = [ inner ], genArgs = [ item ])
+        Some(libraryCall ctx None file "toList" info [ inner ] (Fable.List item), "list")
     | Fable.DeclaredType(ent, genArgs) when ent.FullName = mapName || ent.FullName = setName ->
         let file =
             if ent.FullName = mapName then
@@ -7378,6 +7480,8 @@ and libraryCall
                 || file = "Task"
                 || file = "ResizeArray"
                 || file = "HashSet"
+                || file = "Stack"
+                || file = "Queue"
                 ->
                 arg
             | Fable.Value(Fable.NewOption(None, Fable.Any, isStruct), r) ->
@@ -7506,6 +7610,8 @@ and libraryCall
             || file = "Task"
             || file = "ResizeArray"
             || file = "HashSet"
+            || file = "Stack"
+            || file = "Queue"
             ->
             lw ctx arg
         // (a sequence given to a function that takes a list: the list of what it gives)

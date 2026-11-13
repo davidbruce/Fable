@@ -51,5 +51,6 @@ let handle (args: string list) =
     for file in System.IO.Directory.GetFiles(testsDir, "*Tests.zig") |> Array.sort do
         Command.Run("zig", $"test %s{System.IO.Path.GetFileName file}", workingDirectory = testsDir)
 
+    // (in Release: F# makes tail calls only there, and the tail-call tests recurse deeply)
     if not noDotnet then
-        Command.Run("dotnet", "test", workingDirectory = testsDir)
+        Command.Run("dotnet", "test -c Release", workingDirectory = testsDir)

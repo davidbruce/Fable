@@ -49,5 +49,11 @@
     <Compile Include="EnumTests.fs" />
     <Compile Include="LoopsTests.fs" />
     <Compile Include="PatternMatchTests.fs" />
+    <Compile Include="CustomOperatorsTests.fs" />
+    <Compile Include="FnTests.fs" />
+    <Compile Include="TailCallTests.fs" />
+    <Compile Include="InlineIfLambdaTests.fs" />
+    <Compile Include="QueueTests.fs" />
+    <Compile Include="StackTests.fs" />
   </ItemGroup>
 </Project>
