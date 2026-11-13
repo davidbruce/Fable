@@ -2426,6 +2426,18 @@ pub const stack_traces: bool = blk: {
     break :blk c.stack_traces;
 };
 
+/// `LanguagePrimitives.GenericZero` and `GenericOne` of a type parameter: of the number type
+/// Zig instantiates it with.
+pub fn genericNumber(comptime T: type, comptime one: bool) T {
+    const v: i32 = if (one) 1 else 0;
+    if (T == BigInt) return bigOf(v);
+    if (T == NetDecimal) return decLit(v, 0);
+    return switch (@typeInfo(T)) {
+        .int, .float => @as(T, v),
+        else => @compileError("fable: GenericZero of " ++ @typeName(T) ++ ", which is no number"),
+    };
+}
+
 /// The type of a cell's `$gc` field: the collector's header, or nothing.
 pub fn GcHdr(comptime cyclic: bool) type {
     return if (cyclic) sgc.Hdr else void;

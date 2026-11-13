@@ -634,7 +634,8 @@ let rec private borrowSources (p: P) (fn: FnInfo) (aliases: Map<int, Set<int>>) 
     | ECon(_, _, [], _) -> Some Set.empty // a constructor without fields owns nothing
     | ECall(g, _, args, _) ->
         match p.Fns.TryGetValue g with
-        | true, gi when gi.RetFrom.IsSome ->
+        // (a call that gives fewer arguments than the function takes: not known, so owned)
+        | true, gi when gi.RetFrom.IsSome && gi.RetFrom.Value |> List.forall (fun i -> i < args.Length) ->
             gi.RetFrom.Value
             |> List.fold (fun acc i -> union acc (borrowSources p fn aliases args[i])) (Some Set.empty)
         | _ -> None
@@ -1408,7 +1409,7 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
                 && not v.FMutable
                 && isBorrowedRet p g
                 && p.Fns[g].RetFrom.Value
-                   |> List.forall (fun i -> isStablePath args[i] && not (touchesMutable args[i]))
+                   |> List.forall (fun i -> i < args.Length && isStablePath args[i] && not (touchesMutable args[i]))
                 ->
                 // the result is a borrow of the source arguments: they stay alive while it is live
                 let srcs =

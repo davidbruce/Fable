@@ -727,6 +727,15 @@ let emitUnpack (em: Em) (ind: string) (u: Unpack) =
         for (f, _) in u.Drops do
             L(dropCode (projAccess u.Scrut.Ty u.Case f x))
 
+/// Does this statement always raise (end in a `raise` on every path it can take)?
+let rec alwaysRaises (e: Expr) : bool =
+    match e with
+    | ERaise _ -> true
+    | ELet(_, _, b)
+    | ESeq(_, b) -> alwaysRaises b
+    | EIf(_, t, f, _) -> alwaysRaises t && alwaysRaises f
+    | _ -> false
+
 let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
     let L = line em ind
 
@@ -797,6 +806,8 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
                 block rhs (fun lbl -> $"%s{kw} %s{name}: %s{zigType v.Ty} = %s{lbl}: {{")
 
         stmt em ind body dest
+    // (after what always raises, nothing runs: Zig refuses code after its jump)
+    | ESeq(a, _) when alwaysRaises a -> stmt em ind a DDiscard
     | ESeq(a, b) ->
         stmt em ind a DDiscard
         stmt em ind b dest

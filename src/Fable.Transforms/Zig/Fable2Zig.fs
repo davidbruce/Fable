@@ -51,8 +51,19 @@ let transformFile (com: Compiler) (file: Fable.File) : ZigFile =
             com.AddLog(msg, Severity.Error, ?range = r, fileName = com.CurrentFile)
             ""
         | e when not (e :? System.OutOfMemoryException) ->
+            // (the innermost frame of the target's own code, for a report of the bug)
+            let where (e: exn) =
+                (if isNull e.StackTrace then
+                     ""
+                 else
+                     e.StackTrace)
+                    .Split('\n')
+                |> Array.map (fun l -> l.Trim())
+                |> Array.tryFind (fun l -> l.Contains "Fable2Zig" || l.Contains "Zig.")
+                |> Option.defaultValue "no frame"
+
             com.AddLog(
-                $"internal error of the Zig target: %s{e.GetType().Name}: %s{e.Message}",
+                $"internal error of the Zig target: %s{e.GetType().Name}: %s{e.Message} (%s{where e})",
                 Severity.Error,
                 fileName = com.CurrentFile
             )

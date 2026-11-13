@@ -85,7 +85,13 @@ let exprKind (e: Fable.Expr) =
     | Fable.Lambda _
     | Fable.Delegate _ -> "function values"
     | Fable.ObjectExpr _ -> "object expressions"
-    | Fable.TypeCast _ -> "this type conversion"
+    | Fable.TypeCast(x, t) ->
+        let name (t: Fable.Type) =
+            match t with
+            | Fable.DeclaredType(e, _) -> e.FullName
+            | t -> (sprintf "%A" t).Split('\n').[0]
+
+        $"this type conversion (%s{name x.Type} to %s{name t})"
     | Fable.Test _ -> "type and pattern tests"
     | Fable.Call _ -> "this kind of call"
     | Fable.CurriedApply _ -> "applying a function value"
@@ -3399,8 +3405,28 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 (values |> List.map (lw ctx))
                 (fun xs -> ECon(TTuple(xs |> List.map typeOf), "", xs, None))
         | Fable.NewAnonymousRecord(values, names, genArgs, _) ->
-            let ty =
-                TEnt(anonEnt ctx.State names, genArgs |> List.map (FableTransforms.uncurryType >> mapTypeArg ctx r))
+            // (Fable's uncurrying makes the record again with the types of the signature it is
+            // given to, which can name its type parameters: the values' own types then)
+            let rec hasGeneric (t: Fable.Type) =
+                match t with
+                | Fable.GenericParam _ -> true
+                | t -> t.Generics |> List.exists hasGeneric
+
+            let fieldTys =
+                if genArgs.Length = values.Length then
+                    List.map2
+                        (fun (g: Fable.Type) (v: Fable.Expr) ->
+                            if hasGeneric g && not (hasGeneric v.Type) then
+                                mapTypeArg ctx r v.Type
+                            else
+                                mapTypeArg ctx r (FableTransforms.uncurryType g)
+                        )
+                        genArgs
+                        values
+                else
+                    genArgs |> List.map (FableTransforms.uncurryType >> mapTypeArg ctx r)
+
+            let ty = TEnt(anonEnt ctx.State names, fieldTys)
 
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
         // `[| a; b |]`, and an array of a given length
@@ -4587,6 +4613,25 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 && not c.ArgTypes.IsEmpty
                 ->
                 List.take c.ArgTypes.Length allArgs
+            | _ -> allArgs
+
+        // (optional arguments left out at the end of the call, which Fable drops: `None`)
+        let allArgs =
+            match tryCallable ctx callee with
+            | Some c when
+                allArgs.Length < c.ArgTypes.Length
+                && c.ArgTypes
+                   |> List.skip allArgs.Length
+                   |> List.forall (fun t ->
+                       match t with
+                       | Fable.Option(_, false) -> true
+                       | _ -> false
+                   )
+                ->
+                allArgs
+                @ (c.ArgTypes
+                   |> List.skip allArgs.Length
+                   |> List.map (fun t -> Fable.Value(Fable.NewOption(None, t.Generics.Head, false), None)))
             | _ -> allArgs
 
         let args = allArgs |> List.map (lw ctx)
@@ -6154,18 +6199,25 @@ and dotnetCall
             else
                 Fable.TypeCast(a, Fable.Any), Fable.TypeCast(b, Fable.Any)
 
-        // (a record, a union or a tuple that is a value here has no identity to compare)
-        match mapType ctx r a.Type with
-        | TEnt(e, _) when e.Kind = KRecord || e.Kind = KValueUnion ->
-            fail
-                r
-                "the Zig target keeps %s as a value, which has no identity: ReferenceEquals and PhysicalEquality cannot be answered as on .NET (mark the type [<ReferenceEquality>] to give its values one)"
-                e.Ref.FullName
-        | TTuple _ ->
-            fail
-                r
-                "the Zig target keeps tuples as values, which have no identity: ReferenceEquals cannot be answered as on .NET"
-        | _ -> pure' "fable_rt.refEql($0, $1)" [ a; b ] tBool
+        // (numbers, chars and bools are boxed one by one for the call: never the same object)
+        match a.Type, b.Type with
+        | (Fable.Number _ | Fable.Char | Fable.Boolean), _
+        | _, (Fable.Number _ | Fable.Char | Fable.Boolean) ->
+            lw ctx (Fable.Sequential [ a; b; Fable.Value(Fable.BoolConstant false, r) ])
+        | _ ->
+
+            // (a record, a union or a tuple that is a value here has no identity to compare)
+            match mapType ctx r a.Type with
+            | TEnt(e, _) when e.Kind = KRecord || e.Kind = KValueUnion ->
+                fail
+                    r
+                    "the Zig target keeps %s as a value, which has no identity: ReferenceEquals and PhysicalEquality cannot be answered as on .NET (mark the type [<ReferenceEquality>] to give its values one)"
+                    e.Ref.FullName
+            | TTuple _ ->
+                fail
+                    r
+                    "the Zig target keeps tuples as values, which have no identity: ReferenceEquals cannot be answered as on .NET"
+            | _ -> pure' "fable_rt.refEql($0, $1)" [ a; b ] tBool
     // `x.Equals(o)`: by the type's `Equals`, through an object
     | "System.Object", "Equals", [ a; b ] ->
         let asObj (x: Fable.Expr) =
@@ -6456,6 +6508,16 @@ and dotnetCall
                 | Fable.Option(item, _) -> item
                 | _ -> t
             | _ -> t
+
+        // (a member of F#'s list reached through a trait call, `(^a: (member Length: int) x)`,
+        // comes with the list's type as its type argument; the functions take the item's)
+        let info =
+            match entity, info.ThisArg with
+            | "Microsoft.FSharp.Collections.FSharpList`1", Some this ->
+                match this.Type with
+                | Fable.List item -> { info with GenericArgs = [ item ] }
+                | _ -> info
+            | _ -> info
 
         match libraryFunction entity name with
         | Some(file, fn) -> libraryCall ctx r file fn info args t
@@ -7272,6 +7334,17 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         Range = d.Body.Range
                     }
         with
+        // (an `inline` member: F# puts its body in at each use, which compile on their own; its
+        // compiled body, which the target cannot make, is never called)
+        | ZigError _ when
+            (match d.MemberRef with
+             | Fable.MemberRef _ ->
+                 match com.TryGetMember d.MemberRef with
+                 | Some m -> m.IsInline
+                 | None -> false
+             | _ -> false)
+            ->
+            ()
         | ZigError(msg, r) ->
             report
                 (match r with

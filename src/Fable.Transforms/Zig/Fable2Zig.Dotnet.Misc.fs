@@ -192,6 +192,37 @@ let call
             ))
     // ---- enums: numbers of their underlying type ----
     | "System.Enum", "HasFlag", [ v; Uncast flag ] -> pure' "(($0 & $1) == $1)" [ v; flag ] tBool
+    // `LanguagePrimitives.GenericZero` and `GenericOne` of a number
+    | "Microsoft.FSharp.Core.LanguagePrimitives", ("GenericZero" | "GenericOne" as which), [] when
+        (match t with
+         | Fable.GenericParam _ -> true
+         | _ -> false)
+        ->
+        ctx.State.UsesRuntime <- true
+
+        EEmit($"""fable_rt.genericNumber($R, %b{which = "GenericOne"})""", [], mapType ctx r t)
+    | "Microsoft.FSharp.Core.LanguagePrimitives", ("GenericZero" | "GenericOne" as which), [] when
+        (match t with
+         | Fable.Number _ -> true
+         | _ -> false)
+        ->
+        let get =
+            if which = "GenericZero" then
+                "get_Zero"
+            else
+                "get_One"
+
+        match t with
+        | Fable.Number(Decimal, _) -> dotnetCall ctx r "System.Decimal" get info t
+        | Fable.Number(BigInt, _) -> dotnetCall ctx r "System.Numerics.BigInteger" get info t
+        | _ ->
+            let v =
+                if which = "GenericZero" then
+                    "0"
+                else
+                    "1"
+
+            EEmit($"@as($R, %s{v})", [], mapType ctx r t)
     | "Microsoft.FSharp.Core.LanguagePrimitives", ("EnumOfValue" | "EnumToValue"), [ x ] ->
         if mapType ctx r x.Type = mapType ctx r t then
             lw ctx x
@@ -592,5 +623,21 @@ let call
                     r
                 )
             ))
-    | ("System.Tuple`1" | "System.ValueTuple`1"), "get_Item1", [ x ] -> lw ctx (Fable.Get(x, Fable.TupleIndex 0, t, r))
+    // `t.Item1` ... `t.Item7` of a tuple
+    | e, item, [ x ] when
+        (e.StartsWith("System.Tuple`", System.StringComparison.Ordinal)
+         || e.StartsWith("System.ValueTuple`", System.StringComparison.Ordinal))
+        && item.Length = 9
+        && item.StartsWith("get_Item", System.StringComparison.Ordinal)
+        && System.Char.IsDigit item[8]
+        ->
+        lw ctx (Fable.Get(x, Fable.TupleIndex(int item[8] - int '1'), t, r))
+    // `OptimizedClosures.FSharpFunc<_, _, _>.Adapt f` and its `Invoke(a, b, ...)`: the function
+    // itself, applied to the arguments
+    | ("Microsoft.FSharp.Core.OptimizedClosures.FSharpFunc`3" | "Microsoft.FSharp.Core.OptimizedClosures.FSharpFunc`4" | "Microsoft.FSharp.Core.OptimizedClosures.FSharpFunc`5" | "Microsoft.FSharp.Core.OptimizedClosures.FSharpFunc`6"),
+      "Adapt",
+      [ f ] -> lw ctx f
+    | ("Microsoft.FSharp.Core.OptimizedClosures.FSharpFunc`3" | "Microsoft.FSharp.Core.OptimizedClosures.FSharpFunc`4" | "Microsoft.FSharp.Core.OptimizedClosures.FSharpFunc`5" | "Microsoft.FSharp.Core.OptimizedClosures.FSharpFunc`6"),
+      "Invoke",
+      f :: args -> lw ctx (Fable.CurriedApply(f, args, t, r))
     | _ -> Unchecked.defaultof<Expr>

@@ -190,10 +190,7 @@ let call
         | _ -> fail r "the Zig target does not support ResizeArray.%s yet" name
     // (F#'s `dict` and `readOnlyDict`: dictionaries that cannot be changed)
     | "Microsoft.FSharp.Core.ExtraTopLevelOperators", ("CreateDictionary" | "CreateReadOnlyDictionary"), [ pairs ] ->
-        match forInSource ctx pairs with
-        | Some(listIr, "list") ->
-            bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.dictOfList($R, $0, true)", xs, mapType ctx r t))
-        | Some(seqIr, "seq") ->
+        let ofSeq (seqIr: Expr) =
             let itemTy = itemOf seqIr
 
             bindArgs
@@ -212,7 +209,28 @@ let call
                         ]
                         (fun ls -> EEmit("fable_rt.dictOfList($R, $0, true)", ls, mapType ctx r t))
                 )
-        | _ -> fail r "the Zig target does not support dict of this kind of sequence yet"
+
+        match forInSource ctx pairs with
+        | Some(listIr, "list") ->
+            bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.dictOfList($R, $0, true)", xs, mapType ctx r t))
+        | Some(seqIr, "seq") -> ofSeq seqIr
+        // (an array, or anything else that is a sequence of pairs: the sequence of it)
+        | _ ->
+            match t with
+            | Fable.DeclaredType(_, [ k; v ]) ->
+                Fable.TypeCast(
+                    pairs,
+                    Fable.DeclaredType(
+                        {
+                            FullName = "System.Collections.Generic.IEnumerable`1"
+                            Path = Fable.CoreAssemblyName "System.Runtime"
+                        },
+                        [ Fable.Tuple([ k; v ], false) ]
+                    )
+                )
+                |> lw ctx
+                |> ofSeq
+            | _ -> fail r "the Zig target does not support dict of this kind of sequence yet"
     // `Dictionary(other)`: a copy of another dictionary or of a map
     | "System.Collections.Generic.Dictionary`2", ".ctor", [ Uncast source ] when
         (match source.Type with

@@ -53,6 +53,7 @@
     <Compile Include="PatternMatchTests.fs" />
     <Compile Include="CustomOperatorsTests.fs" />
     <Compile Include="FnTests.fs" />
+    <Compile Include="ApplicativeTests.fs" />
     <Compile Include="TailCallTests.fs" />
     <Compile Include="NestedAndRecursivePatternTests.fs" />
     <Compile Include="InlineIfLambdaTests.fs" />
