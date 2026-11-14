@@ -863,12 +863,10 @@ let ``test DefaultParameterValue works with null`` () = // See #3326
     StaticClass.DefaultNullParam() |> isNull |> equal true
     StaticClass.DefaultNullParam(5) |> isNull |> equal false
 
-#if !FABLE_COMPILER_ZIG // (an omitted optional argument of an inline member: Fable types its None as an option of an option)
 [<Fact>]
 let ``test Inlined methods can have optional arguments`` () =
     StaticClass.InlineAdd(2, 3) |> equal 5
     StaticClass.InlineAdd(5) |> equal 7
-#endif
 
 // TODO: This test produces different results in Fable and .NET
 // See Fable.Transforms.FSharp2Fable.TypeHelpers.makeTypeGenArgs

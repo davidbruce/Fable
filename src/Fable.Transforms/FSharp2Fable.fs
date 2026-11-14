@@ -3160,9 +3160,15 @@ type FableCompiler(com: Compiler) =
             | argIdent :: restArgIdents, argExpr :: restArgExprs ->
                 foldArgs ((argIdent, argExpr) :: acc) (restArgIdents, restArgExprs)
             | (argIdent: Fable.Ident) :: restArgIdents, [] ->
+                // An omitted optional argument: `None` of the parameter's item type (the
+                // parameter's own type is the option).
+                let noneType, isStruct =
+                    match argIdent.Type with
+                    | Fable.Option(item, isStruct) -> item, isStruct
+                    | t -> t, false
+
                 foldArgs
-                    ((argIdent, Fable.Value(Fable.NewOption(None, argIdent.Type, false), None))
-                     :: acc)
+                    ((argIdent, Fable.Value(Fable.NewOption(None, noneType, isStruct), None)) :: acc)
                     (restArgIdents, [])
             | [], _ -> List.rev acc
 
