@@ -4362,7 +4362,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     // A function declared inside this one becomes a function of the file (see `LocalFn`).
     | Fable.Let(id, (Fable.Lambda _ | Fable.Delegate _ as fnExpr), body) when
         not id.IsMutable
-        && not (onlyAsValue id.Name body && not ((namesRead fnExpr).Contains id.Name))
+        && (not (onlyAsValue id.Name body && not ((namesRead fnExpr).Contains id.Name))
+            // (a generic function, which F# generalizes: a function of the file whose uses give
+            // its type arguments; a value of it could not be generic)
+            || freeGens [ mapType ctx id.Range id.Type ]
+               |> List.exists (fun g -> not (List.contains g ctx.TypeParams)))
         ->
         liftGroup ctx id.Range [ Some id.Name, id.Name, fnExpr ] |> ignore
         lw ctx body
@@ -4663,6 +4667,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let v = ctx.State.NewVar(id.Name, ty, VLocal, false)
         ctx.Vars[id.Name] <- v
         ELet(v, place, lw ctx body)
+
+    // another name of a function of this function (`let alias = f`): the same function, so a
+    // generic one stays generic, each use giving its type arguments
+    | Fable.Let(id, Fable.IdentExpr other, body) when
+        not id.IsMutable
+        && not (ctx.Vars.ContainsKey other.Name)
+        && ctx.LocalFns.ContainsKey other.Name
+        ->
+        ctx.LocalFns[id.Name] <- ctx.LocalFns[other.Name]
+        lw ctx body
 
     // (a part of a value that a pattern names and nothing uses: Zig rejects a constant that is
     // never read)

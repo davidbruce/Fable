@@ -745,7 +745,7 @@ let ``test Function generic type alias works II`` () =
     bind three (fun i -> three) "environment"
     |> equal 3
 
-#if !FABLE_COMPILER_ZIG // (a generic function value (a lambda with a type parameter of its own))
+#if !FABLE_COMPILER_ZIG // (a generic value holding a generic function, `let f_option = Some f`, used at another type)
 [<Fact>]
 let ``test Piping to an alias of a function which returns a function works`` () = // See #2657
     let f a b = sprintf $"{a} {b}"
@@ -769,9 +769,6 @@ let ``test Piping to an alias of a function which returns a function works`` () 
     functionC "functionC" "works" |> equal "functionC works"
 #endif
 
-#if !FABLE_COMPILER_ZIG // (a generic function value (a lambda with a type parameter of its own))
-#endif
-#if !FABLE_COMPILER_ZIG // (a generic function value (a lambda with a type parameter of its own))
 [<Fact>]
 let ``test Piping to an alias of a function which returns a function works II`` () = // See #2657
     let f a b = sprintf $"{a} {b}"
@@ -787,7 +784,6 @@ let ``test Piping to an alias of a function which returns a function works II`` 
 
     let functionC = f |> getFunctionAlias 2
     functionC "functionC" "works?" |> equal "functionC works?"
-#endif
 
 module CurriedApplicative =
     type Option2<'T> =
@@ -1378,7 +1374,6 @@ let ``test Arguments passed to point-free function are uncurried`` () = // See #
     equal 3 x
     equal 3 y
 
-#if !FABLE_COMPILER_ZIG // (a generic function value (a lambda with a type parameter of its own))
 [<Fact>]
 let ``test fold produces incorrect output when state is a function with arity > 1`` () = // See #2035
     let folder state value x y = value :: state x y
@@ -1387,7 +1382,6 @@ let ``test fold produces incorrect output when state is a function with arity > 
     d 42 42 |> equal [3; 2; 1; 0; 42; 42]
     let s = Seq.fold folder state [0..3]
     s 15 20 |> equal [3; 2; 1; 0; 15; 20]
-#endif
 
 [<Fact>]
 let ``test Assigning a function with arity > 1 to a scoped mutable variable #2046`` () =
