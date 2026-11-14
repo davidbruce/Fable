@@ -1629,7 +1629,7 @@ let emitFile (state: FileState) : string =
 
     out
         .AppendLine(
-            $"pub const @\"$cycles\" = fable_rt.joinCycles(.{{ .holds = %s{b holds}, .generic = %s{b generic}, .instantiated = %s{b instantiated}, .stack_traces = %s{b state.UsesStackTrace} }}, %s{used});"
+            $"pub const @\"$cycles\" = fable_rt.joinCycles(.{{ .holds = %s{b holds}, .generic = %s{b generic}, .instantiated = %s{b instantiated}, .stack_traces = %s{b state.UsesStackTrace}, .reflection = %s{b state.UsesReflection} }}, %s{used});"
         )
         .AppendLine()
     |> ignore

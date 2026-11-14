@@ -1812,6 +1812,9 @@ pub const ObjType = struct {
     compare: ?*const fn (Obj, Obj) i32 = null,
     /// a boxed array (`o :? System.Array`)
     is_array: bool = false,
+    /// the reflection information of the boxed type (when the program asks for it, see
+    /// `reflection`)
+    reflect: ?*const fn () reflect.Type = null,
 };
 
 pub const ObjHeader = struct {
@@ -2022,7 +2025,11 @@ pub fn boxType(comptime T: type) *const ObjType {
             .hash = boxHash,
             .compare = if (comparable(T)) boxCompare else null,
             .is_array = @typeInfo(T) == .pointer and @hasDecl(@typeInfo(T).pointer.child, "fable_array"),
+            .reflect = if (reflection) &reflectOf else null,
         };
+        pub fn reflectOf() reflect.Type {
+            return reflect.typeOf(T);
+        }
         pub fn boxText(_: ?*Env, o: Obj, _: void) Raised!String {
             defer drop(o);
             const x = boxed(T, o).value;
@@ -2053,6 +2060,7 @@ pub fn comparable(comptime T: type) bool {
 /// (what `T` holds, to `depth` levels: a function value anywhere makes it not comparable; a type
 /// that holds itself is looked into that far)
 fn comparableTo(comptime T: type, comptime depth: u8) bool {
+    @setEvalBranchQuota(1_000_000);
     if (isFunc(T) or T == Exn or T == Obj or (isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity"))) return false;
     if (depth == 0 or T == String) return true;
     switch (@typeInfo(T)) {
@@ -2542,7 +2550,7 @@ const verify_cycles: bool = if (@hasDecl(@import("root"), "fable_verify_cycles")
 ///   value or an exception.
 /// What a file and the files it uses do, that the runtime adapts to: function values in cycles
 /// (see `functions_in_cycles`), and reading an exception's `StackTrace` (see `stack_traces`).
-pub const Cycles = struct { holds: bool = false, generic: bool = false, instantiated: bool = false, stack_traces: bool = false };
+pub const Cycles = struct { holds: bool = false, generic: bool = false, instantiated: bool = false, stack_traces: bool = false, reflection: bool = false };
 
 /// A file's own answer joined with those of the files it uses.
 pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
@@ -2552,6 +2560,7 @@ pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
         r.generic = r.generic or u.generic;
         r.instantiated = r.instantiated or u.instantiated;
         if (@hasField(@TypeOf(u), "stack_traces")) r.stack_traces = r.stack_traces or u.stack_traces;
+        if (@hasField(@TypeOf(u), "reflection")) r.reflection = r.reflection or u.reflection;
     }
     return r;
 }
@@ -2573,6 +2582,17 @@ pub const functions_in_cycles: bool = blk: {
 /// Does an exception capture the stack where it is thrown? Only when some file of the program
 /// reads `StackTrace`: the capture costs each throw, and the frames make each exception larger.
 /// (Yes when the root file does not say.)
+/// Does a boxed value know its type's reflection information (`GetType()` of an `obj`,
+/// Fable.Core.Reflection)? Only when some file of the program reflects on values of unknown
+/// type: the information of each boxed type is then part of the program. (Yes when the root
+/// file does not say.)
+pub const reflection: bool = blk: {
+    // (yes when the root file does not say, as under `zig test`)
+    if (!@hasDecl(root, "$cycles")) break :blk true;
+    const c: Cycles = root.@"$cycles";
+    break :blk c.reflection;
+};
+
 pub const stack_traces: bool = blk: {
     if (!@hasDecl(root, "$cycles")) break :blk true;
     const c: Cycles = root.@"$cycles";

@@ -609,6 +609,23 @@ let call
         | "Parse", [ x; v ] -> rt "fable_rt.reflect.enumParse($0, $1, false)" [ x; v ] tAny
         | "Parse", [ x; v; ignoreCase ] -> rt "fable_rt.reflect.enumParse($0, $1, $2)" [ x; v; ignoreCase ] tAny
         | _ -> fail r "the Zig target does not support Enum.%s with these arguments yet" name
+    // (Fable.Core.Reflection: of an object, by what its box says of its type)
+    | "Fable.Core.Reflection",
+      ("isUnion" | "isRecord" | "getCaseTag" | "getCaseName" | "getCaseFields" | "getRecordFields"),
+      [ o ] ->
+        ctx.State.UsesRuntime <- true
+        ctx.State.UsesReflection <- true
+
+        let fn, ty =
+            match name with
+            | "isUnion" -> "objectIsUnion", tBool
+            | "isRecord" -> "objectIsRecord", tBool
+            | "getCaseTag" -> "objectCaseTag", tI32
+            | "getCaseName" -> "objectCaseName", tStr
+            | "getCaseFields" -> "objectCaseFields", mapType ctx r t
+            | _ -> "objectRecordFields", mapType ctx r t
+
+        rt $"fable_rt.reflect.%s{fn}($0)" [ Fable.TypeCast(o, Fable.Any) ] ty
     | ("Microsoft.FSharp.Core.Operators" | "System.Type" | "System.Object" | "Microsoft.FSharp.Reflection.FSharpType" | "Microsoft.FSharp.Reflection.FSharpValue" | "System.Reflection.PropertyInfo" | "System.Reflection.MemberInfo" | "Microsoft.FSharp.Reflection.UnionCaseInfo"),
       name,
       args when
@@ -787,7 +804,13 @@ let call
 
             let typeIr =
                 if st = Fable.Any then
-                    fail r "the Zig target needs the type of the value given to reflection to be known (here it is obj)"
+                    // (an object: what its box says)
+                    ctx.State.UsesReflection <- true
+
+                    bindArgs
+                        ctx
+                        [ lw ctx (Fable.TypeCast(o, Fable.Any)) ]
+                        (fun xs -> ERt("fable_rt.reflect.typeOfObject($0)", xs, tType))
                 else
                     typeOfIr st
 
@@ -796,6 +819,9 @@ let call
         match entity, name, args with
         | _, "TypeOf", [] -> typeOfIr info.GenericArgs.Head
         | _, "TypeDefOf", [] -> EEmit($"fable_rt.reflect.definitionOf(%s{typeExpr info.GenericArgs.Head})", [], tType)
+        | "System.Object", "GetType", [ Unboxed inner as x ] when inner.Type = Fable.Any ->
+            ctx.State.UsesReflection <- true
+            rfl "typeOfObject" [ x ] tType
         | "System.Object", "GetType", [ x ] -> bindArgs ctx [ lw ctx x ] (fun _ -> typeOfIr x.Type)
         // (two Type objects: the same type information)
         | "System.Object", "ReferenceEquals", [ Unboxed a; Unboxed b ] -> pure' "($0 == $1)" [ a; b ] tBool
@@ -849,6 +875,7 @@ let call
                 | _ -> false
 
             if dynamic then
+                ctx.State.UsesReflection <- true
                 pureRfl "isInstanceOf" [ x; Fable.TypeCast(inner, Fable.Any) ] tBool
             else
                 bindArgs

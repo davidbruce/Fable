@@ -680,6 +680,9 @@ type FileState() =
     /// Does this file read an exception's `StackTrace`? (If no file of the program does,
     /// exceptions capture none.)
     member val UsesStackTrace = false with get, set
+    /// Does this file reflect on values of unknown type? (Then each boxed type carries its
+    /// reflection information, see `fable_rt.reflection`.)
+    member val UsesReflection = false with get, set
     /// the .NET names of the records and unions this file declares, by their Zig name: what
     /// reflection says of them (`fable_type`): .NET's full name, and record or union
     member val NetTypes = Dictionary<string, string * string>()

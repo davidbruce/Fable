@@ -659,7 +659,6 @@ let ``test Name can be extracted from GenericTestRecord`` () =
     let name = Types.getNameOf<Maybe<list<GenericTestRecord<string>>>>()
     equal false (name = "")
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support Fable.Core.Reflection.isRecord yet)
 [<Fact>]
 let ``test Can check unions and records without type`` () =
     let x = box Union20_A
@@ -668,9 +667,7 @@ let ``test Can check unions and records without type`` () =
     isRecord x |> equal false
     isUnion y |> equal false
     isRecord y |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support Fable.Core.Reflection.getCaseFields yet)
 [<Fact>]
 let ``test Can get union values without type`` () =
     let x = box Union20_A
@@ -681,7 +678,6 @@ let ``test Can get union values without type`` () =
     getCaseName y |> equal "Union20_B"
     getCaseFields x |> equal [||]
     getCaseFields y |> equal [|5; "foo"|]
-#endif
 
 type ReactiveNode<'T>(value: 'T) =
     member _.Value = value

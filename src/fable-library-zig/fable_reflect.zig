@@ -753,10 +753,49 @@ pub fn isAssignableFrom(t: Type, s: Type) bool {
     return false;
 }
 
+/// The type of a boxed value or an object (`o.GetType()` of an `obj`)
+pub fn typeOfObject(o: Any) Raised!Type {
+    const p = o orelse return rt.raise(rt.NullReferenceException, rt.str("Object reference not set to an instance of an object."));
+    if (p.type.reflect) |f| return f();
+    // (an object of a class: by its name)
+    const info = rt.allocator.create(TypeInfo) catch @panic("fable: out of memory");
+    info.* = .{ .full_name = p.type.name, .name = p.type.name[if (std.mem.lastIndexOfAny(u8, p.type.name, ".+")) |i| i + 1 else 0..], .namespace = "", .kind = .class };
+    return info;
+}
+
+pub fn objectIsRecord(o: Any) Raised!bool {
+    return isRecord(try typeOfObject(o));
+}
+
+pub fn objectIsUnion(o: Any) Raised!bool {
+    return isUnion(try typeOfObject(o));
+}
+
+pub fn objectCaseTag(o: Any) Raised!i32 {
+    return unionTag(try typeOfObject(o), o);
+}
+
+pub fn objectCaseName(o: Any) Raised!String {
+    const t = try typeOfObject(o);
+    const tag = try unionTag(t, o);
+    return text(t.cases[@intCast(tag)].name);
+}
+
+pub fn objectCaseFields(o: Any) Raised!rt.Array(Any) {
+    const t = try typeOfObject(o);
+    const tag = try unionTag(t, o);
+    return readAll(t.cases[@intCast(tag)].fields, o);
+}
+
+pub fn objectRecordFields(o: Any) Raised!rt.Array(Any) {
+    return getRecordFields(try typeOfObject(o), o);
+}
+
 /// `t.IsInstanceOfType(o)` of an object: by its class (and those above it), or what it holds
 pub fn isInstanceOf(t: Type, o: Any) bool {
     const p = o orelse return false;
     if (std.mem.eql(u8, t.full_name, "System.Object")) return true;
+    if (p.type.reflect) |f| return isAssignableFrom(t, f());
     var ty: ?*const rt.ObjType = p.type;
     while (ty) |x| : (ty = x.parent) {
         if (std.mem.eql(u8, x.name, t.full_name)) return true;
