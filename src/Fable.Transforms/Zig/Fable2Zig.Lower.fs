@@ -129,11 +129,50 @@ let implName (typeName: string) (compiledName: string) : string =
 
 /// The members of an interface, as the fields of the struct of function values that stands
 /// for it: the compiled name (`Area`, `get_Name`), and the types of the arguments and result.
-let interfaceMembers (ent: Fable.Entity) : (string * Fable.Type list * Fable.Type) list =
+/// A short name of a type, to tell overloads apart (`get_Item$Int32`)
+let rec typeTag (t: Fable.Type) : string =
+    match t with
+    | Fable.Number(k, _) -> string k
+    | Fable.DeclaredType(e, []) -> e.FullName.Substring(e.FullName.LastIndexOf '.' + 1).Replace("`", "_")
+    | Fable.DeclaredType(e, gs) ->
+        e.FullName.Substring(e.FullName.LastIndexOf '.' + 1).Replace("`", "_")
+        + "_"
+        + (gs |> List.map typeTag |> String.concat "_")
+    | Fable.GenericParam(n, _, _) -> n
+    | Fable.Array(t, _) -> typeTag t + "Array"
+    | Fable.List t -> typeTag t + "List"
+    | Fable.Option(t, _) -> typeTag t + "Option"
+    | Fable.Tuple(ts, _) -> "Tuple_" + (ts |> List.map typeTag |> String.concat "_")
+    | Fable.LambdaType _
+    | Fable.DelegateType _ -> "Fn"
+    | other -> (sprintf "%A" other).Split([| ' '; '(' |]).[0]
+
+let private paramTypesOf (m: Fable.MemberFunctionOrValue) =
+    m.CurriedParameterGroups |> List.concat |> List.map (fun p -> p.Type)
+
+/// The dispatch slots of an interface (a property is there as itself and as its getter)
+let private dispatchSlots (ent: Fable.Entity) =
     ent.MembersFunctionsAndValues
-    // (a property is there as itself and as its getter)
     |> Seq.filter (fun m -> m.IsDispatchSlot && not (m.IsProperty && not m.IsGetter && not m.IsSetter))
-    |> Seq.distinctBy (fun m -> m.CompiledName)
+
+/// The name of a member's field in the struct of an interface: its compiled name, and when the
+/// interface has overloads of that name, the types of its parameters (`get_Item$Int32`)
+let slotKey (ent: Fable.Entity) (compiled: string) (paramTypes: Fable.Type list) : string =
+    let signatures =
+        dispatchSlots ent
+        |> Seq.filter (fun m -> m.CompiledName = compiled)
+        |> Seq.map (fun m -> paramTypesOf m |> List.map typeTag)
+        |> Seq.distinct
+        |> Seq.length
+
+    if signatures > 1 then
+        compiled + "$" + (paramTypes |> List.map typeTag |> String.concat "_")
+    else
+        compiled
+
+let interfaceMembers (ent: Fable.Entity) : (string * Fable.Type list * Fable.Type) list =
+    dispatchSlots ent
+    |> Seq.distinctBy (fun m -> slotKey ent m.CompiledName (paramTypesOf m))
     // (a generic member, `abstract eval<'a>: ...`, is no field of the struct: a function value
     // has one type; calls of it are refused)
     |> Seq.filter (fun m ->
@@ -156,7 +195,7 @@ let interfaceMembers (ent: Fable.Entity) : (string * Fable.Type list * Fable.Typ
             | [] -> [ Fable.Unit ]
             | ts -> ts
 
-        m.CompiledName, args, m.ReturnParameter.Type
+        slotKey ent m.CompiledName (paramTypesOf m), args, m.ReturnParameter.Type
     )
     |> List.ofSeq
 
@@ -3057,8 +3096,44 @@ let implementationOf (com: Compiler) (r: SourceLocation option) (o: ObjInfo) (sl
 /// The compiled name of the member a call goes to.
 let slotName (com: Compiler) (call: Fable.CallInfo) (fieldName: string) : string =
     match call.MemberRef |> Option.bind com.TryGetMember with
-    | Some m -> m.CompiledName
+    | Some m ->
+        // (an overload of an interface's member: its field says which)
+        match m.DeclaringEntity |> Option.bind com.TryGetEntity with
+        | Some owner when owner.IsInterface && m.IsDispatchSlot -> slotKey owner m.CompiledName (paramTypesOf m)
+        | _ -> m.CompiledName
     | None -> fieldName.Substring(fieldName.LastIndexOf '.' + 1)
+
+/// The field of an interface's struct that a member implements (an object expression's, or a
+/// class's `interface ... with`)
+let implementedSlot (com: Compiler) (m: Fable.MemberFunctionOrValue) : string =
+    let compiled = m.CompiledName.Substring(m.CompiledName.LastIndexOf '.' + 1)
+
+    // (some members cannot say what they implement: those of .NET's own interfaces)
+    let signature =
+        try
+            m.ImplementedAbstractSignatures |> Seq.tryHead
+        with _ ->
+            None
+
+    match signature with
+    | Some sg ->
+        match sg.DeclaringType with
+        | Fable.DeclaredType(i, _) ->
+            match com.TryGetEntity i with
+            | Some owner when owner.IsInterface -> slotKey owner compiled (paramTypesOf m)
+            | _ -> compiled
+        | _ -> compiled
+    | None -> compiled
+
+/// The compiled name an implementation's function is named by: an overload's with its slot
+let implFnName (com: Compiler) (m: Fable.MemberFunctionOrValue) : string =
+    let slot = implementedSlot com m
+
+    if slot.Contains "$" then
+        m.CompiledName.Substring(0, m.CompiledName.LastIndexOf '.' + 1) + slot
+    else
+        m.CompiledName
+
 
 let isConstructorCall (com: Compiler) (call: Fable.CallInfo) : bool =
     match call.MemberRef |> Option.bind com.TryGetMember with
@@ -3117,9 +3192,12 @@ let interfaceImpl
                 ent.MembersFunctionsAndValues
                 |> Seq.tryFind (fun m ->
                     m.IsOverrideOrExplicitInterfaceImplementation
-                    && m.CompiledName.EndsWith("." + name, System.StringComparison.Ordinal)
+                    && (if name.Contains "$" then
+                            implementedSlot ctx.Com m = name
+                        else
+                            m.CompiledName.EndsWith("." + name, System.StringComparison.Ordinal))
                 )
-                |> Option.map (fun m -> implName prefix m.CompiledName)
+                |> Option.map (fun m -> implName prefix (implFnName ctx.Com m))
             | None -> None
         )
 
@@ -4655,13 +4733,47 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             [ lw ctx x ]
             (fun xs ->
                 let fields = caseFields (typeOf xs.Head) ""
+                // (a mangled interface's member is named in full: `Ns.IFoo.get_Bar`)
+                let name = info.Name.Substring(info.Name.LastIndexOf '.' + 1)
 
-                match fields |> List.tryFind (fun (f, _) -> f = info.Name) with
+                // (and its overload's hash, `SumZ35CD86D0`)
+                let name =
+                    if fields |> List.exists (fun (f, _) -> f = name || f = "get_" + name) then
+                        name
+                    else
+                        System.Text.RegularExpressions.Regex.Replace(name, "Z?[0-9A-F]{8}$", "")
+
+                // (an overload: the one whose hash Fable gave the name, `get_ItemZ524259A4`)
+                let name =
+                    if fields |> List.exists (fun (f, _) -> f = name || f = "get_" + name) then
+                        name
+                    else
+                        let full = info.Name.Substring(info.Name.LastIndexOf '.' + 1)
+
+                        match x.Type with
+                        | Fable.DeclaredType(iref, _) ->
+                            match ctx.Com.TryGetEntity iref with
+                            | Some ient ->
+                                let genParams = ient.GenericParameters |> List.map (fun g -> g.Name)
+
+                                ient.MembersFunctionsAndValues
+                                |> Seq.filter (fun m -> m.IsDispatchSlot && m.CompiledName = name)
+                                |> Seq.tryFind (fun m ->
+                                    let groups = m.CurriedParameterGroups |> List.map (List.map (fun p -> p.Type))
+
+                                    full = name + OverloadSuffix.getHash genParams groups
+                                )
+                                |> Option.map (fun m -> slotKey ient m.CompiledName (paramTypesOf m))
+                                |> Option.defaultValue name
+                            | None -> name
+                        | _ -> name
+
+                match fields |> List.tryFind (fun (f, _) -> f = name) with
                 | Some(f, fty) -> EGet(xs.Head, PField f, fty)
                 | None ->
-                    match fields |> List.tryFind (fun (f, _) -> f = "get_" + info.Name) with
+                    match fields |> List.tryFind (fun (f, _) -> f = "get_" + name) with
                     | Some(f, fty) -> ECallClo(EGet(xs.Head, PField f, fty), [ EUnit ], mapType ctx r t)
-                    | None -> fail r "the Zig target cannot find the member %s of this interface" info.Name
+                    | None -> fail r "the Zig target cannot find the member %s of this interface (%A)" info.Name t
             )
 
     // (a dictionary seen as `IDictionary` or `IReadOnlyDictionary`: the same here)
@@ -5156,7 +5268,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             |> List.map (fun m ->
                 let compiled =
                     match ctx.Com.TryGetMember m.MemberRef with
-                    | Some info -> info.CompiledName
+                    | Some info ->
+                        let slot = implementedSlot ctx.Com info
+
+                        // (the field of the struct: the slot, when the member says which)
+                        if slot.Contains "$" then
+                            slot
+                        else
+                            info.CompiledName
                     | None -> m.Name
 
                 compiled, m
@@ -5470,7 +5589,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             ctx
             [ lw ctx x; lw ctx value ]
             (fun xs ->
-                match caseFields (typeOf xs[0]) "" |> List.tryFind (fun (f, _) -> f = "set_" + name) with
+                // (a mangled interface's member is named in full: `Ns.IFoo.set_Bar`)
+                let short = name.Substring(name.LastIndexOf '.' + 1)
+
+                let setter =
+                    if short.StartsWith("set_", System.StringComparison.Ordinal) then
+                        short
+                    else
+                        "set_" + short
+
+                match caseFields (typeOf xs[0]) "" |> List.tryFind (fun (f, _) -> f = setter) with
                 | Some(f, fty) -> ECallClo(EGet(xs[0], PField f, fty), [ xs[1] ], tVoid)
                 | None -> fail r "the Zig target cannot find the setter of %s of this interface" name
             )
@@ -8104,7 +8232,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
                             let compiled =
                                 match info with
-                                | Some info -> info.CompiledName
+                                | Some info -> implFnName com info
                                 | None -> m.Name
 
                             if m.Name = "ToString" then
@@ -8157,7 +8285,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         |> List.choose (fun m ->
                             let compiled =
                                 match com.TryGetMember m.MemberRef with
-                                | Some info -> info.CompiledName
+                                | Some info -> implFnName com info
                                 | None -> m.Name
 
                             if m.Name = "ToString" then

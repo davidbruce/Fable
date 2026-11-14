@@ -450,7 +450,6 @@ type FooInterface =
     abstract Item: int -> char with get, set
     abstract Sum: [<ParamArray>] items: string [] -> string
 
-#if !FABLE_COMPILER_ZIG // (overloaded interface members (two Item indexers))
 [<Fable.Core.Mangle>]
 type BarInterface =
     abstract Bar: string with get, set
@@ -458,7 +457,6 @@ type BarInterface =
     abstract Item: int -> char with get, set
     abstract Item: char -> bool with get
     abstract Sum: [<ParamArray>] items: string [] -> string
-#endif
 
 [<AbstractClass>]
 type FooAbstractClass(x: float) =
@@ -500,7 +498,6 @@ type BarAbstractClass(x: float) =
     member _.DoSomething(x, y) = x ** y
     abstract DoSomething: float -> float
 
-#if !FABLE_COMPILER_ZIG // (overloaded interface members (two Item indexers))
 type BarClass(x) =
     inherit BarAbstractClass(10.)
     let mutable x = x
@@ -526,7 +523,6 @@ type BarClass(x) =
 
         member _.Sum(items) =
             Array.reduce (fun x y -> x + x + y + y) items
-#endif
 
 type Interface2 =
     abstract Value: int
@@ -1488,7 +1484,6 @@ let ``test Non-mangled interfaces work with object expressions`` () =
 
     foo.Foo |> equal "FoW19.20Wabcd"
 // See #2084
-#if !FABLE_COMPILER_ZIG // (overloaded interface members (two Item indexers))
 [<Fact>]
 let ``test Mangled interfaces work with object expressions`` () =
     let mutable bar = "Bar"
@@ -1530,7 +1525,6 @@ let ``test Mangled interfaces work with object expressions`` () =
     bar.Bar <- bar.Bar + bar.Sum("a", "bc", "d")
 
     bar.Bar |> equal "Zar77.40rfalsefalsedbca"
-#endif
 *)
 
 // See #2084
@@ -1553,8 +1547,6 @@ let ``test Non-mangled interfaces work with classes`` () =
     foo2.Foo |> equal "Woo1020.00oabcabcdabcabcd"
 
 // See #2084
-#if !FABLE_COMPILER_ZIG // (an interface property overridden with a setter)
-#if !FABLE_COMPILER_ZIG // (overloaded interface members (two Item indexers))
 [<Fact>]
 let ``test Mangled interfaces work with classes`` () =
     let addPlus2 x y = x + y + 2.
@@ -1575,8 +1567,6 @@ let ``test Mangled interfaces work with classes`` () =
 
     bar2.Bar
     |> equal "BZr9536.74rtruefalseaabcbcaabcbcdd"
-#endif
-#endif
 
 #if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
