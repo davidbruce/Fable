@@ -3575,6 +3575,79 @@ let forInLoop (enumerator: string) (rest: Fable.Expr) : (Fable.Expr * Fable.Expr
         )
     | _ -> loopOf rest |> Option.map (fun body -> body, None)
 
+/// A delegate's body that applies an expression to the delegate's own parameters, in order and
+/// nothing else, when that expression is a computation (not a variable, a function or an
+/// import): the expression, and the body with another in its place
+let etaHead (args: Fable.Ident list) (body: Fable.Expr) : (Fable.Expr * (Fable.Expr -> Fable.Expr)) option =
+    let names = args |> List.map (fun a -> a.Name)
+
+    let isParams (xs: Fable.Expr list) =
+        xs.Length = names.Length
+        && List.forall2
+            (fun (x: Fable.Expr) n ->
+                match x with
+                | Fable.IdentExpr i -> i.Name = n
+                | _ -> false
+            )
+            xs
+            names
+
+    // (the applications from the outside in, until those peeled give exactly the parameters)
+    let rec peel (e: Fable.Expr) (given: Fable.Expr list) : (Fable.Expr * (Fable.Expr -> Fable.Expr)) option =
+        if not given.IsEmpty && isParams given then
+            Some(e, id)
+        elif given.Length >= names.Length then
+            None
+        else
+            match e with
+            // (an application of more than the parameters: the arguments before them are applied
+            // once, `f x` of `f x a b`)
+            | Fable.CurriedApply(f, xs, t, r) when
+                (xs @ given).Length > names.Length
+                && isParams (List.skip ((xs @ given).Length - names.Length) (xs @ given))
+                ->
+                let inXs = names.Length - given.Length
+                let before = List.take (xs.Length - inXs) xs
+                let after = List.skip (xs.Length - inXs) xs
+
+                // (the type of `f` with `before` applied)
+                let rec drop (n: int) (ty: Fable.Type) =
+                    if n = 0 then
+                        ty
+                    else
+                        match ty with
+                        | Fable.LambdaType(_, ret) -> drop (n - 1) ret
+                        | other -> other
+
+                let head = Fable.CurriedApply(f, before, drop before.Length f.Type, r)
+                Some(head, (fun h -> Fable.CurriedApply(h, after, t, r)))
+            | Fable.CurriedApply(f, xs, t, r) ->
+                peel f (xs @ given)
+                |> Option.map (fun (head, rebuild) -> head, (fun h -> Fable.CurriedApply(rebuild h, xs, t, r)))
+            | _ -> None
+
+    match peel body [] with
+    | Some(head, rebuild) ->
+        let isComputation =
+            match head with
+            | Fable.IdentExpr _
+            | Fable.Import _
+            | Fable.Lambda _
+            | Fable.Delegate _
+            | Fable.Value _ -> false
+            | _ -> true
+
+        let rec uses (e: Fable.Expr) =
+            match e with
+            | Fable.IdentExpr i -> List.contains i.Name names
+            | _ -> AST.getSubExpressions e |> List.exists uses
+
+        if isComputation && not (uses head) then
+            Some(head, rebuild)
+        else
+            None
+    | None -> None
+
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
     // ---- objects of classes that take part in inheritance ----
@@ -4043,6 +4116,13 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         lw ctx body
 
+    // (a function value made of the partial application of another, `fun a b -> (f x) a b`, as
+    // Fable writes it to keep the value uncurried: `f x` is computed once, when the value is
+    // made, as F# computes it)
+    | Fable.Delegate(args, body, name, tags) when (etaHead args body).IsSome ->
+        let head, rebuild = (etaHead args body).Value
+        let held = AST.makeTypedIdent head.Type "applied"
+        lw ctx (Fable.Let(held, head, Fable.Delegate(args, rebuild (Fable.IdentExpr held), name, tags)))
     // (a delegate of no parameters takes the unit here, as its type says)
     | Fable.Delegate([], body, name, tags) ->
         lw ctx (Fable.Delegate([ AST.makeTypedIdent Fable.Unit "unitVar" ], body, name, tags))

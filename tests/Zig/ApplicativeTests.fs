@@ -1307,7 +1307,7 @@ let ``test failwithf is not compiled as function`` () =
     equal "Boom!" x
 
 
-#if !FABLE_COMPILER_ZIG // (partial application of a function value declared with fewer parameters than its type has arrows: its body runs at each full application, not once)
+#if !FABLE_COMPILER_ZIG // (a function value of several arrows is kept uncurried: applying it to its first arguments (mapSetState setState) cannot run its body once and keep the rest)
 [<Fact>]
 let ``test Partial Applying caches side-effects`` () = // See #1836
     PseudoElmish.reset()
@@ -1332,7 +1332,6 @@ let ``test Partial Applying caches side-effects`` () = // See #1836
     PseudoElmish.setStateAccumulated |> equal "FooBar"
 #endif
 
-#if !FABLE_COMPILER_ZIG // (partial application of a function value declared with fewer parameters than its type has arrows: its body runs at each full application, not once)
 [<Fact>]
 let ``test Partial Applying locally caches side-effects`` () = // See #1836
     let mutable doMapRunTimes = 0
@@ -1353,7 +1352,6 @@ let ``test Partial Applying locally caches side-effects`` () = // See #1836
 
     doMapRunTimes |> equal 1
     setStateAccumulated |> equal "FooBarBaz"
-#endif
 
 [<Fact>]
 let ``test Fix lambda uncurry/curry semantic #1836`` () =
