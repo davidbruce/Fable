@@ -1194,6 +1194,13 @@ let call
                 "the Zig target does not support %s.%s with these arguments yet"
                 (entity.Substring(entity.LastIndexOf '.' + 1))
                 name
+    // ---- threads (the runtime's ThreadOf: what the function captured is shared when it starts) ----
+    | "System.Threading.Thread", ".ctor", [ start ] ->
+        pure' "fable_rt.threadNew($0)" [ start ] (TPrim "fable_rt.ThreadOf")
+    | "System.Threading.Thread", "Start", [ th ] -> rt "fable_rt.threadStart($0)" [ th ] tVoid
+    | "System.Threading.Thread", "Join", [ th ] -> pure' "fable_rt.threadJoin($0)" [ th ] tVoid
+    | "System.Threading.Thread", "get_CurrentThread", [] -> ELit("{}", tVoid)
+    | "System.Threading.Thread", "get_ManagedThreadId", _ -> pure' "fable_rt.threadId()" [] tI32
     // ---- `System.Diagnostics.Stopwatch` and `Thread.Sleep`: the library's Stopwatch.fs ----
     | ("System.Diagnostics.Stopwatch" | "System.Threading.Thread"), name, args ->
         let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]

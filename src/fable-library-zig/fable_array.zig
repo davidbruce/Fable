@@ -249,6 +249,7 @@ pub fn arrayPut(a: anytype, i: usize, value: @typeInfo(@TypeOf(a.items)).pointer
         storeValue(h, value);
     } else {
         touch(value);
+        if (rt.isShared(a)) rt.shareStored(value);
     }
     drop(old);
 }

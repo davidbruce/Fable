@@ -596,6 +596,7 @@ let dotnetExceptions =
             "System.IO.FileNotFoundException", "fable_rt.FileNotFoundException"
             "System.IO.DirectoryNotFoundException", "fable_rt.DirectoryNotFoundException"
             "System.Threading.Tasks.TaskCanceledException", "fable_rt.TaskCanceledException"
+            "System.Threading.ThreadStateException", "fable_rt.ThreadStateException"
         ]
     |> Map.ofList
 
@@ -633,6 +634,7 @@ let defaultExnMessages =
             "System.IO.FileNotFoundException", "Unable to find the specified file."
             "System.IO.DirectoryNotFoundException", "Attempted to access a path that is not on the disk."
             "System.Threading.Tasks.TaskCanceledException", "A task was canceled."
+            "System.Threading.ThreadStateException", "Thread was in an invalid state for the operation being executed."
         ]
 
 /// A .NET exception class that the runtime library declares (`System.Exception` is what
@@ -1312,6 +1314,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "Regex" regexTypes[ent.FullName], [])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.IO.DirectoryInfo" ->
         TEnt(libRecordEnt ctx "Path" "DirectoryInfoOf", [])
+    // (.NET's threads: the runtime's ThreadOf)
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Thread" -> TPrim "fable_rt.ThreadOf"
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Diagnostics.Stopwatch" ->
         TEnt(libRecordEnt ctx "Stopwatch" "StopwatchOf", [])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->

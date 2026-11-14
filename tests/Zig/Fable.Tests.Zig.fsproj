@@ -78,6 +78,7 @@
     <Compile Include="RandomTests.fs" />
     <Compile Include="NullnessTests.fs" />
     <Compile Include="NullReferenceTests.fs" />
+    <Compile Include="ThreadTests.fs" />
     <Compile Include="GuidTests.fs" />
     <Compile Include="TimeSpanTests.fs" />
     <Compile Include="DateTimeTests.fs" />

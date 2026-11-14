@@ -121,6 +121,7 @@ let rec isManaged (t: Ty) =
     | TPrim "fable_rt.Exn"
     | TPrim "fable_rt.Obj"
     | TPrim "fable_rt.BigInt"
+    | TPrim "fable_rt.ThreadOf"
     | TPrim "fable_rt.String" -> true
     | _ -> false
 
@@ -153,6 +154,7 @@ let rec isManagedDecl (t: Ty) =
     | TPrim "fable_rt.Exn"
     | TPrim "fable_rt.Obj"
     | TPrim "fable_rt.BigInt"
+    | TPrim "fable_rt.ThreadOf"
     | TPrim "fable_rt.String" -> true
     | _ -> false
 

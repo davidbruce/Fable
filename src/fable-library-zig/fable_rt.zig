@@ -128,7 +128,180 @@ pub inline fn isUnique(c: anytype) bool {
     return c.@"$rc" == 1;
 }
 
+// ---- values shared between threads (Koka's Perceus) ----
+//
+// A cell's count is plain while one thread has it. A value made reachable from another thread
+// is first marked shared, with everything it reaches (`markShared`): the top bit of the count.
+// The count of a shared cell is changed atomically; one test of that bit is what the others
+// pay. A shared cell is never unique (`isUnique`), so it is never changed in place. Cells the
+// cycle collector follows cannot be shared (the collector belongs to one thread).
+
+pub const shared_bit: u32 = 1 << 31;
+
+/// Mark a value shared between threads, with everything it reaches. A cell the cycle collector
+/// follows cannot be shared: NotSupportedException.
+pub fn markShared(x: anytype) Raised!void {
+    const T = @TypeOf(x);
+    if (comptime !isManaged(T)) return;
+    if (comptime isFunc(T)) {
+        const e = x.env orelse return;
+        if (!try markCell(e)) return;
+        return e.share(e);
+    }
+    if (T == Obj) {
+        if (!try markCell(x)) return;
+        return x.type.share(x);
+    }
+    if (T == Exn) {
+        if (!try markCell(x)) return;
+        return x.type.share(x);
+    }
+    if (T == String) {
+        const p = x orelse return;
+        const rc = @atomicLoad(u32, &p.rc, .monotonic);
+        if (rc != Str.literal and rc & shared_bit == 0) p.rc = rc | shared_bit;
+        return;
+    }
+    if (comptime isSlice(T)) {
+        for (x) |item| try markShared(item);
+        return;
+    }
+    if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_weak")) return notShareable("a weak reference");
+    switch (@typeInfo(T)) {
+        .pointer => try shareCells(T, x),
+        .optional => if (x) |v| try markShared(v),
+        .@"struct" => |s| inline for (s.field_names) |name| try markShared(@field(x, name)),
+        .@"union" => if (comptime isHeapUnion(T)) try shareCells(T, x) else switch (x) {
+            inline else => |p| try markShared(p),
+        },
+        else => comptime unreachable,
+    }
+}
+
+/// A value stored into a shared cell is shared too. (Reading and writing a shared cell's
+/// fields from several threads at once needs a `lock`, as on .NET.)
+pub fn shareStored(value: anytype) void {
+    markShared(value) catch {
+        const e = take();
+        defer drop(e);
+        @panic("fable: a value the cycle collector follows was stored into a value shared between threads");
+    };
+}
+
+/// .NET's `Thread`: a function run on a thread of its own. What the function captured is
+/// shared when the thread starts (`markShared`).
+pub const ThreadStart = Func(*const fn (?*Env, void) Raised!void);
+
+pub const ThreadOf = *struct {
+    pub const fable_identity = {};
+    @"$rc": u32 = 1,
+    start: ThreadStart,
+    /// the thread, once started and until joined
+    handle: ?*std.Thread = null,
+    started: bool = false,
+};
+
+/// `Thread(fun () -> ...)`
+pub fn threadNew(start: ThreadStart) ThreadOf {
+    return new(ThreadOf, .{ .start = dup(start) });
+}
+
+/// `t.Start()`
+pub fn threadStart(t: ThreadOf) Raised!void {
+    if (t.started) return raise(ThreadStateException, str("Thread is running or terminated; it cannot restart."));
+    try markShared(t.start);
+    const h = allocator.create(std.Thread) catch @panic("fable: out of memory");
+    h.* = std.Thread.spawn(.{}, threadMain, .{dup(t.start)}) catch {
+        allocator.destroy(h);
+        return raise(OutOfMemoryException, str("Thread failed to start."));
+    };
+    t.handle = h;
+    t.started = true;
+}
+
+/// (what a thread runs: its function, then what it kept for itself is given up; an exception
+/// that leaves it ends the program, as on .NET)
+fn threadMain(f: ThreadStart) void {
+    f.code(f.env, {}) catch {
+        uncaught();
+        std.process.exit(134);
+    };
+    drop(f);
+    collectorDeinit();
+}
+
+/// `t.Join()`: waits for the thread to end
+pub fn threadJoin(t: ThreadOf) void {
+    const h = t.handle orelse return;
+    h.join();
+    allocator.destroy(h);
+    t.handle = null;
+}
+
+/// `Thread.CurrentThread.ManagedThreadId`
+pub fn threadId() i32 {
+    return @truncate(@as(i64, @intCast(std.Thread.getCurrentId())));
+}
+
+fn notShareable(what: []const u8) Raised {
+    var b: TextBuilder = .{};
+    b.addAscii("The Zig target cannot share ");
+    b.addAscii(what);
+    b.addAscii(" between threads.");
+    return raise(NotSupportedException, b.finish());
+}
+
+/// Set the shared bit of a cell: false if it was set already
+fn markCell(c: anytype) Raised!bool {
+    // (shared already: other threads may be changing the count; until then, no other has it)
+    if (isShared(c)) return false;
+    if (gcOf(c) != null) return notShareable("a value that can be part of a cycle (the cycle collector follows it)");
+    c.@"$rc" |= shared_bit;
+    return true;
+}
+
+/// A cell (or a list's cells, or a tree's) and what it holds. The field of a cell that has the
+/// value's own type is followed in a loop, so a long list does not use stack in proportion.
+fn shareCells(comptime T: type, x: T) Raised!void {
+    var cur = x;
+    while (true) {
+        var next: ?T = null;
+        switch (@typeInfo(T)) {
+            .pointer => {
+                if (!try markCell(cur)) return;
+                inline for (@typeInfo(@typeInfo(T).pointer.child).@"struct".field_names) |name| {
+                    if (comptime isCount(name)) continue;
+                    const F = @TypeOf(@field(cur, name));
+                    if (F == T) next = @field(cur, name) else if (F == ?T) next = @field(cur, name) else try markShared(@field(cur, name));
+                }
+            },
+            else => switch (cur) {
+                inline else => |p| {
+                    const P = @TypeOf(p);
+                    if (comptime !isCellPtr(P)) {
+                        try markShared(p);
+                    } else if (try markCell(p)) {
+                        inline for (@typeInfo(@typeInfo(P).pointer.child).@"struct".field_names) |name| {
+                            if (comptime isCount(name)) continue;
+                            if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else try markShared(@field(p, name));
+                        }
+                    }
+                },
+            },
+        }
+        cur = next orelse return;
+    }
+}
+
+pub inline fn isShared(c: anytype) bool {
+    return @atomicLoad(u32, &c.@"$rc", .monotonic) & shared_bit != 0;
+}
+
 pub inline fn retain(c: anytype) void {
+    if (isShared(c)) {
+        _ = @atomicRmw(u32, &c.@"$rc", .Add, 1, .monotonic);
+        return;
+    }
     c.@"$rc" += 1;
     if (track) thread.stats.dups += 1;
     if (gcOf(c)) |h| thread.collector.onRetain(h);
@@ -136,6 +309,10 @@ pub inline fn retain(c: anytype) void {
 
 /// Take one reference off a cell that is known to be shared.
 pub inline fn release(c: anytype) void {
+    if (isShared(c)) {
+        _ = @atomicRmw(u32, &c.@"$rc", .Sub, 1, .release);
+        return;
+    }
     c.@"$rc" -= 1;
     if (track) thread.stats.decs += 1;
     if (gcOf(c)) |h| thread.collector.onRelease(h);
@@ -145,6 +322,11 @@ pub inline fn release(c: anytype) void {
 /// cell holds and frees it. (False also when the cell's whole structure died with this
 /// reference: the collector frees all of it, this cell included.)
 pub inline fn releaseIsLast(c: anytype) bool {
+    if (isShared(c)) {
+        // (the last reference of any thread: what the others wrote is seen before it is freed)
+        if (@atomicRmw(u32, &c.@"$rc", .Sub, 1, .acq_rel) != shared_bit | 1) return false;
+        return true;
+    }
     if (c.@"$rc" != 1) {
         c.@"$rc" -= 1;
         if (track) thread.stats.decs += 1;
@@ -608,6 +790,7 @@ pub inline fn storeIn(owner: anytype, comptime field: []const u8, value: @FieldT
         storeValue(h, value);
     } else {
         touch(value);
+        if (isShared(owner)) shareStored(value);
     }
     drop(old);
 }
@@ -1811,6 +1994,8 @@ pub const ObjType = struct {
     /// that introduces none, and in an abstract class)
     vtables: []const ?*const anyopaque,
     destroy: *const fn (Obj) void,
+    /// marks what the object holds shared (see `markShared`)
+    share: *const fn (Obj) Raised!void,
     /// the class's `ToString` (its own or the nearest one it inherits), if it has one
     to_string: ?*const fn (?*Env, Obj, void) Raised!String = null,
     /// `Equals(obj)`, `GetHashCode()` and `IComparable.CompareTo(obj)`, where the class or the
@@ -1901,6 +2086,10 @@ fn ObjCell(comptime Chain: type) type {
             free(@as(*Raw, @ptrCast(@alignCast(o))));
         }
 
+        pub fn share(o: Obj) Raised!void {
+            inline for (0..parts.len) |i| try markShared(part(o, i).*);
+        }
+
         pub fn new(ty: *const ObjType, chain: Chain) Obj {
             if (comptime cyclic) gcTick();
             const raw = allocator.create(Raw) catch @panic("fable: out of memory");
@@ -1974,7 +2163,7 @@ pub fn objTypeWith(
     comptime hash_: ?*const fn (Obj) i32,
     comptime compare_: ?*const fn (Obj, Obj) i32,
 ) ObjType {
-    return .{ .name = name, .parent = parent, .vtables = vtables, .destroy = ObjCell(Chain).destroy, .to_string = to_string, .equals = equals, .hash = hash_, .compare = compare_ };
+    return .{ .name = name, .parent = parent, .vtables = vtables, .destroy = ObjCell(Chain).destroy, .share = ObjCell(Chain).share, .to_string = to_string, .equals = equals, .hash = hash_, .compare = compare_ };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2028,6 +2217,7 @@ pub fn boxType(comptime T: type) *const ObjType {
             .parent = null,
             .vtables = &.{},
             .destroy = ObjCell(BoxChain(T)).destroy,
+            .share = ObjCell(BoxChain(T)).share,
             .to_string = boxText,
             .equals = boxEquals,
             .hash = boxHash,
@@ -2498,6 +2688,7 @@ pub inline fn objStore(o: Obj, place: anytype, value: @TypeOf(place.*)) void {
         storeValue(h, value);
     } else {
         touch(value);
+        if (isShared(o)) shareStored(value);
     }
     drop(old);
 }
@@ -3040,15 +3231,28 @@ pub fn strFrom(u: []const u16) String {
 
 pub inline fn strRetain(s: String) void {
     const p = s orelse return;
-    if (p.rc == Str.literal) return;
-    p.rc += 1;
+    const rc = @atomicLoad(u32, &p.rc, .monotonic);
+    if (rc == Str.literal) return;
+    if (rc & shared_bit != 0) {
+        _ = @atomicRmw(u32, &p.rc, .Add, 1, .monotonic);
+        return;
+    }
+    p.rc = rc + 1;
     if (track) thread.stats.dups += 1;
 }
 
 pub inline fn strRelease(s: String) void {
     const p = s orelse return;
-    if (p.rc == Str.literal) return;
+    const rc = @atomicLoad(u32, &p.rc, .monotonic);
+    if (rc == Str.literal) return;
     const m = p;
+    if (rc & shared_bit != 0) {
+        if (@atomicRmw(u32, &m.rc, .Sub, 1, .acq_rel) != shared_bit | 1) return;
+        if (track) thread.stats.frees += 1;
+        const words: [*]u32 = @ptrCast(@alignCast(m));
+        allocator.free(words[0..strWords(m.cap)]);
+        return;
+    }
     if (m.rc != 1) {
         m.rc -= 1;
         if (track) thread.stats.decs += 1;
@@ -5520,6 +5724,8 @@ pub const Env = struct {
     /// the collector's header of this environment, if what it captured can be part of a cycle
     gc: ?*sgc.Hdr = null,
     destroy: *const fn (*Env) void,
+    /// marks what the function captured shared (see `markShared`)
+    share: *const fn (*Env) Raised!void,
 };
 
 pub fn Func(comptime Code: type) type {
@@ -5554,6 +5760,11 @@ pub fn EnvOf(comptime Captures: type) type {
             drop(self.captures);
             free(self);
         }
+
+        pub fn share(header: *Env) Raised!void {
+            const self: *Self = @alignCast(@fieldParentPtr("header", header));
+            try markShared(self.captures);
+        }
     };
 }
 
@@ -5562,7 +5773,7 @@ pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captu
     const E = EnvOf(Captures);
     if (comptime E.cyclic) gcTick();
     const e = allocator.create(E) catch @panic("fable: out of memory");
-    e.* = .{ .header = .{ .destroy = E.destroy }, .captures = captures };
+    e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
     if (comptime E.cyclic) {
         e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
         e.header.gc = &e.hdr;
@@ -5594,6 +5805,8 @@ pub const Raised = error{Raised};
 pub const ExnType = struct {
     name: []const u8,
     destroy: *const fn (Exn) void,
+    /// marks what the exception holds shared (see `markShared`)
+    share: *const fn (Exn) Raised!void,
     /// the message, for an exception that was made with one
     message: ?*const fn (Exn) String = null,
     /// the .NET class this one derives from, if a program can name it
@@ -5654,6 +5867,7 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
         pub const info: ExnType = .{
             .name = name,
             .destroy = destroy,
+            .share = share,
             .message = if (Payload == Described) message else if (is_match_failure) matchMessage else if (@hasField(Payload, "fable_message")) classMessage else null,
             .parent = parent,
             .show = show,
@@ -5756,6 +5970,11 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
             drop(c.payload);
             free(c);
         }
+
+        pub fn share(e: Exn) Raised!void {
+            const c: *Whole = @alignCast(@fieldParentPtr("header", e));
+            try markShared(c.payload);
+        }
     };
 }
 
@@ -5812,6 +6031,7 @@ pub const ArithmeticException = Class("System.ArithmeticException", SystemExcept
 pub const DivideByZeroException = Class("System.DivideByZeroException", ArithmeticException);
 pub const OverflowException = Class("System.OverflowException", ArithmeticException);
 pub const InvalidOperationException = Class("System.InvalidOperationException", SystemException);
+pub const ThreadStateException = Class("System.Threading.ThreadStateException", SystemException);
 pub const NotSupportedException = Class("System.NotSupportedException", SystemException);
 pub const NotImplementedException = Class("System.NotImplementedException", SystemException);
 pub const IndexOutOfRangeException = Class("System.IndexOutOfRangeException", SystemException);
@@ -7616,4 +7836,54 @@ test "exception stack trace is null before throw and captured on throw" {
         try std.testing.expect(unitsOf(trace).len > 0);
     }
     try std.testing.expectEqual(start_stats.allocs - start_stats.frees, thread.stats.allocs - thread.stats.frees);
+}
+
+
+// ---- values shared between threads ----
+
+const ShareTestList = List(String);
+const ShareTestRec = *struct { @"$rc": u32 = 1, name: String, items: ShareTestList };
+
+fn shareTestList(n: usize) ShareTestList {
+    var l: ShareTestList = .Empty;
+    var i: usize = 0;
+    while (i < n) : (i += 1) l = ShareTestList{ .Cons = cell(ShareTestList, .Cons, .{ .Head = strConcat(str("x"), str("y")), .Tail = l }) };
+    return l;
+}
+
+fn shareTestReader(r: ShareTestRec, out: *usize) void {
+    var k: usize = 0;
+    var round: usize = 0;
+    while (round < 2000) : (round += 1) {
+        const mine = dup(r);
+        var cur = dup(mine.items);
+        while (true) {
+            switch (cur) {
+                .Empty => break,
+                .Cons => |c| {
+                    k += 1;
+                    const next = dup(c.Tail);
+                    drop(cur);
+                    cur = next;
+                },
+            }
+        }
+        drop(mine);
+    }
+    out.* = k;
+    drop(r);
+}
+
+test "a value shared between threads is counted atomically and freed once" {
+    const before = thread.stats;
+    const r = new(ShareTestRec, .{ .name = strConcat(str("a"), str("b")), .items = shareTestList(100_000) });
+    try markShared(r);
+    var outs: [4]usize = @splat(0);
+    var ts: [4]std.Thread = undefined;
+    for (&ts, &outs) |*t, *o| t.* = try std.Thread.spawn(.{}, shareTestReader, .{ dup(r), o });
+    for (ts) |t| t.join();
+    for (outs) |o| try std.testing.expectEqual(@as(usize, 2000 * 100_000), o);
+    drop(r);
+    // (allocations on this thread; frees happened on whichever thread let go last: this one)
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }
