@@ -1503,19 +1503,15 @@ module FSharpPlus =
             r <- Apply.Invoke (Map.Invoke add r) e.Current
         Map.Invoke (List.rev >> conversion) r
 
-#if !FABLE_COMPILER_ZIG // (an enumerator used by hand: `use e = t.GetEnumerator()` with `MoveNext` under another condition)
     let sequence (t: seq<option<'t>>) =
         forInfiniteSeqs (t, Option.isNone, List.toSeq) : option<seq<'t>>
-#endif
 
 open FSharpPlus
 
-#if !FABLE_COMPILER_ZIG // (an enumerator used by hand: `use e = t.GetEnumerator()` with `MoveNext` under another condition)
 [<Fact>]
 let ``test FSharpPlus regression`` () = // See #2471
     let expected = Some(seq [1; 2] |> List.ofSeq)
     sequence (seq [Some 1; Some 2]) |> Option.map List.ofSeq |> equal expected
-#endif
 
 module Curry =
     let addString (value : string) (f : string -> 'T) =

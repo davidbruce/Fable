@@ -4971,6 +4971,25 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             )
         )
 
+    // (`Dispose` of an enumerator, as `use e = s.GetEnumerator()` calls it through an unboxing
+    // to `IDisposable`: the enumerator's own)
+    | Fable.Call(Fable.Import(imp, it, ir), info, t, r) when
+        imp.Selector = "Dispose"
+        && imp.Path = Replacements.DotnetPrefix + "System.IDisposable"
+        && (
+            match info.ThisArg with
+            | Some(Fable.Call _ as unboxing) ->
+                let (Unboxed inner) = unboxing
+
+                match inner.Type with
+                | Fable.DeclaredType(e, _) -> e.FullName = "System.Collections.Generic.IEnumerator`1"
+                | _ -> false
+            | _ -> false
+        )
+        ->
+        let (Unboxed inner) = info.ThisArg.Value
+        lw ctx (Fable.Call(Fable.Import(imp, it, ir), { info with ThisArg = Some inner }, t, r))
+
     // (`Dispose` of a cancellation source, as `use` calls it: the library's Async.fs)
     | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
         imp.Selector = "Dispose"
