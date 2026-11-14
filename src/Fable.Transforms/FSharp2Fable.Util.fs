@@ -2458,7 +2458,8 @@ module Util =
         match com.Options.Language with
         | JavaScript
         | TypeScript
-        | Python -> true
+        | Python
+        | Zig -> true
         | _ -> false
 
     /// A class without a primary constructor gets a compiler-generated one that takes its fields

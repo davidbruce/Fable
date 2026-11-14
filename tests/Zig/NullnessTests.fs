@@ -60,13 +60,11 @@ module NullChecking =
 [<AutoOpen>]
 module TypeInference =
 
-#if !FABLE_COMPILER_ZIG // (null of a list, a record or a reference type parameter: they have no null in the Zig target)
     // type of `x` as well as the return value are `(string list)| null`. Nullness is inferred from the initial `x = null` assignment
     let getList() =
         let mutable x = null
         x <- ["a"; "b"]
         x
-#endif
 
     // Signature is `(int list)| null -> int list`. Parameter nullness is inferred from `nullArgCheck function`
     // Return type is not-nullable, because body of the function handles nullness
@@ -84,7 +82,6 @@ type Person =
     { First: string
       Last: string }
 
-#if !FABLE_COMPILER_ZIG // (null of a list, a record or a reference type parameter: they have no null in the Zig target)
 [<Fact>]
 let ``test Lists of nullable records works`` () =
     let args: (Person | null) list =
@@ -97,7 +94,6 @@ let ``test Lists of nullable records works`` () =
         ]
     let nullCount = args |> List.filter isNull |> List.length
     nullCount |> equal 2
-#endif
 
 [<Fact>]
 let ``test Lists of nullable strings works`` () =
@@ -157,10 +153,8 @@ let ``test Nullable pattern matching works`` () =
 
 [<Fact>]
 let ``test Nullable type inferrence works`` () =
-#if !FABLE_COMPILER_ZIG // (null of a list, a record or a reference type parameter: they have no null in the Zig target)
     getList() |> isNull |> equal false
     getList() |> nonNull |> List.length |> equal 2
-#endif
     processNullableList [2;3] |> List.length |> equal 2
     processNullableList [1;2] |> List.sum |> equal 5
     processNullString "abc" |> equal 3
@@ -192,7 +186,6 @@ let ``test NonNull active pattern works`` () =
 
     equal (getLength (B "hello")) 5
 
-#if !FABLE_COMPILER_ZIG // (null of a list, a record or a reference type parameter: they have no null in the Zig target)
 [<Fact>]
 let ``test Nullness works with generics`` () =
     // Generic code, note 'T must be constrained to be a reference type
@@ -203,7 +196,6 @@ let ``test Nullness works with generics`` () =
 
     equal (findOrNull 1 [ "a"; "b"; "c" ]) "b"
     equal (findOrNull 3 [ "a"; "b"; "c" ]) null
-#endif
 
 [<Fact>]
 let ``test Unchecked.nonNull works`` () =

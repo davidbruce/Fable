@@ -2083,6 +2083,9 @@ pub const ObjType = struct {
     /// the reflection information of the boxed type (when the program asks for it, see
     /// `reflection`)
     reflect: ?*const fn () reflect.Type = null,
+    /// starting field bit index of each part in the initialization bitset, and byte offset of the bitset
+    part_field_bases: []const usize = &.{},
+    init_offset: usize = 0,
 };
 
 pub const ObjHeader = struct {
@@ -2124,15 +2127,36 @@ fn partOffset(comptime parts: []const type, comptime i: usize) usize {
     return std.mem.alignForward(usize, off, @alignOf(parts[i]));
 }
 
+fn partBases(comptime parts: []const type) []const usize {
+    comptime {
+        var bases: [parts.len]usize = undefined;
+        var total: usize = 0;
+        for (parts, 0..) |P, i| {
+            bases[i] = total;
+            total += @typeInfo(P).@"struct".field_names.len;
+        }
+        const out = bases;
+        return &out;
+    }
+}
+
 /// An object whose class has the chain of fields `Chain`: the header, the fields of each class
-/// in turn, and the collector's header if what it holds can be part of a cycle.
+/// in turn, the collector's header if what it holds can be part of a cycle, and the field-init bits.
 fn ObjCell(comptime Chain: type) type {
     return struct {
         const parts = partsOf(Chain);
+        const part_bases = partBases(parts);
+        const total_fields = blk: {
+            var total: usize = 0;
+            for (parts) |P| total += @typeInfo(P).@"struct".field_names.len;
+            break :blk total;
+        };
+        const init_bytes_len = (total_fields + 7) / 8;
         const cyclic = functions_in_cycles and holdsCyclic(Chain);
         const end = partOffset(parts, parts.len - 1) + @sizeOf(parts[parts.len - 1]);
         const gc_at = std.mem.alignForward(usize, end, @alignOf(sgc.Hdr));
-        const size = if (cyclic) gc_at + @sizeOf(sgc.Hdr) else end;
+        const init_at = if (cyclic) gc_at + @sizeOf(sgc.Hdr) else end;
+        const size = init_at + init_bytes_len;
         const alignment = blk: {
             var a: usize = @max(@alignOf(ObjHeader), if (cyclic) @alignOf(sgc.Hdr) else 1);
             for (parts) |P| a = @max(a, @alignOf(P));
@@ -2142,6 +2166,13 @@ fn ObjCell(comptime Chain: type) type {
 
         pub inline fn part(o: Obj, comptime i: usize) *parts[i] {
             return @ptrFromInt(@intFromPtr(o) + comptime partOffset(parts, i));
+        }
+
+        inline fn isInit(o: Obj, comptime i: usize, comptime j: usize) bool {
+            if (comptime init_bytes_len == 0) return true;
+            const bit_idx = comptime part_bases[i] + j;
+            const bytes: [*]const u8 = @ptrFromInt(@intFromPtr(o) + init_at);
+            return (bytes[bit_idx >> 3] & (@as(u8, 1) << @intCast(bit_idx & 7))) != 0;
         }
 
         pub inline fn hdrOf(o: Obj) *sgc.Hdr {
@@ -2157,12 +2188,45 @@ fn ObjCell(comptime Chain: type) type {
         }
 
         pub fn destroy(o: Obj) void {
-            inline for (0..parts.len) |i| drop(part(o, i).*);
+            inline for (0..parts.len) |i| {
+                const names = @typeInfo(parts[i]).@"struct".field_names;
+                if (comptime names.len > 0) {
+                    const p = part(o, i);
+                    inline for (names, 0..) |fname, j| {
+                        if (isInit(o, i, j)) drop(@field(p, fname));
+                    }
+                }
+            }
             free(@as(*Raw, @ptrCast(@alignCast(o))));
         }
 
         pub fn share(o: Obj) Raised!void {
-            inline for (0..parts.len) |i| try markShared(part(o, i).*);
+            inline for (0..parts.len) |i| {
+                const names = @typeInfo(parts[i]).@"struct".field_names;
+                if (comptime names.len > 0) {
+                    const p = part(o, i);
+                    inline for (names, 0..) |fname, j| {
+                        if (isInit(o, i, j)) try markShared(@field(p, fname));
+                    }
+                }
+            }
+        }
+
+        pub fn alloc(ty: *const ObjType) Obj {
+            if (comptime cyclic) gcTick();
+            const raw = allocator.create(Raw) catch @panic("fable: out of memory");
+            const o: Obj = @ptrCast(@alignCast(&raw.bytes));
+            o.* = .{ .type = ty };
+            if (comptime init_bytes_len > 0) {
+                const bytes: [*]u8 = @ptrFromInt(@intFromPtr(o) + init_at);
+                @memset(bytes[0..init_bytes_len], 0);
+            }
+            if (comptime cyclic) {
+                hdrOf(o).* = thread.collector.hdr(&desc, true);
+                o.gc = hdrOf(o);
+            }
+            if (track) thread.stats.allocs += 1;
+            return o;
         }
 
         pub fn new(ty: *const ObjType, chain: Chain) Obj {
@@ -2171,6 +2235,10 @@ fn ObjCell(comptime Chain: type) type {
             const o: Obj = @ptrCast(@alignCast(&raw.bytes));
             o.* = .{ .type = ty };
             inline for (0..parts.len) |i| part(o, i).* = chainPart(chain, i);
+            if (comptime init_bytes_len > 0) {
+                const bytes: [*]u8 = @ptrFromInt(@intFromPtr(o) + init_at);
+                @memset(bytes[0..init_bytes_len], 0xFF);
+            }
             if (comptime cyclic) {
                 hdrOf(o).* = thread.collector.hdr(&desc, isLeaf(o));
                 o.gc = hdrOf(o);
@@ -2181,12 +2249,28 @@ fn ObjCell(comptime Chain: type) type {
 
         pub fn trace(n: *sgc.Hdr, v: *sgc.Visitor) void {
             const o = objOfHdr(n);
-            inline for (0..parts.len) |i| eachHdr(part(o, i).*, v, visit);
+            inline for (0..parts.len) |i| {
+                const names = @typeInfo(parts[i]).@"struct".field_names;
+                if (comptime names.len > 0) {
+                    const p = part(o, i);
+                    inline for (names, 0..) |fname, j| {
+                        if (isInit(o, i, j)) eachHdr(@field(p, fname), v, visit);
+                    }
+                }
+            }
         }
 
         pub fn releaseOutside(n: *sgc.Hdr, _: ?*anyopaque) void {
             const o = objOfHdr(n);
-            inline for (0..parts.len) |i| dropOutside(part(o, i).*);
+            inline for (0..parts.len) |i| {
+                const names = @typeInfo(parts[i]).@"struct".field_names;
+                if (comptime names.len > 0) {
+                    const p = part(o, i);
+                    inline for (names, 0..) |fname, j| {
+                        if (isInit(o, i, j)) dropOutside(@field(p, fname));
+                    }
+                }
+            }
         }
 
         pub fn freeCell(n: *sgc.Hdr, _: ?*anyopaque) void {
@@ -2195,13 +2279,29 @@ fn ObjCell(comptime Chain: type) type {
 
         pub fn finalize(n: *sgc.Hdr, _: ?*anyopaque) void {
             const o = objOfHdr(n);
-            inline for (0..parts.len) |i| drop(part(o, i).*);
+            inline for (0..parts.len) |i| {
+                const names = @typeInfo(parts[i]).@"struct".field_names;
+                if (comptime names.len > 0) {
+                    const p = part(o, i);
+                    inline for (names, 0..) |fname, j| {
+                        if (isInit(o, i, j)) drop(@field(p, fname));
+                    }
+                }
+            }
             free(@as(*Raw, @ptrCast(@alignCast(o))));
         }
 
         pub fn isLeaf(o: Obj) bool {
             var n: usize = 0;
-            inline for (0..parts.len) |i| eachHdr(part(o, i).*, &n, countOne);
+            inline for (0..parts.len) |i| {
+                const names = @typeInfo(parts[i]).@"struct".field_names;
+                if (comptime names.len > 0) {
+                    const p = part(o, i);
+                    inline for (names, 0..) |fname, j| {
+                        if (isInit(o, i, j)) eachHdr(@field(p, fname), &n, countOne);
+                    }
+                }
+            }
             return n == 0;
         }
 
@@ -2238,7 +2338,7 @@ pub fn objTypeWith(
     comptime hash_: ?*const fn (Obj) i32,
     comptime compare_: ?*const fn (Obj, Obj) i32,
 ) ObjType {
-    return .{ .name = name, .parent = parent, .vtables = vtables, .destroy = ObjCell(Chain).destroy, .share = ObjCell(Chain).share, .to_string = to_string, .equals = equals, .hash = hash_, .compare = compare_ };
+    return .{ .name = name, .parent = parent, .vtables = vtables, .destroy = ObjCell(Chain).destroy, .share = ObjCell(Chain).share, .to_string = to_string, .equals = equals, .hash = hash_, .compare = compare_, .part_field_bases = ObjCell(Chain).part_bases, .init_offset = ObjCell(Chain).init_at };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2361,6 +2461,7 @@ fn comptimeComparable(comptime T: type, comptime depth: u8) bool {
 /// `box x` (it borrows `x`). A null string and `None` box to null, as on .NET.
 pub fn box(x: anytype) Any {
     const T = @TypeOf(x);
+    if (T == void) return null;
     if (T == Any) return dup(x);
     if (T == Obj) return dup(x);
     if (T == String and x == null) return null;
@@ -2376,6 +2477,7 @@ pub fn box(x: anytype) Any {
 
 /// `o :? T` (of a type that is not a class: those are `anyIsClass`)
 pub fn isType(comptime T: type, o: Any) bool {
+    if (T == void) return o == null;
     const p = o orelse return false;
     return p.type == boxType(T);
 }
@@ -2383,6 +2485,7 @@ pub fn isType(comptime T: type, o: Any) bool {
 /// `o :? T` with what it holds: `?T`, null when it is not a `T` (`OT` is `?T`)
 pub fn tryUnbox(comptime OT: type, o: Any) OT {
     const T = @typeInfo(OT).optional.child;
+    if (T == void) return if (o == null) {} else null;
     const p = o orelse return null;
     if (T == Any or T == Obj) return dup(p);
     if (p.type == boxType(T)) return dup(boxed(T, p).value);
@@ -2420,6 +2523,7 @@ pub fn unbox(comptime T: type, x: anytype) Raised!T {
     const o: Any = x;
     if (T == Any) return dup(o);
     const p = o orelse {
+        if (T == void) return {};
         if (comptime @typeInfo(T) == .optional) return null;
         // (null as an array: the array's null)
         if (comptime isArrayPtr(T)) return arrayNull(T);
@@ -2553,6 +2657,7 @@ pub fn genericText(x: anytype) Raised!String {
 pub fn defaultOf(comptime T: type) T {
     if (T == BigInt) return bigOf(@as(i32, 0));
     if (T == NetDecimal) return .{};
+    if (comptime isArrayPtr(T)) return arrayNull(T);
     return switch (@typeInfo(T)) {
         .@"struct" => |st| blk: {
             var x: T = undefined;
@@ -2702,6 +2807,47 @@ pub fn hookType(comptime T: type) type {
 /// A new object of class `ty` with these fields (which it shares).
 pub fn objNew(ty: *const ObjType, chain: anytype) Obj {
     return ObjCell(@TypeOf(chain)).new(ty, dup(chain));
+}
+
+/// An empty object of class `ty` whose fields are filled by its constructor (`objInitField`).
+pub fn objAlloc(comptime Chain: type, ty: *const ObjType) Obj {
+    return ObjCell(Chain).alloc(ty);
+}
+
+/// Set a field of an object during construction: initializes it safely if not yet set, or replaces
+/// the previous value (`objStore`) if set before.
+pub inline fn objInitField(
+    comptime P: type,
+    comptime parts: []const type,
+    comptime field_idx: usize,
+    o: Obj,
+    value: @FieldType(P, @typeInfo(P).@"struct".field_names[field_idx]),
+) void {
+    const p = objPart(*P, parts, o);
+    const place = &@field(p, @typeInfo(P).@"struct".field_names[field_idx]);
+    const bit_idx = o.type.part_field_bases[parts.len - 1] + field_idx;
+    const bytes: [*]u8 = @ptrFromInt(@intFromPtr(o) + o.type.init_offset);
+    const byte_idx = bit_idx >> 3;
+    const mask: u8 = @as(u8, 1) << @intCast(bit_idx & 7);
+    if ((bytes[byte_idx] & mask) != 0) {
+        if (comptime isManaged(@TypeOf(value))) {
+            objStore(o, place, value);
+        } else {
+            place.* = value;
+        }
+    } else {
+        place.* = value;
+        bytes[byte_idx] |= mask;
+        if (comptime isManaged(@TypeOf(value))) {
+            if (isShared(o)) {
+                shareStored(value);
+            } else if (o.gc) |h| {
+                storeValue(h, value);
+            } else {
+                touch(value);
+            }
+        }
+    }
 }
 
 /// The fields that the last class of `parts` (a class and the classes above it, the root
@@ -3655,6 +3801,20 @@ pub fn nonNullValue(x: anytype) Raised!@TypeOf(x) {
 /// `nullArgCheck name x`
 pub fn nullArgCheck(name: String, x: anytype) Raised!@TypeOf(x) {
     if (!isNullValue(x)) return dup(x);
+    const head = strConcat(str("Value cannot be null. (Parameter '"), name);
+    defer drop(head);
+    return raise(ArgumentNullException, strConcat(head, str("')")));
+}
+
+/// `nonNull x` when `x` is a Zig optional wrapping a type whose unwrapped F# type has a non-optional Zig type
+pub fn nonNullUnwrap(x: anytype) Raised!@typeInfo(@TypeOf(x)).optional.child {
+    const inner = x orelse return nullRef();
+    return dup(inner);
+}
+
+/// `nullArgCheck name x` when `x` is a Zig optional wrapping a type whose unwrapped F# type has a non-optional Zig type
+pub fn nullArgCheckUnwrap(name: String, x: anytype) Raised!@typeInfo(@TypeOf(x)).optional.child {
+    if (x) |inner| return dup(inner);
     const head = strConcat(str("Value cannot be null. (Parameter '"), name);
     defer drop(head);
     return raise(ArgumentNullException, strConcat(head, str("')")));
@@ -7760,6 +7920,14 @@ test "box" {
     defer drop(t);
     try std.testing.expect(strEql(t, str("x")));
     try std.testing.expect(box(@as(String, null)) == null);
+    try std.testing.expect(box({}) == null);
+    try std.testing.expect(isType(void, null));
+    try std.testing.expect(!isType(void, a));
+    try std.testing.expect(tryUnbox(?void, null) != null);
+    try std.testing.expect(tryUnbox(?void, a) == null);
+    try std.testing.expectEqual({}, try unbox(void, box({})));
+    try std.testing.expectError(error.Raised, unbox(void, a));
+    drop(take());
 }
 
 test "Random(seed) gives .NET's numbers" {

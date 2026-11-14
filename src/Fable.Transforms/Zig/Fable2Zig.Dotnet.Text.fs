@@ -135,18 +135,18 @@ let call
     | "System.String", "Format", pattern :: values when
         (match pattern with
          | Fable.Value(Fable.StringConstant _, _) -> false
-         | _ -> pattern.Type = Fable.String)
+         | _ -> unwrapNullness pattern.Type = Fable.String)
         ->
         let objs =
             match values with
-            | [ arr ] when arr.Type = Fable.Array(Fable.Any, Fable.MutableArray) -> arr
+            | [ arr ] when unwrapNullness arr.Type = Fable.Array(Fable.Any, Fable.MutableArray) -> arr
             | _ ->
                 Fable.Value(
                     Fable.NewArray(
                         Fable.ArrayValues(
                             values
                             |> List.map (fun v ->
-                                if v.Type = Fable.Any then
+                                if unwrapNullness v.Type = Fable.Any then
                                     v
                                 else
                                     Fable.TypeCast(v, Fable.Any)
@@ -427,7 +427,7 @@ let call
     // ---- strings ----
     // (what a null string or an argument out of range raises on .NET, it raises here: those
     // calls are `ERt`. The `String` module takes a null string for an empty one.)
-    | "Microsoft.FSharp.Core.Operators.Unchecked", "DefaultOf", [] when t = Fable.String ->
+    | "Microsoft.FSharp.Core.Operators.Unchecked", "DefaultOf", [] when unwrapNullness t = Fable.String ->
         ELit("@as(fable_rt.String, null)", tStr)
     | "Microsoft.FSharp.Core.Operators.Unchecked", "DefaultOf", [] ->
         match t with
@@ -438,7 +438,7 @@ let call
         | Fable.Boolean -> ELit("false", tBool)
         | Fable.Unit -> EUnit
         // (a struct tuple: each item's default)
-        | Fable.Tuple(items, true) when items |> List.forall hasDefault ->
+        | Fable.Tuple(items, true) when items |> List.forall (hasDefault ctx) ->
             let defaults =
                 items
                 |> List.map (fun it ->
@@ -460,8 +460,19 @@ let call
 
             lw ctx (Fable.Value(Fable.NewTuple(defaults, true), r))
         | Fable.Any -> ELit("@as(fable_rt.Any, null)", tAny)
-        | Fable.Option(inner, _)
-        | Fable.Nullable(inner, _) -> ECon(mapType ctx r t, "None", [], None)
+        | Fable.Option _ -> ECon(mapType ctx r t, "None", [], None)
+        | Fable.Nullable(inner, false) ->
+            match mapType ctx r t with
+            | TOpt _ as optTy -> ECon(optTy, "None", [], None)
+            | _ ->
+                dotnetCall
+                    ctx
+                    r
+                    "Microsoft.FSharp.Core.Operators.Unchecked"
+                    "DefaultOf"
+                    { info with GenericArgs = [ inner ] }
+                    inner
+        | Fable.Nullable(_, true) -> ECon(mapType ctx r t, "None", [], None)
         | Fable.DeclaredType(entRef, [ _ ]) when
             entRef.FullName = "System.Span`1" || entRef.FullName = "System.ReadOnlySpan`1"
             ->
@@ -474,7 +485,7 @@ let call
                  && not ent.IsFSharpUnion
                  && (ent.FSharpFields
                      |> List.filter (fun f -> not f.IsStatic)
-                     |> List.forall (fun f -> hasDefault f.FieldType))
+                     |> List.forall (fun f -> hasDefault ctx f.FieldType))
              | None -> false)
             && (
                 match entRef.Path with
@@ -606,10 +617,26 @@ let call
         | Fable.DeclaredType(entRef, _) when isWitnessClass ctx entRef -> EUnit
         // (a class: null)
         | Fable.DeclaredType _ when (objOfType ctx r t).IsSome -> lw ctx (Fable.Value(Fable.Null t, r))
+        // (an interface whose Zig type is nullable: None)
+        | Fable.DeclaredType _ when
+            isInterfaceType ctx.Com t
+            && (
+                match mapType ctx r t with
+                | TOpt _ -> true
+                | _ -> false
+            )
+            ->
+            ECon(mapType ctx r t, "None", [], None)
         // (an array: the array's null, see fable_array.zig)
         | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> lw ctx (Fable.Value(Fable.Null t, r))
+        // (of a type parameter: chosen for each type it stands for, see fable_rt.defaultOf)
+        | Fable.GenericParam _ ->
+            ctx.State.UsesRuntime <- true
+            EEmit("fable_rt.defaultOf($R)", [], mapType ctx r t)
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
-    | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String || x.Type = Fable.Any ->
+    | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when
+        unwrapNullness x.Type = Fable.String || unwrapNullness x.Type = Fable.Any
+        ->
         pure' "($0 == null)" [ x ] tBool
     | "System.Decimal", "Equals", [ a; b ] when isDec a && isDec b -> pure' "fable_rt.eql($0, $1)" [ a; b ] tBool
     // `x.Equals y` and `x.CompareTo y` of numbers, chars and bools (NaN equals NaN, as .NET's
@@ -641,9 +668,14 @@ let call
         )
         ->
         pure' "($0 == $1)" [ a; b ] tBool
-    | "System.Object", "Equals", Uncast a :: Uncast b :: _ when a.Type = b.Type && a.Type <> Fable.String ->
+    | "System.Object", "Equals", Uncast a :: Uncast b :: _ when
+        unwrapNullness a.Type = unwrapNullness b.Type
+        && unwrapNullness a.Type <> Fable.String
+        ->
         bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("eql", xs, tBool))
-    | "System.String", "Equals", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
+    | "System.String", "Equals", [ a; b ] when
+        unwrapNullness a.Type = Fable.String && unwrapNullness b.Type = Fable.String
+        ->
         if info.ThisArg.IsSome then
             rt "fable_rt.strEquals($0, $1)" [ a; b ] tBool
         else
@@ -656,25 +688,25 @@ let call
         rt "fable_rt.strIndexOfChar($0, $1, 0)" [ s; x ] tI32
     | "System.String", "IndexOf", [ s; x; start ] when x.Type = Fable.Char && isInt start ->
         rt "fable_rt.strIndexOfChar($0, $1, $2)" [ s; x; start ] tI32
-    | "System.String", "IndexOf", [ s; x ] when x.Type = Fable.String ->
+    | "System.String", "IndexOf", [ s; x ] when unwrapNullness x.Type = Fable.String ->
         rt "fable_rt.strIndexOf($0, $1, 0)" [ s; x ] tI32
-    | "System.String", "IndexOf", [ s; x; start ] when x.Type = Fable.String && isInt start ->
+    | "System.String", "IndexOf", [ s; x; start ] when unwrapNullness x.Type = Fable.String && isInt start ->
         rt "fable_rt.strIndexOf($0, $1, $2)" [ s; x; start ] tI32
     | "System.String", "LastIndexOf", [ s; x ] when x.Type = Fable.Char ->
         rt "fable_rt.strLastIndexOfChar($0, $1)" [ s; x ] tI32
-    | "System.String", "LastIndexOf", [ s; x ] when x.Type = Fable.String ->
+    | "System.String", "LastIndexOf", [ s; x ] when unwrapNullness x.Type = Fable.String ->
         rt "fable_rt.strLastIndexOf($0, $1)" [ s; x ] tI32
     | "System.String", "Contains", [ s; x ] when x.Type = Fable.Char ->
         rt "fable_rt.strContainsChar($0, $1)" [ s; x ] tBool
-    | "System.String", "Contains", [ s; x ] when x.Type = Fable.String ->
+    | "System.String", "Contains", [ s; x ] when unwrapNullness x.Type = Fable.String ->
         rt "fable_rt.strContains($0, $1)" [ s; x ] tBool
     | "System.String", "StartsWith", [ s; x ] when x.Type = Fable.Char ->
         rt "fable_rt.strStartsWithChar($0, $1)" [ s; x ] tBool
-    | "System.String", "StartsWith", [ s; x ] when x.Type = Fable.String ->
+    | "System.String", "StartsWith", [ s; x ] when unwrapNullness x.Type = Fable.String ->
         rt "fable_rt.strStartsWith($0, $1)" [ s; x ] tBool
     | "System.String", "EndsWith", [ s; x ] when x.Type = Fable.Char ->
         rt "fable_rt.strEndsWithChar($0, $1)" [ s; x ] tBool
-    | "System.String", "EndsWith", [ s; x ] when x.Type = Fable.String ->
+    | "System.String", "EndsWith", [ s; x ] when unwrapNullness x.Type = Fable.String ->
         rt "fable_rt.strEndsWith($0, $1)" [ s; x ] tBool
     // (there is no current culture here: `ToUpper` is `ToUpperInvariant`)
     | "System.String", ("ToUpper" | "ToUpperInvariant"), [ s ] -> rt "fable_rt.strCase($0, true)" [ s ] tStr
@@ -690,7 +722,9 @@ let call
         rt "fable_rt.strTrim($0, false, true, $1)" [ s; c ] tStr
     | "System.String", "Replace", [ s; a; b ] when a.Type = Fable.Char && b.Type = Fable.Char ->
         rt "fable_rt.strReplaceChar($0, $1, $2)" [ s; a; b ] tStr
-    | "System.String", "Replace", [ s; a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
+    | "System.String", "Replace", [ s; a; b ] when
+        unwrapNullness a.Type = Fable.String && unwrapNullness b.Type = Fable.String
+        ->
         rt "fable_rt.strReplace($0, $1, $2)" [ s; a; b ] tStr
     | "System.String", "Insert", [ s; at; x ] -> rt "fable_rt.strInsert($0, $1, $2)" [ s; at; x ] tStr
     | "System.String", "Remove", [ s; start ] -> rt "fable_rt.strRemove($0, $1, null)" [ s; start ] tStr
@@ -711,7 +745,10 @@ let call
     | "Microsoft.FSharp.Core.StringModule", "Exists", [ f; s ] -> rt "fable_rt.strExists($0, $1)" [ f; s ] tBool
     | "Microsoft.FSharp.Core.StringModule", "Filter", [ f; s ] -> rt "fable_rt.strFilter($0, $1)" [ f; s ] tStr
     | "Microsoft.FSharp.Core.StringModule", "Collect", [ f; s ] -> rt "fable_rt.strCollect($0, $1)" [ f; s ] tStr
-    | "System.String", "Concat", parts when not parts.IsEmpty && parts |> List.forall (fun x -> x.Type = Fable.String) ->
+    | "System.String", "Concat", parts when
+        not parts.IsEmpty
+        && parts |> List.forall (fun x -> unwrapNullness x.Type = Fable.String)
+        ->
         let holes = parts |> List.mapi (fun i _ -> $"$%d{i}") |> String.concat ", "
         pure' $"fable_rt.format(.{{ %s{holes} }})" parts tStr
     | "Microsoft.FSharp.Core.Operators", ("op_Addition" | "op_Subtraction"), [ a; _ ] when
@@ -743,14 +780,17 @@ let call
             args
             t
     // `a + b + c`: one new string, whatever the number of parts
-    | "Microsoft.FSharp.Core.Operators", "op_Addition", [ a; b ] when a.Type = Fable.String && b.Type = Fable.String ->
+    | "Microsoft.FSharp.Core.Operators", "op_Addition", [ a; b ] when
+        unwrapNullness a.Type = Fable.String && unwrapNullness b.Type = Fable.String
+        ->
         let rec parts (x: Fable.Expr) : Fable.Expr list =
             match x with
-            | Fable.Call(Fable.Import(imp, _, _), inner, Fable.String, _) when
-                imp.Selector = "op_Addition"
+            | Fable.Call(Fable.Import(imp, _, _), inner, t, _) when
+                unwrapNullness t = Fable.String
+                && imp.Selector = "op_Addition"
                 && imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
                 && inner.Args.Length = 2
-                && inner.Args |> List.forall (fun arg -> arg.Type = Fable.String)
+                && inner.Args |> List.forall (fun arg -> unwrapNullness arg.Type = Fable.String)
                 ->
                 inner.Args |> List.collect parts
             | _ -> [ x ]
@@ -807,7 +847,7 @@ let call
         )
         ->
         dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
-    | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when x.Type = Fable.Any ->
+    | ("Microsoft.FSharp.Core.Operators" | "System.Object"), "ToString", [ x ] when unwrapNullness x.Type = Fable.Any ->
         if entity = "System.Object" then
             rt "fable_rt.anyToString($0, false)" [ x ] tStr
         else

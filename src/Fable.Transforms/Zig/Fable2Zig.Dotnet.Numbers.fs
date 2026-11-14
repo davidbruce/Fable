@@ -241,7 +241,7 @@ let call
     | "Microsoft.FSharp.Core.Operators.Checked", _, [ x ] when name.StartsWith("To", System.StringComparison.Ordinal) ->
         let ty = mapType ctx r t
 
-        if x.Type = Fable.String then
+        if unwrapNullness x.Type = Fable.String then
             dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
         elif intBits ty > 0 then
             bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.checkedConv(%s{zigTypeName ty}, $0)", xs, ty))

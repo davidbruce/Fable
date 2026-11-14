@@ -59,6 +59,8 @@ type Ctx =
         OutTuples: Dictionary<string, Var>
         /// inside a `with` handler: the exception it caught (for `reraise ()`)
         CaughtExn: Var option
+        /// inside an `Obj` constructor: writes to fields of `Obj` use `objInitField`
+        InCtor: bool
     }
 
 /// Something that is called by name.
@@ -479,6 +481,9 @@ let settleCycles (state: FileState) =
             for fieldTy in fieldsOf (typeOf chain) do
                 if reachesOpaque fieldTy then
                     holds <- true
+
+                if not (freeGens [ fieldTy ]).IsEmpty then
+                    generic <- true
         // (a new array is a cell whose items can be assigned)
         | EEmit(_, _, TEnt({ Name = "fable_rt.Array" }, [ item ]))
         | ERt(_, _, TEnt({ Name = "fable_rt.Array" }, [ item ])) ->
@@ -497,6 +502,22 @@ let settleCycles (state: FileState) =
 
     for fn in state.Fns do
         exists look fn.Body |> ignore
+
+    for chainTy in state.AllocChains do
+        let rec fieldsOf (t: Ty) =
+            match t with
+            | TEnt(e, _) when e.Name.EndsWith("__chain", System.StringComparison.Ordinal) ->
+                caseFields t "" |> List.collect (snd >> fieldsOf)
+            | TEnt(e, _) when e.Name.EndsWith("__part", System.StringComparison.Ordinal) ->
+                caseFields t "" |> List.map snd
+            | _ -> []
+
+        for fieldTy in fieldsOf chainTy do
+            if reachesOpaque fieldTy then
+                holds <- true
+
+            if not (freeGens [ fieldTy ]).IsEmpty then
+                generic <- true
 
     state.Cycles <- (holds, generic, instantiated)
 
@@ -1193,6 +1214,12 @@ let regexTypes =
             "System.Text.RegularExpressions.GroupCollection", "GroupCollectionOf"
         ]
 
+/// Unwrap F# 9 nullness (`T | null` = `Fable.Nullable(t, false)`), leaving `System.Nullable<T>` untouched.
+let rec unwrapNullness (t: Fable.Type) : Fable.Type =
+    match t with
+    | Fable.Nullable(inner, false) -> unwrapNullness inner
+    | _ -> t
+
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
     | Fable.Unit -> tVoid
@@ -1232,8 +1259,29 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TTuple [ mapType ctx r t ]
     // (`None` and `[]` whose item type F# leaves as `obj` are of `obj` here too)
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
-    // (`Nullable<T>`: an option)
-    | Fable.Nullable(t, _) -> TOpt(mapType ctx r t)
+    // (`Nullable<T>`: an option; `T | null`: the same Zig type when already nullable here)
+    | Fable.Nullable(t, false) ->
+        let inner = mapType ctx r t
+
+        match t with
+        | Fable.String
+        | Fable.Any
+        | Fable.MetaType -> inner
+        | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> inner
+        | _ when (objOfType ctx r t).IsSome -> inner
+        | Fable.DeclaredType(ent, _) when
+            (match ctx.Com.TryGetEntity ent with
+             | Some e -> e.IsInterface
+             | None -> false)
+            && (
+                match inner with
+                | TOpt _ -> true
+                | _ -> false
+            )
+            ->
+            inner
+        | _ -> TOpt inner
+    | Fable.Nullable(t, true) -> TOpt(mapType ctx r t)
     // (reflection: the runtime's fable_reflect.zig)
     | Fable.MetaType -> TPrim "fable_rt.reflect.Type"
     // (quotations and their variables: objects of the library's Quotation.fs; a method by its name)
@@ -1394,18 +1442,25 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         let members =
             allInterfaceMembers ctx.Com e subst |> List.sortBy (fun (_, n, _, _) -> n)
 
-        TEnt(
-            anonEnt ctx.State (members |> List.map (fun (_, n, _, _) -> n) |> Array.ofList),
-            // (functions in the signatures as values have them: uncurried)
-            members
-            |> List.map (fun (_, _, args, ret) ->
-                TFn(
-                    args |> List.map (FableTransforms.uncurryType >> mapType ctx r),
-                    mapType ctx r (FableTransforms.uncurryType ret)
+        TOpt(
+            TEnt(
+                anonEnt ctx.State (members |> List.map (fun (_, n, _, _) -> n) |> Array.ofList),
+                // (functions in the signatures as values have them: uncurried)
+                members
+                |> List.map (fun (_, _, args, ret) ->
+                    TFn(
+                        args |> List.map (FableTransforms.uncurryType >> mapType ctx r),
+                        mapType ctx r (FableTransforms.uncurryType ret)
+                    )
                 )
             )
         )
-    | Fable.DeclaredType(ent, genArgs) -> TEnt(entOf ctx r ent, genArgs |> List.map (mapTypeArg ctx r))
+    | Fable.DeclaredType(ent, genArgs) ->
+        let ty = TEnt(entOf ctx r ent, genArgs |> List.map (mapTypeArg ctx r))
+
+        match ctx.Com.TryGetEntity ent with
+        | Some e when e.IsInterface -> TOpt ty
+        | _ -> ty
     | Fable.Any -> tAny
     | _ -> fail r "the Zig target does not support this type yet (%A)" t
 
@@ -1847,7 +1902,7 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
 
 /// The class of an object, if its type is one that takes part in inheritance.
 and objOfType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : ObjInfo option =
-    match t with
+    match unwrapNullness t with
     | Fable.DeclaredType(e, _) -> objInfo ctx r e
     | _ -> None
 
@@ -2397,10 +2452,34 @@ let tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
         | Fable.MemberImport memberRef ->
             match ctx.Com.TryGetMember memberRef with
             | Some m when not m.IsValue ->
+                let ctorSelf =
+                    if m.IsConstructor then
+                        m.DeclaringEntity
+                        |> Option.bind (fun entRef ->
+                            objInfo ctx None entRef
+                            |> Option.map (fun _ ->
+                                let gs =
+                                    match ctx.Com.TryGetEntity entRef with
+                                    | Some ent ->
+                                        ent.GenericParameters
+                                        |> List.map (fun g -> Fable.GenericParam(g.Name, false, []))
+                                    | None -> []
+
+                                Fable.DeclaredType(entRef, gs)
+                            )
+                        )
+                    else
+                        None
+
+                let ps = m.CurriedParameterGroups |> List.concat |> List.map (fun p -> p.Type)
+
                 let argTypes =
-                    match m.CurriedParameterGroups |> List.concat |> List.map (fun p -> p.Type) with
-                    | [] -> [ Fable.Unit ]
-                    | ts -> ts
+                    match ctorSelf with
+                    | Some selfTy -> selfTy :: ps
+                    | None ->
+                        match ps with
+                        | [] -> [ Fable.Unit ]
+                        | ts -> ts
 
                 Some
                     {
@@ -2416,7 +2495,11 @@ let tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
                             @ (m.GenericParameters |> List.map (fun g -> g.Name))
                             |> List.distinct
                         ArgTypes = argTypes
-                        Ret = m.ReturnParameter.Type
+                        Ret =
+                            if ctorSelf.IsSome then
+                                Fable.Unit
+                            else
+                                m.ReturnParameter.Type
                     }
             | _ -> None
         | _ -> None
@@ -2691,7 +2774,7 @@ let mutable divRemTemps = 0
 
 /// Is this a culture or a format provider given to a .NET method (`CultureInfo.InvariantCulture`)?
 let isCulture (x: Fable.Expr) =
-    match x.Type with
+    match unwrapNullness x.Type with
     | Fable.DeclaredType(e, _) ->
         e.FullName = "System.Globalization.CultureInfo"
         || e.FullName = "System.IFormatProvider"
@@ -3061,7 +3144,7 @@ let isSeqType (t: Fable.Type) : bool =
 
 /// Is this the type of an interface?
 let isInterfaceType (com: Compiler) (t: Fable.Type) : bool =
-    match t with
+    match unwrapNullness t with
     | Fable.DeclaredType(entRef, _) ->
         match com.TryGetEntity entRef with
         | Some ent -> ent.IsInterface
@@ -3547,48 +3630,159 @@ let constructorBody
         (fun values -> Fable.Value(Fable.NewRecord(values, classRef, genArgs), None))
         body
 
-/// The constructor of a class that takes part in inheritance: the chain of its fields, the
-/// parent's (which its constructor computes, first) and its own.
+/// Build the self identifier parameter for an object-first constructor of class `o`.
+let objSelfIdent (o: ObjInfo) : Fable.Ident =
+    let genArgs = o.Gens |> List.map (fun g -> Fable.GenericParam(g, false, []))
+
+    {
+        Name = "self_obj"
+        Type = Fable.DeclaredType(o.Ref, genArgs)
+        IsMutable = false
+        IsThisArgument = true
+        IsCompilerGenerated = true
+        Range = None
+        IsInlineIfLambda = false
+    }
+
+/// The constructor of an object class (`objAlloc` allocates `selfId` first; the base constructor
+/// runs with the same `selfId`, then the fields, `init@`, and `do` statements execute in order
+/// directly against the live heap object).
 let objConstructorBody
     (o: ObjInfo)
+    (selfId: Fable.Ident)
     (defaults: string -> Fable.Expr option)
     (baseCall: Fable.Expr option)
     (body: Fable.Expr)
     : Fable.Expr
     =
     let fields = caseFields (TEnt(o.Part, [])) "" |> List.map fst
+    let assigned = HashSet<string>()
+    let typedThisAliases = HashSet<string>()
 
-    let baseId (t: Fable.Type) : Fable.Ident =
-        {
-            Name = "base_chain"
-            Type = t
-            IsMutable = false
-            IsThisArgument = false
-            IsCompilerGenerated = true
-            Range = None
-            IsInlineIfLambda = false
-        }
+    let rec rewriteCtor (e: Fable.Expr) : Fable.Expr =
+        match e with
+        // (the constructor of System.Object)
+        | Fable.Call(Fable.Import(imp, _, _), _, _, _) when imp.Selector = ".ctor" && imp.Path.EndsWith "System.Object" ->
+            Fable.Value(Fable.UnitConstant, None)
+        // (`FSharp2Fable` binds `_this: Any = ThisValue Any` around object expressions inside an
+        // implicit constructor; give `_this` the class type so member/field lookups recognize it)
+        | Fable.Let(id, Fable.Value(Fable.ThisValue _, r), body) when id.Type = Fable.Any ->
+            typedThisAliases.Add id.Name |> ignore
 
-    let finish (values: Fable.Expr list) =
-        let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, ownArgs o), None)
+            let id =
+                { id with
+                    Type = selfId.Type
+                    IsThisArgument = true
+                }
 
-        let chain =
-            match o.Parent with
-            | Some p -> [ Fable.IdentExpr(baseId (chainTypeOf p o.ParentArgs)); own ]
-            | None -> [ own ]
+            Fable.Let(id, Fable.IdentExpr { selfId with Range = r }, rewriteCtor body)
+        | Fable.IdentExpr id when typedThisAliases.Contains id.Name && id.Type = Fable.Any ->
+            Fable.IdentExpr
+                { id with
+                    Type = selfId.Type
+                    IsThisArgument = true
+                }
+        // (`type C() as this`: the self reference starts empty)
+        | Fable.Set(Fable.Value(Fable.ThisValue owner, _), Fable.FieldSet name, t, _, r) when isSelfRefType owner t ->
+            assigned.Add name |> ignore
+            let kept = selfRefType t
 
-        Fable.Value(Fable.NewRecord(chain, o.Chain.Ref, ownArgs o), None)
+            let empty =
+                match kept with
+                | Fable.DeclaredType(refEntRef, [ Fable.Option(c, _) as optT ]) ->
+                    Fable.Value(
+                        Fable.NewRecord([ Fable.Value(Fable.NewOption(None, c, false), None) ], refEntRef, [ optT ]),
+                        None
+                    )
+                | _ -> raise (ZigError("internal: a self reference", r))
 
-    let inner = constructorBodyWith fields defaults finish body
+            Fable.Set(Fable.IdentExpr selfId, Fable.FieldSet name, kept, empty, r)
+        // (and is filled with `Some self_obj` right where F# puts the store)
+        | Fable.Set(Fable.Get(Fable.Value(Fable.ThisValue owner, _), Fable.FieldGet fi, refT, r1),
+                    Fable.FieldSet "contents",
+                    _,
+                    Fable.Value(Fable.ThisValue _, _),
+                    r2) when isSelfRefType owner refT ->
+            let kept = selfRefType refT
 
-    match o.Parent, baseCall with
-    | Some p, Some(Fable.Call(callee, info, _, r)) ->
-        Fable.Let(baseId (chainTypeOf p o.ParentArgs), Fable.Call(callee, info, chainTypeOf p o.ParentArgs, r), inner)
-    | Some _, _ ->
-        raise (
-            ZigError($"the Zig target does not support this call of the base constructor of %s{o.FullName} yet", None)
+            let optT, itemT =
+                match kept with
+                | Fable.DeclaredType(_, [ Fable.Option(c, _) as optT ]) -> optT, c
+                | _ -> raise (ZigError("internal: a self reference", r2))
+
+            let cell =
+                Fable.Get(Fable.IdentExpr selfId, Fable.FieldGet { fi with FieldType = Some kept }, kept, r1)
+
+            Fable.Set(
+                cell,
+                Fable.FieldSet "contents",
+                optT,
+                Fable.Value(Fable.NewOption(Some(Fable.IdentExpr selfId), itemT, false), r2),
+                r2
+            )
+        | Fable.Set(Fable.Value(Fable.ThisValue _, _), Fable.FieldSet name, t, value, r) ->
+            assigned.Add name |> ignore
+            Fable.Set(Fable.IdentExpr selfId, Fable.FieldSet name, t, rewriteCtor value, r)
+        | Fable.Value(Fable.ThisValue _, r) -> Fable.IdentExpr { selfId with Range = r }
+        | _ -> e |> AST.visit rewriteCtor
+
+    let rewritten = rewriteCtor body
+
+    let missingDefaults =
+        fields
+        |> List.choose (fun f ->
+            if assigned.Contains f then
+                None
+            else
+                match defaults f with
+                | Some d -> Some(Fable.Set(Fable.IdentExpr selfId, Fable.FieldSet f, d.Type, d, None))
+                | None ->
+                    raise (
+                        ZigError(
+                            $"the Zig target needs every field of a class to be given a value in its constructor (`%s{f}`)",
+                            None
+                        )
+                    )
         )
-    | None, _ -> inner
+
+    let baseStep =
+        match o.Parent, baseCall with
+        | Some p, Some(Fable.Call(callee, info, retTy, r)) ->
+            let pArgs =
+                match retTy with
+                | Fable.DeclaredType(_, gs) when not gs.IsEmpty -> gs
+                | _ -> o.ParentArgs
+
+            let call =
+                Fable.Call(
+                    callee,
+                    { info with
+                        ThisArg = Some(Fable.IdentExpr selfId)
+                        GenericArgs =
+                            if info.GenericArgs.IsEmpty then
+                                pArgs
+                            else
+                                info.GenericArgs
+                    },
+                    Fable.Unit,
+                    r
+                )
+
+            [ call ]
+        | Some _, _ ->
+            raise (
+                ZigError(
+                    $"the Zig target does not support this call of the base constructor of %s{o.FullName} yet",
+                    None
+                )
+            )
+        | None, _ -> []
+
+    Fable.Sequential(
+        baseStep
+        @ missingDefaults
+        @ [ rewritten; Fable.Value(Fable.UnitConstant, None) ]
+    )
 
 /// A module-level value, of this file or (`alias.name`) of another.
 let globalVar (name: string) (ty: Ty) (isMutable: bool) : Expr =
@@ -3627,22 +3821,124 @@ let rec neverNull (e: Fable.Expr) : bool =
     | _ -> false
 
 /// Has this type a default value here (what .NET's is: zero, false, null of a string, None)?
-let rec hasDefault (t: Fable.Type) : bool =
+let rec hasDefault (ctx: Ctx) (t: Fable.Type) : bool =
     match t with
     | Fable.Number _
     | Fable.Char
     | Fable.Boolean
     | Fable.String
     | Fable.Unit
-    | Fable.Option _ -> true
-    | Fable.Tuple(ts, _) -> List.forall hasDefault ts
+    | Fable.Any
+    | Fable.MetaType
+    | Fable.Option _
+    | Fable.Nullable _ -> true
+    | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> true
+    | Fable.Tuple(ts, _) -> List.forall (hasDefault ctx) ts
+    | Fable.DeclaredType(entRef, _) when
+        entRef.FullName = "System.Span`1"
+        || entRef.FullName = "System.ReadOnlySpan`1"
+        || entRef.FullName = "System.DateOnly"
+        || entRef.FullName = "System.TimeOnly"
+        || entRef.FullName = "System.DateTimeOffset"
+        || entRef.FullName = "System.DateTime"
+        || entRef.FullName = "System.TimeSpan"
+        || entRef.FullName = "System.Guid"
+        || entRef.FullName = "System.Uri"
+        ->
+        true
+    | Fable.DeclaredType(entRef, _) when (objInfo ctx None entRef).IsSome -> true
+    | Fable.DeclaredType _ when
+        isInterfaceType ctx.Com t
+        && (
+            match mapType ctx None t with
+            | TOpt _ -> true
+            | _ -> false
+        )
+        ->
+        true
+    | Fable.DeclaredType(entRef, genArgs) ->
+        match ctx.Com.TryGetEntity entRef with
+        | Some ent when
+            ent.IsFSharpUnion
+            && ent.UnionCases.Length = 1
+            && ent.UnionCases.Head.UnionCaseFields.IsEmpty
+            ->
+            true
+        | Some ent when
+            ent.IsValueType
+            && not ent.IsFSharpUnion
+            && not ent.IsInterface
+            && (
+                match entRef.Path with
+                | Fable.SourcePath _ -> true
+                | _ -> false
+            )
+            ->
+            let sub =
+                if ent.GenericParameters.Length = genArgs.Length then
+                    List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) genArgs
+                    |> Map.ofList
+                else
+                    Map.empty
+
+            ent.FSharpFields
+            |> List.filter (fun f -> not f.IsStatic)
+            |> List.forall (fun f -> hasDefault ctx (substFableType sub f.FieldType))
+        | _ -> isWitnessClass ctx entRef
     | _ -> false
+
+/// Adapt a lowered IR expression between `T` and `T | null` when their Zig types differ
+/// (wrapping `T` into `Some` for `?T`, or unwrapping generic `?inner` to nullable `inner`).
+let rec coerceTy (ctx: Ctx) (expectedTy: Ty) (expr: Expr) : Expr =
+    let actualTy = typeOf expr
+
+    if actualTy = expectedTy then
+        expr
+    else
+        match expr with
+        | ERaise(ex, _) -> ERaise(ex, expectedTy)
+        | ESeq(s, last) -> ESeq(s, coerceTy ctx expectedTy last)
+        | _ ->
+            match actualTy, expectedTy with
+            | _, TOpt inner when inner = actualTy ->
+                bindArgsIn true ctx [ expr ] (fun xs -> ECon(expectedTy, "Some", xs, None))
+            | TOpt inner, _ when inner = expectedTy ->
+                let nullVal =
+                    match expectedTy with
+                    | TOpt _ -> Some(ECon(expectedTy, "None", [], None))
+                    | TPrim "fable_rt.String" -> Some(ELit("@as(fable_rt.String, null)", expectedTy))
+                    | TPrim "fable_rt.reflect.Type" ->
+                        ctx.State.UsesRuntime <- true
+                        Some(EEmit("fable_rt.reflect.nullType()", [], expectedTy))
+                    | TEnt({ Name = "fable_rt.Array" }, _) ->
+                        ctx.State.UsesRuntime <- true
+                        Some(EEmit("fable_rt.arrayNull($R)", [], expectedTy))
+                    | _ -> None
+
+                match nullVal with
+                | Some nv ->
+                    bindArgs
+                        ctx
+                        [ expr ]
+                        (fun xs ->
+                            EIf(ETest(xs.Head, "None", actualTy), nv, EGet(xs.Head, PSome, expectedTy), expectedTy)
+                        )
+                | None -> expr
+            | _ -> expr
+
+/// Unwrap an interface struct option, raising NullReferenceException when null.
+let unwrapIface (ctx: Ctx) (x: Expr) : Expr =
+    match typeOf x with
+    | TOpt innerTy ->
+        ctx.State.UsesRuntime <- true
+        ERt("fable_rt.nonNullUnwrap($0)", [ x ], innerTy)
+    | _ -> x
 
 /// The default value of a class's field the constructor does not set (`[<DefaultValue>] val
 /// mutable`), if its type has one
-let fieldDefaults (ent: Fable.Entity) (name: string) : Fable.Expr option =
+let fieldDefaults (ctx: Ctx) (ent: Fable.Entity) (name: string) : Fable.Expr option =
     ent.FSharpFields
-    |> List.tryFind (fun f -> f.Name = name && not f.IsStatic && hasDefault f.FieldType)
+    |> List.tryFind (fun f -> f.Name = name && not f.IsStatic && hasDefault ctx f.FieldType)
     |> Option.map (fun f ->
         Fable.Call(
             Fable.Import(
@@ -3781,6 +4077,66 @@ let rec moreGeneral (t: Fable.Type) (wanted: Fable.Type) : bool =
     | Fable.LambdaType(a, r), Fable.LambdaType(a2, r2) -> moreGeneral a a2 && moreGeneral r r2
     | _ -> t = wanted
 
+/// Propagates an outer `T | null` type into inner `DefaultOf` (`null` literal) expressions.
+let rec wrapNullCast (wanted: Fable.Type) (e: Fable.Expr) : Fable.Expr =
+    match wanted with
+    | Fable.Nullable(inner, false) ->
+        match e with
+        | Fable.Call(Fable.Import(imp, ct, cr), info, t, r) when
+            imp.Selector = "DefaultOf" && unwrapNullness inner = unwrapNullness t
+            ->
+            Fable.Call(Fable.Import(imp, ct, cr), { info with GenericArgs = [ wanted ] }, wanted, r)
+        | Fable.TypeCast(Fable.Call(Fable.Import(imp, ct, cr), info, t, r), _) when
+            imp.Selector = "DefaultOf" && unwrapNullness inner = unwrapNullness t
+            ->
+            Fable.Call(Fable.Import(imp, ct, cr), { info with GenericArgs = [ wanted ] }, wanted, r)
+        | Fable.TypeCast(x, _) ->
+            let x' = wrapNullCast wanted x
+
+            if x'.Type = wanted then
+                x'
+            else
+                Fable.TypeCast(x', wanted)
+        | Fable.IfThenElse(g, a, b, r) ->
+            let ifE = Fable.IfThenElse(g, wrapNullCast wanted a, wrapNullCast wanted b, r)
+
+            if ifE.Type = wanted then
+                ifE
+            else
+                Fable.TypeCast(ifE, wanted)
+        | Fable.Let(id, v, body) -> Fable.Let(id, v, wrapNullCast wanted body)
+        | Fable.Sequential es when not es.IsEmpty ->
+            let rev = List.rev es
+            Fable.Sequential(List.rev (wrapNullCast wanted rev.Head :: rev.Tail))
+        | Fable.DecisionTree(expr, targets) ->
+            let targets' =
+                targets |> List.map (fun (ids, body) -> ids, wrapNullCast wanted body)
+
+            let dt = Fable.DecisionTree(expr, targets')
+
+            if dt.Type = wanted then
+                dt
+            else
+                Fable.TypeCast(dt, wanted)
+        | _ -> e
+    | _ -> e
+
+let rec wrapFnNullCast (fnTy: Fable.Type) (fnExpr: Fable.Expr) : Fable.Expr =
+    let rec peel (n: int) (t: Fable.Type) =
+        match n, t with
+        | 0, _ -> Some t
+        | n, Fable.LambdaType(_, r) when n > 0 -> peel (n - 1) r
+        | _, Fable.DelegateType(_, r) -> Some r
+        | _ -> None
+
+    match fnExpr, fnTy with
+    | Fable.Lambda(arg, body, name), Fable.LambdaType(_, rest) -> Fable.Lambda(arg, wrapFnNullCast rest body, name)
+    | Fable.Delegate(args, body, name, tags), _ ->
+        match peel args.Length fnTy with
+        | Some ret -> Fable.Delegate(args, wrapNullCast ret body, name, tags)
+        | None -> fnExpr
+    | _ -> wrapNullCast fnTy fnExpr
+
 /// A value made at a more general type than the variable it is bound to has: F# generalizes
 /// `let a = Ok string`, and where Fable puts the value in at its use, its type parameters are obj
 /// (`Ok (fun (v: obj) -> string v)`) though the use is at `Result<int -> string, _>`. The value,
@@ -3867,10 +4223,26 @@ let rec adaptTo (com: Compiler) (wanted: Fable.Type) (e: Fable.Expr) : Fable.Exp
             Fable.Value(Fable.NewOption(Some(adaptTo com item v), item, isStruct), r)
         | Fable.Value(Fable.NewTuple(values, isStruct), r), Fable.Tuple(ts, _) when ts.Length = values.Length ->
             Fable.Value(Fable.NewTuple(List.map2 (adaptTo com) ts values, isStruct), r)
+        | _, Fable.Nullable(inner, false) ->
+            let e = wrapNullCast wanted e
+
+            if e.Type = wanted then
+                e
+            else
+                let adapted = adaptTo com inner e
+
+                if adapted.Type = wanted then
+                    adapted
+                else
+                    Fable.TypeCast(adapted, wanted)
         // (a value boxed and unboxed again)
         | Fable.TypeCast(inner, Fable.Any), _ when inner.Type = wanted -> inner
         // (an object where a value of a type is wanted: unboxed)
-        | _, _ when e.Type = Fable.Any && not (hasTypeParams wanted) && wanted <> Fable.Any ->
+        | _, _ when
+            unwrapNullness e.Type = Fable.Any
+            && not (hasTypeParams wanted)
+            && unwrapNullness wanted <> Fable.Any
+            ->
             match wanted with
             | Fable.LambdaType _
             | Fable.DelegateType _ -> e
@@ -3917,7 +4289,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     // ---- objects of classes that take part in inheritance ----
     // `base`: the object itself, seen as its parent class
     | Fable.Value(Fable.BaseValue(Some id, _), _) -> lw ctx (Fable.IdentExpr id)
-    // `Circle 1.0`: the constructor computes the chain of fields; the object is made of it
+    // `Circle 1.0`: allocate the object first, then run its constructor on it.
     | Fable.Call(callee, info, Fable.DeclaredType(cls, clsArgs), r) when
         isConstructorCall ctx.Com info && (objInfo ctx r cls).IsSome
         ->
@@ -3926,74 +4298,34 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         if o.IsAbstract then
             fail r "the abstract class %s cannot be made" o.FullName
 
-        let typeRef = objTypeRef o (clsArgs |> List.map (mapTypeArg ctx r))
+        let targs = clsArgs |> List.map (mapTypeArg ctx r)
+        let chainTy = TEnt(o.Chain, targs)
+        ctx.State.AllocChains.Add chainTy
+        let typeRef = objTypeRef o targs
+        let v = ctx.State.NewVar("made", tObj, VLocal, false)
 
-        let made =
-            bindArgs
-                ctx
-                [ lw ctx (Fable.Call(callee, info, chainTypeOf o clsArgs, r)) ]
-                (fun xs -> EEmit($"fable_rt.objNew(%s{typeRef}, $0)", xs, tObj))
+        let madeId =
+            { AST.makeTypedIdent (Fable.DeclaredType(cls, clsArgs)) $"__made_%d{v.Id}" with IsThisArgument = true }
 
-        // (`type C() as this`, here or in a class above: its self reference is the object)
-        let selfFields =
-            let rec levels (o: ObjInfo) =
-                o
-                :: (
-                    match o.Parent with
-                    | Some p -> levels p
-                    | None -> []
-                )
+        ctx.Vars[madeId.Name] <- v
+        let alloc = EEmit($"fable_rt.objAlloc(%s{zigType chainTy}, %s{typeRef})", [], tObj)
 
-            levels o
-            |> List.collect (fun level ->
-                match ctx.Com.TryGetEntity level.Ref with
-                | Some ent ->
-                    ent.FSharpFields
-                    |> List.filter (fun f ->
-                        not f.IsStatic && isSelfRefType (Fable.DeclaredType(level.Ref, [])) f.FieldType
-                    )
-                    |> List.map (fun f -> f.Name, selfRefType f.FieldType)
-                | None -> []
+        let ctorCall =
+            Fable.Call(
+                callee,
+                { info with
+                    ThisArg = Some(Fable.IdentExpr madeId)
+                    GenericArgs =
+                        if info.GenericArgs.IsEmpty then
+                            clsArgs
+                        else
+                            info.GenericArgs
+                },
+                Fable.Unit,
+                r
             )
 
-        if selfFields.IsEmpty then
-            made
-        else
-            let objT = Fable.DeclaredType(cls, [])
-            let objId = AST.makeTypedIdent objT "made"
-            let v = ctx.State.NewVar("made", tObj, VLocal, false)
-            ctx.Vars[objId.Name] <- v
-
-            let fills =
-                selfFields
-                |> List.map (fun (name, refT) ->
-                    let optT, itemT =
-                        match refT with
-                        | Fable.DeclaredType(_, [ Fable.Option(c, _) as o ]) -> o, c
-                        | _ -> fail r "internal: a self reference"
-
-                    let fieldInfo: Fable.FieldInfo =
-                        {
-                            Name = name
-                            FieldType = Some refT
-                            IsMutable = true
-                            MaybeCalculated = false
-                            Tags = []
-                        }
-
-                    Fable.Set(
-                        Fable.Get(Fable.IdentExpr objId, Fable.GetKind.FieldGet fieldInfo, refT, r),
-                        Fable.FieldSet "contents",
-                        optT,
-                        Fable.Value(
-                            Fable.NewOption(Some(Fable.TypeCast(Fable.IdentExpr objId, itemT)), itemT, false),
-                            r
-                        ),
-                        r
-                    )
-                )
-
-            ELet(v, made, ESeq(lwStmt ctx (Fable.Sequential fills), EVar v))
+        ELet(v, alloc, ESeq(lwStmt ctx ctorCall, EVar v))
     // `base.Describe()`: the implementation its parent class has, called directly
     | Fable.Call(Fable.Get(Fable.Value(Fable.BaseValue(Some id, baseTy), _), Fable.FieldGet field, _, _), call, t, r) when
         (objOfType ctx r baseTy).IsSome
@@ -4098,7 +4430,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                                 slotTy
                             )
 
-                        ECallClo(fn, [ xs.Head; EUnit ], mapType ctx r t)
+                        let retTy =
+                            match slotTy with
+                            | TFn(_, ret) -> ret
+                            | _ -> mapType ctx r t
+
+                        ECallClo(fn, [ xs.Head; EUnit ], retTy)
                     )
             )
     // a field of an object: in the part of the chain of the class that declares it
@@ -4139,7 +4476,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let level = (fieldOwner o name).Value
         let largs = argsOfLevel ctx r o x.Type level
         let part = TEnt(level.Part, largs)
-        let fty = caseFields part "" |> List.find (fun (f, _) -> f = name) |> snd
+        let fields = caseFields part ""
+        let fieldIdx = fields |> List.findIndex (fun (f, _) -> f = name)
+        let fty = snd fields[fieldIdx]
         let parts = partNamesOf ctx r level largs
 
         bindArgs
@@ -4152,11 +4491,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     [ asObj given[0] ]
                     (fun o ->
                         let place =
-                            EGet(
-                                EEmit($"fable_rt.objPart($R, &[_]type{{ %s{parts} }}, $0)", o, TPtr(part, false)),
-                                PField name,
-                                fty
-                            )
+                            if ctx.InCtor then
+                                EGet(EEmit($"objInit:%d{fieldIdx}:%s{parts}", o, TPtr(part, false)), PField name, fty)
+                            else
+                                EGet(
+                                    EEmit($"fable_rt.objPart($R, &[_]type{{ %s{parts} }}, $0)", o, TPtr(part, false)),
+                                    PField name,
+                                    fty
+                                )
 
                         EStore(place, given[1])
                     )
@@ -4221,8 +4563,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 r
             ))
     // `o :? T` of an `obj` (not one F# made by boxing a value of a known type, as `use` does)
-    | Fable.Test(x, Fable.TypeTest t, r) when x.Type = Fable.Any && (let (Unboxed inner) = x in inner.Type = Fable.Any) ->
-        match t with
+    | Fable.Test(x, Fable.TypeTest t, r) when
+        unwrapNullness x.Type = Fable.Any
+        && (let (Unboxed inner) = x in unwrapNullness inner.Type = Fable.Any)
+        ->
+        match unwrapNullness t with
         // (`o :? System.Array`: any array)
         | Fable.DeclaredType(cls, []) when cls.FullName = "System.Array" ->
             ctx.State.UsesRuntime <- true
@@ -4233,7 +4578,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
             bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.anyIsClass($0, %s{typeRef})", xs, tBool))
         | _ ->
-            let found = ctx.State.NewVar("unboxed", TOpt(mapType ctx r t), VLocal, false)
+            let ty = mapType ctx r t
+            let found = ctx.State.NewVar("unboxed", TOpt ty, VLocal, false)
 
             bindArgs
                 ctx
@@ -4241,7 +4587,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 (fun xs ->
                     ELet(
                         found,
-                        EEmit("fable_rt.tryUnbox($R, $0)", xs, TOpt(mapType ctx r t)),
+                        EEmit("fable_rt.tryUnbox($R, $0)", xs, TOpt ty),
                         EPrim("not", [ ETest(EVar found, "None", found.Ty) ], tBool)
                     )
                 )
@@ -4256,6 +4602,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         match kind with
         | Fable.UnitConstant -> EUnit
         // `null`: of a string and of `obj` (other types have no null here)
+        | Fable.Null(Fable.Nullable(inner, false) as t) ->
+            match mapType ctx r t with
+            | TOpt _ as optTy -> ECon(optTy, "None", [], None)
+            | _ -> lw ctx (Fable.Value(Fable.Null inner, r))
         | Fable.Null Fable.String -> ELit("@as(fable_rt.String, null)", tStr)
         | Fable.Null Fable.Any ->
             ctx.State.UsesRuntime <- true
@@ -4272,6 +4622,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.Null t when (objOfType ctx r t).IsSome ->
             ctx.State.UsesRuntime <- true
             ELit("@as(fable_rt.Any, null)", tAny)
+        | Fable.Null t ->
+            match mapType ctx r t with
+            | TOpt _ as optTy -> ECon(optTy, "None", [], None)
+            | _ -> fail r "the Zig target does not support null of this type (%A)" t
         | Fable.BoolConstant b ->
             ELit(
                 (if b then
@@ -4319,13 +4673,71 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> EExnNew(ent, xs))
         | Fable.NewRecord(values, entRef, genArgs) ->
             let ty = TEnt(entOf ctx r entRef, genArgs |> List.map (mapTypeArg ctx r))
-            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
+            let fieldTys = caseFields ty "" |> List.map snd
+
+            let values =
+                match ctx.Com.TryGetEntity entRef with
+                | Some fEnt when fEnt.FSharpFields.Length = values.Length ->
+                    let subst =
+                        if fEnt.GenericParameters.Length = genArgs.Length then
+                            List.zip (fEnt.GenericParameters |> List.map (fun g -> g.Name)) genArgs
+                            |> Map.ofList
+                        else
+                            Map.empty
+
+                    List.map2
+                        (fun (f: Fable.Field) v -> wrapNullCast (substFableType subst f.FieldType) v)
+                        fEnt.FSharpFields
+                        values
+                | _ -> values
+
+            let irs =
+                if fieldTys.Length = values.Length then
+                    List.map2 (fun fty v -> coerceTy ctx fty (lw ctx v)) fieldTys values
+                else
+                    values |> List.map (lw ctx)
+
+            bindArgsIn true ctx irs (fun xs -> ECon(ty, "", xs, None))
         | Fable.NewUnion(values, tag, entRef, genArgs) ->
             let ent = entOf ctx r entRef
             let ty = TEnt(ent, genArgs |> List.map (mapTypeArg ctx r))
             let case = fst (List.item tag ent.Cases)
-            bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, case, xs, None))
+            let fieldTys = caseFields ty case |> List.map snd
+
+            let values =
+                match ctx.Com.TryGetEntity entRef with
+                | Some fEnt when tag < fEnt.UnionCases.Length ->
+                    let fields = fEnt.UnionCases[tag].UnionCaseFields
+
+                    if fields.Length = values.Length then
+                        let subst =
+                            if fEnt.GenericParameters.Length = genArgs.Length then
+                                List.zip (fEnt.GenericParameters |> List.map (fun g -> g.Name)) genArgs
+                                |> Map.ofList
+                            else
+                                Map.empty
+
+                        List.map2
+                            (fun (f: Fable.Field) v -> wrapNullCast (substFableType subst f.FieldType) v)
+                            fields
+                            values
+                    else
+                        values
+                | _ -> values
+
+            let irs =
+                if fieldTys.Length = values.Length then
+                    List.map2 (fun fty v -> coerceTy ctx fty (lw ctx v)) fieldTys values
+                else
+                    values |> List.map (lw ctx)
+
+            bindArgsIn true ctx irs (fun xs -> ECon(ty, case, xs, None))
         | Fable.NewTuple(values, _) ->
+            let values =
+                match e.Type with
+                | Fable.Tuple(ts, _) when ts.Length = values.Length -> List.map2 wrapNullCast ts values
+                | _ -> values
+
             bindArgsIn
                 true
                 ctx
@@ -4355,15 +4767,22 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
             let ty = TEnt(anonEnt ctx.State names, fieldTys)
 
+            let values =
+                if genArgs.Length = values.Length then
+                    List.map2 wrapNullCast genArgs values
+                else
+                    values
+
             bindArgsIn true ctx (values |> List.map (lw ctx)) (fun xs -> ECon(ty, "", xs, None))
         // `[| a; b |]`, and an array of a given length
         | Fable.NewArray(Fable.ArrayValues values, t, _) ->
+            let itemTy = mapType ctx r t
             let ty = TEnt(arrayEnt ctx.State, [ mapTypeArg ctx r t ])
             let holes = values |> List.mapi (fun i _ -> $"$%d{i}") |> String.concat ", "
 
             bindArgs
                 ctx
-                (values |> List.map (lw ctx))
+                (values |> List.map (wrapNullCast t >> lw ctx >> coerceTy ctx itemTy))
                 (fun xs -> EEmit($"fable_rt.arrayOf($R, .{{ %s{holes} }})", xs, ty))
         | Fable.NewArray(Fable.ArrayAlloc size, t, _) ->
             let ty = TEnt(arrayEnt ctx.State, [ mapTypeArg ctx r t ])
@@ -4372,19 +4791,33 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             let ty = TEnt(arrayEnt ctx.State, [ mapTypeArg ctx r t ])
             bindArgs ctx [ lw ctx source ] (fun xs -> EEmit("fable_rt.arrayOfList($R, $0)", xs, ty))
         | Fable.NewList(headAndTail, t) ->
+            let itemTy = mapType ctx r t
             let ty = mapType ctx r (Fable.List t)
 
             match headAndTail with
             | Some(head, tail) ->
-                bindArgsIn true ctx [ lw ctx head; lw ctx tail ] (fun xs -> ECon(ty, "Cons", xs, None))
+                bindArgsIn
+                    true
+                    ctx
+                    [
+                        coerceTy ctx itemTy (lw ctx (wrapNullCast t head))
+                        coerceTy ctx ty (lw ctx tail)
+                    ]
+                    (fun xs -> ECon(ty, "Cons", xs, None))
             | None -> ECon(ty, "Empty", [], None)
         // (a `None` whose item type Fable lost: Zig's `null` fits the option it is given to)
         | Fable.NewOption(None, Fable.Any, _) -> ELit("null", TOpt tVoid)
         | Fable.NewOption(value, t, isStruct) ->
+            let itemTy = mapType ctx r t
             let ty = mapType ctx r (Fable.Option(t, isStruct))
 
             match value with
-            | Some v -> bindArgsIn true ctx [ lw ctx v ] (fun xs -> ECon(ty, "Some", xs, None))
+            | Some v ->
+                bindArgsIn
+                    true
+                    ctx
+                    [ coerceTy ctx itemTy (lw ctx (wrapNullCast t v)) ]
+                    (fun xs -> ECon(ty, "Some", xs, None))
             | None -> ECon(ty, "None", [], None)
         | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
 
@@ -4443,7 +4876,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             || freeGens [ mapType ctx id.Range id.Type ]
                |> List.exists (fun g -> not (List.contains g ctx.TypeParams)))
         ->
-        liftGroup ctx id.Range [ Some id.Name, id.Name, fnExpr ] |> ignore
+        liftGroup ctx id.Range [ Some id.Name, id.Name, wrapFnNullCast id.Type fnExpr ]
+        |> ignore
+
         lw ctx body
 
     | Fable.LetRec(bindings, body) ->
@@ -4453,7 +4888,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | Fable.Delegate _ -> ()
             | _ -> fail id.Range "the Zig target does not support recursive values yet (`%s`)" id.Name
 
-        liftGroup ctx e.Range (bindings |> List.map (fun (id, value) -> Some id.Name, id.Name, value))
+        liftGroup
+            ctx
+            e.Range
+            (bindings
+             |> List.map (fun (id, value) -> Some id.Name, id.Name, wrapFnNullCast id.Type value))
         |> ignore
 
         lw ctx body
@@ -4515,7 +4954,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 body) when
         defaultOf.Selector = "DefaultOf"
         && outRef.Name = out.Name
-        && not (hasDefault out.Type)
+        && not (hasDefault ctx out.Type)
         ->
         let valueTy = mapType ctx e.Range out.Type
         let found = ctx.State.NewVar("found", TOpt valueTy, VLocal, false)
@@ -4782,6 +5221,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         if isVoid ty then
             ESeq(asStmt ctx rhs, lw ctx body)
         else
+            let rhs = coerceTy ctx ty rhs
+
             match rhs with
             // an immutable name for an immutable variable is that variable
             | EVar x when not id.IsMutable && not x.FMutable && x.Kind <> VGlobal ->
@@ -4837,8 +5278,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             restRev |> List.fold (fun acc s -> ESeq(lwStmt ctx s, acc)) lastIr
 
     | Fable.IfThenElse(guard, thenExpr, elseExpr, r) ->
-        let ty = mapType ctx r e.Type
-        bindArgs ctx [ lw ctx guard ] (fun xs -> EIf(xs.Head, lw ctx thenExpr, lw ctx elseExpr, ty))
+        let merged =
+            match e.Type, elseExpr.Type with
+            | Fable.Nullable(_, false), _ -> e.Type
+            | _, (Fable.Nullable(_, false) as n) when unwrapNullness n = unwrapNullness e.Type -> n
+            | _ -> e.Type
+
+        let ty = mapType ctx r merged
+        let thenExpr = wrapNullCast merged thenExpr
+        let elseExpr = wrapNullCast merged elseExpr
+
+        bindArgs
+            ctx
+            [ lw ctx guard ]
+            (fun xs -> EIf(xs.Head, coerceTy ctx ty (lw ctx thenExpr), coerceTy ctx ty (lw ctx elseExpr), ty))
 
     | Fable.Operation(kind, _, t, r) ->
         let ty = mapType ctx r t
@@ -5017,27 +5470,40 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         )
         ->
         ESeq(lwStmt ctx inner, ELit("true", tBool))
-    // (a value of the interface itself: it is one)
+    // (a value of the interface itself: it is one unless null)
     | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _) as ifaceType), _) when
         isInterfaceType ctx.Com ifaceType
         && (
-            match inner.Type with
+            match unwrapNullness inner.Type with
             | Fable.DeclaredType(e, _) -> e.FullName = ifaceRef.FullName
             | _ -> false
         )
         ->
-        ESeq(lwStmt ctx inner, ELit("true", tBool))
+        bindArgs
+            ctx
+            [ lw ctx inner ]
+            (fun xs ->
+                match typeOf xs.Head with
+                | TOpt _ -> EPrim("not", [ ETest(xs.Head, "None", typeOf xs.Head) ], tBool)
+                | _ -> ELit("true", tBool)
+            )
     | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _) as ifaceType), _) when
         isInterfaceType ctx.Com ifaceType
         && (implements ctx.Com inner.Type ifaceRef.FullName).IsSome
         ->
-        ESeq(
-            lwStmt ctx inner,
-            ELit(
-                string ((implements ctx.Com inner.Type ifaceRef.FullName).Value)
-                |> fun b -> b.ToLowerInvariant(), tBool
+        let impl = (implements ctx.Com inner.Type ifaceRef.FullName).Value
+
+        bindArgs
+            ctx
+            [ lw ctx inner ]
+            (fun xs ->
+                if not impl then
+                    ELit("false", tBool)
+                else
+                    match typeOf xs.Head with
+                    | TOpt _ -> EPrim("not", [ ETest(xs.Head, "None", typeOf xs.Head) ], tBool)
+                    | _ -> ELit("true", tBool)
             )
-        )
 
     // (`Dispose` of an enumerator, as `use e = s.GetEnumerator()` calls it through an unboxing
     // to `IDisposable`: the enumerator's own)
@@ -5113,6 +5579,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
         imp.Path.StartsWith(Replacements.DotnetPrefix, System.StringComparison.Ordinal)
         ->
+        let info =
+            if info.SignatureArgTypes.Length = info.Args.Length then
+                { info with Args = List.map2 wrapNullCast info.SignatureArgTypes info.Args }
+            else
+                info
+
         dotnetCall ctx r (imp.Path.Substring Replacements.DotnetPrefix.Length) imp.Selector info t
 
     // `[<Emit("...")>]`: Zig text, with `$0`, `$1`, ... standing for the arguments
@@ -5202,49 +5674,62 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         bindArgs
             ctx
             [ lw ctx x ]
-            (fun xs ->
-                let fields = caseFields (typeOf xs.Head) ""
-                // (a mangled interface's member is named in full: `Ns.IFoo.get_Bar`)
-                let name = info.Name.Substring(info.Name.LastIndexOf '.' + 1)
+            (fun given ->
+                bindArgs
+                    ctx
+                    [ unwrapIface ctx given.Head ]
+                    (fun xs ->
+                        let fields = caseFields (typeOf xs.Head) ""
+                        // (a mangled interface's member is named in full: `Ns.IFoo.get_Bar`)
+                        let name = info.Name.Substring(info.Name.LastIndexOf '.' + 1)
 
-                // (and its overload's hash, `SumZ35CD86D0`)
-                let name =
-                    if fields |> List.exists (fun (f, _) -> f = name || f = "get_" + name) then
-                        name
-                    else
-                        System.Text.RegularExpressions.Regex.Replace(name, "Z?[0-9A-F]{8}$", "")
+                        // (and its overload's hash, `SumZ35CD86D0`)
+                        let name =
+                            if fields |> List.exists (fun (f, _) -> f = name || f = "get_" + name) then
+                                name
+                            else
+                                System.Text.RegularExpressions.Regex.Replace(name, "Z?[0-9A-F]{8}$", "")
 
-                // (an overload: the one whose hash Fable gave the name, `get_ItemZ524259A4`)
-                let name =
-                    if fields |> List.exists (fun (f, _) -> f = name || f = "get_" + name) then
-                        name
-                    else
-                        let full = info.Name.Substring(info.Name.LastIndexOf '.' + 1)
+                        // (an overload: the one whose hash Fable gave the name, `get_ItemZ524259A4`)
+                        let name =
+                            if fields |> List.exists (fun (f, _) -> f = name || f = "get_" + name) then
+                                name
+                            else
+                                let full = info.Name.Substring(info.Name.LastIndexOf '.' + 1)
 
-                        match x.Type with
-                        | Fable.DeclaredType(iref, _) ->
-                            match ctx.Com.TryGetEntity iref with
-                            | Some ient ->
-                                let genParams = ient.GenericParameters |> List.map (fun g -> g.Name)
+                                match unwrapNullness x.Type with
+                                | Fable.DeclaredType(iref, _) ->
+                                    match ctx.Com.TryGetEntity iref with
+                                    | Some ient ->
+                                        let genParams = ient.GenericParameters |> List.map (fun g -> g.Name)
 
-                                ient.MembersFunctionsAndValues
-                                |> Seq.filter (fun m -> m.IsDispatchSlot && m.CompiledName = name)
-                                |> Seq.tryFind (fun m ->
-                                    let groups = m.CurriedParameterGroups |> List.map (List.map (fun p -> p.Type))
+                                        ient.MembersFunctionsAndValues
+                                        |> Seq.filter (fun m -> m.IsDispatchSlot && m.CompiledName = name)
+                                        |> Seq.tryFind (fun m ->
+                                            let groups =
+                                                m.CurriedParameterGroups |> List.map (List.map (fun p -> p.Type))
 
-                                    full = name + OverloadSuffix.getHash genParams groups
-                                )
-                                |> Option.map (fun m -> slotKey ient m.CompiledName (paramTypesOf m))
-                                |> Option.defaultValue name
-                            | None -> name
-                        | _ -> name
+                                            full = name + OverloadSuffix.getHash genParams groups
+                                        )
+                                        |> Option.map (fun m -> slotKey ient m.CompiledName (paramTypesOf m))
+                                        |> Option.defaultValue name
+                                    | None -> name
+                                | _ -> name
 
-                match fields |> List.tryFind (fun (f, _) -> f = name) with
-                | Some(f, fty) -> EGet(xs.Head, PField f, fty)
-                | None ->
-                    match fields |> List.tryFind (fun (f, _) -> f = "get_" + name) with
-                    | Some(f, fty) -> ECallClo(EGet(xs.Head, PField f, fty), [ EUnit ], mapType ctx r t)
-                    | None -> fail r "the Zig target cannot find the member %s of this interface (%A)" info.Name t
+                        match fields |> List.tryFind (fun (f, _) -> f = name) with
+                        | Some(f, fty) -> EGet(xs.Head, PField f, fty)
+                        | None ->
+                            match fields |> List.tryFind (fun (f, _) -> f = "get_" + name) with
+                            | Some(f, fty) ->
+                                let retTy =
+                                    match fty with
+                                    | TFn(_, ret) -> ret
+                                    | _ -> mapType ctx r t
+
+                                ECallClo(EGet(xs.Head, PField f, fty), [ EUnit ], retTy)
+                            | None ->
+                                fail r "the Zig target cannot find the member %s of this interface (%A)" info.Name t
+                    )
             )
 
     // (a dictionary seen as `IDictionary` or `IReadOnlyDictionary`: the same here)
@@ -5285,7 +5770,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         )
         // (both structs of members: not a sequence, a dictionary, ..., which are what they are)
         && (let isStruct (ty: Ty) =
-                match ty with
+                let inner =
+                    match ty with
+                    | TOpt s -> s
+                    | _ -> ty
+
+                match inner with
                 | TEnt(e, _) -> e.Name.StartsWith("fable_anon_", System.StringComparison.Ordinal)
                 | _ -> false
 
@@ -5294,21 +5784,41 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ->
         let targetTy = mapType ctx e.Range targetType
 
+        let targetStructTy =
+            match targetTy with
+            | TOpt s -> s
+            | _ -> targetTy
+
+        let buildFrom (src: Expr) =
+            let fromFields = caseFields (typeOf src) ""
+
+            let values =
+                caseFields targetStructTy ""
+                |> List.map (fun (f, fty) ->
+                    match fromFields |> List.tryFind (fun (g, _) -> g = f) with
+                    | Some(_, gty) -> EDup(EGet(src, PField f, gty), gty)
+                    | None -> fail e.Range "the Zig target cannot see %A as %A yet" x.Type targetType
+                )
+
+            let built = ECon(targetStructTy, "", values, None)
+
+            match targetTy with
+            | TOpt _ -> ECon(targetTy, "Some", [ built ], None)
+            | _ -> built
+
         bindArgs
             ctx
             [ lw ctx x ]
             (fun xs ->
-                let fromFields = caseFields (typeOf xs.Head) ""
-
-                let values =
-                    caseFields targetTy ""
-                    |> List.map (fun (f, fty) ->
-                        match fromFields |> List.tryFind (fun (g, _) -> g = f) with
-                        | Some(_, gty) -> EDup(EGet(xs.Head, PField f, gty), gty)
-                        | None -> fail e.Range "the Zig target cannot see %A as %A yet" x.Type targetType
+                match typeOf xs.Head with
+                | TOpt srcStructTy ->
+                    EIf(
+                        ETest(xs.Head, "None", typeOf xs.Head),
+                        ECon(targetTy, "None", [], None),
+                        bindArgs ctx [ EGet(xs.Head, PSome, srcStructTy) ] (fun ys -> buildFrom ys.Head),
+                        targetTy
                     )
-
-                ECon(targetTy, "", values, None)
+                | _ -> buildFrom xs.Head
             )
     // a collection given where a sequence is expected: a sequence that walks it
     | Fable.TypeCast(x, Fable.DeclaredType(seqRef, [ item ])) when
@@ -5421,31 +5931,62 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ->
         let ifaceTy = mapType ctx e.Range ifaceType
 
+        let ifaceStructTy =
+            match ifaceTy with
+            | TOpt s -> s
+            | _ -> ifaceTy
+
         bindArgs
             ctx
             [ lw ctx x ]
             (fun xs ->
-                let members =
-                    caseFields ifaceTy "" |> List.map (fun (f, fty) -> EGet(xs.Head, PField f, fty))
+                let buildFrom (src: Expr) =
+                    let members =
+                        caseFields ifaceStructTy ""
+                        |> List.map (fun (f, fty) -> EGet(src, PField f, fty))
 
-                ECon(ifaceTy, "", members, None)
+                    let built = ECon(ifaceStructTy, "", members, None)
+
+                    match ifaceTy with
+                    | TOpt _ -> ECon(ifaceTy, "Some", [ built ], None)
+                    | _ -> built
+
+                match typeOf xs.Head with
+                | TOpt srcStructTy ->
+                    EIf(
+                        ETest(xs.Head, "None", typeOf xs.Head),
+                        ECon(ifaceTy, "None", [], None),
+                        bindArgs ctx [ EGet(xs.Head, PSome, srcStructTy) ] (fun ys -> buildFrom ys.Head),
+                        ifaceTy
+                    )
+                | _ -> buildFrom xs.Head
             )
 
     // a value given where an interface is expected: each member, a function value that
     // holds the object
-    | Fable.TypeCast(x, (Fable.DeclaredType(ifaceRef, _) as ifaceType)) when
-        isInterfaceType ctx.Com ifaceType && not (isInterfaceType ctx.Com x.Type)
-        ->
-        let ifaceTy = mapType ctx e.Range ifaceType
+    | Fable.TypeCast(x, ifaceTarget) when isInterfaceType ctx.Com ifaceTarget && not (isInterfaceType ctx.Com x.Type) ->
+        let ifaceRef, ifaceType =
+            match unwrapNullness ifaceTarget with
+            | Fable.DeclaredType(r, _) as t -> r, t
+            | _ -> fail e.Range "internal: not an interface type"
 
-        let typeName, typeArgs =
-            match x.Type with
+        let ifaceTy = mapType ctx e.Range ifaceTarget
+
+        let ifaceStructTy =
+            match ifaceTy with
+            | TOpt s -> s
+            | _ -> ifaceTy
+
+        let innerSrcType = unwrapNullness x.Type
+
+        let _, typeArgs =
+            match innerSrcType with
             | Fable.DeclaredType(classRef, genArgs) ->
                 classPrefix ctx e.Range classRef (Some ifaceRef.FullName), genArgs |> List.map (mapType ctx e.Range)
             | other -> fail e.Range "the Zig target cannot make an interface of a value of this type yet (%A)" other
 
         let classRef =
-            match x.Type with
+            match innerSrcType with
             | Fable.DeclaredType(classRef, _) -> classRef
             | _ -> fail e.Range "internal: not a declared type"
 
@@ -5453,36 +5994,101 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             ctx
             [ lw ctx x ]
             (fun objs ->
-                // (the object: checked for null; an interface value here is never null)
-                bindArgs
-                    ctx
-                    [ asObj objs.Head ]
-                    (fun xs ->
-                        let members =
-                            caseFields ifaceTy ""
-                            |> List.map (fun (f, fty) ->
-                                EClosure(
-                                    interfaceImpl ctx e.Range classRef ifaceRef.FullName f,
-                                    typeArgs,
-                                    [ xs.Head ],
-                                    fty
-                                )
+                let buildWith (xs: Expr list) =
+                    let members =
+                        caseFields ifaceStructTy ""
+                        |> List.map (fun (f, fty) ->
+                            EClosure(
+                                interfaceImpl ctx e.Range classRef ifaceRef.FullName f,
+                                typeArgs,
+                                [ xs.Head ],
+                                fty
                             )
+                        )
 
-                        ECon(ifaceTy, "", members, None)
+                    let built = ECon(ifaceStructTy, "", members, None)
+
+                    match ifaceTy with
+                    | TOpt _ -> ECon(ifaceTy, "Some", [ built ], None)
+                    | _ -> built
+
+                match typeOf objs.Head with
+                | TOpt innerTy ->
+                    EIf(
+                        ETest(objs.Head, "None", typeOf objs.Head),
+                        ECon(ifaceTy, "None", [], None),
+                        bindArgs ctx [ EGet(objs.Head, PSome, innerTy) ] buildWith,
+                        ifaceTy
                     )
+                | _ -> bindArgs ctx [ objs.Head ] buildWith
             )
 
     // `{ new IShape with ... }`: each member, a function value of its own
     // `{ new Shape("x") with member _.Area() = ... }`: an object of a class of its own that
     // derives from Shape. Its fields are the function values of its members (which hold what
     // they capture); its table calls them.
-    | Fable.ObjectExpr(members, Fable.DeclaredType(baseRef, _), Some(Fable.Call(callee, call, _, cr))) when
+    | Fable.ObjectExpr(members, Fable.DeclaredType(baseRef, baseGenArgs), Some(Fable.Call(callee, call, _, cr))) when
         (objInfo ctx e.Range baseRef).IsSome
         ->
         let parent = (objInfo ctx e.Range baseRef).Value
         let n = ctx.State.ObjInfos.Count
         let prefix = $"%s{cleanIdent ctx.FnBase}__obj%d{n}"
+
+        // (enclosing type parameters used by the base class arguments or overridden members)
+        let gens =
+            if ctx.TypeParams.IsEmpty then
+                []
+            else
+                let used = HashSet<string>()
+
+                let rec collect (t: Fable.Type) =
+                    match t with
+                    | Fable.GenericParam(name, _, _) -> used.Add name |> ignore
+                    | Fable.Option(i, _)
+                    | Fable.Nullable(i, _)
+                    | Fable.Array(i, _)
+                    | Fable.List i -> collect i
+                    | Fable.Tuple(ts, _)
+                    | Fable.AnonymousRecordType(_, ts, _) -> List.iter collect ts
+                    | Fable.LambdaType(a, r) ->
+                        collect a
+                        collect r
+                    | Fable.DelegateType(args, r) ->
+                        List.iter collect args
+                        collect r
+                    | Fable.DeclaredType(_, gs) -> List.iter collect gs
+                    | _ -> ()
+
+                List.iter collect baseGenArgs
+
+                for m in members do
+                    collect m.Body.Type
+
+                    for a in m.Args do
+                        collect a.Type
+
+                for a in call.Args do
+                    collect a.Type
+
+                ctx.TypeParams |> List.filter used.Contains
+
+        let genTys = gens |> List.map TGen
+        let fableGenArgs = gens |> List.map (fun g -> Fable.GenericParam(g, false, []))
+
+        let parentChainArgs =
+            if parent.Gens.IsEmpty then
+                []
+            else
+                baseGenArgs
+
+        let parentLevels =
+            levelArgs ctx e.Range parent (parentChainArgs |> List.map (mapTypeArg ctx e.Range))
+
+        let parentArgsOf (k: ObjInfo) =
+            parentLevels
+            |> List.tryFind (fun (x, _) -> x.FullName = k.FullName)
+            |> Option.map snd
+            |> Option.defaultValue []
 
         let slots =
             members
@@ -5492,9 +6098,21 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     | Some info -> info.CompiledName
                     | None -> m.Name
 
-                match virtualSlot parent slot with
-                | Some(_, ty) -> slot, ty, m
-                | None -> fail e.Range "the Zig target does not support %s in this object expression yet" slot
+                if slot = "ToString" then
+                    "ToString", TFn([ tObj; tVoid ], tStr), m
+                else
+                    match virtualSlot parent slot with
+                    | Some(declarer, ty) ->
+                        let dArgs = parentArgsOf declarer
+
+                        let subst =
+                            if declarer.Gens.Length = dArgs.Length then
+                                List.zip declarer.Gens dArgs |> Map.ofList
+                            else
+                                Map.empty
+
+                        slot, substTy subst ty, m
+                    | None -> fail e.Range "the Zig target does not support %s in this object expression yet" slot
             )
 
         let synth (suffix: string) (cases: (string * Ty) list) : Ent =
@@ -5506,7 +6124,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         Path = baseRef.Path
                     }
                 Kind = KRecord
-                TypeParams = []
+                TypeParams = gens
                 Cases = [ "", cases ]
                 MutableFields = []
                 Managed = false
@@ -5519,7 +6137,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             }
 
         let part = synth "part" (slots |> List.map (fun (slot, ty, _) -> slot, ty))
-        let chain = synth "chain" [ "base", TEnt(parent.Chain, []); "own", TEnt(part, []) ]
+
+        let chain =
+            synth
+                "chain"
+                [
+                    "base", TEnt(parent.Chain, parentChainArgs |> List.map (mapTypeArg ctx e.Range))
+                    "own", TEnt(part, genTys)
+                ]
 
         for ent in [ part; chain ] do
             ctx.State.Ents[ent.Ref.FullName] <- ent
@@ -5545,47 +6170,67 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 Table = None
                 IsAbstract = false
                 IsLocal = true
-                Gens = []
-                ParentArgs = []
+                Gens = gens
+                ParentArgs = parentChainArgs
             }
 
         ctx.State.ObjInfos[info.FullName] <- box info
         let overridden = slots |> List.map (fun (slot, _, _) -> slot) |> set
 
         let tables =
-            ancestors info
+            (None
+             :: (parentLevels
+                 |> List.map (fun (level, largs) ->
+                     match level.Table with
+                     | Some vt ->
+                         let subst =
+                             if level.Gens.Length = largs.Length then
+                                 List.zip level.Gens largs |> Map.ofList
+                             else
+                                 Map.empty
+
+                         let entries =
+                             level.Slots
+                             |> List.map (fun (slot, slotTy) ->
+                                 if overridden.Contains slot then
+                                     slot, "@raw:" + prefix + "__" + slot, genTys, substTy subst slotTy
+                                 else
+                                     let impl =
+                                         match
+                                             ancestors parent
+                                             |> List.tryFind (fun k -> classImplements ctx.Com k slot)
+                                         with
+                                         | Some k -> k
+                                         | None ->
+                                             fail
+                                                 e.Range
+                                                 "the Zig target finds no implementation of %s for %s"
+                                                 slot
+                                                 parent.FullName
+
+                                     slot, implName impl.Prefix slot, parentArgsOf impl, substTy subst slotTy
+                             )
+
+                         Some(TEnt(vt, largs), entries)
+                     | None -> None
+                 )))
             |> List.rev
-            |> List.map (fun level ->
-                match level.Table with
-                | Some vt ->
-                    let entries =
-                        level.Slots
-                        |> List.map (fun (slot, slotTy) ->
-                            let target =
-                                if overridden.Contains slot then
-                                    "@raw:" + prefix + "__" + slot
-                                else
-                                    implementationOf ctx.Com e.Range parent slot
-
-                            slot, target, ([]: Ty list), slotTy
-                        )
-
-                    Some(TEnt(vt, []), entries)
-                | None -> None
-            )
 
         ctx.State.Objs.Add
             {
                 TypeName = prefix + "__type"
-                TypeParams = []
-                Chain = TEnt(chain, [])
+                TypeParams = gens
+                Chain = TEnt(chain, genTys)
                 DotnetName = parent.FullName.Substring(parent.FullName.LastIndexOf '.' + 1) + "@" + string n
-                Parent = Some(objTypeRef parent [])
+                Parent = Some(objTypeRef parent (parentArgsOf parent))
                 Tables = tables
                 ToString =
-                    ancestors parent
-                    |> List.tryFind (fun k -> classImplements ctx.Com k "ToString")
-                    |> Option.map (fun k -> k.Prefix + "__ToString", ([]: Ty list))
+                    if overridden.Contains "ToString" then
+                        Some("@raw:" + prefix + "__ToString", ([]: Ty list))
+                    else
+                        ancestors parent
+                        |> List.tryFind (fun k -> classImplements ctx.Com k "ToString")
+                        |> Option.map (fun k -> k.Prefix + "__ToString", parentArgsOf k)
                 Overrides =
                     [
                         "equals", "Equals"
@@ -5600,35 +6245,61 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 Thunks =
                     slots
                     |> List.map (fun (slot, ty, _) ->
-                        prefix + "__" + slot, TPtr(TEnt(part, []), false), partNames info, slot, ty
+                        prefix + "__" + slot,
+                        TPtr(TEnt(part, genTys), false),
+                        partNamesOf ctx e.Range info genTys,
+                        slot,
+                        ty
                     )
             }
 
-        let baseChain = Fable.Call(callee, call, chainType parent, cr)
+        let chainTy = TEnt(chain, genTys)
+        ctx.State.AllocChains.Add chainTy
+        let v = ctx.State.NewVar("made", tObj, VLocal, false)
 
-        // (a member's first argument is the object, which the call checks is not null)
-        let closures =
+        let madeId =
+            { AST.makeTypedIdent (Fable.DeclaredType(info.Ref, fableGenArgs)) $"__made_%d{v.Id}" with
+                IsThisArgument = true
+            }
+
+        ctx.Vars[madeId.Name] <- v
+
+        let alloc =
+            EEmit($"fable_rt.objAlloc(%s{zigType chainTy}, %s{objTypeRef info genTys})", [], tObj)
+
+        // (a member's first argument is the object, which the call checks is not null; store the
+        // object expression's method closures into its part before calling the base constructor, so
+        // virtual calls inside the base constructor find them ready)
+        let partSets =
             slots
-            |> List.map (fun (_, _, m) ->
+            |> List.map (fun (slot, _, m) ->
                 let args =
                     match m.Args with
+                    | [ this ] when slot = "ToString" ->
+                        [ { this with IsThisArgument = true }; AST.makeTypedIdent Fable.Unit "unitArg" ]
                     | this :: rest -> { this with IsThisArgument = true } :: rest
                     | [] -> []
 
-                Fable.Delegate(args, m.Body, None, [])
+                let closure = Fable.Delegate(args, m.Body, None, [])
+                Fable.Set(Fable.IdentExpr madeId, Fable.FieldSet slot, closure.Type, closure, e.Range)
             )
 
-        let value =
-            Fable.Value(
-                Fable.NewRecord(
-                    [ baseChain; Fable.Value(Fable.NewRecord(closures, part.Ref, []), None) ],
-                    chain.Ref,
-                    []
-                ),
-                None
+        let baseCallExpr =
+            Fable.Call(
+                callee,
+                { call with
+                    ThisArg = Some(Fable.IdentExpr madeId)
+                    GenericArgs =
+                        if call.GenericArgs.IsEmpty then
+                            parentChainArgs
+                        else
+                            call.GenericArgs
+                },
+                Fable.Unit,
+                cr
             )
 
-        bindArgs ctx [ lw ctx value ] (fun xs -> EEmit($"fable_rt.objNew(&%s{objTypeName info}, $0)", xs, tObj))
+        ELet(v, alloc, ESeq(lwStmt { ctx with InCtor = true } (Fable.Sequential(partSets @ [ baseCallExpr ])), EVar v))
 
     // an object expression of `IEnumerable<'T>`: a sequence of its `GetEnumerator`
     | Fable.ObjectExpr(members, Fable.DeclaredType(seqRef, [ item ]), None) when
@@ -5750,6 +6421,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.ObjectExpr(members, ifaceType, None) when isInterfaceType ctx.Com ifaceType ->
         let ifaceTy = mapType ctx e.Range ifaceType
 
+        let ifaceStructTy =
+            match ifaceTy with
+            | TOpt s -> s
+            | _ -> ifaceTy
+
         let rec usesIdent (name: string) (e: Fable.Expr) =
             match e with
             | Fable.IdentExpr id -> id.Name = name
@@ -5795,7 +6471,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 |> Some
 
         let closures =
-            caseFields ifaceTy ""
+            caseFields ifaceStructTy ""
             |> List.map (fun (f, fty) ->
                 match pick f fty with
                 | Some m ->
@@ -5809,47 +6485,61 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | None -> fail e.Range "the Zig target cannot find the member %s in this object expression" f
             )
 
-        bindArgsIn true ctx closures (fun xs -> ECon(ifaceTy, "", xs, None))
+        bindArgsIn
+            true
+            ctx
+            closures
+            (fun xs ->
+                let built = ECon(ifaceStructTy, "", xs, None)
+
+                match ifaceTy with
+                | TOpt _ -> ECon(ifaceTy, "Some", [ built ], None)
+                | _ -> built
+            )
 
     | Fable.Get(x, kind, t, r) ->
         let ty = mapType ctx r t
+
+        let getFrom (v: Expr) =
+            // (a function of several arguments is kept uncurried in a field, as Fable has it:
+            // the field's own type says how)
+            let stored (case: string) (field: string) =
+                match ty with
+                | TFn _
+                | TOpt(TFn _) ->
+                    match caseFields (typeOf v) case |> List.tryFind (fun (f, _) -> f = field) with
+                    | Some(_, (TFn _ | TOpt(TFn _) as fty)) -> fty
+                    | _ -> ty
+                | _ -> ty
+
+            match kind, typeOf v with
+            | Fable.FieldGet info, TEnt(ent, _) when ent.Kind = KRecord || ent.Kind = KRefRecord ->
+                EGet(v, PField info.Name, stored "" info.Name)
+            | Fable.TupleIndex i, TTuple _ -> EGet(v, PItem i, ty)
+            | Fable.UnionField info, TEnt(ent, _) ->
+                let case, fields = List.item info.CaseIndex ent.Cases
+                let field = fst (List.item info.FieldIndex fields)
+                EGet(v, PCase(case, field), stored case field)
+            | Fable.UnionTag, TEnt _ -> EPrim("tag", [ v ], tI32)
+            | Fable.ListHead, TEnt _ -> EGet(v, PCase("Cons", "Head"), ty)
+            | Fable.ListTail, TEnt _ -> EGet(v, PCase("Cons", "Tail"), ty)
+            | Fable.OptionValue, TOpt(TFn _ as inner) when
+                (match ty with
+                 | TFn _ -> true
+                 | _ -> false)
+                ->
+                EGet(v, PSome, inner)
+            | Fable.OptionValue, TOpt _ -> EGet(v, PSome, ty)
+            | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
 
         bindArgs
             ctx
             [ lw ctx x ]
             (fun xs ->
-                let v = xs.Head
-
-                // (a function of several arguments is kept uncurried in a field, as Fable has it:
-                // the field's own type says how)
-                let stored (case: string) (field: string) =
-                    match ty with
-                    | TFn _
-                    | TOpt(TFn _) ->
-                        match caseFields (typeOf v) case |> List.tryFind (fun (f, _) -> f = field) with
-                        | Some(_, (TFn _ | TOpt(TFn _) as fty)) -> fty
-                        | _ -> ty
-                    | _ -> ty
-
-                match kind, typeOf v with
-                | Fable.FieldGet info, TEnt(ent, _) when ent.Kind = KRecord || ent.Kind = KRefRecord ->
-                    EGet(v, PField info.Name, stored "" info.Name)
-                | Fable.TupleIndex i, TTuple _ -> EGet(v, PItem i, ty)
-                | Fable.UnionField info, TEnt(ent, _) ->
-                    let case, fields = List.item info.CaseIndex ent.Cases
-                    let field = fst (List.item info.FieldIndex fields)
-                    EGet(v, PCase(case, field), stored case field)
-                | Fable.UnionTag, TEnt _ -> EPrim("tag", [ v ], tI32)
-                | Fable.ListHead, TEnt _ -> EGet(v, PCase("Cons", "Head"), ty)
-                | Fable.ListTail, TEnt _ -> EGet(v, PCase("Cons", "Tail"), ty)
-                | Fable.OptionValue, TOpt(TFn _ as inner) when
-                    (match ty with
-                     | TFn _ -> true
-                     | _ -> false)
-                    ->
-                    EGet(v, PSome, inner)
-                | Fable.OptionValue, TOpt _ -> EGet(v, PSome, ty)
-                | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
+                match kind, typeOf xs.Head with
+                | Fable.OptionValue, _ -> getFrom xs.Head
+                | _, TOpt _ -> bindArgs ctx [ unwrapIface ctx xs.Head ] (fun ys -> getFrom ys.Head)
+                | _ -> getFrom xs.Head
             )
 
     // `:? SomeException`, and the patterns of a `with` handler
@@ -5888,33 +6578,37 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 ELet(result, tried, ESeq(lwStmt ctx fin, EVar result))
 
     | Fable.Test(x, kind, r) ->
+        let testOf (v: Expr) =
+            match kind, typeOf v with
+            | Fable.UnionCaseTest tag, (TEnt(ent, _) as t) -> ETest(v, fst (List.item tag ent.Cases), t)
+            | Fable.ListTest isCons, (TEnt _ as t) ->
+                ETest(
+                    v,
+                    (if isCons then
+                         "Cons"
+                     else
+                         "Empty"),
+                    t
+                )
+            | Fable.OptionTest isSome, (TOpt _ as t) ->
+                ETest(
+                    v,
+                    (if isSome then
+                         "Some"
+                     else
+                         "None"),
+                    t
+                )
+            | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
+
         bindArgs
             ctx
             [ lw ctx x ]
             (fun xs ->
-                let v = xs.Head
-
-                match kind, typeOf v with
-                | Fable.UnionCaseTest tag, (TEnt(ent, _) as t) -> ETest(v, fst (List.item tag ent.Cases), t)
-                | Fable.ListTest isCons, (TEnt _ as t) ->
-                    ETest(
-                        v,
-                        (if isCons then
-                             "Cons"
-                         else
-                             "Empty"),
-                        t
-                    )
-                | Fable.OptionTest isSome, (TOpt _ as t) ->
-                    ETest(
-                        v,
-                        (if isSome then
-                             "Some"
-                         else
-                             "None"),
-                        t
-                    )
-                | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
+                match kind, typeOf xs.Head with
+                | Fable.OptionTest _, _ -> testOf xs.Head
+                | _, TOpt _ -> bindArgs ctx [ unwrapIface ctx xs.Head ] (fun ys -> testOf ys.Head)
+                | _ -> testOf xs.Head
             )
 
     // (a function of the quotations' library, as the shared mapping and emitter call it)
@@ -5967,27 +6661,40 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                    |> List.map (fun t -> Fable.Value(Fable.NewOption(None, t.Generics.Head, false), None)))
             | _ -> allArgs
 
+        let allArgs =
+            if info.SignatureArgTypes.Length = allArgs.Length then
+                List.map2 wrapNullCast info.SignatureArgTypes allArgs
+            elif info.ThisArg.IsSome && info.SignatureArgTypes.Length + 1 = allArgs.Length then
+                allArgs.Head :: List.map2 wrapNullCast info.SignatureArgTypes allArgs.Tail
+            else
+                allArgs
+
         // (an argument made at a more general type than the parameter's, see adaptTo)
         let allArgs =
             match tryCallable ctx callee with
             | Some c when
                 c.ArgTypes.Length = allArgs.Length
                 && c.TypeParams.Length = info.GenericArgs.Length
-                && allArgs |> List.exists (fun a -> hasTypeParams a.Type |> not)
                 ->
                 let subst = List.zip c.TypeParams info.GenericArgs |> Map.ofList
 
-                List.map2
-                    (fun (p: Fable.Type) (a: Fable.Expr) ->
-                        let wanted = substFableType subst p
+                if allArgs |> List.exists (fun a -> hasTypeParams a.Type |> not) then
+                    List.map2
+                        (fun (p: Fable.Type) (a: Fable.Expr) ->
+                            let wanted = substFableType subst p
 
-                        if hasTypeParams wanted then
-                            a
-                        else
-                            adaptTo ctx.Com wanted a
-                    )
-                    c.ArgTypes
-                    allArgs
+                            if hasTypeParams wanted then
+                                wrapNullCast wanted a
+                            else
+                                adaptTo ctx.Com wanted a
+                        )
+                        c.ArgTypes
+                        allArgs
+                else
+                    List.map2
+                        (fun (p: Fable.Type) (a: Fable.Expr) -> wrapNullCast (substFableType subst p) a)
+                        c.ArgTypes
+                        allArgs
             | _ -> allArgs
 
         let args = allArgs |> List.map (lw ctx)
@@ -6015,7 +6722,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         match tryCallable ctx callee, callee with
         | Some c, _ ->
-            let typeArgs, _ =
+            let typeArgs, subst =
                 typeArgsOf ctx r c (Some info.GenericArgs) (allArgs |> List.map (fun a -> a.Type)) (Some t)
 
             // (F# gives a value, not its address, where an `inref` is expected)
@@ -6083,17 +6790,56 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                             xs
                             wantsAddress
 
-                    Seq.foldBack
-                        (fun (v, x) body -> ELet(v, x, body))
-                        temps
-                        (ECall(c.Target, typeArgs, c.Captures @ xs, ty))
+                    let callRetTy =
+                        if ty = tVoid then
+                            tVoid
+                        else
+                            let instRet = substTy subst (mapType ctx r c.Ret)
+
+                            if instRet = TOpt ty || ty = TOpt instRet then
+                                instRet
+                            else
+                                ty
+
+                    let callExpr =
+                        Seq.foldBack
+                            (fun (v, x) body -> ELet(v, x, body))
+                            temps
+                            (ECall(c.Target, typeArgs, c.Captures @ xs, callRetTy))
+
+                    if ty = tVoid then
+                        callExpr
+                    else
+                        coerceTy ctx ty callExpr
                 )
         | None, Fable.Import(imp, _, _) ->
             fail r "the Zig target does not support this library call yet (%s from %s)" imp.Selector imp.Path
         // a function value: all its arguments at once
-        | None, _ -> bindArgs ctx (lw ctx callee :: args) (fun xs -> ECallClo(xs.Head, xs.Tail, ty))
+        | None, _ ->
+            bindArgs
+                ctx
+                (lw ctx callee :: args)
+                (fun xs ->
+                    let callRetTy =
+                        match typeOf xs.Head with
+                        | TFn(_, ret) -> ret
+                        | _ -> ty
+
+                    ECallClo(xs.Head, xs.Tail, callRetTy)
+                )
 
     | Fable.CurriedApply(applied, args, t, r) ->
+        let rec wrapApplyArgs (fnTy: Fable.Type) (xs: Fable.Expr list) =
+            match fnTy, xs with
+            | Fable.LambdaType(p, rest), a :: tail -> wrapNullCast p a :: wrapApplyArgs rest tail
+            | Fable.DelegateType(ps, _), _ when ps.Length <= xs.Length ->
+                let headArgs, tailArgs = List.splitAt ps.Length xs
+                (List.map2 wrapNullCast ps headArgs) @ tailArgs
+            | _ -> xs
+
+        let args = wrapApplyArgs applied.Type args
+        let targetTy = mapType ctx r t
+
         match tryCallable ctx applied with
         | Some c when args.Length >= c.Arity ->
             let now, rest = List.splitAt c.Arity args
@@ -6112,7 +6858,28 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                          None)
 
             if rest.IsEmpty then
-                bindArgs ctx nowIr (fun xs -> ECall(c.Target, typeArgs, c.Captures @ xs, mapType ctx r t))
+                let callRetTy =
+                    if targetTy = tVoid then
+                        tVoid
+                    else
+                        let instRet = substTy subst (mapType ctx r c.Ret)
+
+                        if instRet = TOpt targetTy || targetTy = TOpt instRet then
+                            instRet
+                        else
+                            targetTy
+
+                bindArgs
+                    ctx
+                    nowIr
+                    (fun xs ->
+                        let ce = ECall(c.Target, typeArgs, c.Captures @ xs, callRetTy)
+
+                        if targetTy = tVoid then
+                            ce
+                        else
+                            coerceTy ctx targetTy ce
+                    )
             else
                 // the function returns a function, which gets the other arguments
                 let first =
@@ -6121,31 +6888,69 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         nowIr
                         (fun xs -> ECall(c.Target, typeArgs, c.Captures @ xs, substTy subst (mapType ctx r c.Ret)))
 
-                applyValue ctx r subst first c.Ret rest t
-        | Some c -> applyValue ctx r Map.empty (fnValue ctx r applied c applied.Type) applied.Type args t
-        | None -> applyValue ctx r Map.empty (lw ctx applied) applied.Type args t
+                coerceTy ctx targetTy (applyValue ctx r subst first c.Ret rest t)
+        | Some c ->
+            coerceTy
+                ctx
+                targetTy
+                (applyValue ctx r Map.empty (fnValue ctx r applied c applied.Type) applied.Type args t)
+        | None -> coerceTy ctx targetTy (applyValue ctx r Map.empty (lw ctx applied) applied.Type args t)
 
     // `record.Field <- value`
     // (a property of an interface: by calling its setter, a field of its struct)
-    | Fable.Set(x, Fable.FieldSet name, _, value, r) when isInterfaceType ctx.Com x.Type ->
+    | Fable.Set(x, Fable.FieldSet name, t, value, r) when isInterfaceType ctx.Com x.Type ->
+        let value = wrapNullCast t value
+
         bindArgs
             ctx
             [ lw ctx x; lw ctx value ]
-            (fun xs ->
-                // (a mangled interface's member is named in full: `Ns.IFoo.set_Bar`)
-                let short = name.Substring(name.LastIndexOf '.' + 1)
+            (fun given ->
+                bindArgs
+                    ctx
+                    [ unwrapIface ctx given[0] ]
+                    (fun xs ->
+                        // (a mangled interface's member is named in full: `Ns.IFoo.set_Bar`)
+                        let short = name.Substring(name.LastIndexOf '.' + 1)
 
-                let setter =
-                    if short.StartsWith("set_", System.StringComparison.Ordinal) then
-                        short
-                    else
-                        "set_" + short
+                        let setter =
+                            if short.StartsWith("set_", System.StringComparison.Ordinal) then
+                                short
+                            else
+                                "set_" + short
 
-                match caseFields (typeOf xs[0]) "" |> List.tryFind (fun (f, _) -> f = setter) with
-                | Some(f, fty) -> ECallClo(EGet(xs[0], PField f, fty), [ xs[1] ], tVoid)
-                | None -> fail r "the Zig target cannot find the setter of %s of this interface" name
+                        match caseFields (typeOf xs.Head) "" |> List.tryFind (fun (f, _) -> f = setter) with
+                        | Some(f, fty) ->
+                            let argVal =
+                                match fty with
+                                | TFn([ pty ], _) -> coerceTy ctx pty given[1]
+                                | _ -> given[1]
+
+                            bindArgs ctx [ argVal ] (fun ys -> ECallClo(EGet(xs.Head, PField f, fty), ys, tVoid))
+                        | None -> fail r "the Zig target cannot find the setter of %s of this interface" name
+                    )
             )
     | Fable.Set(x, Fable.FieldSet name, t, value, r) ->
+        let fieldFableTy =
+            match unwrapNullness x.Type with
+            | Fable.DeclaredType(entRef, genArgs) ->
+                match ctx.Com.TryGetEntity entRef with
+                | Some fEnt ->
+                    let subst =
+                        if fEnt.GenericParameters.Length = genArgs.Length then
+                            List.zip (fEnt.GenericParameters |> List.map (fun g -> g.Name)) genArgs
+                            |> Map.ofList
+                        else
+                            Map.empty
+
+                    fEnt.FSharpFields
+                    |> List.tryFind (fun f -> f.Name = name)
+                    |> Option.map (fun f -> substFableType subst f.FieldType)
+                    |> Option.defaultValue t
+                | None -> t
+            | _ -> t
+
+        let value = wrapNullCast fieldFableTy value
+
         bindArgs
             ctx
             [ lw ctx x; lw ctx value ]
@@ -6155,32 +6960,38 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     let fieldTy =
                         caseFields recTy "" |> List.tryFind (fun (f, _) -> f = name) |> Option.map snd
 
-                    EStore(EGet(xs[0], PField name, defaultArg fieldTy (mapType ctx r t)), xs[1])
+                    let targetTy = defaultArg fieldTy (mapType ctx r t)
+                    EStore(EGet(xs[0], PField name, targetTy), coerceTy ctx targetTy xs[1])
                 | _ -> fail r "the Zig target does not support this kind of assignment yet"
             )
 
     | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, r) when ctx.Boxed.Contains id.Name ->
-        let cell = EGet(EVar ctx.Vars[id.Name], PField "contents", mapType ctx r id.Type)
-        bindArgs ctx [ lw ctx value ] (fun xs -> EStore(cell, xs.Head))
+        let value = wrapNullCast id.Type value
+        let cellTy = mapType ctx r id.Type
+        let cell = EGet(EVar ctx.Vars[id.Name], PField "contents", cellTy)
+        bindArgs ctx [ coerceTy ctx cellTy (lw ctx value) ] (fun xs -> EStore(cell, xs.Head))
 
     | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, r) ->
+        let value = wrapNullCast id.Type value
+
         match ctx.Vars.TryGetValue id.Name, ctx.Members.TryGetValue id.Name with
         | (true, ({ Ty = TPtr(t, _) } as v)), _ ->
-            bindArgs ctx [ lw ctx value ] (fun xs -> EStore(EDeref(EVar v, t), xs.Head))
-        | (true, v), _ -> EAssign(v, lw ctx value)
+            bindArgs ctx [ coerceTy ctx t (lw ctx value) ] (fun xs -> EStore(EDeref(EVar v, t), xs.Head))
+        | (true, v), _ -> EAssign(v, coerceTy ctx v.Ty (lw ctx value))
         // (a module-level value: what it held is given up once the new value is in place)
         | _, (true, MValue ty) ->
             ctx.State.UsesRuntime <- true
 
             bindArgs
                 ctx
-                [ lw ctx value ]
+                [ coerceTy ctx ty (lw ctx value) ]
                 (fun xs ->
                     EEmit("fable_rt.store(&$0, fable_rt.dup($1))", [ globalVar id.Name ty true; xs.Head ], tVoid)
                 )
         | _ -> fail r "the Zig target cannot assign to `%s`" id.Name
 
     | Fable.Set(Fable.Import(imp, t, _), Fable.ValueSet, _, value, r) when (importedValue ctx imp).IsSome ->
+        let value = wrapNullCast t value
         let name, _ = (importedValue ctx imp).Value
         let ty = mapType ctx r t
         ctx.State.UsesRuntime <- true
@@ -6214,21 +7025,82 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ctx.State.UsesRuntime <- true
         bindArgs ctx [ lw ctx info.ThisArg.Value ] (fun xs -> EEmit("fable_rt.exnInnerBoxed($0)", xs, tAny))
     // `x :> obj` and `box x`: an object holds it
-    | Fable.TypeCast(x, Fable.Any) when x.Type <> Fable.Any -> boxed ctx x
+    | Fable.TypeCast(x, t) when unwrapNullness t = Fable.Any && unwrapNullness x.Type <> Fable.Any ->
+        match x with
+        | Fable.Call(Fable.Import(imp, ct, cr), info, _, r) when
+            imp.Selector = "DefaultOf" && not (hasDefault ctx x.Type)
+            ->
+            let nt = Fable.Nullable(x.Type, false)
+            boxed ctx (Fable.Call(Fable.Import(imp, ct, cr), { info with GenericArgs = [ nt ] }, nt, r))
+        | _ -> boxed ctx x
     // `o :?> T` of an `obj`
-    | Fable.TypeCast(x, t) when x.Type = Fable.Any && t <> Fable.Any -> unboxed ctx e.Range x t
-    | Fable.TypeCast(x, t) ->
-        let ir = lw ctx x
+    | Fable.TypeCast(x, t) when unwrapNullness x.Type = Fable.Any && unwrapNullness t <> Fable.Any ->
+        unboxed ctx e.Range x t
+    | Fable.TypeCast(Fable.IfThenElse(guard, thenExpr, elseExpr, r), (Fable.Nullable(_, false) as t)) ->
+        let ty = mapType ctx r t
 
-        match typeOf ir, mapType ctx e.Range t with
+        bindArgs
+            ctx
+            [ lw ctx guard ]
+            (fun xs ->
+                EIf(
+                    xs.Head,
+                    coerceTy ctx ty (lw ctx (wrapNullCast t thenExpr)),
+                    coerceTy ctx ty (lw ctx (wrapNullCast t elseExpr)),
+                    ty
+                )
+            )
+    | Fable.TypeCast(Fable.DecisionTree(expr, targets), (Fable.Nullable(_, false) as t)) ->
+        let targets = targets |> List.map (fun (ids, body) -> ids, wrapNullCast t body)
+
+        match sharedTargets targets expr with
+        | [], _ -> coerceTy ctx (mapType ctx e.Range t) (lw { ctx with DecisionTargets = targets } expr)
+        | fns, small ->
+            coerceTy
+                ctx
+                (mapType ctx e.Range t)
+                (lw
+                    ctx
+                    (List.foldBack
+                        (fun (fnId, fn) rest -> Fable.Let(fnId, fn, rest))
+                        fns
+                        (Fable.DecisionTree(expr, small))))
+    | Fable.TypeCast(x, t) ->
+        let ir = lw ctx (wrapNullCast t x)
+        let targetTy = mapType ctx e.Range t
+
+        match typeOf ir, targetTy with
         | a, b when a = b -> ir
         // (an object known not to be null as an object of a class, which may be)
         | a, TOpt b when a = tObj && b = tObj -> ir
-        | _ -> fail e.Range "the Zig target does not support %s yet" (exprKind e)
+        | _, _ ->
+            let coerced = coerceTy ctx targetTy ir
+
+            if typeOf coerced = targetTy then
+                coerced
+            else
+                fail e.Range "the Zig target does not support %s yet" (exprKind e)
 
     // Pattern matching arrives as a decision tree whose leaves name a target and the values
     // its variables are bound to. A target reached from several leaves is lowered once per leaf.
     | Fable.DecisionTree(expr, targets) ->
+        let merged =
+            match e.Type with
+            | Fable.Nullable(_, false) -> e.Type
+            | _ ->
+                targets
+                |> List.tryPick (fun (_, b) ->
+                    match b.Type with
+                    | Fable.Nullable(_, false) as n when unwrapNullness n = unwrapNullness e.Type -> Some n
+                    | _ -> None
+                )
+                |> Option.defaultValue e.Type
+
+        let targets =
+            match merged with
+            | Fable.Nullable(_, false) -> targets |> List.map (fun (ids, body) -> ids, wrapNullCast merged body)
+            | _ -> targets
+
         match sharedTargets targets expr with
         | [], _ -> lw { ctx with DecisionTargets = targets } expr
         | fns, small ->
@@ -6352,7 +7224,7 @@ and withParameter (ctx: Ctx) (message: Expr) (parameter: Fable.Expr) : Expr =
 
 /// The function that is the `ToString` a record or a union declares for itself, if it does.
 and ownToString (ctx: Ctx) (t: Fable.Type) : string option =
-    match t with
+    match unwrapNullness t with
     | Fable.DeclaredType(entRef, _) ->
         match ctx.Com.TryGetEntity entRef with
         | Some ent when
@@ -6387,7 +7259,7 @@ and boxed (ctx: Ctx) (x: Fable.Expr) : Expr =
 and unboxed (ctx: Ctx) (r: SourceLocation option) (x: Fable.Expr) (t: Fable.Type) : Expr =
     ctx.State.UsesRuntime <- true
 
-    match t with
+    match unwrapNullness t with
     | Fable.DeclaredType(cls, gs) when (objInfo ctx r cls).IsSome ->
         let o = (objInfo ctx r cls).Value
         let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
@@ -6469,6 +7341,7 @@ and showShapeOf (ctx: Ctx) (r: SourceLocation option) (strict: bool) (root: Fabl
         | Fable.LambdaType _
         | Fable.DelegateType _ -> ()
         | Fable.Option(inner, _)
+        | Fable.Nullable(inner, _)
         | Fable.Array(inner, _)
         | Fable.List inner -> check inner
         | Fable.Tuple(ts, _) -> List.iter check ts
@@ -6521,6 +7394,7 @@ and showShapeOf (ctx: Ctx) (r: SourceLocation option) (strict: bool) (root: Fabl
             | Fable.Tuple(_, true)
             | Fable.Number(UInt16, _) -> true
             | Fable.Option(inner, false)
+            | Fable.Nullable(inner, false)
             | Fable.Array(inner, _)
             | Fable.List inner -> go inner
             | Fable.Tuple(ts, false) -> List.exists go ts
@@ -7031,14 +7905,17 @@ and applyValue
     match args with
     | [] -> f
     | _ ->
-        let take, ret =
+        // (the Zig type of what the value returns, when Fable's type of it does not say)
+        let take, ret, valueRet =
             match fTy with
-            | Fable.LambdaType(_, ret) -> 1, ret
-            | Fable.DelegateType(ts, ret) -> ts.Length, ret
+            | Fable.LambdaType(_, ret) -> 1, ret, None
+            | Fable.DelegateType(ts, ret) -> ts.Length, ret, None
             | _ ->
-                // (Fable does not always say what type an item of an array has: the value does)
+                // (Fable does not always say what type an item of an array has: the value does,
+                // a curried one taking its arguments in several steps)
                 match typeOf f with
-                | TFn(ps, _) when ps.Length = args.Length -> ps.Length, finalTy
+                | TFn(ps, _) when ps.Length = args.Length -> ps.Length, finalTy, None
+                | TFn(ps, valueRet) when ps.Length < args.Length -> ps.Length, fTy, Some valueRet
                 | other -> fail r "the Zig target cannot apply a value of this type (%A, %A)" fTy other
 
         if args.Length < take then
@@ -7047,10 +7924,10 @@ and applyValue
         let now, rest = List.splitAt take args
 
         let resultTy =
-            if rest.IsEmpty then
-                mapType ctx r finalTy
-            else
-                substTy subst (mapType ctx r ret)
+            match rest.IsEmpty, valueRet with
+            | true, _ -> mapType ctx r finalTy
+            | false, Some t -> t
+            | false, None -> substTy subst (mapType ctx r ret)
 
         let call =
             bindArgs ctx (f :: (now |> List.map (lw ctx))) (fun xs -> ECallClo(xs.Head, xs.Tail, resultTy))
@@ -7380,20 +8257,23 @@ and dotnetCall
     | "Microsoft.FSharp.Core.Operators", "InfinitySingle", [] -> ELit("std.math.inf(f32)", TPrim "f32")
     // `box x :? int`: a test of what an `obj` holds
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
-        x.Type = Fable.Any && info.GenericArgs.Length = 1
+        unwrapNullness x.Type = Fable.Any && info.GenericArgs.Length = 1
         ->
         lw ctx (Fable.Test(x, Fable.TypeTest info.GenericArgs.Head, r))
     // `x :? T` where Fable keeps it a call: of an exception class, or of a class of objects
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
         (match info.GenericArgs with
-         | [ Fable.DeclaredType(cls, _) ] -> (tryExnEnt ctx r cls).IsSome || (objInfo ctx r cls).IsSome
+         | [ g ] ->
+             match unwrapNullness g with
+             | Fable.DeclaredType(cls, _) -> (tryExnEnt ctx r cls).IsSome || (objInfo ctx r cls).IsSome
+             | _ -> false
          | _ -> false)
         ->
-        match info.GenericArgs with
-        | [ Fable.DeclaredType(cls, _) ] when (tryExnEnt ctx r cls).IsSome ->
+        match unwrapNullness info.GenericArgs.Head with
+        | Fable.DeclaredType(cls, _) when (tryExnEnt ctx r cls).IsSome ->
             let ent = (tryExnEnt ctx r cls).Value
             bindArgs ctx [ lw ctx x ] (fun xs -> EExnTest(xs.Head, ent))
-        | [ Fable.DeclaredType(cls, gs) ] ->
+        | Fable.DeclaredType(cls, gs) ->
             let o = (objInfo ctx r cls).Value
             let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
             bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.objIs($0, %s{typeRef})", xs, tBool))
@@ -7655,14 +8535,15 @@ and dotnetCall
                 )
             )
     | "Microsoft.FSharp.Collections.FSharpList`1", "get_Empty", _ -> ECon(mapType ctx r t, "Empty", [], None)
-    | "System.Exception", "get_InnerException", [ x ] -> rt "fable_rt.exnInner($0)" [ x ] tExn
+    | entity, "get_InnerException", [ x ] when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
+        rt "fable_rt.exnInner($0)" [ x ] tExn
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ Fable.Call(Fable.Import(imp, _, _), inner, _, _) ] when
         imp.Selector = "get_InnerException"
         ->
         pure' "fable_rt.exnHasNoInner($0)" [ inner.ThisArg.Value ] tBool
-    | "System.Exception", "get_Message", x :: _ ->
+    | entity, "get_Message", x :: _ when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
         bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnMessage($0)", xs, tStr))
-    | "System.Exception", "get_StackTrace", x :: _ ->
+    | entity, "get_StackTrace", x :: _ when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
         ctx.State.UsesStackTrace <- true
 
         bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnStackTrace($0)", xs, tStr))
@@ -7684,11 +8565,11 @@ and dotnetCall
     // Random, Nullable, Stack and Queue, tuples): here, in their place among the cases
     | DomainCall "misc" ctx r info t lowered -> lowered
     // ---- obj ----
-    | "Microsoft.FSharp.Core.Operators", "Box", [ x ] when x.Type <> Fable.Any -> boxed ctx x
+    | "Microsoft.FSharp.Core.Operators", "Box", [ x ] when unwrapNullness x.Type <> Fable.Any -> boxed ctx x
     | "Microsoft.FSharp.Core.Operators", "Box", [ x ] -> lw ctx x
     | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
       ("Unbox" | "UnboxGeneric" | "UnboxFast"),
-      [ Uncast x ] when x.Type = Fable.Any && t <> Fable.Any -> unboxed ctx r x t
+      [ Uncast x ] when unwrapNullness x.Type = Fable.Any && unwrapNullness t <> Fable.Any -> unboxed ctx r x t
     // `obj.ReferenceEquals(a, b)` and `PhysicalEquality a b`: the same cell (what F# boxes for
     // the call is looked through: a record is not copied by it on .NET)
     | ("System.Object" | "Microsoft.FSharp.Core.LanguagePrimitives"),
@@ -7723,11 +8604,13 @@ and dotnetCall
     | "System.Object", "Equals", [ a; b ] ->
         let asObj (x: Fable.Expr) =
             match x with
-            | Uncast inner when inner.Type <> Fable.Any -> Fable.TypeCast(inner, Fable.Any)
+            | Uncast inner when unwrapNullness inner.Type <> Fable.Any -> Fable.TypeCast(inner, Fable.Any)
             | _ -> x
 
         pure' "fable_rt.eql($0, $1)" [ asObj a; asObj b ] tBool
-    | "System.Object", "GetHashCode", [ x ] -> pure' "fable_rt.hash($0)" [ x ] tI32
+    | ("System.Object" | "System.String" | "System.Boolean" | "System.Char" | "System.SByte" | "System.Byte" | "System.Int16" | "System.UInt16" | "System.Int32" | "System.UInt32" | "System.Int64" | "System.UInt64" | "System.Single" | "System.Double" | "System.Decimal" | "System.Numerics.BigInteger"),
+      "GetHashCode",
+      [ x ] -> pure' "fable_rt.hash($0)" [ x ] tI32
     | "System.Collections.Generic.EqualityComparer`1", "Equals", [ _; a; b ] ->
         pure' "fable_rt.eql($0, $1)" [ a; b ] tBool
     | "System.Collections.Generic.EqualityComparer`1", "GetHashCode", [ _; x ] -> pure' "fable_rt.hash($0)" [ x ] tI32
@@ -7855,10 +8738,12 @@ and dotnetCall
         pure' "std.math.atan2(@as(f64, $0), @as(f64, $1))" [ y; x ] tF64
     // `char "a"` and `Char.Parse "a"`: a string of exactly one char
     | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), "ToChar", [ x ]
-    | "System.Char", "Parse", [ x ] when x.Type = Fable.String -> rt "fable_rt.strToChar($0)" [ x ] (TPrim "u16")
+    | "System.Char", "Parse", [ x ] when unwrapNullness x.Type = Fable.String ->
+        rt "fable_rt.strToChar($0)" [ x ] (TPrim "u16")
     // text to numbers: F#'s conversions read `0x`, `0o`, `0b` and `_`; .NET's `Parse` does not
     | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when
-        name.StartsWith("To", System.StringComparison.Ordinal) && x.Type = Fable.String
+        name.StartsWith("To", System.StringComparison.Ordinal)
+        && unwrapNullness x.Type = Fable.String
         ->
         let ty = mapType ctx r t
 
@@ -7879,7 +8764,7 @@ and dotnetCall
     | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single"),
       "Parse",
       [ x; provider ] when
-        (match provider.Type with
+        (match unwrapNullness provider.Type with
          | Fable.DeclaredType(e, _) ->
              e.FullName = "System.IFormatProvider"
              || e.FullName = "System.Globalization.CultureInfo"
@@ -8545,6 +9430,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             Enumerators = Dictionary()
             OutTuples = Dictionary()
             CaughtExn = None
+            InCtor = false
         }
 
     let report (r: SourceLocation option) (msg: string) =
@@ -8559,8 +9445,9 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
         decls
         |> List.collect (fun d ->
             match d with
-            // a secondary constructor of a class: like the primary one, it gives the chain of
-            // fields (that the primary constructor computes)
+            // a secondary or explicit constructor of an object class: takes `self_obj` first, runs
+            // any delegating/base constructor on it, writes this class's fields, and runs any `then`
+            // block directly against the live object.
             | Fable.MemberDeclaration m when
                 (match com.TryGetMember m.MemberRef with
                  | Some info when info.IsConstructor ->
@@ -8576,70 +9463,183 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 let cls = (com.TryGetMember m.MemberRef).Value.DeclaringEntity.Value
                 let o = (objInfo (newCtx m.Name) None cls).Value
 
-                let rec chainTail (e: Fable.Expr) : Fable.Expr =
+                let selfId, args =
+                    match m.Args with
+                    | first :: _ when first.IsThisArgument -> first, m.Args
+                    | _ ->
+                        let s = objSelfIdent o
+                        s, s :: m.Args
+
+                let ownFields = caseFields (TEnt(o.Part, [])) ""
+
+                let isSysObjCtor (x: Fable.Expr) =
+                    match x with
+                    | Fable.Call(Fable.Import(imp, _, _), _, _, _) ->
+                        imp.Selector = ".ctor" && imp.Path = Replacements.DotnetPrefix + "System.Object"
+                    | _ -> false
+
+                let rec rewriteSelf (e: Fable.Expr) : Fable.Expr =
                     match e with
-                    | Fable.Call(callee, call, Fable.DeclaredType(c, _), r) when
+                    | Fable.Call(Fable.Import(imp, _, _), _, _, _) when
+                        imp.Selector = ".ctor" && imp.Path = Replacements.DotnetPrefix + "System.Object"
+                        ->
+                        Fable.Value(Fable.UnitConstant, None)
+                    | Fable.Value(Fable.ThisValue _, r) -> Fable.IdentExpr { selfId with Range = r }
+                    | _ -> e |> AST.visit rewriteSelf
+
+                let rec endsWithIdent (name: string) (e: Fable.Expr) =
+                    match e with
+                    | Fable.IdentExpr id -> id.Name = name
+                    | Fable.Sequential xs when not xs.IsEmpty -> endsWithIdent name (List.last xs)
+                    | Fable.Let(_, _, b)
+                    | Fable.LetRec(_, b) -> endsWithIdent name b
+                    | Fable.TypeCast(x, _) -> endsWithIdent name x
+                    | _ -> false
+
+                let rec stripReturnIdent (name: string) (e: Fable.Expr) : Fable.Expr =
+                    match e with
+                    | Fable.IdentExpr id when id.Name = name -> Fable.Value(Fable.UnitConstant, id.Range)
+                    | Fable.Sequential xs when not xs.IsEmpty ->
+                        let rev = List.rev xs
+                        Fable.Sequential(List.rev (stripReturnIdent name rev.Head :: rev.Tail))
+                    | Fable.Let(id, v, b) -> Fable.Let(id, v, stripReturnIdent name b)
+                    | Fable.LetRec(bs, b) -> Fable.LetRec(bs, stripReturnIdent name b)
+                    | Fable.TypeCast(x, _) -> stripReturnIdent name x
+                    | other -> Fable.Sequential [ other; Fable.Value(Fable.UnitConstant, None) ]
+
+                let emitOwnFields (values: Fable.Expr list) (r: SourceLocation option) =
+                    let ownValues =
+                        if values.Length > ownFields.Length then
+                            List.skip (values.Length - ownFields.Length) values
+                        else
+                            values
+
+                    let sets =
+                        List.map2
+                            (fun (fname, _) (v: Fable.Expr) ->
+                                Fable.Set(Fable.IdentExpr selfId, Fable.FieldSet fname, v.Type, rewriteSelf v, r)
+                            )
+                            ownFields
+                            ownValues
+
+                    Fable.Sequential(sets @ [ Fable.Value(Fable.UnitConstant, r) ])
+
+                let isTypeOfClass (entFullName: string) (t: Fable.Type) =
+                    match t with
+                    | Fable.DeclaredType(c, _) -> c.FullName = entFullName
+                    | _ -> false
+
+                let rec initTail (e: Fable.Expr) : Fable.Expr =
+                    match e with
+                    // Delegating secondary constructor (`new() = C(args)`)
+                    | Fable.Call(callee, call, Fable.DeclaredType(c, cArgs), r) when
                         c.FullName = o.FullName && isConstructorCall com call
                         ->
-                        Fable.Call(callee, call, chainTypeOf o (ownArgs o), r)
-                    // (`new(x) = { X = x; ... }` of a class without a base: its fields are the
-                    // whole chain)
-                    | Fable.Value(Fable.NewRecord(values, ent, _), r) when
-                        ent.FullName = o.FullName
-                        && o.Parent.IsNone
-                        && values.Length = (caseFields (TEnt(o.Part, [])) "").Length
+                        Fable.Call(
+                            callee,
+                            { call with
+                                ThisArg = Some(Fable.IdentExpr selfId)
+                                Args = call.Args |> List.map rewriteSelf
+                                GenericArgs =
+                                    if call.GenericArgs.IsEmpty then
+                                        cArgs
+                                    else
+                                        call.GenericArgs
+                            },
+                            Fable.Unit,
+                            r
+                        )
+                    // Explicit constructor with `then` (`let this = created in (rest; this)`)
+                    | Fable.Let(thisId, created, bodyAfter) when
+                        isTypeOfClass o.FullName created.Type && endsWithIdent thisId.Name bodyAfter
                         ->
-                        let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, ownArgs o), r)
-                        Fable.Value(Fable.NewRecord([ own ], o.Chain.Ref, ownArgs o), r)
-                    | Fable.Let(id, v, b) -> Fable.Let(id, v, chainTail b)
-                    | Fable.LetRec(bs, b) -> Fable.LetRec(bs, chainTail b)
+                        Fable.Sequential
+                            [
+                                initTail created
+                                Fable.Let(
+                                    thisId,
+                                    Fable.IdentExpr selfId,
+                                    rewriteSelf (stripReturnIdent thisId.Name bodyAfter)
+                                )
+                            ]
+                    // Derived explicit constructor with compiler-generated base call:
+                    // `let base = Base(args) in { inherited @ own }`
+                    | Fable.Let(baseId, Fable.Call(baseCallee, baseCall, Fable.DeclaredType(baseRef, bArgs), cr), inner) when
+                        o.Parent.IsSome
+                        && baseRef.FullName = o.Parent.Value.FullName
+                        && isConstructorCall com baseCall
+                        ->
+                        let bArgs =
+                            if baseCall.GenericArgs.IsEmpty then
+                                bArgs
+                            else
+                                baseCall.GenericArgs
+
+                        Fable.Sequential
+                            [
+                                Fable.Call(
+                                    baseCallee,
+                                    { baseCall with
+                                        ThisArg = Some(Fable.IdentExpr selfId)
+                                        Args = baseCall.Args |> List.map rewriteSelf
+                                        GenericArgs = bArgs
+                                    },
+                                    Fable.Unit,
+                                    cr
+                                )
+                                Fable.Let(baseId, Fable.IdentExpr selfId, initTail inner)
+                            ]
+                    // Explicit constructor record literal (`{ X = ... }`)
+                    | Fable.Value(Fable.NewRecord(values, ent, _), r) when
+                        ent.FullName = o.FullName && values.Length >= ownFields.Length
+                        ->
+                        emitOwnFields values r
+                    | Fable.Let(id, v, b) -> Fable.Let(id, rewriteSelf v, initTail b)
+                    | Fable.LetRec(bs, b) ->
+                        Fable.LetRec(bs |> List.map (fun (id, v) -> id, rewriteSelf v), initTail b)
                     | Fable.Sequential xs ->
-                        // (`inherit obj()`, which F# puts first, makes nothing here)
-                        let xs =
-                            xs
-                            |> List.filter (fun x ->
-                                match x with
-                                | Fable.Call(Fable.Import(imp, _, _), _, _, _) ->
-                                    not (
-                                        imp.Selector = ".ctor"
-                                        && imp.Path = Replacements.DotnetPrefix + "System.Object"
-                                    )
-                                | _ -> true
-                            )
+                        let xs = xs |> List.filter (not << isSysObjCtor)
 
                         match List.rev xs, o.Parent with
-                        | [ x ], _ -> chainTail x
-                        // (`{ inherit Base(args); Own = x }`: the base's chain, then this class's
-                        // part)
+                        | [ x ], _ -> initTail x
+                        // (`{ inherit Base(args); Own = x }` when Base has a primary constructor)
                         | Fable.Value(Fable.NewRecord(values, ent, _), r) :: Fable.Call(callee,
                                                                                         call,
-                                                                                        Fable.DeclaredType(baseRef, _),
+                                                                                        Fable.DeclaredType(baseRef,
+                                                                                                           bArgs),
                                                                                         cr) :: before,
                           Some p when
                             ent.FullName = o.FullName
                             && baseRef.FullName = p.FullName
                             && isConstructorCall com call
-                            && values.Length = (caseFields (TEnt(o.Part, [])) "").Length
+                            && values.Length >= ownFields.Length
                             ->
-                            let baseId = AST.makeTypedIdent (chainTypeOf p o.ParentArgs) "base_chain"
-                            let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, ownArgs o), r)
+                            let bArgs =
+                                if call.GenericArgs.IsEmpty then
+                                    bArgs
+                                else
+                                    call.GenericArgs
 
-                            let made =
-                                Fable.Let(
-                                    baseId,
-                                    Fable.Call(callee, call, chainTypeOf p o.ParentArgs, cr),
-                                    Fable.Value(
-                                        Fable.NewRecord([ Fable.IdentExpr baseId; own ], o.Chain.Ref, ownArgs o),
-                                        r
-                                    )
+                            let callExpr =
+                                Fable.Call(
+                                    callee,
+                                    { call with
+                                        ThisArg = Some(Fable.IdentExpr selfId)
+                                        Args = call.Args |> List.map rewriteSelf
+                                        GenericArgs = bArgs
+                                    },
+                                    Fable.Unit,
+                                    cr
                                 )
 
-                            match before with
-                            | [] -> made
-                            | _ -> Fable.Sequential(List.rev before @ [ made ])
-                        | rev, _ -> Fable.Sequential(List.rev (chainTail rev.Head :: rev.Tail))
-                    | Fable.IfThenElse(c, a, b, r) -> Fable.IfThenElse(c, chainTail a, chainTail b, r)
-                    | Fable.TypeCast(x, _) -> chainTail x
+                            let setsExpr = emitOwnFields values r
+                            let before = before |> List.rev |> List.map rewriteSelf
+                            Fable.Sequential(before @ [ callExpr; setsExpr ])
+                        | rev, _ ->
+                            let before = rev.Tail |> List.rev |> List.map rewriteSelf
+                            Fable.Sequential(before @ [ initTail rev.Head ])
+                    | Fable.IfThenElse(c, a, b, r) -> Fable.IfThenElse(rewriteSelf c, initTail a, initTail b, r)
+                    | Fable.TypeCast(x, _) -> initTail x
                     | _ ->
                         report
                             e.Range
@@ -8647,7 +9647,12 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
                         e
 
-                [ { m with Body = chainTail m.Body } ]
+                [
+                    { m with
+                        Args = args
+                        Body = initTail m.Body
+                    }
+                ]
             | Fable.MemberDeclaration m -> [ m ]
             | Fable.ModuleDeclaration m -> membersOf m.Members
             // A top-level statement runs when the program starts, in its place among the
@@ -8749,7 +9754,10 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                                 Fable.Value(Fable.NewRecord(message :: values, c.Entity, []), None)
 
                             attached.Add
-                                { ctor with Body = constructorBodyWith fields (fieldDefaults ent) finish ctor.Body }
+                                { ctor with
+                                    Body =
+                                        constructorBodyWith fields (fieldDefaults (newCtx c.Name) ent) finish ctor.Body
+                                }
                         | None -> report None $"the Zig target needs a primary constructor of %s{c.Name}"
 
                         for m in c.AttachedMembers do
@@ -8773,8 +9781,24 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                     try
                         match c.Constructor with
                         | Some ctor ->
+                            let selfId, args =
+                                match ctor.Args with
+                                | first :: _ when first.IsThisArgument -> first, ctor.Args
+                                | _ ->
+                                    let s = objSelfIdent o
+                                    s, s :: ctor.Args
+
                             attached.Add
-                                { ctor with Body = objConstructorBody o (fieldDefaults ent) c.BaseCall ctor.Body }
+                                { ctor with
+                                    Args = args
+                                    Body =
+                                        objConstructorBody
+                                            o
+                                            selfId
+                                            (fieldDefaults (newCtx c.Name) ent)
+                                            c.BaseCall
+                                            ctor.Body
+                                }
                         | None -> ()
 
                         state.Objs.Add(objDecl (newCtx c.Name) None o (dotnetTypeName com ent))
@@ -8829,7 +9853,13 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
                             attached.Add
                                 { ctor with
-                                    Body = constructorBody c.Entity genArgs fields (fieldDefaults ent) ctor.Body
+                                    Body =
+                                        constructorBody
+                                            c.Entity
+                                            genArgs
+                                            fields
+                                            (fieldDefaults (newCtx c.Name) ent)
+                                            ctor.Body
                                 }
                         | _ -> ()
                     with ZigError(msg, r) ->
@@ -8929,6 +9959,11 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
 
         ofType @ (info.GenericParameters |> List.map (fun g -> g.Name)) |> List.distinct
 
+    let effBodyType (info: Fable.MemberFunctionOrValue) (body: Fable.Expr) =
+        match info.ReturnParameter.Type with
+        | Fable.Nullable(_, false) as n when unwrapNullness n = unwrapNullness body.Type -> n
+        | _ -> body.Type
+
     // What the file declares is known before any body is lowered: bodies call each other.
     for d in decls do
         let info = com.GetMember d.MemberRef
@@ -8936,8 +9971,10 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
         try
             reserved.Add d.Name |> ignore
 
+            let retFable = effBodyType info d.Body
+
             if info.IsValue then
-                let ty = mapType (newCtx d.Name) d.Body.Range d.Body.Type
+                let ty = mapType (newCtx d.Name) d.Body.Range retFable
 
                 // (a static field can be assigned: it is `static let mutable` or the field
                 // behind `static member val`)
@@ -8955,7 +9992,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                              [ Fable.Unit ]
                          else
                              d.Args |> List.map (fun a -> a.Type)),
-                        d.Body.Type
+                        retFable
                     )
         with ZigError(msg, r) ->
             report r msg
@@ -8963,15 +10000,36 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
     for d in decls do
         let info = com.GetMember d.MemberRef
         let typeParams = typeParamsOf info
-        let ctx = { newCtx d.Name with TypeParams = typeParams }
+
+        let inObjCtor =
+            info.IsConstructor
+            && (
+                match info.DeclaringEntity with
+                | Some cls ->
+                    (try
+                        (objInfo (newCtx d.Name) None cls).IsSome
+                     with ZigError _ ->
+                         false)
+                | None -> false
+            )
+
+        let ctx =
+            { newCtx d.Name with
+                TypeParams = typeParams
+                InCtor = inObjCtor
+            }
 
         try
+            let retFable = effBodyType info d.Body
+
             if info.IsValue then
-                match members.TryGetValue d.Name, lw ctx d.Body with
+                match members.TryGetValue d.Name, lw ctx (wrapNullCast retFable d.Body) with
                 | (true, MConst ty), ELit(text, _) -> state.Consts.Add((d.Name, ty, text))
                 // A value that is not a literal is computed when the program starts, by a
                 // function of its own, and kept until the program ends.
                 | (true, (MConst ty | MValue ty)), body ->
+                    let body = coerceTy ctx ty body
+
                     if true then
                         let init = uniqueName ctx (d.Name + "_init")
                         state.Values.Add((d.Name, ty, init))
@@ -9018,8 +10076,8 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                             v
                         )
 
-                let ret = mapType ctx d.Body.Range d.Body.Type
-                let d = { d with Body = typeTaskBuilders d.Body }
+                let ret = mapType ctx d.Body.Range retFable
+                let d = { d with Body = wrapNullCast retFable (typeTaskBuilders d.Body) }
 
                 // `[<StackArena(bytes)>]`: what the function allocates comes from its stack
                 match
@@ -9043,7 +10101,13 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                     state.Arenas[d.Name] <- bytes
                 | None -> ()
 
-                let body = lw ctx d.Body
+                let body =
+                    let raw = lw ctx d.Body
+
+                    if ret = tVoid then
+                        raw
+                    else
+                        coerceTy ctx ret raw
 
                 // a test (xUnit's `[<Fact>]`, NUnit's `[<Test>]`): `zig test` runs it
                 if

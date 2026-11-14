@@ -281,7 +281,7 @@ let call
         // (`Find` gives `default(T)` when nothing matches: the library's `tryFind`, and the
         // default where the type has one)
         | ("Find" | "FindLast"), [ _ ] ->
-            if not (hasDefault t) then
+            if not (hasDefault ctx t) then
                 fail
                     r
                     "the Zig target does not support ResizeArray.%s of items whose default is null on .NET; use a function of the List or Seq module"

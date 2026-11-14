@@ -40,7 +40,17 @@ let handle (args: string list) =
 
     Command.Fable(
         CmdLine.empty
-        |> CmdLine.appendRaw testsDir
+        |> CmdLine.appendRaw (Path.Resolve(testsDir, "Fable.Tests.Zig.fsproj"))
+        |> CmdLine.appendPrefix "--lang" "zig"
+        |> CmdLine.appendPrefix "--extension" ".zig"
+        |> CmdLine.appendPrefix "--exclude" "Fable.Core"
+        |> CmdLine.appendRaw "--noCache",
+        workingDirectory = testsDir
+    )
+
+    Command.Fable(
+        CmdLine.empty
+        |> CmdLine.appendRaw (Path.Resolve(testsDir, "Fable.Tests.Zig.Nullness.fsproj"))
         |> CmdLine.appendPrefix "--lang" "zig"
         |> CmdLine.appendPrefix "--extension" ".zig"
         |> CmdLine.appendPrefix "--exclude" "Fable.Core"
@@ -53,4 +63,5 @@ let handle (args: string list) =
 
     // (in Release: F# makes tail calls only there, and the tail-call tests recurse deeply)
     if not noDotnet then
-        Command.Run("dotnet", "test -c Release", workingDirectory = testsDir)
+        Command.Run("dotnet", "test -c Release Fable.Tests.Zig.fsproj", workingDirectory = testsDir)
+        Command.Run("dotnet", "test -c Release Fable.Tests.Zig.Nullness.fsproj", workingDirectory = testsDir)

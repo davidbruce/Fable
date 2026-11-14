@@ -823,6 +823,24 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
 
         finishUnit em ind dest
     // A field that owns its value: the old value is given up once the new one is in place.
+    | EStore(EGet(EEmit(m, [ o ], TPtr(part, false)), PField _, _) as lv, rhs) when
+        m.StartsWith("objInit:", System.StringComparison.Ordinal)
+        ->
+        let rest = m.Substring 8
+        let colon = rest.IndexOf ':'
+        let fieldIdx = rest.Substring(0, colon)
+        let parts = rest.Substring(colon + 1)
+
+        let value =
+            if isFlat rhs || isSimpleIf rhs then
+                ex em rhs
+            else
+                let stored = freshName em "stored"
+                block rhs (fun lbl -> $"const %s{stored}: %s{zigType (typeOf lv)} = %s{lbl}: {{")
+                stored
+
+        L $"fable_rt.objInitField(%s{zigType part}, &[_]type{{ %s{parts} }}, %s{fieldIdx}, %s{ex em o}, %s{value});"
+        finishUnit em ind dest
     | EStore(lv, rhs) ->
         let place = ex em lv
 
@@ -1057,8 +1075,8 @@ let dropUnreadPaths (body: string) =
 
 /// Zig rejects a parameter that is never used.
 let ensureUsed (names: string list) (body: string) =
-    // (a name inside a string literal is not a use of it)
-    let code = Regex.Replace(body, "\"(?:[^\"\\\\]|\\\\.)*\"", "\"\"")
+    // (a name inside a string literal or comment is not a use of it)
+    let code = Regex.Replace(body, "\"(?:[^\"\\\\]|\\\\.)*\"|//[^\\n]*", "\"\"")
 
     names
     |> List.filter (fun n -> not (Regex.IsMatch(code, $@"(?<![\w.])%s{Regex.Escape n}\b")))
@@ -1864,8 +1882,9 @@ let emitFile (state: FileState) : string =
     // the classes that take part in inheritance: the type of each, with its tables of virtual
     // members (function values of the functions that implement them)
     for d in state.Objs do
-        // (an object expression's class: each member calls the function value the object holds)
-        for (name, partPtr, parts, field, fnTy) in d.Thunks do
+        let generic = not d.TypeParams.IsEmpty
+
+        let emitThunk (indent: string) (name, partPtr, parts, field, fnTy) =
             match fnTy with
             | TFn(_ :: args, ret) ->
                 let ps =
@@ -1878,21 +1897,24 @@ let emitFile (state: FileState) : string =
 
                 out
                     .AppendLine(
-                        $"fn %s{topIdent name}(env: ?*fable_rt.Env, this: fable_rt.Obj%s{ps}) fable_rt.Raised!%s{zigType ret} {{"
+                        $"%s{indent}fn %s{topIdent name}(env: ?*fable_rt.Env, this: fable_rt.Obj%s{ps}) fable_rt.Raised!%s{zigType ret} {{"
                     )
-                    .AppendLine("    _ = env;")
+                    .AppendLine($"%s{indent}    _ = env;")
                     .AppendLine(
-                        $"    const f = fable_rt.dup(fable_rt.objPart(%s{zigType partPtr}, &[_]type{{ %s{parts} }}, this).%s{fieldIdent field});"
+                        $"%s{indent}    const f = fable_rt.dup(fable_rt.objPart(%s{zigType partPtr}, &[_]type{{ %s{parts} }}, this).%s{fieldIdent field});"
                     )
-                    .AppendLine("    defer fable_rt.drop(f);")
-                    .AppendLine($"    return f.code(f.env, this%s{xs});")
-                    .AppendLine("}")
+                    .AppendLine($"%s{indent}    defer fable_rt.drop(f);")
+                    .AppendLine($"%s{indent}    return f.code(f.env, this%s{xs});")
+                    .AppendLine($"%s{indent}}}")
                 |> ignore
             | _ -> ()
 
-        // (a generic class: its object type is a function of its type arguments, and what it is
-        // made of is inside it)
-        let generic = not d.TypeParams.IsEmpty
+        // (an object expression's class: each member calls the function value the object holds;
+        // a generic one defines its thunks inside its type builder where the type params live)
+        if not generic then
+            for th in d.Thunks do
+                emitThunk "" th
+
         let decls = System.Collections.Generic.List<string>()
 
         // (a function as the code of a function value: an adapter, generic in the class's type
@@ -1959,8 +1981,11 @@ let emitFile (state: FileState) : string =
         let toString =
             match d.ToString with
             | Some(target, typeArgs) ->
-                let fnTy = TFn([ TPrim "fable_rt.Obj"; tVoid ], tStr)
-                $"%s{adapterRef (adapterFor target typeArgs fnTy)}.code"
+                if target.StartsWith("@raw:", System.StringComparison.Ordinal) then
+                    topIdent (target.Substring 5)
+                else
+                    let fnTy = TFn([ TPrim "fable_rt.Obj"; tVoid ], tStr)
+                    $"%s{adapterRef (adapterFor target typeArgs fnTy)}.code"
             | None -> "null"
 
         let value =
@@ -1988,6 +2013,9 @@ let emitFile (state: FileState) : string =
                 .AppendLine($"pub fn %s{topIdent d.TypeName}(%s{comptimeParams}) *const fable_rt.ObjType {{")
                 .AppendLine("    return &struct {")
             |> ignore
+
+            for th in d.Thunks do
+                emitThunk "        " th
 
             for dl in decls do
                 out.AppendLine("        " + dl) |> ignore

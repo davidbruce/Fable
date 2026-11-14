@@ -696,6 +696,8 @@ type FileState() =
     member val NetTypes = Dictionary<string, string * string>()
     /// every variable made so far, by id
     member val Vars = Dictionary<int, Var>()
+    /// chain types allocated via `objAlloc` (checked by cycle analysis)
+    member val AllocChains = List<Ty>()
     /// how many type declarations are being mapped (they refer to each other)
     member val EntDepth = 0 with get, set
 

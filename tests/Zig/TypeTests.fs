@@ -322,11 +322,9 @@ type MyEx2(f: float) =
     inherit exn(sprintf "Code: %i" (int f))
     member _.Code = f
 
-#if !FABLE_COMPILER_ZIG // (the object being made used in its own constructor (new() as self, then, as this))
 type ThisContextInConstructor(v) =
     let f () = v
     member val Value = f
-#endif
 
 type DowncastTest(value: int) =
     member _.Value = value
@@ -531,7 +529,6 @@ type Interface2 =
 type Interface1 =
     abstract Create: int -> Interface2
 
-#if !FABLE_COMPILER_ZIG // (`this` in an object expression)
 type MixedThese(x: int) =
     member _.Value = x
 
@@ -540,7 +537,6 @@ type MixedThese(x: int) =
             { new Interface2 with
                 member _.Value = y
                 member this2.Add() = this1.Value + this2.Value }
-#endif
 
 let areEqual (x: obj) (y: obj) = x = y
 
@@ -1386,11 +1382,9 @@ let ``test reraise works`` () =
     | ex -> ex.Message
     |> equal "Will I be reraised?"
 
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test This context is not lost in closures within implicit constructor`` () = // See #1444
     ThisContextInConstructor(7).Value() |> equal 7
-#endif
 
 [<Fact>]
 let ``test Type can be casted to an interface implemented by parent`` () =
@@ -1556,12 +1550,10 @@ let ``test Mangled interfaces work with classes`` () =
     bar2.Bar
     |> equal "BZr9536.74rtruefalseaabcbcaabcbcdd"
 
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test Multiple `this` references work in nested attached members`` () =
     (MixedThese(2) :> Interface1).Create(3).Add()
     |> equal 5
-#endif
 
 [<Fact>]
 let ``test Two unions of different type with same shape are not equal`` () =
@@ -1912,14 +1904,12 @@ let ``test Explicit constructors skip static fields next to DefaultValue fields`
     c.Y |> equal 2
     ClassWithDefaultValueStaticAndInstanceFields.Count |> equal 4
 
-#if !FABLE_COMPILER_ZIG // (a default value of this type)
 [<Fact>]
 let ``test Unchecked.defaultof works for fields on structs`` () =
     let top = TopLevelStruct()
     top.A |> equal 0
     top.B.A |> equal 0
     top.B.B |> equal false
-#endif
 
 [<Fact>]
 let ``test Generic abstract class can be instantiated through derived class`` () =
@@ -2050,13 +2040,10 @@ let ``test explicit constructor resolves the generic arguments of the base class
 
 let mutable valClassThenCalls = 0
 
-#if !FABLE_COMPILER_ZIG // (the object being made used in its own constructor (new() as self, then, as this))
 type ValClassThen =
     val mutable Value: int
     new () = { Value = 1 } then valClassThenCalls <- valClassThenCalls + 1
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the object being made used in its own constructor (new() as self, then, as this))
 [<AllowNullLiteral>]
 type ValClassSequenceInit =
     val Next: ValClassSequenceInit
@@ -2066,32 +2053,24 @@ type ValClassSequenceInit =
     new (a: int, b: int) = { Next = (ValClassSequenceInit(a); ValClassSequenceInit(b)); Id = 0; Boxed = box (do ValClassSequenceInit(a)) }
     new (a: int, b: int, c: int) as self = { Next = (ValClassSequenceInit(a); ValClassSequenceInit(b)); Id = c; Boxed = box (do ValClassSequenceInit(a)) } then self.Next.Id |> ignore
 
-#if !FABLE_COMPILER_ZIG // (the object being made used in its own constructor (new() as self, then, as this))
-#endif
 type ValClassSelf =
     val mutable Name: string
     val mutable Count: int
     new (name: string) as self = { Name = name; Count = 0 } then self.Count <- self.Name.Length
     new () as self = ValClassSelf("ab") then self.Count <- self.Count * 10
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the object being made used in its own constructor (new() as self, then, as this))
 type ValClassSelfOutOfOrder =
     val Z: int
     val mutable W: int
     new () as self = { W = 2; Z = 3 } then self.W <- self.W + self.Z
-#endif
 
 let valClassSelfSaved = ResizeArray<obj>()
 
-#if !FABLE_COMPILER_ZIG // (the object being made used in its own constructor (new() as self, then, as this))
 type ValClassSelfSaved =
     val Id: int
     new (id: int) as self = { Id = id } then valClassSelfSaved.Add(box self)
     new () as self = ValClassSelfSaved(1) then valClassSelfSaved.Add(box self)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the object being made used in its own constructor (new() as self, then, as this))
 type SelfPrimaryBase(x: int) as this =
     let mutable touched = 0
     do this.Touch()
@@ -2099,23 +2078,17 @@ type SelfPrimaryBase(x: int) as this =
     member _.X = x
     member _.Touched = touched
     member _.Touch() = touched <- touched + 1
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the object being made used in its own constructor (new() as self, then, as this))
 type SelfPrimaryChild() =
     inherit SelfPrimaryBase(2)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test explicit constructor returns the object after its then block`` () =
     let before = valClassThenCalls
     let c = ValClassThen()
     c.Value |> equal 1
     valClassThenCalls - before |> equal 1
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test explicit constructor keeps sequences of its own constructor calls in field values`` () =
     let c = ValClassSequenceInit(5, 6)
@@ -2123,9 +2096,7 @@ let ``test explicit constructor keeps sequences of its own constructor calls in 
     isNull c.Boxed |> equal true
     let d = ValClassSequenceInit(5, 6, 7)
     (d.Next.Id, d.Id, isNull d.Boxed) |> equal (6, 7, true)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test explicit constructor with a self identifier works`` () = // See #5166
     let a = ValClassSelf("abc")
@@ -2136,18 +2107,14 @@ let ``test explicit constructor with a self identifier works`` () = // See #5166
     b.Count |> equal 20
     let c = ValClassSelfOutOfOrder()
     (c.Z, c.W) |> equal (3, 5)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test primary constructor with a self identifier works with a secondary constructor`` () =
     let a = SelfPrimaryBase()
     (a.X, a.Touched) |> equal (1, 1)
     let b = SelfPrimaryChild()
     (b.X, b.Touched) |> equal (2, 1)
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test explicit constructor self identifier is the created object`` () =
     valClassSelfSaved.Clear()
@@ -2157,4 +2124,3 @@ let ``test explicit constructor self identifier is the created object`` () =
     valClassSelfSaved.Count |> equal 3
     obj.ReferenceEquals(valClassSelfSaved.[1], b) |> equal true
     obj.ReferenceEquals(valClassSelfSaved.[2], b) |> equal true
-#endif

@@ -199,6 +199,7 @@ pub fn bitToString(bytes: Array(u8), start: ?i32, length: ?i32) Raised!String {
 
 /// `Convert.ToHexString(bytes, offset, length)` (`lower`: `ToHexStringLower`)
 pub fn hexOf(bytes: Array(u8), offset: ?i32, length: ?i32, comptime lower: bool) Raised!String {
+    if (rt.arrayIsNull(bytes)) return argNull("inArray");
     const b = bytes.items;
     const off = offset orelse 0;
     const n = length orelse @as(i32, @intCast(b.len));

@@ -137,7 +137,7 @@ let call
     | _, _, this :: rest when
         info.ThisArg.IsSome
         && this.Type =
-            (match this.Type with
+            (match unwrapNullness this.Type with
              | Fable.DeclaredType(e, _) when
                  (match e.Path with
                   | Fable.SourcePath _ -> false
@@ -155,21 +155,30 @@ let call
         bindArgs
             ctx
             (lw ctx this :: (rest |> List.map (lw ctx)))
-            (fun xs ->
-                match caseFields (typeOf xs.Head) "" |> List.tryFind (fun (f, _) -> f = name) with
-                | Some(f, fty) ->
-                    let args =
-                        if xs.Tail.IsEmpty then
-                            [ EUnit ]
-                        else
-                            xs.Tail
+            (fun given ->
+                bindArgs
+                    ctx
+                    [ unwrapIface ctx given.Head ]
+                    (fun xs ->
+                        match caseFields (typeOf xs.Head) "" |> List.tryFind (fun (f, _) -> f = name) with
+                        | Some(f, fty) ->
+                            let args =
+                                if given.Tail.IsEmpty then
+                                    [ EUnit ]
+                                else
+                                    match fty with
+                                    | TFn(ptys, _) when ptys.Length = given.Tail.Length ->
+                                        List.map2 (coerceTy ctx) ptys given.Tail
+                                    | _ -> given.Tail
 
-                    ECallClo(EGet(xs.Head, PField f, fty), args, mapType ctx r t)
-                | None -> fail r "the Zig target cannot find the member %s of %s" name entity
+                            bindArgs ctx args (fun ys -> ECallClo(EGet(xs.Head, PField f, fty), ys, mapType ctx r t))
+                        | None -> fail r "the Zig target cannot find the member %s of %s" name entity
+                    )
             )
     // (a value boxed and unboxed to its own type, as `use` does with an interface value)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxGeneric" | "UnboxFast"), [ Unboxed inner ] when
-        inner.Type <> Fable.Any && mapType ctx r inner.Type = mapType ctx r t
+        unwrapNullness inner.Type <> Fable.Any
+        && mapType ctx r inner.Type = mapType ctx r t
         ->
         lw ctx inner
     // `d.Invoke(a, b)` of a delegate: a call of the function value it is
@@ -329,20 +338,31 @@ let call
             )
     // `Option.toObj` and `Option.ofObj`: of a type that has null here
     | ("Microsoft.FSharp.Core.OptionModule" | "Microsoft.FSharp.Core.ValueOption"), ("ToObj" | "OfObj"), [ x ] when
-        (match
-            (if name = "ToObj" then
-                 t
-             else
-                 x.Type)
-         with
+        (let target =
+            if name = "ToObj" then
+                t
+            else
+                x.Type
+
+         match unwrapNullness target with
          | Fable.String
          | Fable.Any -> true
-         | _ -> false)
+         | _ -> mapType ctx r t = mapType ctx r x.Type)
         ->
-        if name = "ToObj" then
-            pure' "fable_rt.optToObj($0)" [ x ] (mapType ctx r t)
-        else
-            pure' "fable_rt.optOfObj($0)" [ x ] (mapType ctx r t)
+        let target =
+            if name = "ToObj" then
+                t
+            else
+                x.Type
+
+        match unwrapNullness target with
+        | Fable.String
+        | Fable.Any ->
+            if name = "ToObj" then
+                pure' "fable_rt.optToObj($0)" [ x ] (mapType ctx r t)
+            else
+                pure' "fable_rt.optOfObj($0)" [ x ] (mapType ctx r t)
+        | _ -> lw ctx x
     // ---- System.Convert's text in a base, BitConverter, Base64 and hex ----
     | "System.BitConverter", "GetBytes", [ x ] ->
         pure' $"fable_rt.bitGetBytes(%s{typedArg ctx r x 0})" [ x ] (mapType ctx r t)
@@ -444,11 +464,13 @@ let call
     // (`unbox` between types kept alike, as UMX's `%` between a type and the same type with a
     // unit of measure: the value itself)
     | "Microsoft.FSharp.Core.Operators", "Unbox", [ x ] when
-        x.Type <> Fable.Any && mapType ctx r x.Type = mapType ctx r t
+        unwrapNullness x.Type <> Fable.Any && mapType ctx r x.Type = mapType ctx r t
         ->
         lw ctx x
-    | "Microsoft.FSharp.Core.Operators", "Unbox", [ Fable.TypeCast(x, Fable.Any) ] when
-        x.Type <> Fable.Any && mapType ctx r x.Type = mapType ctx r t
+    | "Microsoft.FSharp.Core.Operators", "Unbox", [ Fable.TypeCast(x, nt) ] when
+        unwrapNullness nt = Fable.Any
+        && unwrapNullness x.Type <> Fable.Any
+        && mapType ctx r x.Type = mapType ctx r t
         ->
         lw ctx x
     // (`box e.InnerException`: null when there is none, as on .NET)
@@ -819,7 +841,7 @@ let call
         match entity, name, args with
         | _, "TypeOf", [] -> typeOfIr info.GenericArgs.Head
         | _, "TypeDefOf", [] -> EEmit($"fable_rt.reflect.definitionOf(%s{typeExpr info.GenericArgs.Head})", [], tType)
-        | "System.Object", "GetType", [ Unboxed inner as x ] when inner.Type = Fable.Any ->
+        | "System.Object", "GetType", [ Unboxed inner as x ] when unwrapNullness inner.Type = Fable.Any ->
             ctx.State.UsesReflection <- true
             rfl "typeOfObject" [ x ] tType
         | "System.Object", "GetType", [ x ] -> bindArgs ctx [ lw ctx x ] (fun _ -> typeOfIr x.Type)
@@ -827,9 +849,9 @@ let call
         | "System.Object", "ReferenceEquals", [ Unboxed a; Unboxed b ] -> pure' "($0 == $1)" [ a; b ] tBool
         // System.Type
         | _, ("get_FullName" | "get_Name" | "get_Namespace" | "ToString"), [ x ] when
-            x.Type = Fable.MetaType
+            unwrapNullness x.Type = Fable.MetaType
             || (
-                match x.Type with
+                match unwrapNullness x.Type with
                 | Fable.DeclaredType(e, _) -> e.FullName = "System.Type"
                 | _ -> false
             )
@@ -1379,7 +1401,8 @@ let call
                      "timeCompare")
                 [ a; b ]
         | "ToString", [ x ] -> call (fn "toString") [ x ]
-        | "ToString", x :: format :: _ when format.Type = Fable.String -> call (fn "toStringFormat") [ x; format ]
+        | "ToString", x :: format :: _ when unwrapNullness format.Type = Fable.String ->
+            call (fn "toStringFormat") [ x; format ]
         | "ToString", [ x; _ ] -> call (fn "toString") [ x ]
         | ("op_Equality" | "op_Inequality" | "op_LessThan" | "op_LessThanOrEqual" | "op_GreaterThan" | "op_GreaterThanOrEqual"),
           [ a; b ] when isTypeArg typ b ->
@@ -1470,7 +1493,8 @@ let call
 
             EPrim(op, [ call "compare" [ a; b ]; ELit("0", tI32) ], tBool)
         | "ToString", [ x ] -> call "toString" [ x ]
-        | "ToString", x :: format :: _ when format.Type = Fable.String -> call "toStringFormat" [ x; format ]
+        | "ToString", x :: format :: _ when unwrapNullness format.Type = Fable.String ->
+            call "toStringFormat" [ x; format ]
         | "ToString", [ x; _ ] -> call "toString" [ x ]
         | "Parse", s :: _ -> call "parse" [ s ]
         | "TryParse", s :: rest when
@@ -1577,7 +1601,8 @@ let call
 
             EPrim(op, [ call "compare" [ a; b ]; ELit("0", tI32) ], tBool)
         | "ToString", [ x ] -> call "toString" [ x ]
-        | "ToString", x :: format :: _ when format.Type = Fable.String -> call "toStringFormat" [ x; format ]
+        | "ToString", x :: format :: _ when unwrapNullness format.Type = Fable.String ->
+            call "toStringFormat" [ x; format ]
         | "ToString", [ x; _ ] -> call "toString" [ x ]
         | "Parse", s :: _ -> call "parse" [ s ]
         | "TryParse", s :: rest when
@@ -1773,7 +1798,7 @@ let call
 
         match name, args with
         | (".ctor" | "get_Empty"), [] -> call "create" unitArg
-        | ".ctor", [ s ] when s.Type = Fable.String -> call "parse" [ s ]
+        | ".ctor", [ s ] when unwrapNullness s.Type = Fable.String -> call "parse" [ s ]
         | ".ctor", [ bytes ] -> call "ofBytes" [ bytes ]
         | "NewGuid", [] -> call "newGuid" unitArg
         | "CreateVersion7", [] -> call "createVersion7" unitArg
@@ -1813,15 +1838,15 @@ let call
             match args with
             | [ _ ] -> "create"
             | [ _; kind ] when
-                kind.Type <> Fable.String
+                unwrapNullness kind.Type <> Fable.String
                 && (
-                    match kind.Type with
+                    match unwrapNullness kind.Type with
                     | Fable.DeclaredType(e, _) -> e.FullName <> "System.Uri"
                     | _ -> true
                 )
                 ->
                 "createWithKind"
-            | [ _; rel ] when rel.Type = Fable.String -> "createFromBase"
+            | [ _; rel ] when unwrapNullness rel.Type = Fable.String -> "createFromBase"
             | _ -> "createFromBaseUri"
 
         libraryCall ctx r "Uri" fn { info with ThisArg = None } args t
@@ -1832,7 +1857,7 @@ let call
         let outVar = ctx.Vars[out.Name]
 
         let fn =
-            if a.Type = Fable.String then
+            if unwrapNullness a.Type = Fable.String then
                 "tryCreate"
             else
                 "tryCreateFromBase"
@@ -1844,7 +1869,7 @@ let call
         ELet(pair, pairIr, ESeq(EAssign(outVar, EGet(EVar pair, PItem 1, outVar.Ty)), EGet(EVar pair, PItem 0, tBool)))
     | "System.Uri", "TryCreate", [ a; b ] ->
         let fn =
-            if a.Type = Fable.String then
+            if unwrapNullness a.Type = Fable.String then
                 "tryCreate"
             else
                 "tryCreateFromBase"
@@ -1865,10 +1890,29 @@ let call
     // ---- F#'s nullness operators (a value of a type without null here is never null) ----
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] -> pure' "fable_rt.isNullValue($0)" [ x ] tBool
     | "Microsoft.FSharp.Core.Operators", ("NonNull" | "NonNullQuickPattern"), [ x ] ->
-        rt "fable_rt.nonNullValue($0)" [ x ] (mapType ctx r t)
+        let inTy = mapType ctx r x.Type
+        let outTy = mapType ctx r t
+
+        if inTy = TOpt outTy && inTy <> outTy then
+            rt "fable_rt.nonNullUnwrap($0)" [ x ] outTy
+        else
+            rt "fable_rt.nonNullValue($0)" [ x ] outTy
     | "Microsoft.FSharp.Core.Operators", "NullArgCheck", [ name; x ] ->
-        rt "fable_rt.nullArgCheck($0, $1)" [ name; x ] (mapType ctx r t)
-    | "Microsoft.FSharp.Core.Operators.Unchecked", "NonNull", [ x ] -> lw ctx x
+        let inTy = mapType ctx r x.Type
+        let outTy = mapType ctx r t
+
+        if inTy = TOpt outTy && inTy <> outTy then
+            rt "fable_rt.nullArgCheckUnwrap($0, $1)" [ name; x ] outTy
+        else
+            rt "fable_rt.nullArgCheck($0, $1)" [ name; x ] outTy
+    | "Microsoft.FSharp.Core.Operators.Unchecked", "NonNull", [ x ] ->
+        let inTy = mapType ctx r x.Type
+        let outTy = mapType ctx r t
+
+        if inTy = TOpt outTy && inTy <> outTy then
+            rt "fable_rt.nonNullUnwrap($0)" [ x ] outTy
+        else
+            lw ctx x
     // `match x with Null -> ... | NonNull y -> ...`: the choice of the two
     | "Microsoft.FSharp.Core.Operators", "NullMatchPattern", [ x ] ->
         match t with
@@ -1950,7 +1994,7 @@ let call
     | "System.Nullable`1", "get_HasValue", [ n ] ->
         bindArgs ctx [ lw ctx n ] (fun xs -> EPrim("not", [ ETest(xs.Head, "None", typeOf xs.Head) ], tBool))
     | "System.Nullable`1", "get_Value", [ n ] -> rt "fable_rt.nullableValue($0)" [ n ] (mapType ctx r t)
-    | "System.Nullable`1", "GetValueOrDefault", [ n ] when hasDefault t ->
+    | "System.Nullable`1", "GetValueOrDefault", [ n ] when hasDefault ctx t ->
         pure' "fable_rt.orDefault($R, $0)" [ n ] (mapType ctx r t)
     | "System.Nullable`1", "GetValueOrDefault", [ n; d ] -> pure' "($0 orelse $1)" [ n; d ] (mapType ctx r t)
     // `Nullable.int n` and the other conversions of a nullable: the value converted, if any

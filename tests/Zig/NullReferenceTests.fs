@@ -99,3 +99,20 @@ let ``test An index of a null array raises NullReferenceException`` () =
             true
 
     raised |> equal true
+
+type private INullableIface =
+    abstract Ping: unit -> int
+
+[<Fact>]
+let ``test Null interface value works and raises NullReferenceException on call`` () =
+    let iface: INullableIface = Unchecked.defaultof<INullableIface>
+    obj.ReferenceEquals(iface, null) |> equal true
+
+    let raised =
+        try
+            iface.Ping() |> ignore
+            false
+        with :? System.NullReferenceException ->
+            true
+
+    raised |> equal true

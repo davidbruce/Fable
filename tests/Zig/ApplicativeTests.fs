@@ -1424,7 +1424,6 @@ let ``test Option uncurrying #2116`` () =
     equal 7 x
 
 // See https://github.com/fable-compiler/Fable/issues/2436#issuecomment-919165092
-#if !FABLE_COMPILER_ZIG // (a curried function value as the result of an interface property (Fable gives it uncurried))
 [<Fact>]
 let ``test Functions passed to an object expression are uncurried`` () =
     let mutable d = 0
@@ -1436,7 +1435,6 @@ let ``test Functions passed to an object expression are uncurried`` () =
     let adder = { new IAdder with member _.Add = f }
     d |> equal 2
     adder.Add 3 4 |> equal 11
-#endif
 
 [<Fact>]
 let ``test Iterating list of functions #2047`` () =

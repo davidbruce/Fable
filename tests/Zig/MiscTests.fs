@@ -234,7 +234,6 @@ type Foo(i) =
 type IRenderer =
   abstract member doWork: unit -> string
 
-#if !FABLE_COMPILER_ZIG // (the object being made used during its own construction (a closure or a virtual call that reaches this))
 type MyComponent(name) as self =
   let work i = sprintf "%s-%i" name i
   let create2 () = { new IRenderer with member _.doWork () = work 2 }
@@ -247,7 +246,6 @@ type MyComponent(name) as self =
   member _.works3 () = create3
   member _.works4 () = create4
   member _.works5 () = create5()
-#endif
 
 type IFoo3 =
    abstract Bar: int with get, set
@@ -265,21 +263,17 @@ module NestedModule =
 type INum = abstract member Num: int
 let inline makeNum f = { new INum with member _.Num = f() }
 
-#if !FABLE_COMPILER_ZIG // (the object being made used during its own construction (a closure or a virtual call that reaches this))
 type MyTestClass(n) =
     let addOne x = x + 4
     let inner = makeNum (fun () -> addOne n)
     member _.GetNum() = inner.Num
 
-#if !FABLE_COMPILER_ZIG // (the object being made used during its own construction (a closure or a virtual call that reaches this))
-#endif
 type RecursiveType(subscribe) as self =
     let foo = 3
     let getNumber() = 3
     do subscribe (getNumber >> self.Add2)
     member _.Add2(i) = self.MultiplyFoo(i) + 2
     member _.MultiplyFoo(i) = i * foo
-#endif
 
 module Extensions =
     type IDisposable with
@@ -300,12 +294,10 @@ module Extensions =
     type NestedModule.AnotherClass with
         member x.Value2 = x.Value * 4
 
-#if !FABLE_COMPILER_ZIG // (the object being made used during its own construction (a closure or a virtual call that reaches this))
     [<AbstractClass>]
     type ObjectExprBase (x: int ref) as this =
         do x.Value <- this.dup x.contents
         abstract member dup: int -> int
-#endif
 
 open Extensions
 
@@ -377,11 +369,9 @@ let rec recursive1 = delay (fun () -> recursive2())
 and recursive2 =
     mutableValue <- 5
     fun () -> mutableValue <- mutableValue * 2
+#endif
 
-#if !FABLE_COMPILER_ZIG // (a generic value whose default is null (Unchecked.defaultof<'a>))
-#endif
 let empty<'a> = [Unchecked.defaultof<'a>]
-#endif
 
 type IInterface =
   abstract member Member : thing1:string -> thing2:string -> string
@@ -626,20 +616,16 @@ let ``test for .. downto works`` () = // See #411
         y <- y + (string i)
     equal "54321" y
 
-#if !FABLE_COMPILER_ZIG // (a method called through the self reference during construction: the object is made after its fields here (object-first construction remaining))
 [<Fact>]
 let ``test Self references in constructors work`` () = // See #124
     let t = MyTest(5)
     equal 12 t.Value
     equal 17 t.Value2
-#endif
 
-#if !FABLE_COMPILER_ZIG // (a method called through the self reference during construction: the object is made after its fields here (object-first construction remaining))
 [<Fact>]
 let ``test Using self identifier from class definition in members works`` () = // See #124
     let t = MyTest(5)
     t.Foo() |> equal 24
-#endif
 
 [<Fact>]
 let ``test Module members from partial functions work`` () = // See #115
@@ -880,7 +866,6 @@ let ``test Nested object expressions work`` () = // See #158
     let f2 = f.MakeFoo2()
     f2.MakeFoo().Bar("Numbers") |> equal "Numbers: 10 20 5"
 
-#if !FABLE_COMPILER_ZIG // (uses a declaration excluded above)
 [<Fact>]
 let ``test References to enclosing type from object expression work`` () = // See #438
     MyComponent("TestA").works1().doWork() |> equal "TestA-1"
@@ -888,7 +873,6 @@ let ``test References to enclosing type from object expression work`` () = // Se
     MyComponent("TestC").works3().doWork() |> equal "TestC-3"
     MyComponent("TestD").works4().doWork() |> equal "TestD-4"
     MyComponent("TestE").works5().doWork() |> equal "TestE-5"
-#endif
 
 [<Fact>]
 let ``test Properties in object expression work`` () =
@@ -900,7 +884,11 @@ let ``test Properties in object expression work`` () =
     o.Bar <- 10
     o.Bar |> equal 10
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support ToString in this object expression yet)
+type GenericObjExprBase<'T>(v: 'T) =
+    member _.BaseVal = v
+    abstract Render: 'T -> string
+    default _.Render(x) = sprintf "%A" x
+
 [<Fact>]
 let ``test Object expression from class works`` () =
     let o = { new SomeClass("World") with member x.ToString() = sprintf "Hello %s" x.Name }
@@ -910,16 +898,23 @@ let ``test Object expression from class works`` () =
     // | _ -> "Unknown"
     // |> equal "Hello World"
     o.ToString() |> equal "Hello World"
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a declaration excluded above)
+[<Fact>]
+let ``test Object expression deriving from generic class works`` () =
+    let o =
+        { new GenericObjExprBase<int>(10) with
+            override x.Render(y) = sprintf "%d:%d" x.BaseVal y }
+    o.Render(20) |> equal "10:20"
+    let makeObj (v: 'T) (fmt: 'T -> string) =
+        { new GenericObjExprBase<'T>(v) with
+            override x.Render(y) = fmt x.BaseVal + ":" + fmt y }
+    (makeObj "a" id).Render("b") |> equal "a:b"
+
 [<Fact>]
 let ``test Inlined object expression doesn't change argument this context`` () = // See #1291
     let t = MyTestClass(42)
     t.GetNum() |> equal 46
-#endif
 
-#if !FABLE_COMPILER_ZIG // (`this` in an object expression)
 [<Fact>]
 let ``test Object expressions don't optimize members away`` () = // See #1434
     let o =
@@ -931,24 +926,19 @@ let ``test Object expressions don't optimize members away`` () = // See #1434
             member _.Bite() = 25
         }
     o.Taste(4., 6.) |> equal 28
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a declaration excluded above)
 [<Fact>]
 let ``test Members are accessible in abstract class constructor inherited by object expr`` () = // See #2139
     let x = ref 5
     let obj = { new ObjectExprBase(x) with
                     override _.dup x = x * x }
     equal 25 x.contents
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a declaration excluded above)
 [<Fact>]
 let ``test Composition with recursive `this` works`` () =
     let mutable x = 0
     RecursiveType(fun f -> x <- f()) |> ignore
     equal 11 x
-#endif
 
 [<Fact>]
 let ``test Type extension static methods work`` () =
@@ -1468,12 +1458,10 @@ let ``test Recursive values work`` () = // See #237
     mutableValue |> equal 10
 #endif
 
-#if !FABLE_COMPILER_ZIG // (uses a declaration excluded above)
 [<Fact>]
 let ``test Module generic methods without arguments work`` () =
     let li = empty<string>
     Seq.length li |> equal 1
-#endif
 
 [<Fact>]
 let ``test Public members of private modules can be accessed`` () = // See #696

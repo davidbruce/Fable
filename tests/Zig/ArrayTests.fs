@@ -167,7 +167,6 @@ let ``test Array.zeroCreate with struct tuple works`` () =
     let xs = Array.zeroCreate<struct (int * string)> 3
     xs.Length |> equal 3
 
-#if !FABLE_COMPILER_ZIG // (a default value of this type)
 [<Fact>]
 let ``test Pattern matching with arrays works`` () =
     match [||] with [||] -> true | _ -> false
@@ -176,7 +175,6 @@ let ``test Pattern matching with arrays works`` () =
     |> equal 1
     match [|"a";"b"|] with [|"a";"b"|] -> 1 | _ -> 2
     |> equal 1
-#endif
 
 [<Fact>]
 let ``test ParamArrayAttribute works`` () =
@@ -196,7 +194,6 @@ let ``test Can spread a complex expression`` () =
     ParamArrayTest.Add(let ar = [|1;2;3|] in sideEffect ar; ar)
     |> equal 9
 
-#if !FABLE_COMPILER_ZIG // (the Zig target cannot apply a value of this type (String, TFn)
 [<Fact>]
 let ``test Mapping from values to functions works`` () =
     let a = [| "a"; "b"; "c" |]
@@ -213,7 +210,6 @@ let ``test Mapping from values to functions works`` () =
     concaters5.[1] "x" |> equal "12x"
     let f2 = f
     a |> Array.mapi f2 |> Array.item 2 <| "x" |> equal "2cx"
-#endif
 
 [<Fact>]
 let ``test Mapping from typed arrays to non-numeric arrays doesn't coerce values`` ()=

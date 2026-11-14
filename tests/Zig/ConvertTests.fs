@@ -1080,7 +1080,6 @@ let ``test Convert.ToHexStringLower works`` () =
     Convert.ToHexStringLower([||]) |> equal ""
     Convert.ToHexStringLower(bytes, 1, 3) |> equal "fbfcfd"
 
-#if !FABLE_COMPILER_ZIG // (a default value of this type)
 [<Fact>]
 let ``test Convert.ToHexString checks its arguments`` () =
     let bytes = [| 250uy; 251uy; 252uy; 253uy; 254uy |]
@@ -1093,7 +1092,6 @@ let ``test Convert.ToHexString checks its arguments`` () =
     raisedExceptionType (fun () -> Convert.ToHexStringLower(null: byte[])) |> equal "ArgumentNullException"
     raisedExceptionType (fun () -> Convert.ToHexStringLower(bytes, -1, 1)) |> equal "ArgumentOutOfRangeException"
     raisedExceptionType (fun () -> Convert.ToHexStringLower(bytes, 3, 3)) |> equal "ArgumentOutOfRangeException"
-#endif
 
 [<Fact>]
 let ``test Convert.FromHexString works`` () =
