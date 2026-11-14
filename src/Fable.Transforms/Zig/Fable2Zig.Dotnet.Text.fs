@@ -590,7 +590,7 @@ let call
                 t
         // (a union of one case without fields has one value, which stands for it; null on
         // .NET, where nothing but a test for null tells them apart)
-        | Fable.DeclaredType(entRef, []) when
+        | Fable.DeclaredType(entRef, _) when
             (match ctx.Com.TryGetEntity entRef with
              | Some ent ->
                  ent.IsFSharpUnion
@@ -603,7 +603,7 @@ let call
         // (a Type: its null)
         | Fable.MetaType -> pure' "fable_rt.reflect.nullType()" [] (TPrim "fable_rt.reflect.Type")
         // (a class that has no values but null, a witness of SRTP: nothing)
-        | Fable.DeclaredType(entRef, []) when isWitnessClass ctx entRef -> EUnit
+        | Fable.DeclaredType(entRef, _) when isWitnessClass ctx entRef -> EUnit
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String || x.Type = Fable.Any ->
         pure' "($0 == null)" [ x ] tBool

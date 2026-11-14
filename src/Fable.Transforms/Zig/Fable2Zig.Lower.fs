@@ -1280,7 +1280,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, _) when (tryExnEnt ctx r ent).IsSome -> tExn
     // (a class whose only value is null: nothing)
-    | Fable.DeclaredType(ent, []) when isWitnessClass ctx ent -> tVoid
+    | Fable.DeclaredType(ent, _) when isWitnessClass ctx ent -> tVoid
     | Fable.DeclaredType(ent, _) when (objInfo ctx r ent).IsSome -> tObj
     // an async computation: the record of the library's Async.fs; the builder has no state
     // (F#'s `Event<'T>`: the record of the library's Event.fs)

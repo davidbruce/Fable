@@ -1708,16 +1708,13 @@ module MultipleInlines =
 
         static member codecInner(Codec f: Codec<'T>) : Codec<CodecContainer<'T>> = Codec(fun () -> f () + 1)
 
-#if !FABLE_COMPILER_ZIG // (`Unchecked.defaultof` of a class as an SRTP witness value: classes have no null in the Zig target)
     let getContainerCodecs () =
         codecCalls <- 0
         let (Codec a), (Codec b) = (getCodecs () : Codec<CodecContainer<int>> * Codec<CodecContainer<int>>)
         a (), b ()
-#endif
 
 open MultipleInlines
 
-#if !FABLE_COMPILER_ZIG // (`Unchecked.defaultof` of a class as an SRTP witness value: classes have no null in the Zig target)
 [<Fact>]
 let ``test Trait call works with multiple inlined functions I`` () = // See #2809
     let account = Some { MultipleInlines.Details = { Tag = "Test"; InsurancePolicyData = None }}
@@ -1727,10 +1724,7 @@ let ``test Trait call works with multiple inlined functions I`` () = // See #280
 
     getP InsurancePolicyDetailsDto.discount_
     |> equal None
-#endif
 
-#if !FABLE_COMPILER_ZIG // (`Unchecked.defaultof` of a class as an SRTP witness value: classes have no null in the Zig target)
-#endif
 [<Fact>]
 let ``test Trait call works with multiple inlined functions II`` () = // See #2809
     let account = Some { Details = { Tag = "Test"; InsurancePolicyData = None }}
@@ -1745,11 +1739,9 @@ let ``test Trait call works with multiple inlined functions II`` () = // See #28
 let ``test Identifiers from witnesses don't get duplicated when resolving inline expressions`` () = // See #2855
     NonEmptyList("a", ["b"; "c"]) |> mapMyList |> equal (NonEmptyList("a_", ["b_"; "c_"]))
 
-#if !FABLE_COMPILER_ZIG // (`Unchecked.defaultof` of a class as an SRTP witness value: classes have no null in the Zig target)
 [<Fact>]
 let ``test Identifiers from a witness inlined twice in the same scope don't get duplicated`` () = // See #3921
     getContainerCodecs () |> equal (11, 21)
-#endif
 
 module AccessorFunctionShorthand =
 
