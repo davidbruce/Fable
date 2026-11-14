@@ -42,6 +42,24 @@ pub fn weakHandle(addr: usize) *WeakHandle {
     return entry.value_ptr.*;
 }
 
+/// (a class's value may be null: the cell it points at, if any)
+fn CellOf(comptime T: type) type {
+    return if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
+}
+
+/// The handle for a target: none for null (a handle of its own, never filled)
+fn handleOf(target: anytype) *WeakHandle {
+    if (comptime @typeInfo(@TypeOf(target)) == .optional) {
+        const p = target orelse {
+            const h = bookkeeping().create(WeakHandle) catch @panic("fable: out of memory");
+            h.* = .{ .target = null, .refs = 1 };
+            return h;
+        };
+        return weakHandle(@intFromPtr(p));
+    }
+    return weakHandle(@intFromPtr(target));
+}
+
 pub fn weakLetGo(h: *WeakHandle) void {
     h.refs -= 1;
     if (h.refs != 0) return;
@@ -52,7 +70,7 @@ pub fn weakLetGo(h: *WeakHandle) void {
 /// .NET's `WeakReference<'T>` of a reference type (a class, a record with mutable fields, an
 /// array, ...: a cell).
 pub fn Weak(comptime T: type) type {
-    if (comptime !isCellPtr(T)) @compileError("fable: a weak reference needs a reference type (a class, a record with mutable fields, an array, ...), not " ++ @typeName(T));
+    if (comptime !isCellPtr(CellOf(T))) @compileError("fable: a weak reference needs a reference type (a class, a record with mutable fields, an array, ...), not " ++ @typeName(T));
     return *struct {
         const Self = @This();
         pub const fable_identity = {};
@@ -75,7 +93,7 @@ pub fn Weak(comptime T: type) type {
 /// `WeakReference<'T>(target)`
 pub fn weakNew(comptime W: type, target: @typeInfo(W).pointer.child.fable_weak) W {
     const c = rt.allocator.create(@typeInfo(W).pointer.child) catch @panic("fable: out of memory");
-    c.* = .{ .handle = weakHandle(@intFromPtr(target)) };
+    c.* = .{ .handle = handleOf(target) };
     if (track) thread.stats.allocs += 1;
     return c;
 }
@@ -84,13 +102,13 @@ pub fn weakNew(comptime W: type, target: @typeInfo(W).pointer.child.fable_weak) 
 pub fn weakTryGet(w: anytype) ?@typeInfo(@TypeOf(w)).pointer.child.fable_weak {
     const T = @typeInfo(@TypeOf(w)).pointer.child.fable_weak;
     const addr = w.handle.target orelse return null;
-    const target: T = @ptrFromInt(addr);
-    return dup(target);
+    const target: CellOf(T) = @ptrFromInt(addr);
+    return @as(T, dup(target));
 }
 
 /// `w.SetTarget(target)`
 pub fn weakSet(w: anytype, target: @typeInfo(@TypeOf(w)).pointer.child.fable_weak) void {
     const old = w.handle;
-    w.handle = weakHandle(@intFromPtr(target));
+    w.handle = handleOf(target);
     weakLetGo(old);
 }

@@ -2124,10 +2124,16 @@ pub fn anyIsClass(o: Any, ty: *const ObjType) bool {
     return objIs(p, ty);
 }
 
-/// `o :?> C` of a class
-pub fn anyToClass(o: Any, ty: *const ObjType) Raised!Obj {
+/// An object of a class used (a member called, a field read): .NET's NullReferenceException
+/// for null (a reference of its own, as what the runtime gives is owned)
+pub inline fn objNonNull(o: Any) Raised!Obj {
     const p = o orelse return nullRef();
-    return objCast(p, ty);
+    return dup(p);
+}
+
+/// `o :?> C` of a class: null stays null
+pub fn anyToClass(o: Any, ty: *const ObjType) Raised!Any {
+    return objCast(o, ty);
 }
 
 /// `unbox<T> o` and `o :?> T`
@@ -2439,16 +2445,19 @@ pub inline fn objVt(comptime P: type, o: Obj, comptime depth: usize) P {
 }
 
 /// `o :? C`: is the object of class `ty`, or of a class that derives from it?
-pub fn objIs(o: Obj, ty: *const ObjType) bool {
-    var t: ?*const ObjType = o.type;
+pub fn objIs(o: Any, ty: *const ObjType) bool {
+    // (null is of no type)
+    const p = o orelse return false;
+    var t: ?*const ObjType = p.type;
     while (t) |class| : (t = class.parent) {
         if (class == ty) return true;
     }
     return false;
 }
 
-/// `o :?> C`
-pub fn objCast(o: Obj, ty: *const ObjType) Raised!Obj {
+/// `o :?> C`: null stays null, as on .NET
+pub fn objCast(any: Any, ty: *const ObjType) Raised!Any {
+    const o = any orelse return null;
     if (objIs(o, ty)) return dup(o);
     // (.NET names a class nested in a module without the module here)
     const Short = struct {

@@ -604,6 +604,8 @@ let call
         | Fable.MetaType -> pure' "fable_rt.reflect.nullType()" [] (TPrim "fable_rt.reflect.Type")
         // (a class that has no values but null, a witness of SRTP: nothing)
         | Fable.DeclaredType(entRef, _) when isWitnessClass ctx entRef -> EUnit
+        // (a class: null)
+        | Fable.DeclaredType _ when (objOfType ctx r t).IsSome -> lw ctx (Fable.Value(Fable.Null t, r))
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String || x.Type = Fable.Any ->
         pure' "($0 == null)" [ x ] tBool
