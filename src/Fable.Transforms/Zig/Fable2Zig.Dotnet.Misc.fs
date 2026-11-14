@@ -543,6 +543,375 @@ let call
                 Args = args
             }
             t
+    // ---- reflection: the runtime's fable_reflect.zig ----
+    // (`FSharpValue.GetUnionFields(v, t, allowAccessToPrivateRepresentation = true)`: an extension
+    // of FSharp.Core's, the same member)
+    | "Microsoft.FSharp.Reflection.FSharpReflectionExtensions", extName, _ when
+        extName.StartsWith("FSharpValue.", System.StringComparison.Ordinal)
+        || extName.StartsWith("FSharpType.", System.StringComparison.Ordinal)
+        ->
+        let owner = extName.Substring(0, extName.IndexOf '.')
+        let rest = extName.Substring(extName.IndexOf '.' + 1)
+
+        let memberName =
+            if rest.EndsWith ".Static" then
+                rest.Substring(0, rest.Length - 7)
+            else
+                rest
+
+        dotnetCall ctx r ("Microsoft.FSharp.Reflection." + owner) memberName info t
+    // (`Enum.Parse<'T>(s)`: of the type's information, as the value)
+    | "System.Enum", "Parse", (s :: rest) when info.GenericArgs.Length = 1 && s.Type = Fable.String ->
+        let enumT = info.GenericArgs.Head
+
+        let typeOfT =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "TypeOf"
+                        Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(genArgs = [ enumT ]),
+                Fable.MetaType,
+                r
+            )
+
+        let parsed =
+            dotnetCall
+                ctx
+                r
+                "System.Enum"
+                "Parse"
+                { info with
+                    GenericArgs = []
+                    ThisArg = None
+                    Args = typeOfT :: s :: rest
+                }
+                Fable.Any
+
+        bindArgs ctx [ parsed ] (fun xs -> ERt("fable_rt.unbox($R, $0)", xs, mapType ctx r enumT))
+    // (`Enum.GetNames(t)` and the others of a Type)
+    | "System.Enum", ("GetUnderlyingType" | "GetNames" | "GetName" | "IsDefined" | "Parse"), (t0 :: _ as args) when
+        t0.Type = Fable.MetaType
+        ->
+        ctx.State.UsesRuntime <- true
+
+        match name, args with
+        | "GetUnderlyingType", [ x ] ->
+            rt "fable_rt.reflect.enumUnderlyingType($0)" [ x ] (TPrim "fable_rt.reflect.Type")
+        | "GetNames", [ x ] -> rt "fable_rt.reflect.enumNames($0)" [ x ] (mapType ctx r t)
+        | "GetName", [ x; v ] -> rt "fable_rt.reflect.enumName($0, $1)" [ x; Fable.TypeCast(v, Fable.Any) ] tStr
+        | "IsDefined", [ x; v ] -> rt "fable_rt.reflect.enumIsDefined($0, $1)" [ x; Fable.TypeCast(v, Fable.Any) ] tBool
+        | "Parse", [ x; v ] -> rt "fable_rt.reflect.enumParse($0, $1, false)" [ x; v ] tAny
+        | "Parse", [ x; v; ignoreCase ] -> rt "fable_rt.reflect.enumParse($0, $1, $2)" [ x; v; ignoreCase ] tAny
+        | _ -> fail r "the Zig target does not support Enum.%s with these arguments yet" name
+    | ("Microsoft.FSharp.Core.Operators" | "System.Type" | "System.Object" | "Microsoft.FSharp.Reflection.FSharpType" | "Microsoft.FSharp.Reflection.FSharpValue" | "System.Reflection.PropertyInfo" | "System.Reflection.MemberInfo" | "Microsoft.FSharp.Reflection.UnionCaseInfo"),
+      name,
+      args when
+        (entity <> "Microsoft.FSharp.Core.Operators"
+         || name = "TypeOf"
+         || name = "TypeDefOf"
+         || (name = "IsNull" && args |> List.exists (fun a -> a.Type = Fable.MetaType)))
+        && (entity <> "System.Object"
+            || name = "GetType"
+            || (name = "ReferenceEquals"
+                && args |> List.forall (fun a -> (let (Unboxed i) = a in i.Type = Fable.MetaType))))
+        ->
+        ctx.State.UsesRuntime <- true
+        let tType = TPrim "fable_rt.reflect.Type"
+
+        // (the information of a type: of a record, a union, a tuple... from its Zig type; a class,
+        // an interface or an enum by its .NET name)
+        let rec typeExpr (t: Fable.Type) : string =
+            let named (ent: Fable.Entity) (kind: string) (genArgs: Fable.Type list) =
+                let args =
+                    match genArgs with
+                    | [] -> ""
+                    | gs ->
+                        gs
+                        |> List.map (fun g -> IR.zigType (mapType ctx r g))
+                        |> String.concat ", "
+                        |> sprintf ", .args = .{ %s }"
+
+                // (the type's own type parameters, as these arguments)
+                let subst (x: Fable.Type) =
+                    let pairs =
+                        List.zip
+                            (ent.GenericParameters |> List.map (fun p -> p.Name))
+                            (if genArgs.Length = ent.GenericParameters.Length then
+                                 genArgs
+                             else
+                                 ent.GenericParameters |> List.map (fun _ -> Fable.Any))
+                        |> Map.ofList
+
+                    let rec go (x: Fable.Type) =
+                        match x with
+                        | Fable.GenericParam(n, _, _) when pairs.ContainsKey n -> pairs[n]
+                        | Fable.DeclaredType(e, gs) -> Fable.DeclaredType(e, List.map go gs)
+                        | other -> other
+
+                    go x
+
+                let parent =
+                    match ent.BaseType with
+                    | Some b when kind = ".@\"enum\"" -> ""
+                    | Some b when b.Entity.FullName = "System.Object" -> ""
+                    | Some b ->
+                        match b.Entity.Path with
+                        | Fable.SourcePath _ ->
+                            $", .parent = %s{typeExpr (subst (Fable.DeclaredType(b.Entity, b.GenericArgs)))}"
+                        // (a class of .NET's: by its name)
+                        | _ ->
+                            $", .parent = fable_rt.reflect.named(.{{ .full_name = \"%s{b.Entity.FullName}\", .kind = .class }})"
+                    | None -> ""
+
+                let interfaces =
+                    match List.ofSeq ent.DeclaredInterfaces with
+                    | [] -> ""
+                    | ifs ->
+                        ifs
+                        |> List.map (fun i -> typeExpr (subst (Fable.DeclaredType(i.Entity, i.GenericArgs))))
+                        |> String.concat ", "
+                        |> sprintf ", .interfaces = .{ %s }"
+
+                let underlying =
+                    if kind = ".@\"enum\"" then
+                        let numberType =
+                            ent.FSharpFields
+                            |> List.tryFind (fun f -> f.Name = "value__")
+                            |> Option.map (fun f -> IR.zigType (mapType ctx r f.FieldType))
+                            |> Option.defaultValue "i32"
+
+                        // (the cases: names and values)
+                        let cases =
+                            ent.FSharpFields
+                            |> List.filter (fun f -> f.Name <> "value__")
+                            |> List.choose (fun f ->
+                                match f.LiteralValue with
+                                | Some v -> Some(f.Name, System.Convert.ToInt64 v)
+                                | None -> None
+                            )
+
+                        let names = cases |> List.map (fun (n, _) -> $"\"%s{n}\"") |> String.concat ", "
+                        let values = cases |> List.map (fun (_, v) -> $"%d{v}") |> String.concat ", "
+
+                        let valueList =
+                            if cases.IsEmpty then
+                                ""
+                            else
+                                $"@as(i64, %s{values})"
+
+                        $", .underlying = %s{numberType}, .enum_names = [_][]const u8{{ %s{names} }}, .enum_values = [_]i64{{ %s{values} }}"
+                    else
+                        ""
+
+                $"fable_rt.reflect.named(.{{ .full_name = \"%s{dotnetTypeName ctx.Com ent}\", .kind = %s{kind}%s{args}%s{parent}%s{interfaces}%s{underlying} }})"
+
+            match t with
+            | Fable.Number(_, Fable.NumberInfo.IsEnum entRef) ->
+                match ctx.Com.TryGetEntity entRef with
+                | Some ent -> named ent ".@\"enum\"" []
+                | None -> $"fable_rt.reflect.typeOf(%s{IR.zigType (mapType ctx r t)})"
+            | Fable.DeclaredType(entRef, genArgs) ->
+                match ctx.Com.TryGetEntity entRef with
+                // (an erased union of one field: the type it erases to)
+                | Some ent when
+                    ent.IsFSharpUnion
+                    && ent.Attributes
+                       |> Seq.exists (fun a -> a.Entity.FullName = "Fable.Core.EraseAttribute")
+                    && ent.UnionCases.Length = 1
+                    && ent.UnionCases.Head.UnionCaseFields.Length = 1
+                    ->
+                    let field = ent.UnionCases.Head.UnionCaseFields.Head.FieldType
+
+                    let pairs =
+                        List.zip (ent.GenericParameters |> List.map (fun p -> p.Name)) genArgs
+                        |> Map.ofList
+
+                    let rec go (x: Fable.Type) =
+                        match x with
+                        | Fable.GenericParam(n, _, _) when pairs.ContainsKey n -> pairs[n]
+                        | Fable.DeclaredType(e, gs) -> Fable.DeclaredType(e, List.map go gs)
+                        | other -> other
+
+                    typeExpr (go field)
+                | Some ent when ent.IsInterface -> named ent ".interface" genArgs
+                | Some ent when
+                    not ent.IsFSharpRecord
+                    && not ent.IsFSharpUnion
+                    && (
+                        match entRef.Path with
+                        | Fable.SourcePath _ -> true
+                        | _ -> false
+                    )
+                    ->
+                    named ent ".class" genArgs
+                | _ when libraryValueTypes.ContainsKey entRef.FullName ->
+                    $"fable_rt.reflect.named(.{{ .full_name = \"%s{entRef.FullName}\", .kind = .class }})"
+                | _ -> $"fable_rt.reflect.typeOf(%s{IR.zigType (mapType ctx r t)})"
+            | _ -> $"fable_rt.reflect.typeOf(%s{IR.zigType (mapType ctx r t)})"
+
+        let typeOfIr (t: Fable.Type) = EEmit(typeExpr t, [], tType)
+
+        // (a boxed argument: the type it is of, when it is known here)
+        let staticTypeOf (x: Fable.Expr) =
+            let (Unboxed inner) = x
+            inner.Type
+
+        let rfl (fn: string) (xs: Fable.Expr list) (ty: Ty) =
+            let holes = xs |> List.mapi (fun i _ -> $"${i}") |> String.concat ", "
+            rt $"fable_rt.reflect.%s{fn}(%s{holes})" xs ty
+
+        let pureRfl (fn: string) (xs: Fable.Expr list) (ty: Ty) =
+            let holes = xs |> List.mapi (fun i _ -> $"${i}") |> String.concat ", "
+            pure' $"fable_rt.reflect.%s{fn}(%s{holes})" xs ty
+
+        // (the optional `allowAccessToPrivateRepresentation` and binding flags: nothing here)
+        let isFlag (x: Fable.Expr) =
+            match x.Type with
+            | Fable.Option(Fable.Boolean, _) -> true
+            | Fable.Option(Fable.Number(_, Fable.NumberInfo.IsEnum _), _)
+            | Fable.Number(_, Fable.NumberInfo.IsEnum _) -> true
+            | _ -> false
+
+        let args = args |> List.filter (fun a -> not (isFlag a) && a.Type <> Fable.Unit)
+        let resultTy = mapType ctx r t
+
+        // (a value of a type known here: its type's information and the value boxed)
+        let withType (o: Fable.Expr) (k: Expr -> Expr -> Expr) =
+            let st = staticTypeOf o
+
+            let typeIr =
+                if st = Fable.Any then
+                    fail r "the Zig target needs the type of the value given to reflection to be known (here it is obj)"
+                else
+                    typeOfIr st
+
+            bindArgs ctx [ typeIr; lw ctx (Fable.TypeCast(o, Fable.Any)) ] (fun xs -> k xs.[0] xs.[1])
+
+        match entity, name, args with
+        | _, "TypeOf", [] -> typeOfIr info.GenericArgs.Head
+        | _, "TypeDefOf", [] -> EEmit($"fable_rt.reflect.definitionOf(%s{typeExpr info.GenericArgs.Head})", [], tType)
+        | "System.Object", "GetType", [ x ] -> bindArgs ctx [ lw ctx x ] (fun _ -> typeOfIr x.Type)
+        // (two Type objects: the same type information)
+        | "System.Object", "ReferenceEquals", [ Unboxed a; Unboxed b ] -> pure' "($0 == $1)" [ a; b ] tBool
+        // System.Type
+        | _, ("get_FullName" | "get_Name" | "get_Namespace" | "ToString"), [ x ] when
+            x.Type = Fable.MetaType
+            || (
+                match x.Type with
+                | Fable.DeclaredType(e, _) -> e.FullName = "System.Type"
+                | _ -> false
+            )
+            ->
+            let fn =
+                match name with
+                | "get_FullName" -> "fullName"
+                | "get_Name" -> "name"
+                | "get_Namespace" -> "namespace"
+                | _ -> "toString"
+
+            pureRfl fn [ x ] tStr
+        | _, "get_IsGenericType", [ x ] -> pureRfl "isGenericType" [ x ] tBool
+        | _, "get_IsGenericTypeDefinition", [ x ] -> pureRfl "isGenericTypeDefinition" [ x ] tBool
+        | _, "get_IsArray", [ x ] -> pureRfl "isArray" [ x ] tBool
+        | _, "get_IsEnum", [ x ] -> pureRfl "isEnum" [ x ] tBool
+        | _, "get_IsClass", [ x ] -> pureRfl "isClass" [ x ] tBool
+        | _, "get_IsInterface", [ x ] -> pureRfl "isInterface" [ x ] tBool
+        | _, "GetElementType", [ x ] -> pureRfl "elementOrNull" [ x ] tType
+        | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] -> pureRfl "isNullType" [ x ] tBool
+        | _, "IsSubclassOf", [ a; b ] -> pureRfl "isSubclassOf" [ a; b ] tBool
+        | _, "GetInterface", [ x; n ] ->
+            pureRfl "getInterface" [ x; n; Fable.Value(Fable.BoolConstant false, None) ] tType
+        | _, "GetInterface", [ x; n; ignoreCase ] -> pureRfl "getInterface" [ x; n; ignoreCase ] tType
+        | _, "GetEnumUnderlyingType", [ x ] -> rfl "enumUnderlyingType" [ x ] tType
+        | _, "GetEnumNames", [ x ] -> rfl "enumNames" [ x ] resultTy
+        | _, "IsAssignableFrom", [ a; b ] -> pureRfl "isAssignableFrom" [ a; b ] tBool
+        // (a value whose type cannot hold others (a record, a union, a number...): by that type;
+        // an object: by its class)
+        | _, "IsInstanceOfType", [ x; o ] ->
+            let (Unboxed inner) = o
+
+            let dynamic =
+                match inner.Type with
+                | Fable.Any -> true
+                | Fable.DeclaredType(e, _) ->
+                    (objInfo ctx r e).IsSome
+                    || (
+                        match ctx.Com.TryGetEntity e with
+                        | Some ent -> ent.IsInterface
+                        | None -> false
+                    )
+                | _ -> false
+
+            if dynamic then
+                pureRfl "isInstanceOf" [ x; Fable.TypeCast(inner, Fable.Any) ] tBool
+            else
+                bindArgs
+                    ctx
+                    [ lw ctx x; lw ctx inner; typeOfIr inner.Type ]
+                    (fun xs -> EEmit("fable_rt.reflect.isAssignableFrom($0, $2)", xs, tBool))
+        | _, "GetGenericTypeDefinition", [ x ] -> rfl "genericDefinition" [ x ] tType
+        | _, ("get_GenericTypeArguments" | "GetGenericArguments"), [ x ] -> pureRfl "genericArguments" [ x ] resultTy
+        | _, "Equals", [ a; b ] -> pureRfl "equals" [ a; b ] tBool
+        // FSharpType
+        | "Microsoft.FSharp.Reflection.FSharpType", ("IsRecord" | "IsUnion" | "IsTuple" | "IsFunction"), [ x ] ->
+            pureRfl (name.Substring(0, 1).ToLowerInvariant() + name.Substring 1) [ x ] tBool
+        | "Microsoft.FSharp.Reflection.FSharpType", "GetRecordFields", [ x ] -> rfl "recordFields" [ x ] resultTy
+        | "Microsoft.FSharp.Reflection.FSharpType", "GetUnionCases", [ x ] -> rfl "unionCases" [ x ] resultTy
+        | "Microsoft.FSharp.Reflection.FSharpType", "GetTupleElements", [ x ] -> rfl "tupleElements" [ x ] resultTy
+        | "Microsoft.FSharp.Reflection.FSharpType", "GetFunctionElements", [ x ] ->
+            rfl "functionElements" [ x ] resultTy
+        | "Microsoft.FSharp.Reflection.FSharpType", "MakeTupleType", [ xs ] -> pureRfl "makeTupleType" [ xs ] tType
+        // FSharpValue
+        | "Microsoft.FSharp.Reflection.FSharpValue", "GetRecordFields", [ o ] ->
+            withType o (fun t v -> ERt("fable_rt.reflect.getRecordFields($0, $1)", [ t; v ], resultTy))
+        | "Microsoft.FSharp.Reflection.FSharpValue", "GetTupleFields", [ o ] ->
+            withType o (fun t v -> ERt("fable_rt.reflect.getTupleFields($0, $1)", [ t; v ], resultTy))
+        | "Microsoft.FSharp.Reflection.FSharpValue", "GetTupleField", [ o; i ] ->
+            withType
+                o
+                (fun t v ->
+                    bindArgs
+                        ctx
+                        [ lw ctx i ]
+                        (fun is -> ERt("fable_rt.reflect.getTupleField($0, $1, $2)", [ t; v; is.Head ], resultTy))
+                )
+        | "Microsoft.FSharp.Reflection.FSharpValue", "GetRecordField", [ o; p ] ->
+            rfl "getRecordField" [ o; p ] resultTy
+        | "Microsoft.FSharp.Reflection.FSharpValue", "MakeRecord", [ ty; vals ] ->
+            rfl "makeRecord" [ ty; vals ] resultTy
+        | "Microsoft.FSharp.Reflection.FSharpValue", "MakeTuple", [ vals; ty ] -> rfl "makeTuple" [ vals; ty ] resultTy
+        | "Microsoft.FSharp.Reflection.FSharpValue", "MakeUnion", [ c; vals ] -> rfl "makeUnion" [ c; vals ] resultTy
+        | "Microsoft.FSharp.Reflection.FSharpValue", "GetUnionFields", [ o; ty ] ->
+            rfl "getUnionFields" [ ty; o ] resultTy
+        | "Microsoft.FSharp.Reflection.FSharpValue", "GetUnionFields", [ o ] ->
+            withType o (fun t v -> ERt("fable_rt.reflect.getUnionFields($0, $1)", [ t; v ], resultTy))
+        // PropertyInfo, UnionCaseInfo
+        | _, "get_Name", [ x ] when
+            (match x.Type with
+             | Fable.DeclaredType(e, _) -> e.FullName.EndsWith "PropertyInfo" || e.FullName.EndsWith "MemberInfo"
+             | _ -> false)
+            ->
+            pureRfl "propertyName" [ x ] tStr
+        | _, "get_PropertyType", [ x ] -> pureRfl "propertyType" [ x ] tType
+        | _, "GetValue", p :: o :: _ -> rfl "propertyValue" [ p; o ] resultTy
+        | "Microsoft.FSharp.Reflection.UnionCaseInfo", "get_Name", [ c ] -> pureRfl "caseName" [ c ] tStr
+        | "Microsoft.FSharp.Reflection.UnionCaseInfo", "get_Tag", [ c ] -> pureRfl "caseTag" [ c ] tI32
+        | "Microsoft.FSharp.Reflection.UnionCaseInfo", "GetFields", [ c ] -> pureRfl "caseFieldsOf" [ c ] resultTy
+        | "Microsoft.FSharp.Reflection.UnionCaseInfo", "get_DeclaringType", [ c ] ->
+            pureRfl "caseDeclaringType" [ c ] tType
+        | _ ->
+            fail
+                r
+                "the Zig target does not support %s.%s with these arguments yet (%A)"
+                (entity.Substring(entity.LastIndexOf '.' + 1))
+                name
+                (args |> List.map (fun a -> a.Type))
     // ---- files, directories, paths, the environment: the library's Path.fs and fable_io.zig ----
     | ("System.IO.Path" | "System.IO.File" | "System.IO.Directory" | "System.IO.DirectoryInfo" | "System.Environment"),
       name,

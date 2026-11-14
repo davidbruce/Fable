@@ -225,7 +225,7 @@ let ``test Decision targets in nested pattern matching can be found`` () =
         | _ -> 0
     test 2 |> equal 1
 
-#if !FABLE_COMPILER_ZIG // (reflection (typeof, Enum.GetValues, GetNames) is not supported by the Zig target)
+#if !FABLE_COMPILER_ZIG // (System.Array as a value (Enum.GetValues))
 [<Fact>]
 let ``test Enum.GetValues works`` () =
     let check (ar: Array) =
@@ -238,24 +238,19 @@ let ``test Enum.GetValues works`` () =
     t.GetEnumValues() |> check
 #endif
 
-#if !FABLE_COMPILER_ZIG // (reflection (typeof, Enum.GetValues, GetNames) is not supported by the Zig target)
 [<Fact>]
 let ``test Enum.GetNames works`` () =
     let t = typeof<MyEnum>
     Enum.GetNames(t) |> equal [|"Foo"; "Bar"; "Baz"|]
     t.GetEnumNames() |> equal [|"Foo"; "Bar"; "Baz"|]
 
-#if !FABLE_COMPILER_ZIG // (reflection (typeof, Enum.GetValues, GetNames) is not supported by the Zig target)
-#endif
 [<Fact>]
 let ``test Enum.GetName works`` () =
     let t = typeof<MyEnum>
     Enum.GetName(t, MyEnum.Foo) |> equal "Foo"
     Enum.GetName(t, box 5y) |> equal "Bar"
     Enum.GetName(t, MyEnum.Baz) |> equal "Baz"
-#endif
 
-#if !FABLE_COMPILER_ZIG // (reflection (typeof, Enum.GetValues, GetNames) is not supported by the Zig target)
 [<Fact>]
 let ``test Enum.IsDefined works`` () =
     let t = typeof<MyEnum>
@@ -264,9 +259,7 @@ let ``test Enum.IsDefined works`` () =
     Enum.IsDefined(t, "Ozu") |> equal false
     Enum.IsDefined(t, 5y) |> equal true
     Enum.IsDefined(t, 10y) |> equal false
-#endif
 
-#if !FABLE_COMPILER_ZIG // (reflection (typeof, Enum.GetValues, GetNames) is not supported by the Zig target)
 [<Fact>]
 let ``test Enum.Parse works`` () =
     let t = typeof<MyEnum>
@@ -276,7 +269,6 @@ let ``test Enum.Parse works`` () =
     Enum.Parse<MyEnum>("Foo") |> equal (MyEnum.Foo)
     Enum.Parse<MyEnum>("Bar") |> equal (MyEnum.Bar)
     Enum.Parse<MyEnum>("8") |> equal (MyEnum.Baz)
-#endif
 
 [<Fact>]
 let ``test Enum.TryParse works`` () =

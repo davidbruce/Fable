@@ -1087,6 +1087,8 @@ let rec dotnetTypeName (com: Compiler) (ent: Fable.Entity) : string =
     match ent.DeclaringEntity with
     | Some d ->
         match com.TryGetEntity d with
+        // (a namespace is not a type: the name is the namespace's, then a dot)
+        | Some outer when outer.IsNamespace -> ent.FullName
         | Some outer -> dotnetTypeName com outer + "+" + ent.CompiledName
         | None -> ent.FullName
     | None -> ent.FullName
@@ -1180,6 +1182,13 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Option(t, _) -> TOpt(mapType ctx r t)
     // (`Nullable<T>`: an option)
     | Fable.Nullable(t, _) -> TOpt(mapType ctx r t)
+    // (reflection: the runtime's fable_reflect.zig)
+    | Fable.MetaType -> TPrim "fable_rt.reflect.Type"
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Type" -> TPrim "fable_rt.reflect.Type"
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Reflection.PropertyInfo" ->
+        TPrim "fable_rt.reflect.Property"
+    | Fable.DeclaredType(ent, []) when ent.FullName = "Microsoft.FSharp.Reflection.UnionCaseInfo" ->
+        TPrim "fable_rt.reflect.UnionCase"
     | Fable.List t -> TEnt(listEnt ctx.State, [ mapType ctx r t ])
     | Fable.Array(t, Fable.ResizeArray) -> TEnt(netEnt ctx.State "ResizeArray", [ mapType ctx r t ])
     | Fable.AnonymousRecordType(names, genArgs, _) ->
@@ -1587,6 +1596,15 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
 
         if isLocal then
             ctx.State.LocalEnts.Add e
+
+            // (what reflection says of it: .NET's name, and what it is)
+            if ent.IsFSharpRecord || ent.IsFSharpUnion then
+                ctx.State.NetTypes[e.Name] <-
+                    (dotnetTypeName ctx.Com ent,
+                     if ent.IsFSharpRecord then
+                         "record"
+                     else
+                         "union")
 
         // (the types this one refers to are all known once the outermost one is finished)
         if ctx.State.EntDepth = 0 then
@@ -3762,6 +3780,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.Null Fable.Any ->
             ctx.State.UsesRuntime <- true
             ELit("@as(fable_rt.Any, null)", tAny)
+        | Fable.Null Fable.MetaType ->
+            ctx.State.UsesRuntime <- true
+            EEmit("fable_rt.reflect.nullType()", [], TPrim "fable_rt.reflect.Type")
         | Fable.BoolConstant b ->
             ELit(
                 (if b then

@@ -8,6 +8,7 @@ pub const sgc = @import("fable_sgc.zig");
 pub const unicode = @import("fable_unicode.zig");
 pub const time = @import("fable_time.zig");
 pub const io = @import("fable_io.zig");
+pub const reflect = @import("fable_reflect.zig");
 
 pub const interface_version: i32 = 12;
 
@@ -486,6 +487,7 @@ fn byReference(comptime T: type) bool {
 
 pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     const T = @TypeOf(a);
+    if (T == reflect.Type) return reflect.equals(a, b);
     if (comptime byReference(T)) return std.meta.eql(a, b);
     if (comptime hookOf(T, "fable_equals")) return hookType(T).fable_equals.call(.{ a, box(b) });
     if (comptime isCollection(T)) return treeEql(a, b);
@@ -646,6 +648,7 @@ pub fn Ref(comptime T: type) type {
 /// F#'s `Result`.
 pub fn Result(comptime T: type, comptime E: type) type {
     return union(enum) {
+        pub const fable_type = .{ .full_name = "Microsoft.FSharp.Core.FSharpResult`2", .kind = .@"union", .args = .{ T, E } };
         Ok: struct { ResultValue: T },
         Error: struct { ErrorValue: E },
     };
@@ -653,27 +656,66 @@ pub fn Result(comptime T: type, comptime E: type) type {
 
 /// F#'s `Choice` of two to seven cases.
 pub fn Choice2(comptime T1: type, comptime T2: type) type {
-    return union(enum) { Choice1Of2: struct { Item: T1 }, Choice2Of2: struct { Item: T2 } };
+    return union(enum) {
+        pub const fable_type = .{ .full_name = "Microsoft.FSharp.Core.FSharpChoice`2", .kind = .@"union", .args = .{ T1, T2 } };
+        Choice1Of2: struct { Item: T1 },
+        Choice2Of2: struct { Item: T2 },
+    };
 }
 
 pub fn Choice3(comptime T1: type, comptime T2: type, comptime T3: type) type {
-    return union(enum) { Choice1Of3: struct { Item: T1 }, Choice2Of3: struct { Item: T2 }, Choice3Of3: struct { Item: T3 } };
+    return union(enum) {
+        pub const fable_type = .{ .full_name = "Microsoft.FSharp.Core.FSharpChoice`3", .kind = .@"union", .args = .{ T1, T2, T3 } };
+        Choice1Of3: struct { Item: T1 },
+        Choice2Of3: struct { Item: T2 },
+        Choice3Of3: struct { Item: T3 },
+    };
 }
 
 pub fn Choice4(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type) type {
-    return union(enum) { Choice1Of4: struct { Item: T1 }, Choice2Of4: struct { Item: T2 }, Choice3Of4: struct { Item: T3 }, Choice4Of4: struct { Item: T4 } };
+    return union(enum) {
+        pub const fable_type = .{ .full_name = "Microsoft.FSharp.Core.FSharpChoice`4", .kind = .@"union", .args = .{ T1, T2, T3, T4 } };
+        Choice1Of4: struct { Item: T1 },
+        Choice2Of4: struct { Item: T2 },
+        Choice3Of4: struct { Item: T3 },
+        Choice4Of4: struct { Item: T4 },
+    };
 }
 
 pub fn Choice5(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type) type {
-    return union(enum) { Choice1Of5: struct { Item: T1 }, Choice2Of5: struct { Item: T2 }, Choice3Of5: struct { Item: T3 }, Choice4Of5: struct { Item: T4 }, Choice5Of5: struct { Item: T5 } };
+    return union(enum) {
+        pub const fable_type = .{ .full_name = "Microsoft.FSharp.Core.FSharpChoice`5", .kind = .@"union", .args = .{ T1, T2, T3, T4, T5 } };
+        Choice1Of5: struct { Item: T1 },
+        Choice2Of5: struct { Item: T2 },
+        Choice3Of5: struct { Item: T3 },
+        Choice4Of5: struct { Item: T4 },
+        Choice5Of5: struct { Item: T5 },
+    };
 }
 
 pub fn Choice6(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type) type {
-    return union(enum) { Choice1Of6: struct { Item: T1 }, Choice2Of6: struct { Item: T2 }, Choice3Of6: struct { Item: T3 }, Choice4Of6: struct { Item: T4 }, Choice5Of6: struct { Item: T5 }, Choice6Of6: struct { Item: T6 } };
+    return union(enum) {
+        pub const fable_type = .{ .full_name = "Microsoft.FSharp.Core.FSharpChoice`6", .kind = .@"union", .args = .{ T1, T2, T3, T4, T5, T6 } };
+        Choice1Of6: struct { Item: T1 },
+        Choice2Of6: struct { Item: T2 },
+        Choice3Of6: struct { Item: T3 },
+        Choice4Of6: struct { Item: T4 },
+        Choice5Of6: struct { Item: T5 },
+        Choice6Of6: struct { Item: T6 },
+    };
 }
 
 pub fn Choice7(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type) type {
-    return union(enum) { Choice1Of7: struct { Item: T1 }, Choice2Of7: struct { Item: T2 }, Choice3Of7: struct { Item: T3 }, Choice4Of7: struct { Item: T4 }, Choice5Of7: struct { Item: T5 }, Choice6Of7: struct { Item: T6 }, Choice7Of7: struct { Item: T7 } };
+    return union(enum) {
+        pub const fable_type = .{ .full_name = "Microsoft.FSharp.Core.FSharpChoice`7", .kind = .@"union", .args = .{ T1, T2, T3, T4, T5, T6, T7 } };
+        Choice1Of7: struct { Item: T1 },
+        Choice2Of7: struct { Item: T2 },
+        Choice3Of7: struct { Item: T3 },
+        Choice4Of7: struct { Item: T4 },
+        Choice5Of7: struct { Item: T5 },
+        Choice6Of7: struct { Item: T6 },
+        Choice7Of7: struct { Item: T7 },
+    };
 }
 
 /// An anonymous record with these fields (F# sorts them by name): one type per shape,
@@ -965,6 +1007,7 @@ pub fn List(comptime T: type) type {
     return union(enum) {
         pub const fable_cyclic = holdsCyclic(T);
         pub const fable_list = {};
+        pub const fable_type = .{ .full_name = "Microsoft.FSharp.Collections.FSharpList`1", .kind = .@"union", .args = .{T} };
         Empty,
         Cons: *struct { @"$rc": u32 = 1, @"$gc": GcHdr(fable_cyclic) = undefined, Head: T, Tail: List(T) },
     };
@@ -2004,14 +2047,34 @@ pub fn boxType(comptime T: type) *const ObjType {
 }
 
 pub fn comparable(comptime T: type) bool {
+    return comparableTo(T, 6);
+}
+
+/// (what `T` holds, to `depth` levels: a function value anywhere makes it not comparable; a type
+/// that holds itself is looked into that far)
+fn comparableTo(comptime T: type, comptime depth: u8) bool {
     if (isFunc(T) or T == Exn or T == Obj or (isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity"))) return false;
-    // (a value of an interface: a struct of function values)
-    if (@typeInfo(T) == .@"struct") {
-        inline for (@typeInfo(T).@"struct".field_names) |name| {
-            if (comptime isFunc(@FieldType(T, name))) return false;
-        }
+    if (depth == 0 or T == String) return true;
+    switch (@typeInfo(T)) {
+        .@"struct" => |st| {
+            inline for (st.field_types) |F| {
+                if (!comptimeComparable(F, depth - 1)) return false;
+            }
+        },
+        .@"union" => |u| {
+            inline for (u.field_types) |F| {
+                if (!comptimeComparable(F, depth - 1)) return false;
+            }
+        },
+        .optional => |o| return comptimeComparable(o.child, depth - 1),
+        .pointer => |ptr| if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct" and !@hasDecl(ptr.child, "fable_array")) return comptimeComparable(ptr.child, depth - 1),
+        else => {},
     }
     return true;
+}
+
+fn comptimeComparable(comptime T: type, comptime depth: u8) bool {
+    return comptime comparableTo(T, depth);
 }
 
 /// `box x` (it borrows `x`). A null string and `None` box to null, as on .NET.
@@ -2071,6 +2134,10 @@ pub fn unbox(comptime T: type, x: anytype) Raised!T {
     };
     if (T == Obj) return dup(p);
     if (p.type == boxType(T)) return dup(boxed(T, p).value);
+    // (a tuple FSharpValue.MakeTuple made of a type MakeTupleType made)
+    if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple and T != reflect.LooseTuple) {
+        if (p.type == boxType(reflect.LooseTuple)) return reflect.tupleOfLoose(T, boxed(reflect.LooseTuple, p).value);
+    }
     var b: TextBuilder = .{};
     b.addAscii("Unable to cast object of type '");
     b.addAscii(p.type.name);
@@ -3149,6 +3216,7 @@ pub fn minOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
 /// hash of anything else is this library's.
 pub fn hash(x: anytype) i32 {
     const T = @TypeOf(x);
+    if (T == reflect.Type) return @bitCast(@as(u32, @truncate(std.hash.Wyhash.hash(0, x.full_name))));
     if (comptime byReference(T)) {
         const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&x));
         return @bitCast(@as(u32, @truncate(h)));
@@ -4859,6 +4927,8 @@ pub const Shower = struct {
         const T = @TypeOf(x);
         if (depth <= 0) return b.word("...");
         if (T == String) return if (x) |p| b.quoted(p.units()) else b.word("null");
+        if (T == reflect.Type) return b.word(x.full_name);
+        if (T == Any) return if (x) |o| b.showShape(o, shape, node_idx, prec, depth) else b.word("null");
         if (comptime isBigInt(T)) {
             const d = bigDigits(x);
             defer allocator.free(d);
@@ -5149,6 +5219,12 @@ pub fn writeNet(out: *TextBuilder, x: anytype) void {
 fn writeNetShape(out: *TextBuilder, x: anytype, comptime shape: TypeShape, node_idx: u16) void {
     const T = @TypeOf(x);
     if (T == String) return out.add(unitsOf(x));
+    if (T == reflect.Type) return out.addAscii(x.full_name);
+    // (an object: what it holds, as .NET writes it; null: nothing)
+    if (T == Any) {
+        if (x) |o| return writeNetShape(out, o, shape, node_idx);
+        return;
+    }
     if (comptime isBigInt(T)) {
         const d = bigDigits(x);
         defer allocator.free(d);

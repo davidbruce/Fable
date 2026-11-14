@@ -600,6 +600,8 @@ let call
             ->
             let ent = ctx.Com.GetEntity entRef
             ECon(mapType ctx r t, ent.UnionCases.Head.Name, [], None)
+        // (a Type: its null)
+        | Fable.MetaType -> pure' "fable_rt.reflect.nullType()" [] (TPrim "fable_rt.reflect.Type")
         // (a class that has no values but null, a witness of SRTP: nothing)
         | Fable.DeclaredType(entRef, []) when isWitnessClass ctx entRef -> EUnit
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t

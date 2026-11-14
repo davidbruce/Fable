@@ -1601,7 +1601,6 @@ let ``test Two records of different type with same shape are not equal`` () =
     areEqual { MyRecord1.Foo = 2; Bar = "oh" } { MyRecord1.Foo = 2; Bar = "oh" }
     |> equal true
 
-#if !FABLE_COMPILER_ZIG // (System.Type reflection)
 [<Fact>]
 let ``test IsSubclassOf checks whole hierarchy`` () =
     typeof<SubclassTest2>.IsSubclassOf (typeof<SubclassTest1>)
@@ -1609,9 +1608,7 @@ let ``test IsSubclassOf checks whole hierarchy`` () =
 
     typeof<SubclassTest3>.IsSubclassOf (typeof<SubclassTest1>)
     |> equal true
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Type reflection)
 [<Fact>]
 let ``test IsInstanceOfType works with class types`` () =
     let s1, s2 = SubclassTest1(), SubclassTest2()
@@ -1634,9 +1631,7 @@ let ``test IsInstanceOfType works with class types`` () =
 
     typeof<SubclassTest3>.IsInstanceOfType (s2)
     |> equal false
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Type reflection)
 [<Fact>]
 let ``test IsInstanceOfType works with nominal records`` () =
     typeof<MyRecord1>.IsInstanceOfType ({ MyRecord1.Foo = 2; Bar = "oh" })
@@ -1647,9 +1642,7 @@ let ``test IsInstanceOfType works with nominal records`` () =
 
     typeof<MyRecord2>.IsInstanceOfType ({ MyRecord1.Foo = 2; Bar = "oh" })
     |> equal false
-#endif
 
-#if !FABLE_COMPILER_ZIG // (System.Type reflection)
 [<Fact>]
 let ``test IsInstanceOfType works with nominal unions`` () =
     typeof<MyUnion1>.IsInstanceOfType (MyUnion1.Foo(1, 2))
@@ -1660,10 +1653,8 @@ let ``test IsInstanceOfType works with nominal unions`` () =
 
     typeof<MyUnion2>.IsInstanceOfType (MyUnion1.Foo(1, 2))
     |> equal false
-#endif
 
 // Expected to always return true for any numeric type, just like :? operator
-#if !FABLE_COMPILER_ZIG // (System.Type reflection)
 [<Fact>]
 let ``test IsInstanceOfType works with enums`` () =
     typeof<EnumFoo>.IsInstanceOfType (EnumFoo.Foo)
@@ -1674,10 +1665,8 @@ let ``test IsInstanceOfType works with enums`` () =
 
     typeof<obj>.IsInstanceOfType (EnumFoo.Bar)
     |> equal true
-#endif
 
 // Expected to always return true for any function and function type, just like :? operator
-#if !FABLE_COMPILER_ZIG // (System.Type reflection)
 [<Fact>]
 let ``test IsInstanceOfType works with functions`` () =
     typeof<unit -> unit>.IsInstanceOfType (fun () -> ())
@@ -1691,10 +1680,8 @@ let ``test IsInstanceOfType works with functions`` () =
 
     typeof<obj>.IsInstanceOfType (String.length)
     |> equal true
-#endif
 //typeof<int -> int>.IsInstanceOfType(String.length) |> equal false
 
-#if !FABLE_COMPILER_ZIG // (System.Type reflection)
 [<Fact>]
 let ``test IsInstanceOfType works with primitives`` () =
     typeof<string>.IsInstanceOfType ("hello")
@@ -1709,7 +1696,6 @@ let ``test IsInstanceOfType works with primitives`` () =
 
     typeof<int>.IsInstanceOfType ("hello")
     |> equal false
-#endif
 
 #if FABLE_COMPILER
 #if !FABLE_COMPILER_ZIG // (Fable.Core.Reflection)

@@ -702,12 +702,10 @@ let ``test FSharp.UMX works`` () =
     |> Option.map (fun o -> UMX.untag o.quantity)
     |> equal (Some 50)
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support Microsoft.FSharp.Reflection.FSharpType.GetRecord)
 [<Fact>]
 let ``test FSharp.UMX: reflection info`` () =
     let fields = Reflection.FSharpType.GetRecordFields typeof<Order>
     fields.Length |> equal 3
-#endif
 
 [<Fact>]
 let ``test Static constructors work`` () =
@@ -1663,12 +1661,10 @@ let ``test conditional expressions`` () = // See #2782
 type Æøå =
     | Union1 of string
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Type.get_FullName yet)
 [<Fact>]
 let ``test unicode chars in identifiers are preserved`` () =
     let x = typeof<Æøå>.FullName
     x.Replace("+", ".") |> equal "Fable.Tests.Zig.MiscTests.Æøå"
-#endif
 
 [<Fact>]
 let ``test System.Diagnostics.Stopwatch.Frequency works`` () =

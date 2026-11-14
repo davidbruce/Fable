@@ -32,7 +32,7 @@ fn freeZ(z: [:0]u8) void {
 }
 
 /// A string of UTF-8 bytes: what is not UTF-8 is U+FFFD, as .NET decodes it
-fn fromUtf8(bytes: []const u8) String {
+pub fn fromUtf8(bytes: []const u8) String {
     var b: rt.TextBuilder = .{};
     var i: usize = 0;
     while (i < bytes.len) {

@@ -680,6 +680,9 @@ type FileState() =
     /// Does this file read an exception's `StackTrace`? (If no file of the program does,
     /// exceptions capture none.)
     member val UsesStackTrace = false with get, set
+    /// the .NET names of the records and unions this file declares, by their Zig name: what
+    /// reflection says of them (`fable_type`): .NET's full name, and record or union
+    member val NetTypes = Dictionary<string, string * string>()
     /// every variable made so far, by id
     member val Vars = Dictionary<int, Var>()
     /// how many type declarations are being mapped (they refer to each other)
@@ -809,3 +812,48 @@ let callTarget (f: string) =
     match f.IndexOf '.' with
     | -1 -> topIdent f
     | i -> f.Substring(0, i + 1) + topIdent (f.Substring(i + 1))
+
+/// The Zig name of a field or of a union case.
+let fieldIdent (s: string) =
+    let c = cleanIdent s
+
+    if isReservedIdent c then
+        $"@\"%s{c}\""
+    else
+        c
+
+/// A type parameter. (`'` cannot be part of a name that comes from F#, so a type parameter
+/// never has the name of a value.)
+let genName (n: string) = $"@\"'%s{n}\""
+
+/// The Zig text of a type.
+let rec zigType (t: Ty) : string =
+    match t with
+    | TPrim s -> s
+    | TEnt(e, []) -> callTarget e.Name
+    | TEnt(e, args) ->
+        args
+        |> List.map zigType
+        |> String.concat ", "
+        |> sprintf "%s(%s)" (callTarget e.Name)
+    | TGen n -> genName n
+    | TOpt t -> "?" + zigType t
+    | TTuple ts -> ts |> List.map zigType |> String.concat ", " |> sprintf "@Tuple(&.{ %s })"
+    | TPtr(t, c) ->
+        (if c then
+             "*const "
+         else
+             "*")
+        + zigType t
+    | TSlice(t, c) ->
+        (if c then
+             "[]const "
+         else
+             "[]")
+        + zigType t
+    | TArr(t, n) -> $"[%d{n}]%s{zigType t}"
+    // (a function value may raise, whatever function is behind it)
+    | TFn(args, ret) ->
+        let ps = "?*fable_rt.Env" :: (args |> List.map zigType) |> String.concat ", "
+        $"fable_rt.Func(*const fn (%s{ps}) fable_rt.Raised!%s{zigType ret})"
+    | TTok(t, c) -> $"?*fable_rt.Cell(%s{zigType t}, .%s{fieldIdent c})"

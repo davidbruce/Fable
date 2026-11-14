@@ -6,15 +6,6 @@ open System.Text
 open System.Text.RegularExpressions
 open Fable.Transforms.Zig.IR
 
-/// The Zig name of a field or of a union case.
-let fieldIdent (s: string) =
-    let c = cleanIdent s
-
-    if isReservedIdent c then
-        $"@\"%s{c}\""
-    else
-        c
-
 type Dest =
     | DReturn
     | DBreak of string
@@ -132,41 +123,6 @@ let sigName (f: string) =
     match f.IndexOf '.' with
     | -1 -> $"@\"%s{topIdent f}$sig\""
     | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$sig\""
-
-/// A type parameter. (`'` cannot be part of a name that comes from F#, so a type parameter
-/// never has the name of a value.)
-let genName (n: string) = $"@\"'%s{n}\""
-
-let rec zigType (t: Ty) : string =
-    match t with
-    | TPrim s -> s
-    | TEnt(e, []) -> callTarget e.Name
-    | TEnt(e, args) ->
-        args
-        |> List.map zigType
-        |> String.concat ", "
-        |> sprintf "%s(%s)" (callTarget e.Name)
-    | TGen n -> genName n
-    | TOpt t -> "?" + zigType t
-    | TTuple ts -> ts |> List.map zigType |> String.concat ", " |> sprintf "@Tuple(&.{ %s })"
-    | TPtr(t, c) ->
-        (if c then
-             "*const "
-         else
-             "*")
-        + zigType t
-    | TSlice(t, c) ->
-        (if c then
-             "[]const "
-         else
-             "[]")
-        + zigType t
-    | TArr(t, n) -> $"[%d{n}]%s{zigType t}"
-    // (a function value may raise, whatever function is behind it)
-    | TFn(args, ret) ->
-        let ps = "?*fable_rt.Env" :: (args |> List.map zigType) |> String.concat ", "
-        $"fable_rt.Func(*const fn (%s{ps}) fable_rt.Raised!%s{zigType ret})"
-    | TTok(t, c) -> $"?*fable_rt.Cell(%s{zigType t}, .%s{fieldIdent c})"
 
 /// A function with its type arguments: a generic function is a Zig function from types to a
 /// namespace that holds the function itself, as `call`.
@@ -1678,6 +1634,25 @@ let emitFile (state: FileState) : string =
         .AppendLine()
     |> ignore
 
+    // (what reflection says of a record or a union: `fable_type`, its .NET name and what it is,
+    // and its type arguments)
+    let netTypeDecl (e: Ent) (ind: string) =
+        match state.NetTypes.TryGetValue e.Name with
+        | true, (fullName, kind) ->
+            let args =
+                match e.TypeParams with
+                | [] -> ""
+                | ps -> ps |> List.map genName |> String.concat ", " |> sprintf ", .args = .{ %s }"
+
+            let kindLit =
+                if kind = "union" then
+                    ".@\"union\""
+                else
+                    ".record"
+
+            $"%s{ind}    pub const fable_type = .{{ .full_name = \"%s{fullName}\", .kind = %s{kindLit}%s{args} }};\n"
+        | _ -> ""
+
     for e in state.LocalEnts do
         let fields (fs: (string * Ty) list) =
             fs |> List.map (fun (f, t) -> $"%s{fieldIdent f}: %s{zigType t}")
@@ -1689,6 +1664,7 @@ let emitFile (state: FileState) : string =
              |> List.collect (fun (_, fs) -> fs |> List.map (snd >> zigType))
              |> String.concat " ")
             + hookDecls e ""
+            + netTypeDecl e ""
 
         let comptimeParam (g: string) =
             if fieldText.Contains(genName g) then
@@ -1721,6 +1697,8 @@ let emitFile (state: FileState) : string =
                 decl
                 + (hookDecls e "").Replace("\n", " ").Trim()
                 + " "
+                + (netTypeDecl e "").Replace("\n", " ").Trim()
+                + " "
                 + (cellHeader e @ fields (snd e.Cases.Head) |> String.concat ", ")
 
             match e.TypeParams with
@@ -1744,12 +1722,14 @@ let emitFile (state: FileState) : string =
         | KRecord ->
             out.AppendLine(opening "struct") |> ignore
             out.Append(hookDecls e ind) |> ignore
+            out.Append(netTypeDecl e ind) |> ignore
 
             for f in fields (snd e.Cases.Head) do
                 out.AppendLine($"%s{ind}    %s{f},") |> ignore
         | KValueUnion ->
             out.AppendLine(opening "union(enum)") |> ignore
             out.Append(hookDecls e ind) |> ignore
+            out.Append(netTypeDecl e ind) |> ignore
 
             for (c, fs) in e.Cases do
                 if fs.IsEmpty then
@@ -1768,6 +1748,7 @@ let emitFile (state: FileState) : string =
             | None -> ()
 
             out.Append(hookDecls e ind) |> ignore
+            out.Append(netTypeDecl e ind) |> ignore
 
             // (the trees of `Map` and `Set`: the runtime compares and writes them by what they
             // hold, not by their shape)
