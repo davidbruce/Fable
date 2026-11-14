@@ -3880,6 +3880,15 @@ let boxQuotationArgs (e: Fable.Expr) : Fable.Expr =
 
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
+    // (a function cast to a type that is not a function and then applied, as the inliner
+    // leaves an SRTP operator's result (Aether's `(Set ^= optic) value`): the function applied)
+    | Fable.CurriedApply(Fable.TypeCast(f, castTo), args, t, r) when
+        (match f.Type, castTo with
+         | (Fable.LambdaType _ | Fable.DelegateType _), (Fable.LambdaType _ | Fable.DelegateType _ | Fable.Any) -> false
+         | (Fable.LambdaType _ | Fable.DelegateType _), _ -> true
+         | _ -> false)
+        ->
+        lw ctx (Fable.CurriedApply(f, args, t, r))
     // a quotation: what the shared emitter makes of it, nodes of the library's Quotation.fs
     | Fable.Quote(body, _, _) -> lw ctx (boxQuotationArgs (QuotationEmitter.emitQuotedExpr ctx.Com body))
     // ---- objects of classes that take part in inheritance ----
@@ -4930,6 +4939,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     // `x :? IDisposable` where the type of x is known (what `use` asks): true if the type
     // implements the interface
+    // (.NET's enumerators are disposable: what `use e = s.GetEnumerator()` in inlined code asks)
+    | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _)), _) when
+        ifaceRef.FullName = "System.IDisposable"
+        && (
+            match inner.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = "System.Collections.Generic.IEnumerator`1"
+            | _ -> false
+        )
+        ->
+        ESeq(lwStmt ctx inner, ELit("true", tBool))
     // (a value of the interface itself: it is one)
     | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _) as ifaceType), _) when
         isInterfaceType ctx.Com ifaceType
