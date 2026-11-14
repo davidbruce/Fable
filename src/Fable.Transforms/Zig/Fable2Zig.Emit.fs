@@ -1890,6 +1890,41 @@ let emitFile (state: FileState) : string =
                 |> ignore
             | _ -> ()
 
+        // (a generic class: its object type is a function of its type arguments, and what it is
+        // made of is inside it)
+        let generic = not d.TypeParams.IsEmpty
+        let decls = System.Collections.Generic.List<string>()
+
+        // (a function as the code of a function value: an adapter, generic in the class's type
+        // parameters when the class is)
+        let adapterFor (target: string) (typeArgs: Ty list) (fnTy: Ty) =
+            let key =
+                target
+                + "<"
+                + (typeArgs |> List.map zigType |> String.concat ",")
+                + ">"
+                + (if generic then
+                       "/" + String.concat "," d.TypeParams
+                   else
+                       "")
+
+            match adapters.TryGetValue key with
+            | true, a -> a
+            | _ ->
+                let a =
+                    {
+                        Name = $"@\"%s{target}$fn%d{adapters.Count}\""
+                        Target = target
+                        TypeArgs = typeArgs
+                        NCaptures = 0
+                        CaptureTys = []
+                        FnTy = fnTy
+                        Gens = d.TypeParams
+                    }
+
+                adapters[key] <- a
+                a
+
         let tables =
             d.Tables
             |> List.mapi (fun i t ->
@@ -1899,38 +1934,17 @@ let emitFile (state: FileState) : string =
 
                     let inits =
                         entries
-                        |> List.map (fun (slot, target, fnTy) ->
+                        |> List.map (fun (slot, target, typeArgs, fnTy) ->
                             if target.StartsWith("@raw:", System.StringComparison.Ordinal) then
                                 // (a function of this file with the calling convention of a function value)
                                 $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{topIdent (target.Substring 5)} }}"
                             else
-                                let key = target + "<>"
-
-                                let adapter =
-                                    match adapters.TryGetValue key with
-                                    | true, a -> a
-                                    | _ ->
-                                        let a =
-                                            {
-                                                Name = $"@\"%s{target}$fn%d{adapters.Count}\""
-                                                Target = target
-                                                TypeArgs = []
-                                                NCaptures = 0
-                                                CaptureTys = []
-                                                FnTy = fnTy
-                                                Gens = []
-                                            }
-
-                                        adapters[key] <- a
-                                        a
-
+                                let adapter = adapterFor target typeArgs fnTy
                                 $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{adapterRef adapter}.code }}"
                         )
                         |> String.concat ", "
 
-                    out.AppendLine($"const %s{name}: %s{zigType vtTy} = .{{ %s{inits} }};")
-                    |> ignore
-
+                    decls.Add($"const %s{name}: %s{zigType vtTy} = .{{ %s{inits} }};")
                     "&" + name
                 | None -> "null"
             )
@@ -1938,40 +1952,20 @@ let emitFile (state: FileState) : string =
 
         let parent =
             match d.Parent with
-            | Some p -> "&" + callTarget p
+            | Some p -> p
             | None -> "null"
 
         // (the class's ToString, as the code of a function value)
         let toString =
             match d.ToString with
-            | Some target ->
+            | Some(target, typeArgs) ->
                 let fnTy = TFn([ TPrim "fable_rt.Obj"; tVoid ], tStr)
-                let key = target + "<>"
-
-                let adapter =
-                    match adapters.TryGetValue key with
-                    | true, a -> a
-                    | _ ->
-                        let a =
-                            {
-                                Name = $"@\"%s{target}$fn%d{adapters.Count}\""
-                                Target = target
-                                TypeArgs = []
-                                NCaptures = 0
-                                CaptureTys = []
-                                FnTy = fnTy
-                                Gens = []
-                            }
-
-                        adapters[key] <- a
-                        a
-
-                $"%s{adapterRef adapter}.code"
+                $"%s{adapterRef (adapterFor target typeArgs fnTy)}.code"
             | None -> "null"
 
-        out.AppendLine(
+        let value =
             if d.Overrides.IsEmpty then
-                $"pub const %s{topIdent d.TypeName}: fable_rt.ObjType = fable_rt.objType(%s{zigType d.Chain}, \"%s{d.DotnetName}\", %s{parent}, &.{{ %s{tables} }}, %s{toString});"
+                $"fable_rt.objType(%s{zigType d.Chain}, \"%s{d.DotnetName}\", %s{parent}, &.{{ %s{tables} }}, %s{toString})"
             else
                 let hook (name: string) (asObj: string) =
                     match d.Overrides |> List.tryFind (fun (h, _) -> h = name) with
@@ -1982,9 +1976,30 @@ let emitFile (state: FileState) : string =
                 let hs = hook "hash" "objHash"
                 let cmp = hook "compare" "objCompare"
 
-                $"pub const %s{topIdent d.TypeName}: fable_rt.ObjType = fable_rt.objTypeWith(%s{zigType d.Chain}, \"%s{d.DotnetName}\", %s{parent}, &.{{ %s{tables} }}, %s{toString}, %s{eq}, %s{hs}, %s{cmp});"
-        )
-        |> ignore
+                $"fable_rt.objTypeWith(%s{zigType d.Chain}, \"%s{d.DotnetName}\", %s{parent}, &.{{ %s{tables} }}, %s{toString}, %s{eq}, %s{hs}, %s{cmp})"
+
+        if generic then
+            let comptimeParams =
+                d.TypeParams
+                |> List.map (fun g -> $"comptime %s{genName g}: type")
+                |> String.concat ", "
+
+            out
+                .AppendLine($"pub fn %s{topIdent d.TypeName}(%s{comptimeParams}) *const fable_rt.ObjType {{")
+                .AppendLine("    return &struct {")
+            |> ignore
+
+            for dl in decls do
+                out.AppendLine("        " + dl) |> ignore
+
+            out.AppendLine($"        const ty: fable_rt.ObjType = %s{value};").AppendLine("    }.ty;").AppendLine("}")
+            |> ignore
+        else
+            for dl in decls do
+                out.AppendLine(dl) |> ignore
+
+            out.AppendLine($"pub const %s{topIdent d.TypeName}: fable_rt.ObjType = %s{value};")
+            |> ignore
 
     for a in adapters.Values do
         emitAdapter out fns a

@@ -49,12 +49,10 @@ type MyClass3<'T>(v) =
     interface MyInterface<'T> with
         member _.Value = v
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
 type MyClass<'T1, 'T2>(v1: 'T1, v2: 'T2) =
     inherit MyClass()
     member _.Value1 = v1
     member _.Value2 = v2
-#endif
 
 type MyRecord = {
     String: string
@@ -558,7 +556,7 @@ let ``test Reflection works with enums`` () =
       t.GetEnumUnderlyingType() |> equal typeof<sbyte>
       System.Enum.GetUnderlyingType(t) |> equal typeof<sbyte>
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
+#if !FABLE_COMPILER_ZIG // (Activator.CreateInstance and MakeGenericType)
 [<Fact>]
 let ``test Can create generic classes at runtime`` () =
     let t = typedefof<MyClass<obj, obj>>
@@ -571,7 +569,6 @@ let ``test Can create generic classes at runtime`` () =
     x.Value2 |> equal "abc"
 #endif
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
 [<Fact>]
 let ``test IsSubclassOf works`` () =
     let t1 = typeof<MyClass>
@@ -580,7 +577,6 @@ let ``test IsSubclassOf works`` () =
     t3.IsSubclassOf(t1) |> equal false
     t2.IsSubclassOf(t1) |> equal true
     t1.IsSubclassOf(t2) |> equal false
-#endif
 
 [<Fact>]
 let ``test .GetInterface works when types are know at compile time`` () = // #2321

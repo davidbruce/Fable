@@ -629,12 +629,18 @@ let tempName (e: Expr) =
 type ObjDecl =
     {
         TypeName: string
+        /// the class's type parameters: its object type is a function of them
+        TypeParams: string list
         Chain: Ty
         DotnetName: string
+        /// the parent's object type, as Zig text of a pointer to it
         Parent: string option
-        Tables: (Ty * (string * string * Ty) list) option list
-        /// the function of the class's `ToString` (its own or the nearest inherited one)
-        ToString: string option
+        /// each table: its type, and each slot with the function that fills it and that
+        /// function's type arguments
+        Tables: (Ty * (string * string * Ty list * Ty) list) option list
+        /// the function of the class's `ToString` (its own or the nearest inherited one), and its
+        /// type arguments
+        ToString: (string * Ty list) option
         /// the functions of its `Equals`, `GetHashCode` and `IComparable.CompareTo` (its own or
         /// the nearest inherited ones), by the runtime's names of them
         Overrides: (string * string) list

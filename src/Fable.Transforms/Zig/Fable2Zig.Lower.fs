@@ -944,6 +944,10 @@ type ObjInfo =
         Table: Ent option
         IsAbstract: bool
         IsLocal: bool
+        /// the class's type parameters (its structs and its object type are generic in them)
+        Gens: string list
+        /// the type arguments it gives its base class, in terms of its own type parameters
+        ParentArgs: Fable.Type list
     }
 
 let tObj = TPrim "fable_rt.Obj"
@@ -1673,17 +1677,8 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
                         | Some bt -> bt.Entity.FullName <> "System.Object"
                         | None -> false
 
-                    // (a generic class is still a plain counted cell unless it shows that it
-                    // takes part in inheritance)
-                    if
-                        ent.GenericParameters.IsEmpty
-                        || ent.IsAbstractClass
-                        || derives
-                        || ent.MembersFunctionsAndValues |> Seq.exists (fun m -> m.IsDispatchSlot)
-                    then
-                        Some ent
-                    else
-                        None
+                    ignore derives
+                    Some ent
                 | _ -> None
             | _ -> None
 
@@ -1692,11 +1687,12 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
             ctx.State.ObjInfos[entRef.FullName] <- null
             None
         | Some ent ->
-            if not ent.GenericParameters.IsEmpty then
-                fail
-                    r
-                    "the Zig target does not support generic classes that take part in inheritance yet (%s)"
-                    entRef.FullName
+            let gens = ent.GenericParameters |> List.map (fun g -> g.Name)
+
+            let parentArgs =
+                match ent.BaseType with
+                | Some bt when bt.Entity.FullName <> "System.Object" -> bt.GenericArgs
+                | _ -> []
 
             let parent =
                 match ent.BaseType with
@@ -1721,7 +1717,7 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
                             Path = entRef.Path
                         }
                     Kind = KRecord
-                    TypeParams = []
+                    TypeParams = gens
                     Cases = []
                     MutableFields = []
                     Managed = false
@@ -1764,6 +1760,8 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
                     Table = table
                     IsAbstract = ent.IsAbstractClass
                     IsLocal = isLocal
+                    Gens = gens
+                    ParentArgs = parentArgs
                 }
 
             // (registered before its fields are mapped: they may mention the class)
@@ -1780,9 +1778,9 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
                 [
                     "",
                     (match parent with
-                     | Some p -> [ "base", TEnt(p.Chain, []) ]
+                     | Some p -> [ "base", TEnt(p.Chain, parentArgs |> List.map (mapTypeArg ctx r)) ]
                      | None -> [])
-                    @ [ "own", TEnt(part, []) ]
+                    @ [ "own", TEnt(part, gens |> List.map TGen) ]
                 ]
 
             let slots =
@@ -3049,6 +3047,20 @@ let rec ancestors (o: ObjInfo) : ObjInfo list =
 
 let chainType (o: ObjInfo) : Fable.Type = Fable.DeclaredType(o.Chain.Ref, [])
 
+/// A class's own type parameters, as F# types (the arguments of its structs within its code)
+let ownArgs (o: ObjInfo) : Fable.Type list =
+    o.Gens |> List.map (fun g -> Fable.GenericParam(g, false, []))
+
+/// The type of the chain of a class of these type arguments
+let chainTypeOf (o: ObjInfo) (genArgs: Fable.Type list) : Fable.Type =
+    Fable.DeclaredType(
+        o.Chain.Ref,
+        (if o.Gens.IsEmpty then
+             []
+         else
+             genArgs)
+    )
+
 /// The Zig name of a class's type (`Circle__type`).
 let objTypeName (o: ObjInfo) : string = callTarget (o.Prefix + "__type")
 
@@ -3057,6 +3069,54 @@ let partNames (o: ObjInfo) : string =
     ancestors o
     |> List.rev
     |> List.map (fun k -> callTarget k.Part.Name)
+    |> String.concat ", "
+
+/// Each class of an object's chain with its type arguments, the object's class first: `args` are
+/// the class's own; a base class's are what the class gives it.
+let levelArgs (ctx: Ctx) (r: SourceLocation option) (o: ObjInfo) (args: Ty list) : (ObjInfo * Ty list) list =
+    let rec go (k: ObjInfo) (kargs: Ty list) =
+        (k, kargs)
+        :: (
+            match k.Parent with
+            | Some p ->
+                let subst =
+                    if k.Gens.Length = kargs.Length then
+                        List.zip k.Gens kargs |> Map.ofList
+                    else
+                        Map.empty
+
+                go p (k.ParentArgs |> List.map (mapTypeArg ctx r >> substTy subst))
+            | None -> []
+        )
+
+    go o args
+
+/// The type arguments of an object's class, from its F# type
+let objArgs (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty list =
+    match t with
+    | Fable.DeclaredType(_, gs) -> gs |> List.map (mapTypeArg ctx r)
+    | _ -> []
+
+/// The type arguments of the level `level` of the chain of an object of type `t`
+let argsOfLevel (ctx: Ctx) (r: SourceLocation option) (o: ObjInfo) (t: Fable.Type) (level: ObjInfo) : Ty list =
+    levelArgs ctx r o (objArgs ctx r t)
+    |> List.tryFind (fun (k, _) -> k.FullName = level.FullName)
+    |> Option.map snd
+    |> Option.defaultValue []
+
+/// A pointer to a class's object type, of these type arguments (`&Circle__type`, or
+/// `Box__type(i32)` for a generic class)
+let objTypeRef (o: ObjInfo) (args: Ty list) : string =
+    if o.Gens.IsEmpty then
+        "&" + objTypeName o
+    else
+        objTypeName o + "(" + (args |> List.map zigType |> String.concat ", ") + ")"
+
+/// `partNames` of a chain of type arguments
+let partNamesOf (ctx: Ctx) (r: SourceLocation option) (o: ObjInfo) (args: Ty list) : string =
+    levelArgs ctx r o args
+    |> List.rev
+    |> List.map (fun (k, kargs) -> zigType (TEnt(k.Part, kargs)))
     |> String.concat ", "
 
 /// The class of the chain that declares a field.
@@ -3206,32 +3266,57 @@ let interfaceImpl
     | None -> implName (classPrefix ctx r classRef (Some iface)) (iface + "." + name)
 
 /// What the file emits for a class that takes part in inheritance that it declares.
-let objDecl (com: Compiler) (r: SourceLocation option) (o: ObjInfo) (dotnetName: string) : ObjDecl =
-    let classes = ancestors o |> List.rev
+let objDecl (ctx: Ctx) (r: SourceLocation option) (o: ObjInfo) (dotnetName: string) : ObjDecl =
+    let com = ctx.Com
+    // (each class of the chain with its type arguments, in terms of this class's own)
+    let levels = levelArgs ctx r o (o.Gens |> List.map TGen)
+
+    let argsOf (k: ObjInfo) =
+        levels
+        |> List.tryFind (fun (x, _) -> x.FullName = k.FullName)
+        |> Option.map snd
+        |> Option.defaultValue []
+
+    // (the class of the chain whose member fills a slot)
+    let implementer (slot: string) =
+        match ancestors o |> List.tryFind (fun k -> classImplements com k slot) with
+        | Some k -> k
+        | None -> fail r "the Zig target finds no implementation of %s for %s" slot o.FullName
 
     let tables =
-        classes
-        |> List.map (fun level ->
+        levels
+        |> List.rev
+        |> List.map (fun (level, largs) ->
             match level.Table with
             | Some vt when not o.IsAbstract ->
+                let subst =
+                    if level.Gens.Length = largs.Length then
+                        List.zip level.Gens largs |> Map.ofList
+                    else
+                        Map.empty
+
                 let entries =
                     level.Slots
-                    |> List.map (fun (slot, slotTy) -> slot, implementationOf com r o slot, slotTy)
+                    |> List.map (fun (slot, slotTy) ->
+                        let k = implementer slot
+                        slot, implName k.Prefix slot, argsOf k, substTy subst slotTy
+                    )
 
-                Some(TEnt(vt, []), entries)
+                Some(TEnt(vt, largs), entries)
             | _ -> None
         )
 
     {
         TypeName = o.Prefix + "__type"
-        Chain = TEnt(o.Chain, [])
+        TypeParams = o.Gens
+        Chain = TEnt(o.Chain, o.Gens |> List.map TGen)
         DotnetName = dotnetName
-        Parent = o.Parent |> Option.map (fun p -> p.Prefix + "__type")
+        Parent = o.Parent |> Option.map (fun p -> objTypeRef p (argsOf p))
         Tables = tables
         ToString =
             ancestors o
             |> List.tryFind (fun k -> classImplements com k "ToString")
-            |> Option.map (fun k -> k.Prefix + "__ToString")
+            |> Option.map (fun k -> k.Prefix + "__ToString", argsOf k)
         Thunks = []
         Overrides =
             [
@@ -3450,20 +3535,20 @@ let objConstructorBody
         }
 
     let finish (values: Fable.Expr list) =
-        let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, []), None)
+        let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, ownArgs o), None)
 
         let chain =
             match o.Parent with
-            | Some p -> [ Fable.IdentExpr(baseId (chainType p)); own ]
+            | Some p -> [ Fable.IdentExpr(baseId (chainTypeOf p o.ParentArgs)); own ]
             | None -> [ own ]
 
-        Fable.Value(Fable.NewRecord(chain, o.Chain.Ref, []), None)
+        Fable.Value(Fable.NewRecord(chain, o.Chain.Ref, ownArgs o), None)
 
     let inner = constructorBodyWith fields defaults finish body
 
     match o.Parent, baseCall with
     | Some p, Some(Fable.Call(callee, info, _, r)) ->
-        Fable.Let(baseId (chainType p), Fable.Call(callee, info, chainType p, r), inner)
+        Fable.Let(baseId (chainTypeOf p o.ParentArgs), Fable.Call(callee, info, chainTypeOf p o.ParentArgs, r), inner)
     | Some _, _ ->
         raise (
             ZigError($"the Zig target does not support this call of the base constructor of %s{o.FullName} yet", None)
@@ -3654,7 +3739,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     // `base`: the object itself, seen as its parent class
     | Fable.Value(Fable.BaseValue(Some id, _), _) -> lw ctx (Fable.IdentExpr id)
     // `Circle 1.0`: the constructor computes the chain of fields; the object is made of it
-    | Fable.Call(callee, info, Fable.DeclaredType(cls, _), r) when
+    | Fable.Call(callee, info, Fable.DeclaredType(cls, clsArgs), r) when
         isConstructorCall ctx.Com info && (objInfo ctx r cls).IsSome
         ->
         let o = (objInfo ctx r cls).Value
@@ -3662,11 +3747,13 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         if o.IsAbstract then
             fail r "the abstract class %s cannot be made" o.FullName
 
+        let typeRef = objTypeRef o (clsArgs |> List.map (mapTypeArg ctx r))
+
         let made =
             bindArgs
                 ctx
-                [ lw ctx (Fable.Call(callee, info, chainType o, r)) ]
-                (fun xs -> EEmit($"fable_rt.objNew(&%s{objTypeName o}, $0)", xs, tObj))
+                [ lw ctx (Fable.Call(callee, info, chainTypeOf o clsArgs, r)) ]
+                (fun xs -> EEmit($"fable_rt.objNew(%s{typeRef}, $0)", xs, tObj))
 
         // (`type C() as this`, here or in a class above: its self reference is the object)
         let selfFields =
@@ -3736,12 +3823,18 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let slot = slotName ctx.Com call field.Name
         let target = implementationOf ctx.Com r o slot
 
+        // (the implementing class's type arguments, as the base gives them)
+        let typeArgs =
+            match ancestors o |> List.tryFind (fun k -> classImplements ctx.Com k slot) with
+            | Some k -> argsOfLevel ctx r o baseTy k
+            | None -> []
+
         let args =
             match call.Args with
             | [] -> [ EUnit ]
             | given -> given |> List.map (lw ctx)
 
-        bindArgs ctx (lw ctx (Fable.IdentExpr id) :: args) (fun xs -> ECall(target, [], xs, mapType ctx r t))
+        bindArgs ctx (lw ctx (Fable.IdentExpr id) :: args) (fun xs -> ECall(target, typeArgs, xs, mapType ctx r t))
     // `shape.Area()`: through the table of the class that introduced the member
     | Fable.Call(Fable.Get(x, Fable.FieldGet field, _, _), call, t, r) when
         (match objOfType ctx r x.Type with
@@ -3751,13 +3844,22 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let o = (objOfType ctx r x.Type).Value
         let slot = slotName ctx.Com call field.Name
         let level, slotTy = (virtualSlot o slot).Value
+        let largs = argsOfLevel ctx r o x.Type level
+
+        let slotTy =
+            substTy
+                (if level.Gens.Length = largs.Length then
+                     List.zip level.Gens largs |> Map.ofList
+                 else
+                     Map.empty)
+                slotTy
 
         let args =
             match call.Args with
             | [] -> [ EUnit ]
             | given -> given |> List.map (lw ctx)
 
-        let table = TPtr(TEnt(level.Table.Value, []), true)
+        let table = TPtr(TEnt(level.Table.Value, largs), true)
 
         bindArgs
             ctx
@@ -3777,7 +3879,17 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let o = (objOfType ctx r x.Type).Value
         let slot = "get_" + field.Name.Substring(field.Name.LastIndexOf '.' + 1)
         let level, slotTy = (virtualSlot o slot).Value
-        let table = TPtr(TEnt(level.Table.Value, []), true)
+        let largs = argsOfLevel ctx r o x.Type level
+
+        let slotTy =
+            substTy
+                (if level.Gens.Length = largs.Length then
+                     List.zip level.Gens largs |> Map.ofList
+                 else
+                     Map.empty)
+                slotTy
+
+        let table = TPtr(TEnt(level.Table.Value, largs), true)
 
         bindArgs
             ctx
@@ -3794,16 +3906,19 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
          | Some o -> (fieldOwner o field.Name).IsSome
          | None -> false)
         ->
-        let level = (fieldOwner (objOfType ctx r x.Type).Value field.Name).Value
-        let part = TEnt(level.Part, [])
+        let o = (objOfType ctx r x.Type).Value
+        let level = (fieldOwner o field.Name).Value
+        let largs = argsOfLevel ctx r o x.Type level
+        let part = TEnt(level.Part, largs)
         let fty = caseFields part "" |> List.find (fun (f, _) -> f = field.Name) |> snd
+        let parts = partNamesOf ctx r level largs
 
         bindArgs
             ctx
             [ lw ctx x ]
             (fun xs ->
                 EGet(
-                    EEmit($"fable_rt.objPart($R, &[_]type{{ %s{partNames level} }}, $0)", xs, TPtr(part, false)),
+                    EEmit($"fable_rt.objPart($R, &[_]type{{ %s{parts} }}, $0)", xs, TPtr(part, false)),
                     PField field.Name,
                     fty
                 )
@@ -3813,9 +3928,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
          | Some o -> (fieldOwner o name).IsSome
          | None -> false)
         ->
-        let level = (fieldOwner (objOfType ctx r x.Type).Value name).Value
-        let part = TEnt(level.Part, [])
+        let o = (objOfType ctx r x.Type).Value
+        let level = (fieldOwner o name).Value
+        let largs = argsOfLevel ctx r o x.Type level
+        let part = TEnt(level.Part, largs)
         let fty = caseFields part "" |> List.find (fun (f, _) -> f = name) |> snd
+        let parts = partNamesOf ctx r level largs
 
         bindArgs
             ctx
@@ -3823,11 +3941,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             (fun xs ->
                 let place =
                     EGet(
-                        EEmit(
-                            $"fable_rt.objPart($R, &[_]type{{ %s{partNames level} }}, $0)",
-                            [ xs[0] ],
-                            TPtr(part, false)
-                        ),
+                        EEmit($"fable_rt.objPart($R, &[_]type{{ %s{parts} }}, $0)", [ xs[0] ], TPtr(part, false)),
                         PField name,
                         fty
                     )
@@ -3900,10 +4014,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.DeclaredType(cls, []) when cls.FullName = "System.Array" ->
             ctx.State.UsesRuntime <- true
             bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.isArray($0)", xs, tBool))
-        | Fable.DeclaredType(cls, _) when (objInfo ctx r cls).IsSome ->
+        | Fable.DeclaredType(cls, gs) when (objInfo ctx r cls).IsSome ->
             let o = (objInfo ctx r cls).Value
             ctx.State.UsesRuntime <- true
-            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.anyIsClass($0, &%s{objTypeName o})", xs, tBool))
+            let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.anyIsClass($0, %s{typeRef})", xs, tBool))
         | _ ->
             let found = ctx.State.NewVar("unboxed", TOpt(mapType ctx r t), VLocal, false)
 
@@ -3918,11 +4033,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     )
                 )
     // `x :? Circle`
-    | Fable.Test(x, Fable.TypeTest(Fable.DeclaredType(cls, _)), r) when
+    | Fable.Test(x, Fable.TypeTest(Fable.DeclaredType(cls, gs)), r) when
         (objInfo ctx r cls).IsSome && (objOfType ctx r x.Type).IsSome
         ->
         let o = (objInfo ctx r cls).Value
-        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.objIs($0, &%s{objTypeName o})", xs, tBool))
+        let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
+        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.objIs($0, %s{typeRef})", xs, tBool))
     | Fable.Value(kind, r) ->
         match kind with
         | Fable.UnitConstant -> EUnit
@@ -5143,6 +5259,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 Table = None
                 IsAbstract = false
                 IsLocal = true
+                Gens = []
+                ParentArgs = []
             }
 
         ctx.State.ObjInfos[info.FullName] <- box info
@@ -5163,7 +5281,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                                 else
                                     implementationOf ctx.Com e.Range parent slot
 
-                            slot, target, slotTy
+                            slot, target, ([]: Ty list), slotTy
                         )
 
                     Some(TEnt(vt, []), entries)
@@ -5173,14 +5291,15 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ctx.State.Objs.Add
             {
                 TypeName = prefix + "__type"
+                TypeParams = []
                 Chain = TEnt(chain, [])
                 DotnetName = parent.FullName.Substring(parent.FullName.LastIndexOf '.' + 1) + "@" + string n
-                Parent = Some(parent.Prefix + "__type")
+                Parent = Some(objTypeRef parent [])
                 Tables = tables
                 ToString =
                     ancestors parent
                     |> List.tryFind (fun k -> classImplements ctx.Com k "ToString")
-                    |> Option.map (fun k -> k.Prefix + "__ToString")
+                    |> Option.map (fun k -> k.Prefix + "__ToString", ([]: Ty list))
                 Overrides =
                     [
                         "equals", "Equals"
@@ -5924,9 +6043,10 @@ and unboxed (ctx: Ctx) (r: SourceLocation option) (x: Fable.Expr) (t: Fable.Type
     ctx.State.UsesRuntime <- true
 
     match t with
-    | Fable.DeclaredType(cls, _) when (objInfo ctx r cls).IsSome ->
+    | Fable.DeclaredType(cls, gs) when (objInfo ctx r cls).IsSome ->
         let o = (objInfo ctx r cls).Value
-        bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.anyToClass($0, &%s{objTypeName o})", xs, tObj))
+        let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
+        bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.anyToClass($0, %s{typeRef})", xs, tObj))
     | _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ERt("fable_rt.unbox($R, $0)", xs, mapType ctx r t))
 
 /// `x.ToString()`, as an expression of Fable's.
@@ -6920,9 +7040,10 @@ and dotnetCall
         | [ Fable.DeclaredType(cls, _) ] when (tryExnEnt ctx r cls).IsSome ->
             let ent = (tryExnEnt ctx r cls).Value
             bindArgs ctx [ lw ctx x ] (fun xs -> EExnTest(xs.Head, ent))
-        | [ Fable.DeclaredType(cls, _) ] ->
+        | [ Fable.DeclaredType(cls, gs) ] ->
             let o = (objInfo ctx r cls).Value
-            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.objIs($0, &%s{objTypeName o})", xs, tBool))
+            let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.objIs($0, %s{typeRef})", xs, tBool))
         | _ -> fail r "internal: a type test"
     // `x :?> Circle`: an object of that class, or InvalidCastException
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ Uncast x ] when
@@ -6934,7 +7055,7 @@ and dotnetCall
         if ancestors source |> List.exists (fun k -> k.FullName = o.FullName) then
             lw ctx x
         else
-            rt $"fable_rt.objCast($0, &%s{objTypeName o})" [ x ] tObj
+            rt $"fable_rt.objCast($0, %s{objTypeRef o (objArgs ctx r t)})" [ x ] tObj
     // (a cast that changes nothing here: an exception of a known class is an `exn`)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ x ] when
         mapType ctx r x.Type = mapType ctx r t
@@ -8107,7 +8228,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                     | Fable.Call(callee, call, Fable.DeclaredType(c, _), r) when
                         c.FullName = o.FullName && isConstructorCall com call
                         ->
-                        Fable.Call(callee, call, chainType o, r)
+                        Fable.Call(callee, call, chainTypeOf o (ownArgs o), r)
                     // (`new(x) = { X = x; ... }` of a class without a base: its fields are the
                     // whole chain)
                     | Fable.Value(Fable.NewRecord(values, ent, _), r) when
@@ -8115,8 +8236,8 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         && o.Parent.IsNone
                         && values.Length = (caseFields (TEnt(o.Part, [])) "").Length
                         ->
-                        let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, []), r)
-                        Fable.Value(Fable.NewRecord([ own ], o.Chain.Ref, []), r)
+                        let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, ownArgs o), r)
+                        Fable.Value(Fable.NewRecord([ own ], o.Chain.Ref, ownArgs o), r)
                     | Fable.Let(id, v, b) -> Fable.Let(id, v, chainTail b)
                     | Fable.LetRec(bs, b) -> Fable.LetRec(bs, chainTail b)
                     | Fable.Sequential xs ->
@@ -8147,14 +8268,17 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                             && isConstructorCall com call
                             && values.Length = (caseFields (TEnt(o.Part, [])) "").Length
                             ->
-                            let baseId = AST.makeTypedIdent (chainType p) "base_chain"
-                            let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, []), r)
+                            let baseId = AST.makeTypedIdent (chainTypeOf p o.ParentArgs) "base_chain"
+                            let own = Fable.Value(Fable.NewRecord(values, o.Part.Ref, ownArgs o), r)
 
                             let made =
                                 Fable.Let(
                                     baseId,
-                                    Fable.Call(callee, call, chainType p, cr),
-                                    Fable.Value(Fable.NewRecord([ Fable.IdentExpr baseId; own ], o.Chain.Ref, []), r)
+                                    Fable.Call(callee, call, chainTypeOf p o.ParentArgs, cr),
+                                    Fable.Value(
+                                        Fable.NewRecord([ Fable.IdentExpr baseId; own ], o.Chain.Ref, ownArgs o),
+                                        r
+                                    )
                                 )
 
                             match before with
@@ -8300,7 +8424,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                                 { ctor with Body = objConstructorBody o (fieldDefaults ent) c.BaseCall ctor.Body }
                         | None -> ()
 
-                        state.Objs.Add(objDecl com None o (dotnetTypeName com ent))
+                        state.Objs.Add(objDecl (newCtx c.Name) None o (dotnetTypeName com ent))
                     with ZigError(msg, r) ->
                         report r msg
 

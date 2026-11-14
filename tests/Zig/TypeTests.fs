@@ -629,7 +629,6 @@ type ConcreteClass1() =
 
 // Generic abstract class with members - regression test for Python name-mangling
 // where abstract stubs and overrides produced mismatched names for generic arities.
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
 [<AbstractClass>]
 type GenericAbstractRunner<'A, 'B>() =
     abstract Encode: 'A -> string
@@ -637,8 +636,6 @@ type GenericAbstractRunner<'A, 'B>() =
     abstract MapAToB: 'A -> 'B
     abstract SomeProp: int with get
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
-#endif
 type ConcreteGenericRunner() =
     inherit GenericAbstractRunner<int, string>()
     override _.Encode(a: int) = string a
@@ -647,11 +644,9 @@ type ConcreteGenericRunner() =
     override _.SomeProp = 42
 
 // See #3895 - super call in multi-level generic class hierarchy used wrong mangled name
-#endif
 type IGenericAttach3895<'C> =
     abstract Attach: 'C -> unit
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
 [<AbstractClass>]
 type GenericAttachBase3895<'C>(log: ResizeArray<string>) =
     abstract Attach: 'C -> unit
@@ -660,22 +655,17 @@ type GenericAttachBase3895<'C>(log: ResizeArray<string>) =
     interface IGenericAttach3895<'C> with
         member this.Attach(owner: 'C) = this.Attach(owner)
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
-#endif
 type GenericAttachMid3895<'Container>(log: ResizeArray<string>) =
     inherit GenericAttachBase3895<'Container>(log)
     override this.Attach(owner) =
         base.Attach(owner)
         log.Add("Mid")
-#endif
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
 type GenericAttachLeaf3895(log: ResizeArray<string>) =
     inherit GenericAttachMid3895<string>(log)
     override this.Attach(owner) =
         base.Attach(owner)
         log.Add("Leaf")
-#endif
 
 type IndexedProps(v: int) =
     let mutable v = v
@@ -1933,7 +1923,6 @@ let ``test Unchecked.defaultof works for fields on structs`` () =
     top.B.B |> equal false
 #endif
 
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test Generic abstract class can be instantiated through derived class`` () =
     let runner = ConcreteGenericRunner() :> GenericAbstractRunner<int, string>
@@ -1941,7 +1930,6 @@ let ``test Generic abstract class can be instantiated through derived class`` ()
     runner.Decode "42" |> equal 42
     runner.MapAToB 3 |> equal "3"
     runner.SomeProp |> equal 42
-#endif
 
 [<Fact>]
 let ``test Abstract class property backed by captured variable in object expression works`` () =
@@ -1958,7 +1946,6 @@ let ``test Abstract class property backed by captured variable in object express
     reader.Warnings.Count |> equal 2
 
 // See #3895 - super call in generic class hierarchy was using wrong mangled name
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test Super call works correctly in multi-level generic class hierarchy`` () =
     let log = ResizeArray<string>()
@@ -1966,7 +1953,6 @@ let ``test Super call works correctly in multi-level generic class hierarchy`` (
     obj.Attach("hello")
     // Each override delegates to base before logging, so the chain unwinds Base -> Mid -> Leaf
     log |> List.ofSeq |> equal [ "Base"; "Mid"; "Leaf" ]
-#endif
 
 type ValClassBase =
     val Id: int
@@ -2041,27 +2027,20 @@ let ``test explicit constructor calls a parameterless base constructor`` () =
     c.Tag |> equal "default"
     c.Value |> equal 9
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
 type ValClassGenericBase<'T> =
     val Value: 'T
     new (v: 'T) = { Value = v }
-#endif
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
 type ValClassIntBox =
     inherit ValClassGenericBase<int>
     val Tag: string
     new (v: int, t: string) = { inherit ValClassGenericBase<int>(v); Tag = t }
-#endif
 
-#if !FABLE_COMPILER_ZIG // (generic classes in class hierarchies)
 type ValClassPairBox<'U> =
     inherit ValClassGenericBase<'U * 'U>
     val Count: int
     new (a: 'U, b: 'U) = { inherit ValClassGenericBase<'U * 'U>((a, b)); Count = 2 }
-#endif
 
-#if !FABLE_COMPILER_ZIG // (uses a type excluded above: see its reason)
 [<Fact>]
 let ``test explicit constructor resolves the generic arguments of the base class`` () =
     let intBox = ValClassIntBox(5, "x")
@@ -2070,7 +2049,6 @@ let ``test explicit constructor resolves the generic arguments of the base class
     let pairBox = ValClassPairBox("a", "b")
     pairBox.Value |> equal ("a", "b")
     pairBox.Count |> equal 2
-#endif
 
 let mutable valClassThenCalls = 0
 
