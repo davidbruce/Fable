@@ -228,6 +228,7 @@ fn threadMain(f: ThreadStart) void {
     };
     drop(f);
     collectorDeinit();
+    if (track) _ = @atomicRmw(i64, &ended_threads_live, .Add, thread.stats.allocs - thread.stats.frees, .monotonic);
 }
 
 /// `t.Join()`: waits for the thread to end
@@ -243,6 +244,75 @@ pub fn threadId() i32 {
     return @truncate(@as(i64, @intCast(std.Thread.getCurrentId())));
 }
 
+// ---- `lock`: .NET's Monitor, re-entrant, on the address of the object ----
+//
+// Locks are taken on one of a fixed set of slots chosen by the object's address (two objects
+// may share a slot, which only makes one wait for the other). Each is a flag and its owner, so
+// that the thread that holds it can take it again, as .NET's can.
+
+const LockSlot = struct {
+    held: u32 = 0,
+    owner: usize = 0,
+    depth: u32 = 0,
+};
+
+var lock_slots: [64]LockSlot = @splat(.{});
+
+fn lockSlot(key: usize) *LockSlot {
+    return &lock_slots[(key >> 4) % lock_slots.len];
+}
+
+fn lockEnter(key: usize) void {
+    const slot = lockSlot(key);
+    const me: usize = @intCast(std.Thread.getCurrentId());
+    if (@atomicLoad(u32, &slot.held, .acquire) == 1 and @atomicLoad(usize, &slot.owner, .monotonic) == me) {
+        slot.depth += 1;
+        return;
+    }
+    while (@cmpxchgWeak(u32, &slot.held, 0, 1, .acquire, .monotonic) != null) std.Thread.yield() catch {};
+    @atomicStore(usize, &slot.owner, me, .monotonic);
+    slot.depth = 1;
+}
+
+fn lockExit(key: usize) void {
+    const slot = lockSlot(key);
+    slot.depth -= 1;
+    if (slot.depth != 0) return;
+    @atomicStore(usize, &slot.owner, 0, .monotonic);
+    @atomicStore(u32, &slot.held, 0, .release);
+}
+
+/// (the address a lock is taken on: of the cell; null cannot be locked)
+fn lockKey(o: anytype) ?usize {
+    const T = @TypeOf(o);
+    if (comptime @typeInfo(T) == .optional) {
+        const p = o orelse return null;
+        return lockKey(p);
+    }
+    if (comptime @typeInfo(T) != .pointer) @compileError("fable: `lock` needs an object of a reference type, not " ++ @typeName(T));
+    return @intFromPtr(o);
+}
+
+fn LockResult(comptime F: type) type {
+    return @typeInfo(@typeInfo(@FieldType(F, "code")).pointer.child).@"fn".return_type.?;
+}
+
+/// `lock o (fun () -> ...)`: the function, run while this thread holds the lock of `o`
+pub fn lockRun(o: anytype, f: anytype) LockResult(@TypeOf(f)) {
+    const key = lockKey(o) orelse return raise(ArgumentNullException, str("Value cannot be null. (Parameter 'obj')"));
+    lockEnter(key);
+    defer lockExit(key);
+    return f.code(f.env, {});
+}
+
+/// `obj ()`: an object of no class of the program's, to lock on or compare by reference
+pub fn objectNew() Obj {
+    return objNew(&object_type, PlainObjectChain{ .own = .{} });
+}
+
+const PlainObjectChain = struct { own: struct {} };
+const object_type: ObjType = objType(PlainObjectChain, "System.Object", null, &.{}, null);
+
 fn notShareable(what: []const u8) Raised {
     var b: TextBuilder = .{};
     b.addAscii("The Zig target cannot share ");
@@ -255,7 +325,11 @@ fn notShareable(what: []const u8) Raised {
 fn markCell(c: anytype) Raised!bool {
     // (shared already: other threads may be changing the count; until then, no other has it)
     if (isShared(c)) return false;
-    if (gcOf(c) != null) return notShareable("a value that can be part of a cycle (the cycle collector follows it)");
+    // (a cell the collector follows leaves it when it is shared, unless it is part of a
+    // structure of cells already, where its count is the collector's business)
+    if (gcOf(c)) |h| {
+        if (sgc.inStructure(h)) return notShareable("a value that is part of a structure of cells the cycle collector follows");
+    }
     c.@"$rc" |= shared_bit;
     return true;
 }
@@ -785,12 +859,13 @@ pub inline fn store(place: anytype, value: @TypeOf(place.*)) void {
 pub inline fn storeIn(owner: anytype, comptime field: []const u8, value: @FieldType(@TypeOf(owner.*), field)) void {
     const old = @field(owner, field);
     @field(owner, field) = value;
-    if (gcOf(owner)) |h| {
+    if (isShared(owner)) {
+        shareStored(value);
+    } else if (gcOf(owner)) |h| {
         eachHdr(old, h, unstored);
         storeValue(h, value);
     } else {
         touch(value);
-        if (isShared(owner)) shareStored(value);
     }
     drop(old);
 }
@@ -2683,12 +2758,13 @@ pub fn objCast(any: Any, ty: *const ObjType) Raised!Any {
 pub inline fn objStore(o: Obj, place: anytype, value: @TypeOf(place.*)) void {
     const old = place.*;
     place.* = value;
-    if (o.gc) |h| {
+    if (isShared(o)) {
+        shareStored(value);
+    } else if (o.gc) |h| {
         eachHdr(old, h, unstored);
         storeValue(h, value);
     } else {
         touch(value);
-        if (isShared(o)) shareStored(value);
     }
     drop(old);
 }
@@ -6295,8 +6371,12 @@ pub inline fn across(
 
 /// Cells that were allocated and not freed (0 when counters are not kept).
 pub fn live() i64 {
-    return thread.stats.allocs - thread.stats.frees;
+    return thread.stats.allocs - thread.stats.frees + @atomicLoad(i64, &ended_threads_live, .monotonic);
 }
+
+/// What threads that have ended allocated and did not free themselves: a cell made on one
+/// thread may be freed on another (the last to let go of a shared value).
+var ended_threads_live: i64 = 0;
 
 /// Called when the program's entry point has returned: true, with a message, if cells are
 /// still allocated. Only checks in builds that keep counters.
@@ -6304,7 +6384,7 @@ pub fn leaked() bool {
     // (cycles that died without anything noticing yet are not leaks)
     _ = collect();
     if (!track or live() == 0) return false;
-    std.debug.print("fable: {d} cell(s) were never freed (allocated {d}, freed {d})\n", .{ live(), thread.stats.allocs, thread.stats.frees });
+    std.debug.print("fable: {d} cell(s) were never freed (allocated {d}, freed {d}, and threads that ended {d} more than they freed)\n", .{ live(), thread.stats.allocs, thread.stats.frees, ended_threads_live });
     return true;
 }
 

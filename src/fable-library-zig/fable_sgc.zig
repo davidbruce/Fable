@@ -151,6 +151,19 @@ const tl = if (per_thread) struct {
     var the_gc: ?*Gc = null;
 };
 
+/// Is the cell shared between threads (the top bit of its count, see fable_rt.zig's
+/// `markShared`)? Such a cell is in no structure and the collector leaves it alone.
+pub inline fn isShared(h: *const Hdr) bool {
+    const addr: usize = @bitCast(@as(isize, @bitCast(@intFromPtr(h))) + h.desc().rc_offset);
+    const rc: *const u32 = @ptrFromInt(addr);
+    return @atomicLoad(u32, rc, .monotonic) & (1 << 31) != 0;
+}
+
+/// Is the cell a member of a structure (then it cannot be shared)?
+pub inline fn inStructure(h: *const Hdr) bool {
+    return h.st != 0;
+}
+
 /// Type descriptor (its distance from `anchor` in units of `desc_align`,
 /// +-1 GB), colour and flags.
 pub const Meta = packed struct(u32) {
@@ -283,6 +296,9 @@ pub const Visitor = struct {
     top: ?*Hdr = null,
 
     pub inline fn visit(v: *Visitor, child: *Hdr) void {
+        // (a cell shared between threads is outside every thread's collector: never a member,
+        // never flagged or counted; a cycle through it is not collected)
+        if (isShared(child)) return;
         switch (v.op) {
             .close => v.gc.closeChild(child, v.x),
             .discover => v.gc.discoverChild(child),
@@ -697,6 +713,7 @@ pub const Gc = struct {
     }
 
     pub inline fn onStore(gc: *Gc, owner: *Hdr, child: *Hdr) void {
+        if (isShared(child)) return;
         if (owner.st != 0) return gc.stored(owner, child);
         // The leaf bit only matters while a cell is in no structure.
         const flags = owner.meta.flags;
@@ -719,6 +736,7 @@ pub const Gc = struct {
     }
 
     pub inline fn onUnstore(gc: *Gc, owner: *Hdr, old: *Hdr) void {
+        if (isShared(old)) return;
         if (owner.st == 0 or old.st == 0) return;
         gc.unstored(owner, old);
     }
@@ -731,7 +749,7 @@ pub const Gc = struct {
     }
 
     pub inline fn onMoveOut(gc: *Gc, child: *Hdr) void {
-        if (gc.barrier_on) gc.touch(child);
+        if (gc.barrier_on and !isShared(child)) gc.touch(child);
     }
 
     pub inline fn step(gc: *Gc, budget: usize) bool {

@@ -244,12 +244,13 @@ pub inline fn arraySet(a: anytype, i: i32, value: ItemOf(@TypeOf(a))) Raised!voi
 pub fn arrayPut(a: anytype, i: usize, value: @typeInfo(@TypeOf(a.items)).pointer.child) void {
     const old = a.items[i];
     a.items[i] = value;
-    if (gcOf(a)) |h| {
+    if (rt.isShared(a)) {
+        rt.shareStored(value);
+    } else if (gcOf(a)) |h| {
         eachHdr(old, h, unstored);
         storeValue(h, value);
     } else {
         touch(value);
-        if (rt.isShared(a)) rt.shareStored(value);
     }
     drop(old);
 }

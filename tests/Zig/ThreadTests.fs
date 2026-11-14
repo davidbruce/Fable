@@ -52,3 +52,34 @@ let ``test A thread cannot be started twice`` () =
             true
 
     raised |> equal true
+
+[<Fact>]
+let ``test lock keeps a shared counter and list right`` () =
+    let gate = obj ()
+    let total = ref 0
+    let log = ResizeArray<string>()
+
+    let threads =
+        [
+            for k in 0..3 ->
+                Thread(fun () ->
+                    for _ in 1..2_000 do
+                        lock gate (fun () -> total.Value <- total.Value + 1)
+
+                    lock gate (fun () -> log.Add(sprintf "thread %d" k))
+                )
+        ]
+
+    for t in threads do
+        t.Start()
+
+    for t in threads do
+        t.Join()
+
+    total.Value |> equal 8_000
+    log.Count |> equal 4
+
+[<Fact>]
+let ``test lock can be taken again by the thread that holds it`` () =
+    let gate = obj ()
+    lock gate (fun () -> lock gate (fun () -> 7)) |> equal 7

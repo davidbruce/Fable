@@ -1194,6 +1194,9 @@ let call
                 "the Zig target does not support %s.%s with these arguments yet"
                 (entity.Substring(entity.LastIndexOf '.' + 1))
                 name
+    // `lock o f`: .NET's Monitor (the runtime's lockRun, re-entrant); `obj ()`: an object to lock on
+    | "Microsoft.FSharp.Core.Operators", "Lock", [ o; f ] -> rt "fable_rt.lockRun($0, $1)" [ o; f ] (mapType ctx r t)
+    | "System.Object", ".ctor", [] -> pure' "fable_rt.objectNew()" [] tAny
     // ---- threads (the runtime's ThreadOf: what the function captured is shared when it starts) ----
     | "System.Threading.Thread", ".ctor", [ start ] ->
         pure' "fable_rt.threadNew($0)" [ start ] (TPrim "fable_rt.ThreadOf")
