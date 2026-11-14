@@ -582,6 +582,33 @@ pub fn genericArguments(t: Type) rt.Array(Type) {
     return rt.arrays.arrayFrom(rt.Array(Type), items);
 }
 
+/// A Type known only by its name (a quotation's types)
+pub fn typeNamed(name_: String) Type {
+    var buf: std.ArrayList(u8) = .empty;
+    var tmp: [4]u8 = undefined;
+    for (rt.unitsOf(name_)) |u| {
+        const n = std.unicode.utf8Encode(u, &tmp) catch 1;
+        buf.appendSlice(rt.allocator, tmp[0..n]) catch @panic("fable: out of memory");
+    }
+    const full = buf.toOwnedSlice(rt.allocator) catch @panic("fable: out of memory");
+    const info = rt.allocator.create(TypeInfo) catch @panic("fable: out of memory");
+    const at = if (std.mem.lastIndexOfAny(u8, full, ".+")) |i| i + 1 else 0;
+    info.* = .{ .full_name = full, .name = full[at..], .namespace = if (at > 0) full[0 .. at - 1] else "", .kind = .other };
+    return info;
+}
+
+/// A PropertyInfo of nothing (a quotation keeps a property's name only)
+pub fn nullProperty() Property {
+    return .{ .owner = &null_info, .index = 0 };
+}
+
+/// A tuple of boxed items (a quotation's evaluation): `unbox` to a tuple type makes it
+pub fn looseTuple(items: rt.Array(Any)) Raised!Any {
+    const loose: LooseTuple = .{ .items = rt.dup(items) };
+    defer rt.drop(loose);
+    return rt.box(loose);
+}
+
 pub fn isNullType(t: Type) bool {
     return t == &null_info or t.full_name.len == 0;
 }

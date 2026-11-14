@@ -1227,6 +1227,18 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.Nullable(t, _) -> TOpt(mapType ctx r t)
     // (reflection: the runtime's fable_reflect.zig)
     | Fable.MetaType -> TPrim "fable_rt.reflect.Type"
+    // (quotations and their variables: objects of the library's Quotation.fs; a method by its name)
+    | Fable.DeclaredType(ent, _) when
+        ent.FullName = "Microsoft.FSharp.Quotations.FSharpExpr"
+        || ent.FullName = "Microsoft.FSharp.Quotations.FSharpExpr`1"
+        || ent.FullName = "Microsoft.FSharp.Quotations.FSharpVar"
+        ->
+        tAny
+    | Fable.DeclaredType(ent, []) when
+        ent.FullName = "System.Reflection.MethodInfo"
+        || ent.FullName = "System.Reflection.MethodBase"
+        ->
+        tStr
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Type" -> TPrim "fable_rt.reflect.Type"
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Reflection.PropertyInfo" ->
         TPrim "fable_rt.reflect.Property"
@@ -3733,8 +3745,34 @@ let etaHead (args: Fable.Ident list) (body: Fable.Expr) : (Fable.Expr * (Fable.E
             None
     | None -> None
 
+/// What the shared QuotationEmitter makes of a quotation, with the plain values it gives where
+/// the library takes objects boxed (a value, the items of an array of objects)
+let boxQuotationArgs (e: Fable.Expr) : Fable.Expr =
+    let asObj (x: Fable.Expr) =
+        if x.Type = Fable.Any then
+            x
+        else
+            Fable.TypeCast(x, Fable.Any)
+
+    let rec go (x: Fable.Expr) =
+        match x with
+        | Fable.Call(Fable.Import(imp, it, ir), info, t, r) when imp.Selector = "mkValue" ->
+            let args =
+                match info.Args |> List.map go with
+                | v :: rest -> asObj v :: rest
+                | [] -> []
+
+            Fable.Call(Fable.Import(imp, it, ir), { info with Args = args }, t, r)
+        | Fable.Value(Fable.NewArray(Fable.ArrayValues items, Fable.Any, kind), r) ->
+            Fable.Value(Fable.NewArray(Fable.ArrayValues(items |> List.map (go >> asObj)), Fable.Any, kind), r)
+        | _ -> AST.visit go x
+
+    go e
+
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
+    // a quotation: what the shared emitter makes of it, nodes of the library's Quotation.fs
+    | Fable.Quote(body, _, _) -> lw ctx (boxQuotationArgs (QuotationEmitter.emitQuotedExpr ctx.Com body))
     // ---- objects of classes that take part in inheritance ----
     // `base`: the object itself, seen as its parent class
     | Fable.Value(Fable.BaseValue(Some id, _), _) -> lw ctx (Fable.IdentExpr id)
@@ -5622,6 +5660,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | _ -> fail r "the Zig target does not support %s yet" (exprKind e)
             )
 
+    // (a function of the quotations' library, as the shared mapping and emitter call it)
+    | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
+        imp.Path.EndsWith("quotation.zig", System.StringComparison.OrdinalIgnoreCase)
+        ->
+        libraryCall ctx r "Quotation" imp.Selector info (Option.toList info.ThisArg @ info.Args) t
     | Fable.Call(callee, info, t, r) ->
         let ty = mapType ctx r t
 

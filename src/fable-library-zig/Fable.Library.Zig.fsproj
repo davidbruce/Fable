@@ -28,6 +28,7 @@
     <Compile Include="Stopwatch.fs" />
     <Compile Include="Regex.fs" />
     <Compile Include="Path.fs" />
+    <Compile Include="Quotation.fs" />
     <Compile Include="Async.fs" />
     <Compile Include="Task.fs" />
     <Compile Include="Map.fs" />
