@@ -1216,6 +1216,16 @@ let call
                 "the Zig target does not support %s.%s with these arguments yet"
                 (entity.Substring(entity.LastIndexOf '.' + 1))
                 name
+    // `new 'T()` of a type parameter that is not known here: an inline function's own body,
+    // which Zig looks at only if something calls it (its callers have it inlined)
+    | ("Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions" | "System.Activator"), "CreateInstance", _ when
+        info.ThisArg.IsNone
+        ->
+        EEmit(
+            "@compileError(\"fable: new 'T() needs a type known where it is used (an inline function)\")",
+            [],
+            mapType ctx r t
+        )
     // `lock o f`: .NET's Monitor (the runtime's lockRun, re-entrant); `obj ()`: an object to lock on
     | "Microsoft.FSharp.Core.Operators", "Lock", [ o; f ] -> rt "fable_rt.lockRun($0, $1)" [ o; f ] (mapType ctx r t)
     | "System.Object", ".ctor", [] -> pure' "fable_rt.objectNew()" [] tAny

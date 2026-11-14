@@ -163,8 +163,6 @@ let ``test Type namespace is accessible`` () =
     getName3 typedefof<Firm> "namespace" |> test
     // getName4 x "namespace" |> test
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support Microsoft.FSharp.Core.LanguagePrimitives.Intrins)
-#if !FABLE_COMPILER_ZIG // (Activator.CreateInstance and new 'T() of a type parameter)
 [<Fact>]
 let ``test Type full name is accessible`` () =
     let test (x: string) =
@@ -174,8 +172,6 @@ let ``test Type full name is accessible`` () =
     getName2 x "fullname" |> test
     getName3 typedefof<Firm> "fullname" |> test
     // getName4 x "fullname" |> test
-#endif
-#endif
 
 // FSharpType and FSharpValue reflection tests
 open FSharp.Reflection
@@ -198,9 +194,7 @@ type MyList<'T> =
 | Nil
 | Cons of 'T * MyList<'T>
 
-#if !FABLE_COMPILER_ZIG // (new 'T() of a type parameter)
 let inline create<'T when 'T: (new: unit->'T)> () = new 'T()
-#endif
 
 type A() = member _.Value = 5
 
@@ -525,14 +519,12 @@ let ``test Recursive types work`` () =
     fieldTypes.[0].PropertyType.FullName |> equal typeof<int>.FullName
     fieldTypes.[1].PropertyType.GetGenericTypeDefinition().FullName |> equal typedefof<MyList<obj>>.FullName
 
-#if !FABLE_COMPILER_ZIG // (uses a declaration excluded above)
 [<Fact>]
 let ``test Calling constructor of generic type in inline functions works`` () =
     let a = create<A>()
     let b = create<B>()
     a.Value |> equal 5
     b.Value |> equal 10
-#endif
 
 // See https://github.com/Microsoft/visualfsharp/issues/5992
 [<Fact>]
