@@ -56,3 +56,46 @@ let ``test A downcast of null is null`` () =
     let o: obj = null
     let n = o :?> Node
     isNull n |> equal true
+
+[<Fact>]
+let ``test An array's null is tested with isNull and =`` () =
+    let a: int[] = null
+    isNull a |> equal true
+    isNull Unchecked.defaultof<string[]> |> equal true
+    let e: int[] = [||]
+    isNull e |> equal false
+    (e = null) |> equal false
+    isNull (box a) |> equal true
+
+[<Fact>]
+let ``test Array.Resize grows, shrinks and starts from null`` () =
+    let mutable r: int[] = null
+    System.Array.Resize(&r, 3)
+    r |> equal [| 0; 0; 0 |]
+    r.[1] <- 5
+    System.Array.Resize(&r, 2)
+    r |> equal [| 0; 5 |]
+    let mutable s = [| "a" |]
+    System.Array.Resize(&s, 2)
+    s.[0] |> equal "a"
+    isNull s.[1] |> equal true
+
+[<Fact>]
+let ``test Array.zeroCreate of arrays holds null arrays`` () =
+    let jagged: int[][] = Array.zeroCreate 2
+    isNull jagged.[0] |> equal true
+    jagged.[1] <- [| 1; 2 |]
+    jagged.[1].[1] |> equal 2
+
+[<Fact>]
+let ``test An index of a null array raises NullReferenceException`` () =
+    let a: int[] = null
+
+    let raised =
+        try
+            a.[0] |> ignore
+            false
+        with :? System.NullReferenceException ->
+            true
+
+    raised |> equal true

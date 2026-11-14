@@ -606,6 +606,8 @@ let call
         | Fable.DeclaredType(entRef, _) when isWitnessClass ctx entRef -> EUnit
         // (a class: null)
         | Fable.DeclaredType _ when (objOfType ctx r t).IsSome -> lw ctx (Fable.Value(Fable.Null t, r))
+        // (an array: the array's null, see fable_array.zig)
+        | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> lw ctx (Fable.Value(Fable.Null t, r))
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when x.Type = Fable.String || x.Type = Fable.Any ->
         pure' "($0 == null)" [ x ] tBool

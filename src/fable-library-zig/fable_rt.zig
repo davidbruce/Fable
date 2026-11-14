@@ -59,6 +59,7 @@ pub const thread = if (sgc.per_thread) struct {
     pub threadlocal var current: ?Exn = null;
     pub threadlocal var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
     pub threadlocal var book: ?std.mem.Allocator = null;
+    pub threadlocal var null_arrays: std.ArrayList(NullArray) = .empty;
 } else struct {
     pub var stats: Stats = .{};
     pub var collector: sgc.Gc = undefined;
@@ -66,7 +67,11 @@ pub const thread = if (sgc.per_thread) struct {
     pub var current: ?Exn = null;
     pub var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
     pub var book: ?std.mem.Allocator = null;
+    pub var null_arrays: std.ArrayList(NullArray) = .empty;
 };
+
+/// A null array of a type whose arrays the collector follows, kept until the collector goes
+pub const NullArray = struct { cell: *anyopaque, free: *const fn (*anyopaque) void };
 
 /// Where the runtime's own bookkeeping (the collector's, the table of weak references) comes
 /// from: the allocator, unless a stack arena stands in for it now.
@@ -503,7 +508,7 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     // (.NET's mutable collections are equal only to themselves)
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity")) return a == b;
     // (an array is equal to another with equal items, as F#'s `=` has it)
-    if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or (eql(a.items, b.items) and std.meta.eql(a.shape, b.shape));
+    if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or (!arrayIsNull(a) and !arrayIsNull(b) and eql(a.items, b.items) and std.meta.eql(a.shape, b.shape));
     if (comptime !isManaged(T) and !holdsDecimal(T)) return std.meta.eql(a, b);
     // (a sequence is an object on .NET: equal only to itself, here the same walk and what it holds)
     if (comptime @typeInfo(T) == .@"struct" and @hasField(T, "fable_seq")) return a.fable_seq.env == b.fable_seq.env and a.fable_seq.code == b.fable_seq.code;
@@ -1027,6 +1032,8 @@ pub const arrayFilter = arrays.arrayFilter;
 pub const arrayFold = arrays.arrayFold;
 pub const arrayForall = arrays.arrayForall;
 pub const arrayFrom = arrays.arrayFrom;
+pub const arrayNull = arrays.arrayNull;
+pub const arrayIsNull = arrays.arrayIsNull;
 pub const arrayGet = arrays.arrayGet;
 pub const arrayInit = arrays.arrayInit;
 pub const arrayItems = arrays.arrayItems;
@@ -1044,6 +1051,7 @@ pub const arraySlice = arrays.arraySlice;
 pub const arraySub = arrays.arraySub;
 pub const arrayToList = arrays.arrayToList;
 pub const arrayZero = arrays.arrayZero;
+pub const arrayResize = arrays.arrayResize;
 pub const indexOutside = arrays.indexOutside;
 const listOf = arrays.listOf;
 test {
@@ -2094,6 +2102,10 @@ pub fn box(x: anytype) Any {
     if (comptime @typeInfo(T) == .optional and T != String) {
         if (x == null) return null;
     }
+    // (an array's null is null as an object too)
+    if (comptime isArrayPtr(T)) {
+        if (arrayIsNull(x)) return null;
+    }
     return objNew(boxType(T), BoxChain(T){ .own = .{ .value = x } });
 }
 
@@ -2144,6 +2156,8 @@ pub fn unbox(comptime T: type, x: anytype) Raised!T {
     if (T == Any) return dup(o);
     const p = o orelse {
         if (comptime @typeInfo(T) == .optional) return null;
+        // (null as an array: the array's null)
+        if (comptime isArrayPtr(T)) return arrayNull(T);
         return nullRef();
     };
     if (T == Obj) return dup(p);
@@ -2924,6 +2938,10 @@ pub fn liveCells() i32 {
 /// Give back the collector's own bookkeeping, and the table of weak references. Nothing they
 /// look after may be alive.
 pub fn collectorDeinit() void {
+    // (the null arrays this thread made: given up before the collector goes)
+    for (thread.null_arrays.items) |n| n.free(n.cell);
+    thread.null_arrays.deinit(bookkeeping());
+    thread.null_arrays = .empty;
     if (thread.collector_ready) thread.collector.deinit();
     thread.weak.deinit(bookkeeping());
     thread.weak = .empty;
@@ -3337,7 +3355,15 @@ pub fn argNull(comptime param: []const u8) Raised {
 // `obj`, an option); of any other type it never is ----
 
 pub fn isNullValue(x: anytype) bool {
-    return if (comptime @typeInfo(@TypeOf(x)) == .optional) x == null else false;
+    const T = @TypeOf(x);
+    if (comptime @typeInfo(T) == .optional) return x == null;
+    if (comptime isArrayPtr(T)) return arrayIsNull(x);
+    return false;
+}
+
+/// Is the type an array's (a cell of `fable_array`)?
+pub fn isArrayPtr(comptime T: type) bool {
+    return isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array");
 }
 
 /// `nonNull x`, the `NonNull` and `NonNullQuick` patterns

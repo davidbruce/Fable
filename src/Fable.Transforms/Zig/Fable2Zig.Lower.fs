@@ -4248,6 +4248,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.Null Fable.MetaType ->
             ctx.State.UsesRuntime <- true
             EEmit("fable_rt.reflect.nullType()", [], TPrim "fable_rt.reflect.Type")
+        // (of an array: the array's null, see fable_array.zig)
+        | Fable.Null(Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) as t) ->
+            ctx.State.UsesRuntime <- true
+            let ty = mapType ctx r t
+            EEmit("fable_rt.arrayNull($R)", [], ty)
         // (of a class: no object)
         | Fable.Null t when (objOfType ctx r t).IsSome ->
             ctx.State.UsesRuntime <- true

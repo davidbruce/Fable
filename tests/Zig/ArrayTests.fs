@@ -1496,7 +1496,6 @@ let ``test Array.compareWith works`` () = // See #2961
     equal c2 -1
     equal c3 1
 
-#if !FABLE_COMPILER_ZIG // (a null array: arrays have no null in the Zig target)
 [<Fact>]
 let ``test System.Array.Resize works`` () =
     let mutable xs = [|1; 2; 3; 4; 5|]
@@ -1512,7 +1511,6 @@ let ``test System.Array.Resize works`` () =
     xs <- null
     System.Array.Resize(&xs, 0)
     xs |> equal [||]
-#endif
 
 [<Fact>]
 let ``test Array.randomShuffle works`` () =

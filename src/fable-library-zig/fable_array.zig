@@ -73,6 +73,54 @@ pub fn arrayFrom(comptime A: type, items: []ItemOf(A)) A {
     return c;
 }
 
+/// .NET's null of an array type: one array of no items for each type, which no reference ever
+/// frees (its count stays far from one) and which is never changed in place. Code that walks
+/// arrays sees no items in it; what .NET raises NullReferenceException for, `Length` and an
+/// index, raise it here when given it.
+fn NullOf(comptime A: type) type {
+    const C = @typeInfo(A).pointer.child;
+    return if (hasGc(C)) struct {
+        // (the collector follows these: one of the thread's own, made as any other array, given
+        // up when the collector goes)
+        threadlocal var made: ?A = null;
+
+        fn get() A {
+            if (made) |c| return c;
+            const c = arrayFrom(A, &.{});
+            c.@"$rc" = null_count;
+            rt.thread.null_arrays.append(rt.bookkeeping(), .{ .cell = c, .free = free }) catch @panic("fable: out of memory");
+            made = c;
+            return c;
+        }
+
+        fn free(p: *anyopaque) void {
+            const c: A = @ptrCast(@alignCast(p));
+            c.@"$rc" = 1;
+            rt.drop(c);
+            made = null;
+        }
+    } else struct {
+        var static: C = .{ .@"$rc" = null_count, .items = &.{} };
+
+        fn get() A {
+            return &static;
+        }
+    };
+}
+
+/// (far from one and from overflowing either way)
+const null_count: u32 = 1 << 30;
+
+/// The null of an array type (a reference of its own)
+pub fn arrayNull(comptime A: type) A {
+    return rt.dup(NullOf(A).get());
+}
+
+/// Is an array .NET's null?
+pub fn arrayIsNull(a: anytype) bool {
+    return a == NullOf(@TypeOf(a)).get();
+}
+
 /// `[| a; b; c |]`
 pub fn arrayOf(comptime A: type, values: anytype) A {
     const items = arrayItems(A, values.len);
@@ -102,13 +150,41 @@ pub fn hasZero(comptime T: type) bool {
 pub fn arrayZero(comptime A: type, n: i32) Raised!A {
     if (n < 0) return countNegative(n);
     const items = arrayItems(A, @intCast(n));
-    if (comptime hasZero(ItemOf(A))) {
-        @memset(items, comptime std.mem.zeroes(ItemOf(A)));
-    } else if (n != 0) {
+    fillDefault(A, items) catch |e| {
         rt.allocator.free(items);
+        return e;
+    };
+    return arrayFrom(A, items);
+}
+
+/// Items set to .NET's default of their type: zero, null (an array's null for arrays)
+fn fillDefault(comptime A: type, items: []ItemOf(A)) Raised!void {
+    const T = ItemOf(A);
+    if (comptime hasZero(T)) {
+        @memset(items, comptime std.mem.zeroes(T));
+    } else if (comptime rt.isArrayPtr(T)) {
+        for (items) |*x| x.* = arrayNull(T);
+    } else if (items.len != 0) {
         return raise(NotSupportedException, str("Array.zeroCreate of a type without a null value: use Array.create or Array.init"));
     }
-    return arrayFrom(A, items);
+}
+
+/// `Array.Resize(&a, n)`: a new array of the first items, then defaults (a null array is
+/// one of no items)
+pub fn arrayResize(place: anytype, n: i32) Raised!void {
+    const A = @TypeOf(place.*);
+    if (n < 0) return raise(rt.ArgumentOutOfRangeException, str("Non-negative number required. (Parameter 'newSize')"));
+    const old = place.*;
+    const kept = @min(old.items.len, @as(usize, @intCast(n)));
+    const items = arrayItems(A, @intCast(n));
+    for (items[0..kept], old.items[0..kept]) |*x, y| x.* = rt.dup(y);
+    fillDefault(A, items[kept..]) catch |e| {
+        for (items[0..kept]) |x| rt.drop(x);
+        rt.allocator.free(items);
+        return e;
+    };
+    place.* = arrayFrom(A, items);
+    rt.drop(old);
 }
 
 /// `Array.create n x`
@@ -146,16 +222,22 @@ pub fn indexOutside() Raised {
     return raise(IndexOutOfRangeException, str("Index was outside the bounds of the array."));
 }
 
+/// (an index of an array that is outside it, or of the array's null: NullReferenceException)
+pub fn indexOutsideOf(a: anytype) Raised {
+    if (arrayIsNull(a)) return rt.nullRef();
+    return indexOutside();
+}
+
 /// `a.[i]`: a reference of its own to the item.
 pub inline fn arrayGet(a: anytype, i: i32) Raised!ItemOf(@TypeOf(a)) {
-    if (i < 0 or i >= a.items.len) return indexOutside();
+    if (i < 0 or i >= a.items.len) return indexOutsideOf(a);
     return dup(a.items[@intCast(i)]);
 }
 
 /// `a.[i] <- value`. The collector is told what the array no longer points at and what it
 /// points at now: this is where a cycle can be closed.
 pub inline fn arraySet(a: anytype, i: i32, value: ItemOf(@TypeOf(a))) Raised!void {
-    if (i < 0 or i >= a.items.len) return indexOutside();
+    if (i < 0 or i >= a.items.len) return indexOutsideOf(a);
     arrayPut(a, @intCast(i), dup(value));
 }
 
@@ -226,7 +308,7 @@ pub fn arrayFill(a: anytype, start: i32, count: i32, x: ItemOf(@TypeOf(a))) Rais
     if (count < 0) return countNegative(count);
     var i = start;
     while (i < start + count) : (i += 1) {
-        if (i >= a.items.len) return indexOutside();
+        if (i >= a.items.len) return indexOutsideOf(a);
         arrayPut(a, @intCast(i), dup(x));
     }
 }

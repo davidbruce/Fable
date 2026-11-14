@@ -164,6 +164,11 @@ let call
             tI32
     | "Microsoft.FSharp.Collections.Array2DModule", ("Base1" | "Base2"), [ a ] -> ESeq(lwStmt ctx a, ELit("0", tI32))
     | "System.Array", "GetLength", [ a; d ] -> rt "fable_rt.arrayGetLength($0, $1)" [ a; d ] tI32
+    // `Array.Resize(&a, n)`: the variable is given a new array
+    | "System.Array", "Resize", [ place; n ] ->
+        match tryAddress (lw ctx place) with
+        | Some p -> bindArgs ctx [ p; lw ctx n ] (fun xs -> ERt("fable_rt.arrayResize($0, $1)", xs, tVoid))
+        | None -> fail r "the Zig target cannot take the address of this array yet"
     | "Microsoft.FSharp.Collections.Array2DModule", ("Copy" | "Rebase"), [ a ] ->
         pure' "fable_rt.array2DCopy($0)" [ a ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.Array2DModule", "CopyTo", [ src; si; sj; dst; ti; tj; n1; n2 ] ->
