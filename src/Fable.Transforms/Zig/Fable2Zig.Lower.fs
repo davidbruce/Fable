@@ -3745,6 +3745,115 @@ let etaHead (args: Fable.Ident list) (body: Fable.Expr) : (Fable.Expr * (Fable.E
             None
     | None -> None
 
+/// Whether a type still has type parameters in it
+let rec hasTypeParams (t: Fable.Type) : bool =
+    match t with
+    | Fable.GenericParam _ -> true
+    | _ -> t.Generics |> List.exists hasTypeParams
+
+/// Whether a type is another with obj in some of its places
+let rec moreGeneral (t: Fable.Type) (wanted: Fable.Type) : bool =
+    match t, wanted with
+    | Fable.Any, _ -> true
+    | Fable.LambdaType(a, r), Fable.LambdaType(a2, r2) -> moreGeneral a a2 && moreGeneral r r2
+    | _ -> t = wanted
+
+/// A value made at a more general type than the variable it is bound to has: F# generalizes
+/// `let a = Ok string`, and where Fable puts the value in at its use, its type parameters are obj
+/// (`Ok (fun (v: obj) -> string v)`) though the use is at `Result<int -> string, _>`. The value,
+/// fitted to the type wanted: a function taking obj where a value of a type is given takes that
+/// value and boxes it, as .NET's generic code would see it as that type.
+let rec adaptTo (com: Compiler) (wanted: Fable.Type) (e: Fable.Expr) : Fable.Expr =
+    if e.Type = wanted then
+        e
+    else
+        match e, wanted with
+        // (a function: applied in the body, so it keeps its type there)
+        | Fable.Lambda(arg, body, name), Fable.LambdaType((Fable.LambdaType _ as ta), tr) when
+            arg.Type <> ta && moreGeneral arg.Type ta
+            ->
+            let typed = { arg with Type = ta }
+
+            let body =
+                body
+                |> AST.visitFromInsideOut (fun x ->
+                    match x with
+                    | Fable.IdentExpr i when i.Name = arg.Name -> Fable.IdentExpr typed
+                    | Fable.CurriedApply(Fable.IdentExpr i, args, Fable.Any, r) when i.Name = arg.Name ->
+                        let ret =
+                            List.fold
+                                (fun t _ ->
+                                    match t with
+                                    | Fable.LambdaType(_, r) -> r
+                                    | _ -> t
+                                )
+                                ta
+                                args
+
+                        // (each argument as the parameter's type wants it)
+                        let args =
+                            List.fold
+                                (fun (t, acc) (a: Fable.Expr) ->
+                                    match t with
+                                    | Fable.LambdaType(p, rest) -> rest, adaptTo com p a :: acc
+                                    | _ -> t, a :: acc
+                                )
+                                (ta, [])
+                                args
+                            |> snd
+                            |> List.rev
+
+                        Fable.TypeCast(Fable.CurriedApply(Fable.IdentExpr typed, args, ret, r), Fable.Any)
+                    | _ -> x
+                )
+
+            Fable.Lambda(typed, adaptTo com tr body, name)
+        | Fable.Lambda(arg, body, name), Fable.LambdaType(ta, tr) when arg.Type = Fable.Any && ta <> Fable.Any ->
+            let typed =
+                { arg with
+                    Name = arg.Name + "_typed"
+                    Type = ta
+                }
+
+            Fable.Lambda(
+                typed,
+                Fable.Let(arg, Fable.TypeCast(Fable.IdentExpr typed, Fable.Any), adaptTo com tr body),
+                name
+            )
+        | Fable.Lambda(arg, body, name), Fable.LambdaType(ta, tr) when arg.Type = ta ->
+            Fable.Lambda(arg, adaptTo com tr body, name)
+        | Fable.Value(Fable.NewUnion(values, tag, ent, genArgs), r), Fable.DeclaredType(ent2, targs) when
+            ent.FullName = ent2.FullName && genArgs.Length = targs.Length
+            ->
+            match com.TryGetEntity ent with
+            | Some entity when tag < entity.UnionCases.Length ->
+                let subst =
+                    List.zip (entity.GenericParameters |> List.map (fun g -> g.Name)) targs
+                    |> Map.ofList
+
+                let fields =
+                    entity.UnionCases[tag].UnionCaseFields
+                    |> List.map (fun f -> substFableType subst f.FieldType)
+
+                if fields.Length = values.Length then
+                    Fable.Value(Fable.NewUnion(List.map2 (adaptTo com) fields values, tag, ent, targs), r)
+                else
+                    e
+            | _ -> e
+        | Fable.Value(Fable.NewOption(Some v, _, isStruct), r), Fable.Option(item, _) ->
+            Fable.Value(Fable.NewOption(Some(adaptTo com item v), item, isStruct), r)
+        | Fable.Value(Fable.NewTuple(values, isStruct), r), Fable.Tuple(ts, _) when ts.Length = values.Length ->
+            Fable.Value(Fable.NewTuple(List.map2 (adaptTo com) ts values, isStruct), r)
+        // (a value boxed and unboxed again)
+        | Fable.TypeCast(inner, Fable.Any), _ when inner.Type = wanted -> inner
+        // (an object where a value of a type is wanted: unboxed)
+        | _, _ when e.Type = Fable.Any && not (hasTypeParams wanted) && wanted <> Fable.Any ->
+            match wanted with
+            | Fable.LambdaType _
+            | Fable.DelegateType _ -> e
+            | _ -> Fable.TypeCast(e, wanted)
+        | _ -> e
+
 /// What the shared QuotationEmitter makes of a quotation, with the plain values it gives where
 /// the library takes objects boxed (a value, the items of an array of objects)
 let boxQuotationArgs (e: Fable.Expr) : Fable.Expr =
@@ -4562,7 +4671,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ->
         lw ctx body
     | Fable.Let(id, value, body) ->
-        let rhs = lw ctx value
+        let rhs = lw ctx (adaptTo ctx.Com id.Type value)
         let ty = mapType ctx id.Range id.Type
 
         // (a function of several arguments read from a field is uncurried there, as Fable keeps
@@ -5708,6 +5817,29 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 @ (c.ArgTypes
                    |> List.skip allArgs.Length
                    |> List.map (fun t -> Fable.Value(Fable.NewOption(None, t.Generics.Head, false), None)))
+            | _ -> allArgs
+
+        // (an argument made at a more general type than the parameter's, see adaptTo)
+        let allArgs =
+            match tryCallable ctx callee with
+            | Some c when
+                c.ArgTypes.Length = allArgs.Length
+                && c.TypeParams.Length = info.GenericArgs.Length
+                && allArgs |> List.exists (fun a -> hasTypeParams a.Type |> not)
+                ->
+                let subst = List.zip c.TypeParams info.GenericArgs |> Map.ofList
+
+                List.map2
+                    (fun (p: Fable.Type) (a: Fable.Expr) ->
+                        let wanted = substFableType subst p
+
+                        if hasTypeParams wanted then
+                            a
+                        else
+                            adaptTo ctx.Com wanted a
+                    )
+                    c.ArgTypes
+                    allArgs
             | _ -> allArgs
 
         let args = allArgs |> List.map (lw ctx)

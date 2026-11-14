@@ -138,7 +138,6 @@ let ``test Picks the right witness II`` () =
     getFirstAndLastName {| FirstName = "Alfonso"; LastName = "Horigome" |}
     |> equal "Alfonso Horigome"
 
-#if !FABLE_COMPILER_ZIG // (a generic local value: F# generalizes `let a = Ok string`, and Fable gives its type parameter as obj)
 [<Fact>]
 let ``test Infix applicative can be generated`` () =
     let r = Ok 1
@@ -146,9 +145,7 @@ let ``test Infix applicative can be generated`` () =
     match a <*> r with
     | Ok x -> equal "1" x
     | _ -> failwith "expected Ok('1')"
-#endif
 
-#if !FABLE_COMPILER_ZIG // (a generic local value: F# generalizes `let a = Ok string`, and Fable gives its type parameter as obj)
 [<Fact>]
 let ``test Infix applicative with inline functions can be generated`` () =
     let r = Ok 1
@@ -156,7 +153,6 @@ let ``test Infix applicative with inline functions can be generated`` () =
     match applyInline a r with
     | Ok x -> equal "1" x
     | _ -> failwith "expected Ok('1')"
-#endif
 
 [<Fact>]
 let ``test Infix applicative with inline composed functions can be generated`` () =
@@ -166,7 +162,6 @@ let ``test Infix applicative with inline composed functions can be generated`` (
     | Ok x -> equal 1 x
     | _ -> failwith "expected Ok(1)"
 
-#if !FABLE_COMPILER_ZIG // (a generic local value: F# generalizes `let a = Ok string`, and Fable gives its type parameter as obj)
 [<Fact>]
 let ``test Infix applicative with even more inline functions can be generated`` () =
     let r = Ok (fun x -> x + 1)
@@ -174,7 +169,6 @@ let ``test Infix applicative with even more inline functions can be generated`` 
     match applyInline a r with
     | Ok addOne -> equal 2 (addOne 1)
     | _ -> failwith "expected Ok(addOne) where addOne(1) = 2"
-#endif
 
 [<Fact>]
 let ``test Inline code doesn't call many times function with side effects`` () = // See #1321
