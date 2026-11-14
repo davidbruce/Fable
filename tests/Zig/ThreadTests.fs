@@ -83,3 +83,30 @@ let ``test lock keeps a shared counter and list right`` () =
 let ``test lock can be taken again by the thread that holds it`` () =
     let gate = obj ()
     lock gate (fun () -> lock gate (fun () -> 7)) |> equal 7
+
+[<Fact>]
+let ``test Interlocked counts from several threads and swaps values`` () =
+    let counter = ref 0
+
+    let threads =
+        [
+            for _ in 0..3 ->
+                Thread(fun () ->
+                    for _ in 1..5_000 do
+                        Interlocked.Increment(&counter.contents) |> ignore
+                )
+        ]
+
+    for t in threads do
+        t.Start()
+
+    for t in threads do
+        t.Join()
+
+    counter.Value |> equal 20_000
+    let mutable local = 5
+    Interlocked.Add(&local, 10) |> equal 15
+    Interlocked.Exchange(&local, 3) |> equal 15
+    Interlocked.CompareExchange(&local, 9, 3) |> equal 3
+    Interlocked.CompareExchange(&local, 1, 3) |> equal 9
+    Interlocked.Decrement(&local) |> equal 8

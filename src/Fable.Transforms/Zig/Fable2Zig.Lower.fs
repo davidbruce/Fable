@@ -2932,6 +2932,17 @@ let rec tryAddress (ir: Expr) : Expr option =
         ->
         Some ir
     | EVar v -> Some(EAddr(EVar v, not v.FMutable))
+    // (a field of a reference record that holds a plain value, as `&counter.contents` for
+    // `Interlocked`: what is written through it needs no count)
+    | EGet(EVar _ as cell, PField f, ty) when
+        not (isManaged ty)
+        && (
+            match typeOf cell with
+            | TEnt({ Kind = KRefRecord }, _) -> true
+            | _ -> false
+        )
+        ->
+        Some(EAddr(EGet(cell, PField f, ty), false))
     // (a module-level mutable value, read: its own place)
     | EEmit("fable_rt.dup($0)", [ EVar v ], _) when v.Kind = VGlobal -> Some(EAddr(EVar v, not v.FMutable))
     | ELet(v, rhs, body) -> tryAddress body |> Option.map (fun b -> ELet(v, rhs, b))

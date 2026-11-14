@@ -1197,6 +1197,28 @@ let call
     // `lock o f`: .NET's Monitor (the runtime's lockRun, re-entrant); `obj ()`: an object to lock on
     | "Microsoft.FSharp.Core.Operators", "Lock", [ o; f ] -> rt "fable_rt.lockRun($0, $1)" [ o; f ] (mapType ctx r t)
     | "System.Object", ".ctor", [] -> pure' "fable_rt.objectNew()" [] tAny
+    // ---- `Interlocked`: atomic operations on the place of an integer (a variable, a field) ----
+    | "System.Threading.Interlocked", name, place :: rest when
+        (match place.Type with
+         | Fable.Number((Int32 | Int64 | UInt32 | UInt64), _) -> true
+         | Fable.DeclaredType(e, [ Fable.Number((Int32 | Int64 | UInt32 | UInt64), _) ]) ->
+             e.FullName = "Microsoft.FSharp.Core.byref`2"
+             || e.FullName = "Microsoft.FSharp.Core.byref`3"
+         | _ -> false)
+        ->
+        let macro =
+            match name, rest.Length with
+            | "Increment", 0 -> "(@atomicRmw($R, $0, .Add, 1, .seq_cst) +% 1)"
+            | "Decrement", 0 -> "(@atomicRmw($R, $0, .Sub, 1, .seq_cst) -% 1)"
+            | "Add", 1 -> "(@atomicRmw($R, $0, .Add, $1, .seq_cst) +% $1)"
+            | "Exchange", 1 -> "@atomicRmw($R, $0, .Xchg, $1, .seq_cst)"
+            | "CompareExchange", 2 -> "(@cmpxchgStrong($R, $0, $2, $1, .seq_cst, .seq_cst) orelse $2)"
+            | "Read", 0 -> "@atomicLoad($R, $0, .seq_cst)"
+            | _ -> fail r "the Zig target does not support Interlocked.%s yet" name
+
+        match tryAddress (lw ctx place) with
+        | Some p -> bindArgs ctx (p :: List.map (lw ctx) rest) (fun xs -> EEmit(macro, xs, mapType ctx r t))
+        | None -> fail r "the Zig target cannot take the address of this place for Interlocked yet"
     // ---- threads (the runtime's ThreadOf: what the function captured is shared when it starts) ----
     | "System.Threading.Thread", ".ctor", [ start ] ->
         pure' "fable_rt.threadNew($0)" [ start ] (TPrim "fable_rt.ThreadOf")
