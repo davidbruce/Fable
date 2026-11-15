@@ -479,6 +479,44 @@ let call
             | _ -> Fable.TypeCast(cmp, iface)
 
         libraryCall ctx r "HashSet" "ofSeqWith" { info with GenericArgs = [ key ] } [ xs; cmp ] t
+    // `m.TryGetValue(key, &value)` of an F# map: its tryFind, and the variable set when found
+    | "Microsoft.FSharp.Collections.FSharpMap`2",
+      "TryGetValue",
+      [ m; k; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+        ctx.Vars.ContainsKey out.Name
+        ->
+        let outVar = ctx.Vars[out.Name]
+        let tmp = ctx.State.NewVar("found", TOpt outVar.Ty, VLocal, false)
+
+        let found =
+            libraryCall
+                ctx
+                r
+                "Map"
+                "memberTryFind"
+                { info with
+                    ThisArg = None
+                    Args = [ m; k ]
+                    GenericArgs =
+                        (match m.Type with
+                         | Fable.DeclaredType(_, [ kt; vt ]) -> [ kt; vt ]
+                         | _ -> [ k.Type; out.Type ])
+                    SignatureArgTypes = []
+                    MemberRef = None
+                }
+                [ m; k ]
+                (Fable.Option(out.Type, false))
+
+        ELet(
+            tmp,
+            found,
+            EIf(
+                EPrim("not", [ ETest(EVar tmp, "None", TOpt outVar.Ty) ], tBool),
+                ESeq(EAssign(outVar, EGet(EVar tmp, PSome, outVar.Ty)), ELit("true", tBool)),
+                ELit("false", tBool),
+                tBool
+            )
+        )
     | "System.Collections.Generic.Dictionary`2", _, d :: rest ->
         match name, rest with
         | "Add", [ k; v ] -> rt "fable_rt.dictAdd($0, $1, $2)" [ d; k; v ] tVoid
