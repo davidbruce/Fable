@@ -346,9 +346,19 @@ let settleManaged (state: FileState) =
 /// type gets the same one. (For a generic type it is the answer whatever the type arguments
 /// are; whether an instance is cyclic because of its arguments is decided when the Zig is
 /// compiled: `fable_rt.holdsCyclic`.)
+let private isMutableRuntimeCellName (name: string) =
+    name = "fable_rt.Array"
+    || name = "fable_rt.ResizeArray"
+    || name = "fable_rt.Dictionary"
+    || name = "fable_rt.HashSet"
+    || name = "fable_rt.Lazy"
+
 let settleCyclic (state: FileState) =
     let isCell (e: Ent) =
         e.Kind = KHeapUnion || e.Kind = KRefRecord
+
+    let isAssignableCell (e: Ent) =
+        isCell e && (not e.MutableFields.IsEmpty || isMutableRuntimeCellName e.Name)
 
     let cells = state.Ents.Values |> Seq.filter isCell |> List.ofSeq
 
@@ -373,7 +383,7 @@ let settleCyclic (state: FileState) =
                     [], false
 
             // (the type arguments of a cell with assignable fields are what those fields hold)
-            let assignable = isCell e && not e.MutableFields.IsEmpty
+            let assignable = isAssignableCell e
 
             let inArgs =
                 args
@@ -392,6 +402,13 @@ let settleCyclic (state: FileState) =
     let reachesAny = HashSet<Ent>()
 
     for e in cells do
+        if
+            e.Name = "fable_rt.Lazy"
+            || e.Name = "fable_rt.Dictionary"
+            || e.Name = "fable_rt.HashSet"
+        then
+            reachesAny.Add e |> ignore
+
         for (_, fields) in e.Cases do
             for (f, t) in fields do
                 let tgts, any = targets (HashSet()) t
@@ -479,9 +496,55 @@ let settleCycles (state: FileState) =
         | TTuple ts -> List.exists reachesOpaque ts
         | _ -> false
 
+    let reachesAssignable (t: Ty) : bool =
+        let seen = HashSet<Ent>()
+
+        let rec go (t: Ty) : bool =
+            match t with
+            | TEnt(e, args) ->
+                ((e.Kind = KHeapUnion || e.Kind = KRefRecord)
+                 && (not e.MutableFields.IsEmpty || isMutableRuntimeCellName e.Name)
+                 && reachesOpaque t)
+                || List.exists go args
+                || (if seen.Add e then
+                        e.Cases |> List.exists (fun (c, _) -> caseFields t c |> List.exists (snd >> go))
+                    else
+                        false)
+            | TOpt t -> go t
+            | TTuple ts -> List.exists go ts
+            | _ -> false
+
+        go t
+
+    let rec chainFields (t: Ty) =
+        match t with
+        | TEnt(e, _) when e.Name.EndsWith("__chain", System.StringComparison.Ordinal) ->
+            caseFields t "" |> List.collect (snd >> chainFields)
+        | TEnt(e, _) when e.Name.EndsWith("__part", System.StringComparison.Ordinal) -> caseFields t "" |> List.map snd
+        | _ -> []
+
     let mutable holds = false
     let mutable generic = false
     let mutable instantiated = false
+    let mutable captures = false
+    let mutable capGeneric = false
+    let mutable capInstantiated = false
+
+    let checkOpaquePayload (t: Ty) =
+        if reachesAssignable t then
+            captures <- true
+
+        if not (freeGens [ t ]).IsEmpty then
+            capGeneric <- true
+
+    let checkField (fieldTy: Ty) =
+        if reachesOpaque fieldTy then
+            holds <- true
+
+        if not (freeGens [ fieldTy ]).IsEmpty then
+            generic <- true
+
+        checkOpaquePayload fieldTy
 
     let look (e: Expr) =
         match e with
@@ -493,36 +556,50 @@ let settleCycles (state: FileState) =
 
                     if not (freeGens [ fieldTy ]).IsEmpty then
                         generic <- true
-        // (a new object: every field of its chain can be assigned)
-        | EEmit(m, [ chain ], TPrim "fable_rt.Obj") when
-            m.StartsWith("fable_rt.objNew(", System.StringComparison.Ordinal)
-            ->
-            let rec fieldsOf (t: Ty) =
-                match t with
-                | TEnt(e, _) when e.Name.EndsWith("__chain", System.StringComparison.Ordinal) ->
-                    caseFields t "" |> List.collect (snd >> fieldsOf)
-                | TEnt(e, _) when e.Name.EndsWith("__part", System.StringComparison.Ordinal) ->
-                    caseFields t "" |> List.map snd
-                | _ -> []
+        | EExnNew(ent, args) ->
+            for a in args do
+                checkOpaquePayload (typeOf a)
 
-            for fieldTy in fieldsOf (typeOf chain) do
-                if reachesOpaque fieldTy then
+            for (_, fields) in ent.Cases do
+                for (_, fieldTy) in fields do
+                    checkOpaquePayload fieldTy
+        | EEmit(m, args, t)
+        | ERt(m, args, t) ->
+            match t with
+            | TPrim "fable_rt.Obj" when m.StartsWith("fable_rt.objNew(", System.StringComparison.Ordinal) ->
+                for a in args do
+                    for fieldTy in chainFields (typeOf a) do
+                        checkField fieldTy
+            | TEnt(ent, itemArgs) when isMutableRuntimeCellName ent.Name ->
+                if
+                    List.exists reachesOpaque itemArgs
+                    || (ent.Name = "fable_rt.Lazy" && m.Contains("lazyNew"))
+                    || m.Contains("htNewWith")
+                then
                     holds <- true
 
-                if not (freeGens [ fieldTy ]).IsEmpty then
+                if not (freeGens itemArgs).IsEmpty then
                     generic <- true
-        // (a new array is a cell whose items can be assigned)
-        | EEmit(_, _, TEnt({ Name = "fable_rt.Array" }, [ item ]))
-        | ERt(_, _, TEnt({ Name = "fable_rt.Array" }, [ item ])) ->
-            if reachesOpaque item then
-                holds <- true
+            | _ -> ()
 
-            if not (freeGens [ item ]).IsEmpty then
-                generic <- true
-        | ECall(_, typeArgs, _, _)
-        | EClosure(_, typeArgs, _, _) ->
+            if m.StartsWith("fable_rt.box(", System.StringComparison.Ordinal) then
+                for a in args do
+                    checkOpaquePayload (typeOf a)
+        | EClosure(_, typeArgs, caps, _) ->
             if List.exists reachesOpaque typeArgs then
                 instantiated <- true
+
+            if List.exists reachesAssignable typeArgs then
+                capInstantiated <- true
+
+            for c in caps do
+                checkOpaquePayload (typeOf c)
+        | ECall(_, typeArgs, _, _) ->
+            if List.exists reachesOpaque typeArgs then
+                instantiated <- true
+
+            if List.exists reachesAssignable typeArgs then
+                capInstantiated <- true
         | _ -> ()
 
         false
@@ -531,22 +608,18 @@ let settleCycles (state: FileState) =
         exists look fn.Body |> ignore
 
     for chainTy in state.AllocChains do
-        let rec fieldsOf (t: Ty) =
-            match t with
-            | TEnt(e, _) when e.Name.EndsWith("__chain", System.StringComparison.Ordinal) ->
-                caseFields t "" |> List.collect (snd >> fieldsOf)
-            | TEnt(e, _) when e.Name.EndsWith("__part", System.StringComparison.Ordinal) ->
-                caseFields t "" |> List.map snd
-            | _ -> []
+        for fieldTy in chainFields chainTy do
+            checkField fieldTy
 
-        for fieldTy in fieldsOf chainTy do
-            if reachesOpaque fieldTy then
-                holds <- true
-
-            if not (freeGens [ fieldTy ]).IsEmpty then
-                generic <- true
-
-    state.Cycles <- (holds, generic, instantiated)
+    state.Cycles <-
+        {
+            Holds = holds
+            Generic = generic
+            Instantiated = instantiated
+            Captures = captures
+            CapGeneric = capGeneric
+            CapInstantiated = capInstantiated
+        }
 
 let listName = "Microsoft.FSharp.Collections.FSharpList`1"
 

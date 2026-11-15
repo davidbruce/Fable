@@ -652,6 +652,26 @@ type ObjDecl =
         Thunks: (string * Ty * string * string * Ty) list
     }
 
+type CycleInfo =
+    {
+        Holds: bool
+        Generic: bool
+        Instantiated: bool
+        Captures: bool
+        CapGeneric: bool
+        CapInstantiated: bool
+    }
+
+let emptyCycleInfo =
+    {
+        Holds = false
+        Generic = false
+        Instantiated = false
+        Captures = false
+        CapGeneric = false
+        CapInstantiated = false
+    }
+
 type FileState() =
     let mutable varCounter = 0
     member val Fns = List<FnInfo>()
@@ -683,8 +703,8 @@ type FileState() =
     /// the generated code calls the hand-written runtime (`fable_rt.zig`)
     member val UsesRuntime = false with get, set
     /// what the file's code does that lets a function value be part of a cycle (see
-    /// `fable_rt.Cycles`): holds, generic, instantiated
-    member val Cycles = (false, false, false) with get, set
+    /// `fable_rt.Cycles`)
+    member val Cycles = emptyCycleInfo with get, set
     /// Does this file read an exception's `StackTrace`? (If no file of the program does,
     /// exceptions capture none.)
     member val UsesStackTrace = false with get, set

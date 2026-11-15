@@ -1923,7 +1923,7 @@ pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type
     return *struct {
         const Self = @This();
         pub const fable_identity = {};
-        pub const fable_cyclic = holdsCyclic(K) or holdsCyclic(V);
+        pub const fable_cyclic = functions_in_cycles or holdsCyclic(K) or holdsCyclic(V);
         pub const Entry = struct { hash: i32, next: i32, kv: ?struct { key: K, value: V } };
         @"$rc": u32 = 1,
         @"$gc": GcHdr(fable_cyclic) = undefined,
@@ -2019,13 +2019,24 @@ fn htNextSize(min: usize) usize {
     }
 }
 
+fn htInitComparers(d: anytype, eq: anytype, h: anytype) void {
+    d.cmp_eq = dup(eq);
+    d.cmp_hash = dup(h);
+    if (gcOf(d)) |hdr| {
+        storeValue(hdr, d.cmp_eq);
+        storeValue(hdr, d.cmp_hash);
+    } else {
+        touch(d.cmp_eq);
+        touch(d.cmp_hash);
+    }
+}
+
 /// A new dictionary or set whose keys an IEqualityComparer hashes and compares
 pub fn htNewWith(comptime D: type, comparer: anytype) D {
     const d = htNew(D);
     // (an interface's value may be null: then the keys' own equality, as .NET's default)
     const c = if (comptime @typeInfo(@TypeOf(comparer)) == .optional) (comparer orelse return d) else comparer;
-    d.cmp_eq = dup(@field(c, "Equals"));
-    d.cmp_hash = dup(@field(c, "GetHashCode"));
+    htInitComparers(d, @field(c, "Equals"), @field(c, "GetHashCode"));
     return d;
 }
 
@@ -2035,8 +2046,7 @@ pub fn htEmptyLike(d: anytype) @TypeOf(d) {
     if (shared) lockEnter(@intFromPtr(d));
     defer if (shared) lockExit(@intFromPtr(d));
     const e = htNew(@TypeOf(d));
-    if (d.cmp_eq) |f| e.cmp_eq = dup(f);
-    if (d.cmp_hash) |f| e.cmp_hash = dup(f);
+    if (d.cmp_eq != null and d.cmp_hash != null) htInitComparers(e, d.cmp_eq.?, d.cmp_hash.?);
     return e;
 }
 
@@ -3571,7 +3581,16 @@ const verify_cycles: bool = if (@hasDecl(@import("root"), "fable_verify_cycles")
 ///   value or an exception.
 /// What a file and the files it uses do, that the runtime adapts to: function values in cycles
 /// (see `functions_in_cycles`), and reading an exception's `StackTrace` (see `stack_traces`).
-pub const Cycles = struct { holds: bool = false, generic: bool = false, instantiated: bool = false, stack_traces: bool = false, reflection: bool = false };
+pub const Cycles = struct {
+    holds: bool = false,
+    generic: bool = false,
+    instantiated: bool = false,
+    captures: bool = false,
+    cap_generic: bool = false,
+    cap_instantiated: bool = false,
+    stack_traces: bool = false,
+    reflection: bool = false,
+};
 
 /// A file's own answer joined with those of the files it uses.
 pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
@@ -3580,6 +3599,9 @@ pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
         r.holds = r.holds or u.holds;
         r.generic = r.generic or u.generic;
         r.instantiated = r.instantiated or u.instantiated;
+        if (@hasField(@TypeOf(u), "captures")) r.captures = r.captures or u.captures;
+        if (@hasField(@TypeOf(u), "cap_generic")) r.cap_generic = r.cap_generic or u.cap_generic;
+        if (@hasField(@TypeOf(u), "cap_instantiated")) r.cap_instantiated = r.cap_instantiated or u.cap_instantiated;
         if (@hasField(@TypeOf(u), "stack_traces")) r.stack_traces = r.stack_traces or u.stack_traces;
         if (@hasField(@TypeOf(u), "reflection")) r.reflection = r.reflection or u.reflection;
     }
@@ -3589,15 +3611,14 @@ pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
 /// Can a function value or an exception be part of a cycle in this program? What they hold
 /// is not in their type, so a cell that holds one would have to be taken for cycle-capable
 /// always. But a cycle needs an assignable field to close it, and one through a function
-/// value needs an assignable field that can hold a function value. The program's root file
-/// (the one with the entry point) says in `$cycles` whether the program makes a record with
-/// such a field anywhere, joined over all the files it uses. If it does not, function values
-/// and exceptions are never part of a cycle, and neither they nor the cells that hold them
-/// need the collector. (Yes when the root file does not say.)
+/// value needs both an assignable field that can hold a function value (or exception / object)
+/// and an opaque value whose captures or fields can reach an assignable cell of that kind.
+/// The program's root file says in `$cycles`, joined over all the files it uses, whether both
+/// exist. If either does not, function values and exceptions cannot form cycles.
 pub const functions_in_cycles: bool = blk: {
     if (!@hasDecl(root, "$cycles")) break :blk true;
     const c: Cycles = root.@"$cycles";
-    break :blk c.holds or (c.generic and c.instantiated);
+    break :blk (c.holds or (c.generic and c.instantiated)) and (c.captures or (c.cap_generic and c.cap_instantiated));
 };
 
 /// Does an exception capture the stack where it is thrown? Only when some file of the program

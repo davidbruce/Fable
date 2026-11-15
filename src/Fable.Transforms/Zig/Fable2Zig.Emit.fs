@@ -1644,7 +1644,7 @@ let emitFile (state: FileState) : string =
 
     // What this file's code does that lets a function value be part of a cycle, joined with
     // what the files it uses say (see `fable_rt.functions_in_cycles`).
-    let (holds, generic, instantiated) = state.Cycles
+    let cyc = state.Cycles
 
     let used =
         match
@@ -1664,7 +1664,7 @@ let emitFile (state: FileState) : string =
 
     out
         .AppendLine(
-            $"pub const @\"$cycles\" = fable_rt.joinCycles(.{{ .holds = %s{b holds}, .generic = %s{b generic}, .instantiated = %s{b instantiated}, .stack_traces = %s{b state.UsesStackTrace}, .reflection = %s{b state.UsesReflection} }}, %s{used});"
+            $"pub const @\"$cycles\" = fable_rt.joinCycles(.{{ .holds = %s{b cyc.Holds}, .generic = %s{b cyc.Generic}, .instantiated = %s{b cyc.Instantiated}, .captures = %s{b cyc.Captures}, .cap_generic = %s{b cyc.CapGeneric}, .cap_instantiated = %s{b cyc.CapInstantiated}, .stack_traces = %s{b state.UsesStackTrace}, .reflection = %s{b state.UsesReflection} }}, %s{used});"
         )
         .AppendLine()
     |> ignore

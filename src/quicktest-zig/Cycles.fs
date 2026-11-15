@@ -348,6 +348,44 @@ let exceptionHoldsCycle () : int =
     with Carrying r ->
         walk r 12
 
+// 13. cycles formed through ResizeArray, Dictionary, and Lazy of closures
+let resizeArrayClosureCycle () : int =
+    let xs = System.Collections.Generic.List<unit -> int>()
+    let f () = xs.Count + 40
+    xs.Add f
+    (xs.[0]) ()
+
+let dictionaryClosureCycle () : int =
+    let d = System.Collections.Generic.Dictionary<int, unit -> int>()
+    let f () = d.Count + 41
+    d.[1] <- f
+    (d.[1]) ()
+
+type LazyNode =
+    | LLeaf
+    | LBranch of System.Collections.Generic.List<LazyNode>
+
+let resizeArrayUnionCycle () : int =
+    let kids = System.Collections.Generic.List<LazyNode>()
+    let root = LBranch kids
+    kids.Add root
+
+    match root with
+    | LBranch xs -> xs.Count
+    | LLeaf -> 0
+
+let lazySelfCycle () : int =
+    let holder: Lazy<int> option ref = ref None
+
+    let l =
+        lazy
+            (match holder.Value with
+             | Some _ -> 43
+             | None -> 0)
+
+    holder.Value <- Some l
+    l.Value
+
 let run () : int =
     let before = liveCells ()
 
@@ -363,6 +401,10 @@ let run () : int =
         + expect 21617 (buttons ())
         + expect 5 (selfReferringFunction ())
         + expect 42 (exceptionHoldsCycle ())
+        + expect 41 (resizeArrayClosureCycle ())
+        + expect 42 (dictionaryClosureCycle ())
+        + expect 1 (resizeArrayUnionCycle ())
+        + expect 43 (lazySelfCycle ())
         + (if counting () then
                expect 2001 (automatic ())
            else
