@@ -141,6 +141,9 @@ let call
     | "Microsoft.FSharp.Collections.ComparisonIdentity", "FromFunction", [ f ] -> arrayLib "comparerOfFunction" [ f ]
     | "Microsoft.FSharp.Collections.ComparisonIdentity", "Structural", [] ->
         arrayLib "structuralComparer" [ Fable.Value(Fable.UnitConstant, None) ]
+    // `Comparer<'T>.Default`: F#'s comparison, as an IComparer
+    | "System.Collections.Generic.Comparer`1", "get_Default", [] ->
+        arrayLib "structuralComparer" [ Fable.Value(Fable.UnitConstant, None) ]
     // ---- two-dimensional arrays: arrays that know their rows and columns ----
     | "Microsoft.FSharp.Collections.Array2DModule", "ZeroCreate", [ rows; cols ] ->
         rt "fable_rt.array2DZero($R, $0, $1)" [ rows; cols ] (mapType ctx r t)
@@ -303,6 +306,41 @@ let call
         | "IndexOf", [ _; _ ] -> libraryCall ctx r "ResizeArray" "indexOfFrom" info args t
         | "IndexOf", [ _; _; _ ] -> libraryCall ctx r "ResizeArray" "indexOfRange" info args t
         | "BinarySearch", [ _ ] -> libraryCall ctx r "ResizeArray" "binarySearch" info args t
+        // (with a comparer or a range: Array.BinarySearch over the items, which takes the same
+        // arguments after the array)
+        | "BinarySearch", _ ->
+            let item =
+                match r0.Type with
+                | Fable.Array(item, _)
+                | Fable.DeclaredType(_, [ item ]) -> item
+                | _ -> Fable.Any
+
+            let items =
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = "ToArray"
+                            Path = Replacements.DotnetPrefix + "System.Collections.Generic.List`1"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    Fable.CallInfo.Create(thisArg = r0),
+                    Fable.Array(item, Fable.MutableArray),
+                    r
+                )
+
+            dotnetCall
+                ctx
+                r
+                "System.Array"
+                "BinarySearch"
+                { info with
+                    ThisArg = None
+                    Args = items :: rest
+                }
+                t
         | ("FindAll" | "FindIndex" | "FindLastIndex" | "Exists" | "TrueForAll" | "ForEach" | "RemoveAll" | "RemoveRange" | "GetRange" | "InsertRange"),
           _
         | "AddRange", [ _ ] ->

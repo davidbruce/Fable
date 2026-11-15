@@ -194,7 +194,6 @@ let ``test ResizeArray.IndexOf works`` () =
     li.IndexOf("ab") |> equal 1
     li.IndexOf("cd") |> equal -1
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom comparers, System.Text.Encoding)
 [<Fact>]
 let ``test ResizeArray.BinarySearch works`` () =
     let ra = ResizeArray [1; 3; 5; 7; 9]
@@ -205,9 +204,7 @@ let ``test ResizeArray.BinarySearch works`` () =
     ra.BinarySearch(1, 3, 7, System.Collections.Generic.Comparer<int>.Default) |> equal 3
     ra.BinarySearch(1, 2, 8, System.Collections.Generic.Comparer<int>.Default) |> equal -4
     ra.BinarySearch(1, 2, 3, null) |> equal 1
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom comparers, System.Text.Encoding)
 [<Fact>]
 let ``test ResizeArray.BinarySearch works with an empty list, duplicates and a null range comparer`` () =
     ResizeArray<int>().BinarySearch(1) |> equal -1
@@ -216,9 +213,7 @@ let ``test ResizeArray.BinarySearch works with an empty list, duplicates and a n
     let ra = ResizeArray [1; 3; 5; 7; 9]
     ra.BinarySearch(0, 5, 2, null) |> equal -2
     ra.BinarySearch(2, 3, 9, null) |> equal 4
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom comparers, System.Text.Encoding)
 [<Fact>]
 let ``test ResizeArray.BinarySearch with a range passes the element to the comparer first`` () =
     let ra = ResizeArray [1; 3; 5; 7; 9]
@@ -230,9 +225,7 @@ let ``test ResizeArray.BinarySearch with a range passes the element to the compa
                     compare x y }
     ra.BinarySearch(1, 3, 7, logging) |> equal 3
     List.ofSeq calls |> equal [(5, 7); (7, 7)]
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom comparers, System.Text.Encoding)
 [<Fact>]
 let ``test ResizeArray.BinarySearch with a range checks index and count together`` () =
     let ra = ResizeArray [1; 3; 5; 7; 9]
@@ -247,9 +240,7 @@ let ``test ResizeArray.BinarySearch with a range checks index and count together
     raised (fun () -> ra.BinarySearch(-1, -1, 3, null)) |> equal "ArgumentOutOfRangeException"
     raised (fun () -> ra.BinarySearch(6, 0, 3, null)) |> equal "ArgumentException"
     raised (fun () -> ra.BinarySearch(0, 6, 3, null)) |> equal "ArgumentException"
-#endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom comparers, System.Text.Encoding)
 [<Fact>]
 let ``test ResizeArray.BinarySearch with a range checks its arguments`` () =
     let ra = ResizeArray [1; 3; 5; 7; 9]
@@ -264,7 +255,6 @@ let ``test ResizeArray.BinarySearch with a range checks its arguments`` () =
     raised (fun () -> ra.BinarySearch(-1, 2, 3, null)) |> equal "ArgumentOutOfRangeException"
     raised (fun () -> ra.BinarySearch(1, -1, 3, null)) |> equal "ArgumentOutOfRangeException"
     raised (fun () -> ra.BinarySearch(3, 3, 3, null)) |> equal "ArgumentException"
-#endif
 
 [<Fact>]
 let ``test ResizeArray.Remove works`` () =
@@ -367,7 +357,7 @@ let ``test ResizeArray.ToArray works`` () =
     equal 3. li[0]
     equal 2. ar[0]
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom comparers, System.Text.Encoding)
+#if !FABLE_COMPILER_ZIG // (System.Text.Encoding is not supported by the Zig target yet)
 [<Fact>]
 let ``test ResizeArray<byte>.ToArray works`` () =
     let li = ResizeArray<byte>()
@@ -375,8 +365,8 @@ let ``test ResizeArray<byte>.ToArray works`` () =
     let ar = li.ToArray()
     let text = ar |> Encoding.UTF8.GetString
     equal text "fable"
-#endif
 
+#endif
 [<Fact>]
 let ``test ResizeArray.Item is undefined when index is out of range`` () =
     let xs = ResizeArray [0]

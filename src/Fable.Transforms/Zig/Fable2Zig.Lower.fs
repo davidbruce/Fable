@@ -1386,6 +1386,18 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "Path" "DirectoryInfoOf", [])
     // (what `Parallel.For` gives: nothing here)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Tasks.ParallelLoopResult" -> tVoid
+    // (`Comparer<'T>`, as `Comparer<'T>.Default` gives it: the IComparer it is used as)
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Comparer`1" ->
+        mapType
+            ctx
+            r
+            (Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IComparer`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ item ]
+            ))
     // (.NET's threads: the runtime's ThreadOf)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Thread" -> TPrim "fable_rt.ThreadOf"
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Diagnostics.Stopwatch" ->
@@ -6403,6 +6415,15 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | _ -> buildFrom xs.Head
             )
 
+    // (`Comparer<'T>` where its IComparer is expected: the same value here)
+    | Fable.TypeCast(x, ifaceTarget) when
+        (match x.Type, unwrapNullness ifaceTarget with
+         | Fable.DeclaredType(c, [ _ ]), Fable.DeclaredType(i, [ _ ]) ->
+             c.FullName = "System.Collections.Generic.Comparer`1"
+             && i.FullName = "System.Collections.Generic.IComparer`1"
+         | _ -> false)
+        ->
+        lw ctx x
     // a value given where an interface is expected: each member, a function value that
     // holds the object
     | Fable.TypeCast(x, ifaceTarget) when isInterfaceType ctx.Com ifaceTarget && not (isInterfaceType ctx.Com x.Type) ->
