@@ -1116,7 +1116,6 @@ let ``test Seq.splitInto works`` () =
     seq {1..5} |> Seq.splitInto 4 |> Seq.toList |> equal [ [|1..2|]; [|3|]; [|4|]; [|5|] ]
     seq {1..4} |> Seq.splitInto 20 |> Seq.toList |> equal [ [|1|]; [|2|]; [|3|]; [|4|] ]
 
-#if !FABLE_COMPILER_ZIG // (Seq.transpose of collections is not supported by the Zig target yet)
 [<Fact>]
 let ``test Seq.transpose works`` () =
     let seqEqual (expected: seq<'T seq>) (actual: seq<'T seq>) =
@@ -1145,7 +1144,6 @@ let ``test Seq.transpose works`` () =
     |> seqEqual [seq ["a";"c"]; seq ["b";"d"]]
     Seq.transpose (seq { ["a";"b"]; ["c";"d"] })
     |> seqEqual [seq ["a";"c"]; seq ["b";"d"]]
-#endif
 
 [<Fact>]
 let ``test Seq.udpateAt works`` () =
@@ -1403,7 +1401,6 @@ let ``test Seq.chunkBySize, Seq.windowed and Seq.splitInto check the size when c
     raisedExceptionType (fun () -> Seq.windowed -1 xs) |> equal "ArgumentException"
     raisedExceptionType (fun () -> Seq.splitInto -1 xs) |> equal "ArgumentException"
 
-#if !FABLE_COMPILER_ZIG // (Seq.transpose of collections is not supported by the Zig target yet)
 [<Fact>]
 let ``test Seq.transpose groups jagged input by index`` () =
     let toLists (xss: seq<seq<int>>) = xss |> Seq.map Seq.toList |> Seq.toList
@@ -1414,7 +1411,6 @@ let ``test Seq.transpose groups jagged input by index`` () =
     Seq.transpose [[1; 2; 3]; [4]; [5; 6]] |> toLists |> equal [[1; 4; 5]; [2; 6]; [3]]
     Seq.transpose (seq [seq { 1; 2 }; seq { 3 }]) |> toLists |> equal [[1; 3]; [2]]
     Seq.transpose [|[|1; 2|]; [|3|]|] |> toLists |> equal [[1; 3]; [2]]
-#endif
 
 [<Fact>]
 let ``test Seq.removeManyAt raises ArgumentException where FSharp.Core does`` () =

@@ -9821,7 +9821,7 @@ and libraryCall
             },
             args
         // (a sequence of lists or arrays: each is seen as a sequence first)
-        | "Seq", "concat", [ coll; t ], [ source ] when not (isSeqType coll) ->
+        | "Seq", ("concat" | "transpose"), [ coll; t ], [ source ] when not (isSeqType coll) ->
             let seqT = Fable.DeclaredType(seqEntRef, [ t ])
 
             let x: Fable.Ident =
@@ -9859,7 +9859,7 @@ and libraryCall
                 MemberRef = None
             },
             [ mapped ]
-        | "Seq", "concat", [ _; t ], _ ->
+        | "Seq", ("concat" | "transpose"), [ _; t ], _ ->
             { info with
                 GenericArgs = [ t ]
                 SignatureArgTypes = []

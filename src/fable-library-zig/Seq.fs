@@ -680,6 +680,35 @@ let toList<'T> (source: SeqOf<'T>) : 'T list =
 
 let toArray<'T> (source: SeqOf<'T>) : 'T[] = Array.ofList (toList source)
 
+/// Rows made columns, grouped by index (jagged rows give shorter columns, as FSharp.Core does)
+let transpose<'T> (sources: SeqOf<SeqOf<'T>>) : SeqOf<SeqOf<'T>> =
+    delay (fun () ->
+        let rows = toArray (map toArray sources)
+
+        let width =
+            rows
+            |> Array.fold
+                (fun w (r: 'T[]) ->
+                    if r.Length > w then
+                        r.Length
+                    else
+                        w
+                )
+                0
+
+        ofArray (
+            Array.init
+                width
+                (fun i ->
+                    ofArray (
+                        rows
+                        |> Array.filter (fun (r: 'T[]) -> i < r.Length)
+                        |> Array.map (fun r -> r.[i])
+                    )
+                )
+        )
+    )
+
 let length<'T> (source: SeqOf<'T>) : int = fold (fun n _ -> n + 1) 0 source
 
 let isEmpty<'T> (source: SeqOf<'T>) : bool =
