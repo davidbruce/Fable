@@ -859,7 +859,6 @@ let ``test String.Join with indices works`` () =
     String.Join("*", [|"a"; "b"; "c"; "d"|], 1, 3)
     |> equal "b*c*d"
 
-#if !FABLE_COMPILER_ZIG // (a char given as obj: chars are u16 in the Zig target, and a boxed one is not told from a UInt16)
 [<Fact>]
 let ``test String.Join works with chars`` () =
     String.Join("--", 'a', 'b', 'c')
@@ -870,7 +869,6 @@ let ``test String.Join works with chars`` () =
     |> List.map (fun _ -> '*')
     |> fun chars -> String.Join("", chars)
     |> equal "***********"
-#endif
 
 [<Fact>]
 let ``test String.Join with big integers works`` () =

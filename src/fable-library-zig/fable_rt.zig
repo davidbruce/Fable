@@ -2551,6 +2551,8 @@ pub fn boxType(comptime T: type) *const ObjType {
             defer drop(o);
             const x = boxed(T, o).value;
             if (comptime hookOf(T, "fable_to_string")) return hookType(T).fable_to_string.call(.{x});
+            // (a char: the character; UInt16 is c_ushort here)
+            if (T == u16) return format(.{arg(.{ .kind = 'c' }, x)});
             // (a record, a union, a list, ...: `%A`, which is their `ToString`)
             return switch (@typeInfo(T)) {
                 .int, .float, .bool => format(.{x}),
