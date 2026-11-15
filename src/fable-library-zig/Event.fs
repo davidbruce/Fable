@@ -32,6 +32,54 @@ let publish<'T> (e: EventOf<'T>) : IEvent<'T> =
               }
     }
 
+/// .NET's `Event<'Delegate, 'Args>`, of a delegate that takes the sender and the arguments
+/// (`Action<obj, 'T>`, as `[<CLIEvent>]` members declare them): its handlers
+type DelegateEventOf<'T> = { mutable dhandlers: ResizeArray<Action<obj, 'T>> }
+
+let createDelegate<'T> () : DelegateEventOf<'T> =
+    { dhandlers = ResizeArray<Action<obj, 'T>>() }
+
+/// `e.Trigger(sender, args)`
+let triggerDelegate<'T> (e: DelegateEventOf<'T>) (sender: obj) (args: 'T) : unit =
+    let now = e.dhandlers.ToArray()
+
+    for h in now do
+        h.Invoke(sender, args)
+
+let publishDelegate<'T> (e: DelegateEventOf<'T>) : IEvent<Action<obj, 'T>, 'T> =
+    { new IEvent<Action<obj, 'T>, 'T> with
+        member _.AddHandler h = e.dhandlers.Add h
+        member _.RemoveHandler h = e.dhandlers.Remove h |> ignore
+      interface IObservable<'T> with
+          member _.Subscribe w =
+              let h = Action<obj, 'T>(fun _ v -> w.OnNext v)
+              e.dhandlers.Add h
+
+              { new IDisposable with
+                  member _.Dispose() = e.dhandlers.Remove h |> ignore
+              }
+    }
+
+/// `RuntimeHelpers.CreateEvent`, as F# makes a `[<CLIEvent>]` member of these functions
+let createEvent<'Del, 'T when 'Del: delegate<'T, unit> and 'Del :> Delegate>
+    (addHandler: 'Del -> unit)
+    (removeHandler: 'Del -> unit)
+    (createHandler: (obj -> 'T -> unit) -> 'Del)
+    : IEvent<'Del, 'T>
+    =
+    { new IEvent<'Del, 'T> with
+        member _.AddHandler h = addHandler h
+        member _.RemoveHandler h = removeHandler h
+      interface IObservable<'T> with
+          member _.Subscribe w =
+              let h = createHandler (fun _ v -> w.OnNext v)
+              addHandler h
+
+              { new IDisposable with
+                  member _.Dispose() = removeHandler h
+              }
+    }
+
 /// (FSharp.Core's functions take an event of any delegate type `'Del`: what they need of it is
 /// that it is an observable)
 let add<'Del, 'T when 'Del: delegate<'T, unit> and 'Del :> Delegate>

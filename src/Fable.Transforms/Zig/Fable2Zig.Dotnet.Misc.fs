@@ -207,6 +207,55 @@ let call
             )
     // F#'s `Event<'T>`: the library's Event.fs
     | "Microsoft.FSharp.Control.FSharpEvent`1", ".ctor", _ -> libraryCall ctx r "Event" "create" info [] t
+    // (a `[<CLIEvent>]` member, as F# makes it: the library's Event.createEvent)
+    | "Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers", "CreateEvent", [ add; remove; create ] ->
+        libraryCall
+            ctx
+            r
+            "Event"
+            "createEvent"
+            { info with
+                MemberRef = None
+                SignatureArgTypes = []
+            }
+            [ add; remove; create ]
+            t
+    // (`Event<'Delegate, 'Args>`: the library's DelegateEventOf)
+    | "Microsoft.FSharp.Control.FSharpEvent`2", name, _ ->
+        let args' =
+            match t, info.GenericArgs, args with
+            | _, [ _; a ], _ -> a
+            | _, _, e :: _ ->
+                match e.Type with
+                | Fable.DeclaredType(_, [ _; a ]) -> a
+                | _ -> Fable.Any
+            | _ -> Fable.Any
+
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "Event"
+                fn
+                { info with
+                    GenericArgs = [ args' ]
+                    MemberRef = None
+                    SignatureArgTypes = []
+                }
+                xs
+                t
+
+        match name, args |> List.filter (fun a -> a.Type <> Fable.Unit) with
+        | ".ctor", _ -> call "createDelegate" []
+        | "Trigger", [ e; sender; a ] -> call "triggerDelegate" [ e; sender; a ]
+        | "get_Publish", [ e ] -> call "publishDelegate" [ e ]
+        | _ ->
+            fail
+                r
+                "the Zig target does not support Event<'Delegate, 'Args>.%s yet (this %A, args %A)"
+                name
+                (info.ThisArg |> Option.map (fun x -> x.Type))
+                (args |> List.map (fun x -> x.Type))
     | "Microsoft.FSharp.Control.FSharpEvent`1", "Trigger", _ -> libraryCall ctx r "Event" "trigger" info args t
     | "Microsoft.FSharp.Control.FSharpEvent`1", "get_Publish", _ -> libraryCall ctx r "Event" "publish" info args t
     // `using resource f`: `f resource`, then `resource.Dispose()`, also when it raises

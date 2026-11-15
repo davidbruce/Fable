@@ -1366,6 +1366,9 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     // (F#'s `Event<'T>`: the record of the library's Event.fs)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpEvent`1" ->
         TEnt(libRecordEnt ctx "Event" "EventOf_1", [ mapType ctx r item ])
+    // (`Event<'Delegate, 'Args>`: of a delegate of the sender and the arguments)
+    | Fable.DeclaredType(ent, [ _; args ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpEvent`2" ->
+        TEnt(libRecordEnt ctx "Event" "DelegateEventOf_1", [ mapType ctx r args ])
     // (a unit of measure given as a type argument: nothing here; the numbers it marks are
     // plain numbers)
     | Fable.Measure _ -> tVoid
@@ -2121,6 +2124,10 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                 [
                     "handlers", TEnt(netEnt ctx.State "ResizeArray", [ TFn([ tAny; TGen "T" ], tVoid) ])
                 ]
+            | "DelegateEventOf_1" ->
+                [
+                    "dhandlers", TEnt(netEnt ctx.State "ResizeArray", [ TFn([ tAny; TGen "T" ], tVoid) ])
+                ]
             | "TimeSpanOf" -> [ "ticks", TPrim "i64" ]
             | "DateTimeOf" -> [ "ticks", TPrim "i64"; "kind", TPrim "i32" ]
             | "DateOnlyOf" -> [ "dayNumber", TPrim "i32" ]
@@ -2148,6 +2155,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "StackOf_1" -> [ "items" ]
             | "QueueOf_1" -> [ "items"; "head" ]
             | "EventOf_1" -> [ "handlers" ]
+            | "DelegateEventOf_1" -> [ "dhandlers" ]
             | "CancellationSource" -> [ "cancelled"; "handlers"; "disposed" ]
             | "HandOver" -> [ "handedOver" ]
             | "Timer" -> [ "live" ]

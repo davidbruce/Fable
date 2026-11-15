@@ -16,7 +16,6 @@ type ClassWithNonCLIEvent() =
     member this.TestEvent(arg) =
         event.Trigger(this, arg)
 
-#if !FABLE_COMPILER_ZIG // (events of a delegate type, Event<'Delegate, 'Args>, are not supported by the Zig target yet)
 type InterfaceWithCLIEvent<'t> =
     [<CLIEvent>]
     abstract Event : IEvent<System.Action<obj,'t>,'t>
@@ -28,7 +27,6 @@ type ClassWithInterfaceWithCLIEvent<'t>() =
     interface InterfaceWithCLIEvent<'t> with
         [<CLIEvent>]
         member _.Event = event.Publish
-#endif
 
 [<Fact>]
 let ``test Event.add works`` () =
@@ -215,7 +213,6 @@ let ``test Classes can trigger non-CLI events`` () =
     classWithEvent.TestEvent("Bye")
     equal "Hello" result
 
-#if !FABLE_COMPILER_ZIG // (events of a delegate type, Event<'Delegate, 'Args>, are not supported by the Zig target yet)
 [<Fact>]
 let ``test Classes can trigger CLI events on interfaces`` () =
     let mutable result = 0
@@ -228,9 +225,8 @@ let ``test Classes can trigger CLI events on interfaces`` () =
     classWithEvent.TestEvent(5)
     equal 5 result
     equal (box classWithEvent) sender
-#endif
 
-#if !FABLE_COMPILER_ZIG // (events of a delegate type, Event<'Delegate, 'Args>, are not supported by the Zig target yet)
+#if !FABLE_COMPILER_ZIG // (a [<CLIEvent>] member of an object expression is not supported by the Zig target yet)
 [<Fact>]
 let ``test Generic interface expression can have CLI events`` () = // See #3039
     let mutable actualSender = ""
