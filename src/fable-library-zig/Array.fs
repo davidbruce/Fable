@@ -210,27 +210,67 @@ let minBy<'T, 'U when 'U: comparison> (projection: 'T -> 'U) (array: 'T[]) : 'T 
         )
         array
 
-let sortWith<'T> (comparer: 'T -> 'T -> int) (array: 'T[]) : 'T[] =
-    Array.ofList (List.sortWith comparer (Array.toList array))
+#if FABLE_COMPILER
+[<Fable.Core.Emit("try fable_rt.arraySortWith($0, $1)")>]
+let private nativeSortWith (_comparer: 'T -> 'T -> int) (_array: 'T[]) : 'T[] = Fable.Core.Util.nativeOnly
 
-let sort<'T when 'T: comparison> (array: 'T[]) : 'T[] = sortWith compare array
+[<Fable.Core.Emit("fable_rt.arraySort($0)")>]
+let private nativeSort (_array: 'T[]) : 'T[] = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.arraySortDesc($0)")>]
+let private nativeSortDesc (_array: 'T[]) : 'T[] = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("try fable_rt.arraySortInPlaceWith($0, $1)")>]
+let private nativeSortInPlaceWith (_comparer: 'T -> 'T -> int) (_array: 'T[]) : unit = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.arraySortInPlace($0)")>]
+let private nativeSortInPlace (_array: 'T[]) : unit = Fable.Core.Util.nativeOnly
+#endif
+
+let sortWith<'T> (comparer: 'T -> 'T -> int) (array: 'T[]) : 'T[] =
+#if FABLE_COMPILER
+    nativeSortWith comparer array
+#else
+    Array.ofList (List.sortWith comparer (Array.toList array))
+#endif
+
+let sort<'T when 'T: comparison> (array: 'T[]) : 'T[] =
+#if FABLE_COMPILER
+    nativeSort array
+#else
+    sortWith compare array
+#endif
 
 let sortBy<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (array: 'T[]) : 'T[] =
     sortWith (fun a b -> compare (projection a) (projection b)) array
 
-let sortDescending<'T when 'T: comparison> (array: 'T[]) : 'T[] = sortWith (fun a b -> compare b a) array
+let sortDescending<'T when 'T: comparison> (array: 'T[]) : 'T[] =
+#if FABLE_COMPILER
+    nativeSortDesc array
+#else
+    sortWith (fun a b -> compare b a) array
+#endif
 
 let sortByDescending<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (array: 'T[]) : 'T[] =
     sortWith (fun a b -> compare (projection b) (projection a)) array
 
 /// `Array.sortInPlace`: the array itself, in order.
 let sortInPlaceWith<'T> (comparer: 'T -> 'T -> int) (array: 'T[]) : unit =
+#if FABLE_COMPILER
+    nativeSortInPlaceWith comparer array
+#else
     let sorted = sortWith comparer array
 
     for i in 0 .. array.Length - 1 do
         array.[i] <- sorted.[i]
+#endif
 
-let sortInPlace<'T when 'T: comparison> (array: 'T[]) : unit = sortInPlaceWith compare array
+let sortInPlace<'T when 'T: comparison> (array: 'T[]) : unit =
+#if FABLE_COMPILER
+    nativeSortInPlace array
+#else
+    sortInPlaceWith compare array
+#endif
 
 let sortInPlaceBy<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (array: 'T[]) : unit =
     sortInPlaceWith (fun a b -> compare (projection a) (projection b)) array

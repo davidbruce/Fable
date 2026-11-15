@@ -1586,6 +1586,11 @@ pub const arrayPut = arrays.arrayPut;
 pub const arrayRev = arrays.arrayRev;
 pub const arraySet = arrays.arraySet;
 pub const arraySlice = arrays.arraySlice;
+pub const arraySort = arrays.arraySort;
+pub const arraySortDesc = arrays.arraySortDesc;
+pub const arraySortInPlace = arrays.arraySortInPlace;
+pub const arraySortInPlaceWith = arrays.arraySortInPlaceWith;
+pub const arraySortWith = arrays.arraySortWith;
 pub const arraySub = arrays.arraySub;
 pub const arrayToList = arrays.arrayToList;
 pub const arrayZero = arrays.arrayZero;
@@ -1871,12 +1876,7 @@ pub fn raSort(r: anytype) void {
     const shared = isShared(r);
     if (shared) lockEnter(@intFromPtr(r));
     defer if (shared) lockExit(@intFromPtr(r));
-    const T = rItem(@TypeOf(r));
-    std.sort.insertion(T, r.items, {}, struct {
-        pub fn lt(_: void, a: T, b: T) bool {
-            return compare(a, b) < 0;
-        }
-    }.lt);
+    arrays.sortSliceCmp(rItem(@TypeOf(r)), r.items, false);
 }
 
 /// `r.ToArray()`

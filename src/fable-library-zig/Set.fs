@@ -10,20 +10,8 @@ let private height (t: SetTree<'T>) : int =
     | SetEmpty -> 0
     | SetNode(_, _, _, h) -> h
 
-let private node (k: 'T) (l: SetTree<'T>) (r: SetTree<'T>) : SetTree<'T> =
-    let hl = height l
-    let hr = height r
-
-    SetNode(
-        k,
-        l,
-        r,
-        (if hl < hr then
-             hr
-         else
-             hl)
-        + 1
-    )
+let inline private node (k: 'T) (l: SetTree<'T>) (r: SetTree<'T>) : SetTree<'T> =
+    SetNode(k, l, r, max (height l) (height r) + 1)
 
 let private rebalance (k: 'T) (l: SetTree<'T>) (r: SetTree<'T>) : SetTree<'T> =
     let hl = height l

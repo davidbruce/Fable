@@ -565,3 +565,213 @@ pub fn arrayForall(f: anytype, a: anytype) Raised!bool {
     }
     return true;
 }
+
+fn restoreMergeSlice(comptime T: type, items: []T, src: []const T, dst: []T, i: usize, mid: usize, j: usize, hi: usize, k: usize) void {
+    const left_rem = mid - i;
+    @memcpy(dst[k .. k + left_rem], src[i..mid]);
+    @memcpy(dst[k + left_rem .. hi], src[j..hi]);
+    if (dst.ptr == items.ptr) {
+        @memcpy(items[hi..], src[hi..]);
+    } else {
+        @memcpy(items[0..hi], dst[0..hi]);
+    }
+}
+
+fn sortSliceCore(
+    comptime T: type,
+    items: []T,
+    ctx: anytype,
+    comptime leq: fn (@TypeOf(ctx), T, T) Raised!bool,
+) Raised!void {
+    if (items.len <= 1) return;
+    const n = items.len;
+    const tmp = rt.allocator.alloc(T, n) catch @panic("fable: out of memory");
+    defer rt.allocator.free(tmp);
+    var src: []T = items;
+    var dst: []T = tmp;
+    var width: usize = 1;
+    while (width < n) {
+        const step = width *| 2;
+        var lo: usize = 0;
+        while (lo < n) : (lo +|= step) {
+            const mid = @min(lo +| width, n);
+            const hi = @min(lo +| step, n);
+            if (mid == hi) {
+                @memcpy(dst[lo..hi], src[lo..hi]);
+                continue;
+            }
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (i < mid and j < hi) : (k += 1) {
+                const take_left = leq(ctx, src[i], src[j]) catch |e| {
+                    restoreMergeSlice(T, items, src, dst, i, mid, j, hi, k);
+                    return e;
+                };
+                if (take_left) {
+                    dst[k] = src[i];
+                    i += 1;
+                } else {
+                    dst[k] = src[j];
+                    j += 1;
+                }
+            }
+            const rem = mid - i;
+            @memcpy(dst[k .. k + rem], src[i..mid]);
+            @memcpy(dst[k + rem .. hi], src[j..hi]);
+        }
+        const prev = src;
+        src = dst;
+        dst = prev;
+        width = step;
+    }
+    if (src.ptr != items.ptr) @memcpy(items, src);
+}
+
+pub fn sortSliceCmp(comptime T: type, items: []T, comptime desc: bool) void {
+    const S = struct {
+        fn leq(_: void, a: T, b: T) Raised!bool {
+            return if (desc) rt.compare(b, a) <= 0 else rt.compare(a, b) <= 0;
+        }
+    };
+    sortSliceCore(T, items, {}, S.leq) catch unreachable;
+}
+
+pub fn sortSliceWith(comptime T: type, items: []T, f: anytype) Raised!void {
+    const S = struct {
+        fn leq(g: @TypeOf(f), a: T, b: T) Raised!bool {
+            return (try apply2(i32, g, dup(a), dup(b))) <= 0;
+        }
+    };
+    return sortSliceCore(T, items, f, S.leq);
+}
+
+/// `Array.sort a`
+pub fn arraySort(a: anytype) @TypeOf(a) {
+    const out = arrayCopy(a);
+    sortSliceCmp(ItemOf(@TypeOf(a)), out.items, false);
+    return out;
+}
+
+/// `Array.sortDescending a`
+pub fn arraySortDesc(a: anytype) @TypeOf(a) {
+    const out = arrayCopy(a);
+    sortSliceCmp(ItemOf(@TypeOf(a)), out.items, true);
+    return out;
+}
+
+/// `Array.sortWith f a`
+pub fn arraySortWith(f: anytype, a: anytype) Raised!@TypeOf(a) {
+    const out = arrayCopy(a);
+    errdefer drop(out);
+    try sortSliceWith(ItemOf(@TypeOf(a)), out.items, f);
+    return out;
+}
+
+/// `Array.sortInPlace a`
+pub fn arraySortInPlace(a: anytype) void {
+    if (a.items.len <= 1) return;
+    const T = ItemOf(@TypeOf(a));
+    if (!rt.isShared(a)) {
+        sortSliceCmp(T, a.items, false);
+        return;
+    }
+    const n = a.items.len;
+    const work = rt.allocator.alloc(T, n) catch @panic("fable: out of memory");
+    for (work, 0..) |*to, i| to.* = arrayItemAt(a, i);
+    sortSliceCmp(T, work, false);
+    for (work, 0..) |x, i| arrayPut(a, i, x);
+    rt.allocator.free(work);
+}
+
+/// `Array.sortInPlaceWith f a`
+pub fn arraySortInPlaceWith(f: anytype, a: anytype) Raised!void {
+    if (a.items.len <= 1) return;
+    const T = ItemOf(@TypeOf(a));
+    if (!rt.isShared(a)) {
+        return sortSliceWith(T, a.items, f);
+    }
+    const n = a.items.len;
+    const work = rt.allocator.alloc(T, n) catch @panic("fable: out of memory");
+    for (work, 0..) |*to, i| to.* = arrayItemAt(a, i);
+    sortSliceWith(T, work, f) catch |e| {
+        arrayAbandon(work, n);
+        return e;
+    };
+    for (work, 0..) |x, i| arrayPut(a, i, x);
+    rt.allocator.free(work);
+}
+
+test "array merge sort: zero RC moves, stable, exception-safe" {
+    const A = Array(String);
+    const b0 = rt.strConcat(str("beta-"), str("0"));
+    const a0 = rt.strConcat(str("alp"), str("ha"));
+    const b1 = rt.strConcat(str("beta-"), str("1"));
+    const c0 = rt.strConcat(str("char"), str("lie"));
+    const arr = arrayFrom(A, blk: {
+        const items = arrayItems(A, 4);
+        items[0] = b0;
+        items[1] = a0;
+        items[2] = b1;
+        items[3] = c0;
+        break :blk items;
+    });
+    defer drop(arr);
+
+    // Compare by first UTF-16 unit only so beta-0 and beta-1 compare equal (stability check).
+    const S = struct {
+        const CmpCtx = struct { fail_after: i32, calls: i32 = 0 };
+        fn firstChar(_: ?*rt.Env, x: String, y: String) Raised!i32 {
+            defer drop(x);
+            defer drop(y);
+            const ux = rt.unitsOf(x);
+            const uy = rt.unitsOf(y);
+            if (ux[0] < uy[0]) return -1;
+            if (ux[0] > uy[0]) return 1;
+            return 0;
+        }
+        fn failing(env: ?*rt.Env, x: String, y: String) Raised!i32 {
+            defer drop(x);
+            defer drop(y);
+            const c: *CmpCtx = @ptrCast(@alignCast(env.?));
+            c.calls += 1;
+            if (c.calls >= c.fail_after) return error.Raised;
+            return if (rt.strCompare(x, y) < 0) -1 else if (rt.strCompare(x, y) > 0) 1 else 0;
+        }
+    };
+
+    const F = rt.Func(*const fn (?*rt.Env, String, String) Raised!i32);
+    const before = thread.stats;
+    const sorted = arraySortWith(F{ .env = null, .code = &S.firstChar }, arr) catch unreachable;
+    try std.testing.expect(eql(sorted.items[0], str("alpha")));
+    try std.testing.expect(eql(sorted.items[1], str("beta-0")));
+    try std.testing.expect(eql(sorted.items[2], str("beta-1")));
+    try std.testing.expect(eql(sorted.items[3], str("charlie")));
+    // Only the initial copy and comparator calls dup/drop; the merge itself never retains or drops items.
+    drop(sorted);
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+
+    var ctx = S.CmpCtx{ .fail_after = 2 };
+    const before_err = thread.stats;
+    const err_res = arraySortWith(F{ .env = @ptrCast(@alignCast(&ctx)), .code = &S.failing }, arr);
+    try std.testing.expectError(error.Raised, err_res);
+    try std.testing.expectEqual(thread.stats.allocs - before_err.allocs, thread.stats.frees - before_err.frees);
+
+    ctx = .{ .fail_after = 3 };
+    const before_in_place_err = thread.stats;
+    try std.testing.expectError(error.Raised, arraySortInPlaceWith(F{ .env = @ptrCast(@alignCast(&ctx)), .code = &S.failing }, arr));
+    try std.testing.expectEqual(thread.stats.allocs - before_in_place_err.allocs, thread.stats.frees - before_in_place_err.frees);
+
+    // Zero RC traffic for in-place default sort.
+    const copy = arrayCopy(arr);
+    defer drop(copy);
+    const before_sort = thread.stats;
+    arraySortInPlace(copy);
+    try std.testing.expectEqual(@as(i64, 0), thread.stats.dups - before_sort.dups);
+    try std.testing.expectEqual(@as(i64, 0), thread.stats.frees - before_sort.frees);
+    try std.testing.expectEqual(@as(i64, 0), thread.stats.allocs - before_sort.allocs);
+    try std.testing.expect(eql(copy.items[0], str("alpha")));
+    try std.testing.expect(eql(copy.items[1], str("beta-0")));
+    try std.testing.expect(eql(copy.items[2], str("beta-1")));
+    try std.testing.expect(eql(copy.items[3], str("charlie")));
+}

@@ -22,21 +22,14 @@ let private height (t: MapTree<'Key, 'Value>) : int =
     | MapEmpty -> 0
     | MapNode(_, _, _, _, h) -> h
 
-let private node (k: 'Key) (v: 'Value) (l: MapTree<'Key, 'Value>) (r: MapTree<'Key, 'Value>) : MapTree<'Key, 'Value> =
-    let hl = height l
-    let hr = height r
-
-    MapNode(
-        k,
-        v,
-        l,
-        r,
-        (if hl < hr then
-             hr
-         else
-             hl)
-        + 1
-    )
+let inline private node
+    (k: 'Key)
+    (v: 'Value)
+    (l: MapTree<'Key, 'Value>)
+    (r: MapTree<'Key, 'Value>)
+    : MapTree<'Key, 'Value>
+    =
+    MapNode(k, v, l, r, max (height l) (height r) + 1)
 
 let private rebalance
     (k: 'Key)

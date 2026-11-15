@@ -16,14 +16,12 @@ let private notFound () =
     )
 
 let length<'T> (list: 'T list) : int =
-    let mutable n = 0
-    let mutable rest = list
+    let rec go (n: int) (rest: 'T list) : int =
+        match rest with
+        | [] -> n
+        | _ :: tail -> go (n + 1) tail
 
-    while not rest.IsEmpty do
-        n <- n + 1
-        rest <- rest.Tail
-
-    n
+    go 0 list
 
 let head<'T> (list: 'T list) : 'T =
     match list with
@@ -77,14 +75,12 @@ let getItem<'T> (list: 'T list) (index: int) : 'T =
 let singleton<'T> (value: 'T) : 'T list = [ value ]
 
 let reverse<'T> (list: 'T list) : 'T list =
-    let mutable acc = []
-    let mutable rest = list
+    let rec go (acc: 'T list) (rest: 'T list) : 'T list =
+        match rest with
+        | [] -> acc
+        | x :: tail -> go (x :: acc) tail
 
-    while not rest.IsEmpty do
-        acc <- rest.Head :: acc
-        rest <- rest.Tail
-
-    acc
+    go [] list
 
 let rec append<'T> (list1: 'T list) (list2: 'T list) : 'T list =
     match list1 with
@@ -145,13 +141,14 @@ let rec iterate<'T> (action: 'T -> unit) (list: 'T list) : unit =
         iterate action rest
 
 let iterateIndexed<'T> (action: int -> 'T -> unit) (list: 'T list) : unit =
-    let mutable i = 0
-    let mutable rest = list
+    let rec go (i: int) (rest: 'T list) : unit =
+        match rest with
+        | [] -> ()
+        | x :: tail ->
+            action i x
+            go (i + 1) tail
 
-    while not rest.IsEmpty do
-        action i rest.Head
-        i <- i + 1
-        rest <- rest.Tail
+    go 0 list
 
 let rec fold<'State, 'T> (folder: 'State -> 'T -> 'State) (state: 'State) (list: 'T list) : 'State =
     match list with
@@ -251,24 +248,25 @@ let initialize<'T> (length: int) (initializer: int -> 'T) : 'T list =
     if length < 0 then
         invalidArg "count" ("The input must be non-negative.\ncount = " + string length)
 
-    let rec go (i: int) : 'T list =
+    let rec go (i: int) (acc: 'T list) : 'T list =
         if i = length then
-            []
+            reverse acc
         else
-            initializer i :: go (i + 1)
+            go (i + 1) (initializer i :: acc)
 
-    go 0
+    go 0 []
 
 let replicate<'T> (count: int) (initial: 'T) : 'T list =
     if count < 0 then
         invalidArg "count" "The input must be non-negative."
 
-    let mutable acc = []
+    let rec go (n: int) (acc: 'T list) : 'T list =
+        if n <= 0 then
+            acc
+        else
+            go (n - 1) (initial :: acc)
 
-    for _ in 1..count do
-        acc <- initial :: acc
-
-    acc
+    go count []
 
 let rec zip<'T1, 'T2> (list1: 'T1 list) (list2: 'T2 list) : ('T1 * 'T2) list =
     match list1, list2 with
@@ -516,33 +514,49 @@ let chunkBySize<'T> (chunkSize: int) (list: 'T list) : 'T list list =
     if chunkSize <= 0 then
         invalidArg "chunkSize" ("The input must be positive.\nchunkSize = " + string chunkSize)
 
-    let rec go (list: 'T list) : 'T list list =
-        match list with
-        | [] -> []
-        | _ ->
-            truncate chunkSize list
-            :: go (
-                skip
-                    (if length list < chunkSize then
-                         length list
-                     else
-                         chunkSize)
-                    list
-            )
+    let rec takeChunk (n: int) (acc: 'T list) (rest: 'T list) : 'T list * 'T list =
+        if n = 0 then
+            reverse acc, rest
+        else
+            match rest with
+            | [] -> reverse acc, []
+            | x :: tail -> takeChunk (n - 1) (x :: acc) tail
 
-    go list
+    let rec go (chunks: 'T list list) (rest: 'T list) : 'T list list =
+        match rest with
+        | [] -> reverse chunks
+        | _ ->
+            let chunk, next = takeChunk chunkSize [] rest
+            go (chunk :: chunks) next
+
+    go [] list
 
 let windowed<'T> (windowSize: int) (list: 'T list) : 'T list list =
     if windowSize <= 0 then
         invalidArg "windowSize" ("The input must be positive.\nwindowSize = " + string windowSize)
 
-    let rec go (list: 'T list) : 'T list list =
-        if length list < windowSize then
-            []
+    let rec advance (n: int) (xs: 'T list) : 'T list =
+        if n = 0 then
+            xs
         else
-            truncate windowSize list :: go (tail list)
+            match xs with
+            | [] -> []
+            | _ :: tail -> advance (n - 1) tail
 
-    go list
+    let rec takeN (n: int) (acc: 'T list) (xs: 'T list) : 'T list =
+        if n = 0 then
+            reverse acc
+        else
+            match xs with
+            | [] -> reverse acc
+            | x :: tail -> takeN (n - 1) (x :: acc) tail
+
+    let rec go (windows: 'T list list) (rest: 'T list) (lead: 'T list) : 'T list list =
+        match lead, rest with
+        | _ :: leadTail, _ :: restTail -> go (takeN windowSize [] rest :: windows) restTail leadTail
+        | _ -> reverse windows
+
+    go [] list (advance (windowSize - 1) list)
 
 let rec iterate2<'T1, 'T2> (action: 'T1 -> 'T2 -> unit) (list1: 'T1 list) (list2: 'T2 list) : unit =
     match list1, list2 with
