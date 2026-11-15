@@ -753,6 +753,8 @@ type FileState() =
     member val AllocChains = List<Ty>()
     /// how many type declarations are being mapped (they refer to each other)
     member val EntDepth = 0 with get, set
+    /// 1-arg curried lifted lambda name -> companion 2-arg flat function name (sharing the same captures)
+    member val Curried2 = Dictionary<string, string>()
 
     member this.NewVar(baseName: string, ty: Ty, kind: VarKind, isMut: bool) : Var =
         varCounter <- varCounter + 1

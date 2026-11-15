@@ -423,6 +423,67 @@ pub fn arrayMap(comptime A: type, f: anytype, a: anytype) Raised!A {
     return arrayFrom(A, items);
 }
 
+/// Progressive fill buffer used by specialized `Array.init` / `map` / `mapi` loops.
+pub fn ArrayBuf(comptime A: type) type {
+    return struct {
+        items: []ItemOf(A),
+        filled: usize = 0,
+    };
+}
+
+pub inline fn arrayBufNew(comptime A: type, n: usize) ArrayBuf(A) {
+    return .{ .items = arrayItems(A, n), .filled = 0 };
+}
+
+pub inline fn arrayBufPush(x: anytype, b: anytype) void {
+    b.items[b.filled] = x;
+    b.filled += 1;
+}
+
+pub inline fn arrayBufFinish(comptime A: type, b: ArrayBuf(A)) A {
+    return arrayFrom(A, b.items);
+}
+
+pub inline fn arrayBufAbandon(b: anytype) void {
+    arrayAbandon(b.items, b.filled);
+}
+
+/// Bitmask buffer used by specialized `Array.filter` / `where` loops.
+pub const FilterBuf = struct {
+    keep: []bool,
+    count: usize = 0,
+};
+
+pub inline fn arrayFilterNew(n: usize) FilterBuf {
+    return .{
+        .keep = rt.allocator.alloc(bool, n) catch @panic("fable: out of memory"),
+        .count = 0,
+    };
+}
+
+pub inline fn arrayFilterSet(b: *FilterBuf, i: usize, keep: bool) void {
+    b.keep[i] = keep;
+    b.count += @intFromBool(keep);
+}
+
+pub fn arrayFilterFinish(a: anytype, b: FilterBuf) @TypeOf(a) {
+    defer rt.allocator.free(b.keep);
+    const A = @TypeOf(a);
+    const items = arrayItems(A, b.count);
+    var at: usize = 0;
+    for (b.keep, 0..) |k, i| {
+        if (k and i < a.items.len and at < b.count) {
+            items[at] = arrayItemAt(a, i);
+            at += 1;
+        }
+    }
+    return arrayFrom(A, items);
+}
+
+pub inline fn arrayFilterAbandon(b: *FilterBuf) void {
+    rt.allocator.free(b.keep);
+}
+
 // ---- `Array.Parallel`: on threads (fable_rt.parallelFor); the function and the array are
 // shared first, and so is each item made ----
 

@@ -22,6 +22,7 @@ type private P =
 /// A call into the runtime that takes its first argument over (the others it borrows).
 let private ownsFirst (macro: string) =
     macro.StartsWith("fable_rt.strAppend(", System.StringComparison.Ordinal)
+    || macro.StartsWith("fable_rt.arrayBufPush(", System.StringComparison.Ordinal)
 
 let rec private asRaise (ty: Ty) (e: Expr) : Expr option =
     match e with
@@ -372,8 +373,13 @@ let rec private raisesOf (p: P) (e: Expr) : Raises =
 
     match e with
     | ERaise _ -> RAlways
-    // (what the body raises lands in the handler, which raises again what it does not handle)
-    | ETry(_, _, h, _) -> raisesOf p h
+    // (what the body raises lands in the handler, which raises again what it does not handle;
+    // when the body never raises, `ETry` itself raises `RNever` and `elideDeadTry` removes the wrapper)
+    | ETry(body, _, h, _) ->
+        if raisesOf p body = RNever then
+            RNever
+        else
+            raisesOf p h
     | ECall _
     | ERt _
     | ECallClo _
@@ -403,6 +409,25 @@ let private inferRaises (p: P) : unit =
             if r <> fn.Raises then
                 fn.Raises <- r
                 changed <- true
+
+/// Remove `try ... with ...` wrappers whose body cannot raise.
+let rec private elideDeadTry (p: P) (e: Expr) : Expr =
+    match e with
+    | ETry(body, exV, handler, ty) ->
+        let body' = elideDeadTry p body
+
+        if raisesOf p body' = RNever then
+            body'
+        else
+            ETry(body', exV, elideDeadTry p handler, ty)
+    | ELet(v, r, b) -> ELet(v, elideDeadTry p r, elideDeadTry p b)
+    | ESeq(a, b) -> ESeq(elideDeadTry p a, elideDeadTry p b)
+    | EIf(c, t, f, ty) -> EIf(elideDeadTry p c, elideDeadTry p t, elideDeadTry p f, ty)
+    | EWhile(c, b) -> EWhile(elideDeadTry p c, elideDeadTry p b)
+    | EFor(i, a, b, up, body) -> EFor(i, elideDeadTry p a, elideDeadTry p b, up, elideDeadTry p body)
+    | EAssign(v, r) -> EAssign(v, elideDeadTry p r)
+    | EStore(lv, r) -> EStore(elideDeadTry p lv, elideDeadTry p r)
+    | _ -> e
 
 /// A call that may raise becomes a statement of its own, so that it is exact what the function
 /// still owns when it does. What is evaluated before it in the same expression, and may have
@@ -663,6 +688,19 @@ let private isBorrowedRet (p: P) (fname: string) =
     | true, f -> f.RetFrom.IsSome
     | _ -> false
 
+/// Could a value of `t` be or embed a move-only resource at runtime (e.g. an unboxed
+/// struct/value-union with a type parameter that may be instantiated with `IResource`)?
+let rec private mayBeMoveOnly (t: Ty) =
+    not (isCopyable t)
+    || (
+        match t with
+        | TGen _ -> true
+        | TOpt inner -> mayBeMoveOnly inner
+        | TTuple ts -> List.exists mayBeMoveOnly ts
+        | TEnt(e, args) when e.Kind = KRecord || e.Kind = KValueUnion -> List.exists mayBeMoveOnly args
+        | _ -> false
+    )
+
 /// Variables used in owning positions.
 let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
     let flat (owning: bool) (e: Expr) =
@@ -673,7 +711,11 @@ let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
             | EVar v ->
                 if owning then
                     acc.Add v.Id |> ignore
-            | ECall(f, _, xs, _) -> List.iter2 (fun m x -> go (m = MOwned) x) (modesOf p f xs) xs
+            | ECall(f, _, xs, _) ->
+                if p.Fns.ContainsKey f then
+                    List.iter2 (fun m x -> go (m = MOwned) x) (modesOf p f xs) xs
+                else
+                    xs |> List.iter (fun x -> go (mayBeMoveOnly (typeOf x)) x)
             | ECallClo(f, xs, _) ->
                 go false f
                 List.iter (go true) xs
@@ -1224,8 +1266,29 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
 
             // Borrowed arguments of a call must stay alive for the duration of the call, so an
             // owned argument of the same call must not move them away (e.g. `c.Method(c)`).
+            // For external calls, any root var appearing in >= 2 args must also stay borrowed so
+            // `foo(x, x)` does not move `x` while another arg of the same `across` call reads it.
             let borrowedKids =
                 match e with
+                | ECall(f, _, _, _) when not (p.Fns.ContainsKey f) ->
+                    let perArg = kids |> List.map (fv >> expand env)
+                    let seen = HashSet<int>()
+                    let multi = HashSet<int>()
+
+                    for s in perArg do
+                        for id in s do
+                            if not (seen.Add id) then
+                                multi.Add id |> ignore
+
+                    List.zip flags perArg
+                    |> List.fold
+                        (fun s (own, ks) ->
+                            if own then
+                                s
+                            else
+                                Set.union s ks
+                        )
+                        (Set.ofSeq multi)
                 | ECall _
                 | ECallClo _
                 | ECallVt _
@@ -1660,8 +1723,602 @@ let private emptyEnv =
         RaiseKeep = Set.empty
     }
 
+let private capsAreImmutableVars (caps: Expr list) =
+    caps
+    |> List.forall (
+        function
+        | EVar v -> not v.FMutable && v.Kind <> VGlobal
+        | _ -> false
+    )
+
+let rec private dropDeadClosures (e: Expr) : Expr =
+    match e with
+    | ELet(v, (EClosure(_, _, caps, _) as rhs), body) ->
+        let body' = dropDeadClosures body
+
+        if not v.FMutable && capsAreImmutableVars caps && not ((fv body').Contains v.Id) then
+            body'
+        else
+            ELet(v, rhs, body')
+    | ELet(v, rhs, body) -> ELet(v, dropDeadClosures rhs, dropDeadClosures body)
+    | ESeq(a, b) -> ESeq(dropDeadClosures a, dropDeadClosures b)
+    | EIf(c, t, f, ty) -> EIf(dropDeadClosures c, dropDeadClosures t, dropDeadClosures f, ty)
+    | EWhile(c, b) -> EWhile(dropDeadClosures c, dropDeadClosures b)
+    | EFor(i, a, b, up, body) -> EFor(i, dropDeadClosures a, dropDeadClosures b, up, dropDeadClosures body)
+    | EAssign(v, r) -> EAssign(v, dropDeadClosures r)
+    | EStore(lv, r) -> EStore(dropDeadClosures lv, dropDeadClosures r)
+    | ETry(b, v, h, ty) -> ETry(dropDeadClosures b, v, dropDeadClosures h, ty)
+    | _ -> e
+
+let private resolveKnownClosure
+    (env: Map<int, string * Ty list * Expr list * Ty>)
+    (e: Expr)
+    : (string * Ty list * Expr list * Ty) option
+    =
+    match e with
+    | EClosure(target, typeArgs, caps, ty) when capsAreImmutableVars caps -> Some(target, typeArgs, caps, ty)
+    | EVar v -> env.TryFind v.Id
+    | _ -> None
+
+/// Turn calls to known closures (`let f = closure(...) in f(x)` or direct `closure(...)(x)`)
+/// into direct `ECall`s so no closure indirect call happens and unused closures can be dropped.
+let rec private foldKnownClosures
+    (fns: Dictionary<string, FnInfo>)
+    (curried2: Dictionary<string, string>)
+    (env: Map<int, string * Ty list * Expr list * Ty>)
+    (e: Expr)
+    : Expr
+    =
+    let go = foldKnownClosures fns curried2 env
+
+    let tryDirectCall (target: string) (cTypeArgs: Ty list) (caps: Expr list) (args: Expr list) (resTy: Ty) =
+        match fns.TryGetValue target with
+        | true, fn when
+            fn.Params.Length = caps.Length + args.Length
+            && fn.TypeParams.Length = cTypeArgs.Length
+            ->
+            let inst =
+                if fn.TypeParams.IsEmpty then
+                    Map.empty
+                else
+                    Map.ofList (List.zip fn.TypeParams cTypeArgs)
+
+            let fullArgs = caps @ args
+
+            if
+                List.forall2 (fun (q: Var) a -> zigType (substTy inst q.Ty) = zigType (typeOf a)) fn.Params fullArgs
+                && zigType (substTy inst fn.Ret) = zigType resTy
+            then
+                Some(ECall(target, cTypeArgs, fullArgs, resTy))
+            else
+                None
+        | _ -> None
+
+    match e with
+    | ELet(v, r, b) ->
+        let r' = go r
+
+        let env' =
+            match r' with
+            | EClosure(target, cTypeArgs, caps, cloTy) when not v.FMutable && capsAreImmutableVars caps ->
+                env.Add(v.Id, (target, cTypeArgs, caps, cloTy))
+            | _ -> env
+
+        ELet(v, r', foldKnownClosures fns curried2 env' b)
+    | ESeq(a, b) -> ESeq(go a, go b)
+    | EIf(c, t, f, ty) -> EIf(go c, go t, go f, ty)
+    | EWhile(c, b) -> EWhile(go c, go b)
+    | EFor(i, a, b, up, body) -> EFor(i, go a, go b, up, go body)
+    | EAssign(v, r) -> EAssign(v, go r)
+    | EStore(lv, r) -> EStore(go lv, go r)
+    | ETry(b, v, h, ty) -> ETry(go b, v, go h, ty)
+    | ERaise(x, ty) -> ERaise(go x, ty)
+    | _ ->
+        let e' =
+            match flatKids e with
+            | [] -> e
+            | ks -> withFlatKids e (List.map go ks)
+
+        match e' with
+        | ECallClo(fExpr, args, resTy) ->
+            match resolveKnownClosure env fExpr with
+            | Some(target, cTypeArgs, caps, TFn(ps, _)) when args.Length = ps.Length ->
+                match tryDirectCall target cTypeArgs caps args resTy with
+                | Some call -> call
+                | None -> e'
+            | Some(target, cTypeArgs, caps, TFn([ _ ], TFn([ _ ], _))) when args.Length = 2 ->
+                match curried2.TryGetValue target with
+                | true, target2 ->
+                    match tryDirectCall target2 cTypeArgs caps args resTy with
+                    | Some call -> call
+                    | None -> e'
+                | _ -> e'
+            | _ -> e'
+        | _ -> e'
+
+let private genNameRx =
+    System.Text.RegularExpressions.Regex("@\"'([^\"]+)\"", System.Text.RegularExpressions.RegexOptions.Compiled)
+
+/// Fold calls to known closures and clone intra-file higher-order functions when passed known
+/// local/file callbacks, turning indirect `f.code(...)` calls into direct calls with borrow
+/// inference and TRMC preserved.
+let private specializeHofs (state: FileState) (hooks: HashSet<string>) : unit =
+    let fns = Dictionary<string, FnInfo>()
+
+    for fn in state.Fns do
+        fns[fn.Name] <- fn
+
+    let polishFn (fn: FnInfo) =
+        fn.Body <-
+            fn.Body
+            |> foldKnownClosures fns state.Curried2 Map.empty
+            |> dropDeadClosures
+            |> cleanup
+
+    for fn in state.Fns do
+        polishFn fn
+
+    let substStr (inst: Map<string, Ty>) (s: string) =
+        if inst.IsEmpty || not (s.Contains("@\"'")) then
+            s
+        else
+            genNameRx.Replace(
+                s,
+                fun m ->
+                    match inst.TryFind m.Groups.[1].Value with
+                    | Some ty -> zigType ty
+                    | None -> m.Value
+            )
+
+    let rec instTy (inst: Map<string, Ty>) (t: Ty) =
+        if inst.IsEmpty then
+            t
+        else
+            match t with
+            | TGen n ->
+                match inst.TryFind n with
+                | Some x -> x
+                | None -> t
+            | TPrim s when s.Contains("@\"'") -> TPrim(substStr inst s)
+            | TEnt(ent, args) -> TEnt(ent, args |> List.map (instTy inst))
+            | TOpt x -> TOpt(instTy inst x)
+            | TTuple ts -> TTuple(ts |> List.map (instTy inst))
+            | TPtr(x, c) -> TPtr(instTy inst x, c)
+            | TSlice(x, c) -> TSlice(instTy inst x, c)
+            | TArr(x, n) -> TArr(instTy inst x, n)
+            | TFn(ps, r) -> TFn(ps |> List.map (instTy inst), instTy inst r)
+            | TSlot(ps, r) -> TSlot(ps |> List.map (instTy inst), instTy inst r)
+            | TTok(x, c) -> TTok(instTy inst x, c)
+            | TPrim _ -> t
+
+    let rec exprSize (e: Expr) =
+        match e with
+        | ELet(_, r, b)
+        | ESeq(r, b)
+        | EWhile(r, b)
+        | EStore(r, b) -> 1 + exprSize r + exprSize b
+        | EIf(c, t, f, _) -> 1 + exprSize c + exprSize t + exprSize f
+        | EFor(_, a, b, _, body) -> 1 + exprSize a + exprSize b + exprSize body
+        | EAssign(_, r)
+        | EDrop(_, r)
+        | EUnpack(_, r)
+        | EPromote(_, r)
+        | ERaise(r, _) -> 1 + exprSize r
+        | ETry(b, _, h, _) -> 1 + exprSize b + exprSize h
+        | _ -> 1 + (flatKids e |> List.sumBy exprSize)
+
+    let calleeUsesFnParam (calleeName: string) (pId: int) (body: Expr) =
+        exists
+            (function
+            | ECallClo(EVar v, _, _) when v.Id = pId -> true
+            | ECall(g, _, xs, _) when g <> calleeName && fns.ContainsKey g ->
+                xs
+                |> List.exists (
+                    function
+                    | EVar v -> v.Id = pId
+                    | _ -> false
+                )
+            | _ -> false)
+            body
+
+    let memo = Dictionary<string, string>()
+
+    let freshSpecName (baseName: string) =
+        let mutable i = 0
+        let mutable cand = $"%s{baseName}$spec%d{i}"
+
+        while fns.ContainsKey cand do
+            i <- i + 1
+            cand <- $"%s{baseName}$spec%d{i}"
+
+        cand
+
+    let cloneSpecializedFn
+        (callee: FnInfo)
+        (callTypeArgs: Ty list)
+        (specTypeParams: string list)
+        (specMap: Map<int, string * Ty list * Expr list * Ty>)
+        (specKey: string)
+        =
+        match memo.TryGetValue specKey with
+        | true, existing -> existing
+        | _ ->
+            let specName = freshSpecName callee.Name
+            memo[specKey] <- specName
+
+            let inst =
+                if callee.TypeParams.IsEmpty then
+                    Map.empty
+                else
+                    Map.ofList (List.zip callee.TypeParams callTypeArgs)
+
+            let varMap = Dictionary<int, Var>()
+            let specParams = List<Var>()
+            let capVarsByIdx = Dictionary<int, Var list>()
+            let localCloWrappers = List<Var * Expr>()
+
+            callee.Params
+            |> List.iteri (fun idx p ->
+                match specMap.TryFind idx with
+                | Some(cloTarget, cloTypeArgs, cloCaps, _) ->
+                    let freshCaps =
+                        cloCaps
+                        |> List.mapi (fun k c -> state.NewVar($"%s{p.Base}_c%d{k}", typeOf c, VParam, false))
+
+                    for v in freshCaps do
+                        specParams.Add v
+
+                    capVarsByIdx[idx] <- freshCaps
+                    let pTy = instTy inst p.Ty
+                    let freshClo = state.NewVar(p.Base, pTy, VLocal, false)
+                    varMap[p.Id] <- freshClo
+                    localCloWrappers.Add((freshClo, EClosure(cloTarget, cloTypeArgs, freshCaps |> List.map EVar, pTy)))
+                | None ->
+                    let p' = state.NewVar(p.Base, instTy inst p.Ty, VParam, p.FMutable)
+                    varMap[p.Id] <- p'
+                    specParams.Add p'
+            )
+
+            let mapVar (v: Var) =
+                match varMap.TryGetValue v.Id with
+                | true, v' -> v'
+                | _ -> v
+
+            let freshLocal (v: Var) =
+                let v' = state.NewVar(v.Base, instTy inst v.Ty, v.Kind, v.FMutable)
+                varMap[v.Id] <- v'
+                v'
+
+            let rec clone (e: Expr) : Expr =
+                match e with
+                | EVar v -> EVar(mapVar v)
+                | ELit(s, t) -> ELit(substStr inst s, instTy inst t)
+                | EUnit -> EUnit
+                | EPrim(op, xs, t) -> EPrim(op, xs |> List.map clone, instTy inst t)
+                | ECall(f, recTypeArgs, recArgs, recRetTy) when
+                    f = callee.Name
+                    && recTypeArgs.Length = callee.TypeParams.Length
+                    && (recTypeArgs |> List.map (instTy inst)) = callTypeArgs
+                    && recArgs.Length = callee.Params.Length
+                    && (specMap
+                        |> Map.forall (fun idx _ ->
+                            match recArgs[idx] with
+                            | EVar v -> v.Id = callee.Params[idx].Id
+                            | _ -> false
+                        ))
+                    ->
+                    let expandedRecArgs =
+                        recArgs
+                        |> List.indexed
+                        |> List.collect (fun (idx, a) ->
+                            match capVarsByIdx.TryGetValue idx with
+                            | true, caps -> caps |> List.map EVar
+                            | _ -> [ clone a ]
+                        )
+
+                    ECall(specName, specTypeParams |> List.map TGen, expandedRecArgs, instTy inst recRetTy)
+                | ECall(f, tys, xs, t) -> ECall(f, tys |> List.map (instTy inst), xs |> List.map clone, instTy inst t)
+                | ECallClo(f, xs, t) -> ECallClo(clone f, xs |> List.map clone, instTy inst t)
+                | ECallVt(f, s, xs, t) -> ECallVt(clone f, clone s, xs |> List.map clone, instTy inst t)
+                | EClosure(f, tys, xs, t) ->
+                    EClosure(f, tys |> List.map (instTy inst), xs |> List.map clone, instTy inst t)
+                | EIface(t, src, slots) ->
+                    let src' =
+                        match src with
+                        | ISrcValue x -> ISrcValue(clone x)
+                        | ISrcCaptures xs -> ISrcCaptures(xs |> List.map clone)
+                        | ISrcUpcast x -> ISrcUpcast(clone x)
+
+                    let slots' =
+                        slots |> List.map (fun (s, (f, tys)) -> s, (f, tys |> List.map (instTy inst)))
+
+                    EIface(instTy inst t, src', slots')
+                | ECallIface(r, slot, xs, t) -> ECallIface(clone r, slot, xs |> List.map clone, instTy inst t)
+                | ECon(t, c, xs, tok) -> ECon(instTy inst t, c, xs |> List.map clone, tok |> Option.map mapVar)
+                | EGet(x, p, t) -> EGet(clone x, p, instTy inst t)
+                | ETest(x, c, t) -> ETest(clone x, c, instTy inst t)
+                | EAddr(x, c) -> EAddr(clone x, c)
+                | EDeref(x, t) -> EDeref(clone x, instTy inst t)
+                | EIndex(a, b, t) -> EIndex(clone a, clone b, instTy inst t)
+                | EEmit(m, xs, t) -> EEmit(substStr inst m, xs |> List.map clone, instTy inst t)
+                | ERt(m, xs, t) -> ERt(substStr inst m, xs |> List.map clone, instTy inst t)
+                | EExnNew(ent, xs) -> EExnNew(ent, xs |> List.map clone)
+                | EExnTest(x, ent) -> EExnTest(clone x, ent)
+                | EExnGet(x, ent, f, t) -> EExnGet(clone x, ent, f, instTy inst t)
+                | EOnRaise(x, ds) -> EOnRaise(clone x, ds |> List.map mapVar)
+                | EDup(x, t) -> EDup(clone x, instTy inst t)
+                | ELet(v, r, b) ->
+                    let r' = clone r
+                    let v' = freshLocal v
+                    ELet(v', r', clone b)
+                | ESeq(a, b) -> ESeq(clone a, clone b)
+                | EIf(c, t, f, ty) -> EIf(clone c, clone t, clone f, instTy inst ty)
+                | EWhile(c, b) -> EWhile(clone c, clone b)
+                | EFor(i, a, b, up, body) ->
+                    let a' = clone a
+                    let b' = clone b
+                    let i' = freshLocal i
+                    EFor(i', a', b', up, clone body)
+                | EAssign(v, r) -> EAssign(mapVar v, clone r)
+                | EStore(lv, r) -> EStore(clone lv, clone r)
+                | EDrop(v, k) -> EDrop(mapVar v, clone k)
+                | EUnpack(u, k) ->
+                    let u' =
+                        { u with
+                            Scrut = mapVar u.Scrut
+                            Moves = u.Moves |> List.map (fun (s, v) -> s, freshLocal v)
+                            Token = u.Token |> Option.map freshLocal
+                        }
+
+                    EUnpack(u', clone k)
+                | EPromote(v, k) -> EPromote(mapVar v, clone k)
+                | ERaise(x, t) -> ERaise(clone x, instTy inst t)
+                | ETry(b, v, h, t) ->
+                    let b' = clone b
+                    let v' = freshLocal v
+                    ETry(b', v', clone h, instTy inst t)
+
+            let wrappedBody =
+                Seq.foldBack (fun (v, cExpr) acc -> ELet(v, cExpr, acc)) localCloWrappers (clone callee.Body)
+                |> foldKnownClosures fns state.Curried2 Map.empty
+                |> dropDeadClosures
+                |> cleanup
+
+            match state.Arenas.TryGetValue callee.Name with
+            | true, bytes -> state.Arenas[specName] <- bytes
+            | _ -> ()
+
+            let psList = List.ofSeq specParams
+
+            let specFn =
+                {
+                    Name = specName
+                    TypeParams = specTypeParams
+                    Params = psList
+                    Modes = psList |> List.map (fun _ -> MPlain)
+                    Ret = instTy inst callee.Ret
+                    Body = wrappedBody
+                    RetFrom = None
+                    Raises = RNever
+                    Stores = false
+                    IsLocal = true
+                    IsEntryPoint = false
+                    Range = callee.Range
+                }
+
+            state.Fns.Add specFn
+            fns[specName] <- specFn
+            specName
+
+    let rec rewriteCalls (round: int) (env: Map<int, string * Ty list * Expr list * Ty>) (e: Expr) : Expr =
+        let go = rewriteCalls round env
+
+        match e with
+        | ELet(v, r, b) ->
+            let r' = go r
+
+            let env' =
+                match r' with
+                | EClosure(target, cTypeArgs, caps, cloTy) when not v.FMutable && capsAreImmutableVars caps ->
+                    env.Add(v.Id, (target, cTypeArgs, caps, cloTy))
+                | _ -> env
+
+            ELet(v, r', rewriteCalls round env' b)
+        | ESeq(a, b) -> ESeq(go a, go b)
+        | EIf(c, t, f, ty) -> EIf(go c, go t, go f, ty)
+        | EWhile(c, b) -> EWhile(go c, go b)
+        | EFor(i, a, b, up, body) -> EFor(i, go a, go b, up, go body)
+        | EAssign(v, r) -> EAssign(v, go r)
+        | EStore(lv, r) -> EStore(go lv, go r)
+        | ETry(b, v, h, ty) -> ETry(go b, v, go h, ty)
+        | ERaise(x, ty) -> ERaise(go x, ty)
+        | _ ->
+            let e' =
+                match flatKids e with
+                | [] -> e
+                | ks -> withFlatKids e (List.map go ks)
+
+            match e' with
+            | ECall(calleeName, callTypeArgs, callArgs, callRetTy) ->
+                match fns.TryGetValue calleeName with
+                | true, callee when
+                    not (hooks.Contains calleeName)
+                    && not callee.IsEntryPoint
+                    && callee.Params.Length = callArgs.Length
+                    && callee.TypeParams.Length = callTypeArgs.Length
+                    && exprSize callee.Body <= 250
+                    && (round = 0 || not (calleeName.Contains("$spec")))
+                    ->
+                    let assigned = assignedIn callee.Body
+
+                    let specEntries =
+                        List.zip callee.Params callArgs
+                        |> List.indexed
+                        |> List.choose (fun (idx, (p, a)) ->
+                            match p.Ty with
+                            | TFn _ when not (assigned.Contains p.Id) ->
+                                match resolveKnownClosure env a with
+                                | Some(cloTarget, _, _, _) as found when
+                                    fns.ContainsKey cloTarget && calleeUsesFnParam calleeName p.Id callee.Body
+                                    ->
+                                    Some(idx, found.Value)
+                                | _ -> None
+                            | _ -> None
+                        )
+
+                    if specEntries.IsEmpty then
+                        e'
+                    else
+                        let specMap = Map.ofList specEntries
+
+                        let inst =
+                            if callee.TypeParams.IsEmpty then
+                                Map.empty
+                            else
+                                Map.ofList (List.zip callee.TypeParams callTypeArgs)
+
+                        let specTypeParams =
+                            freeGens (
+                                callTypeArgs
+                                @ [ callRetTy; instTy inst callee.Ret ]
+                                @ (callArgs
+                                   |> List.indexed
+                                   |> List.collect (fun (idx, a) ->
+                                       match specMap.TryFind idx with
+                                       | Some(_, cTys, cCaps, _) -> cTys @ (cCaps |> List.map typeOf)
+                                       | None -> [ typeOf a ]
+                                   ))
+                            )
+
+                        let typeKeyStr = callTypeArgs |> List.map tyKey |> String.concat ","
+
+                        let cloKeyStr =
+                            specEntries
+                            |> List.map (fun (idx, (t, tys, caps, cty)) ->
+                                let cTys = tys |> List.map tyKey |> String.concat ","
+                                let capTys = caps |> List.map (typeOf >> tyKey) |> String.concat ","
+                                $"%d{idx}:%s{t}<%s{cTys}>(%s{capTys}):%s{tyKey cty}"
+                            )
+                            |> String.concat ";"
+
+                        let specParamsStr = String.concat "," specTypeParams
+
+                        let specKey = $"%s{calleeName}|<%s{specParamsStr}>|<%s{typeKeyStr}>|%s{cloKeyStr}"
+
+                        let specName = cloneSpecializedFn callee callTypeArgs specTypeParams specMap specKey
+
+                        let expandedArgs =
+                            callArgs
+                            |> List.indexed
+                            |> List.collect (fun (idx, a) ->
+                                match specMap.TryFind idx with
+                                | Some(_, _, caps, _) -> caps
+                                | None -> [ a ]
+                            )
+
+                        ECall(specName, specTypeParams |> List.map TGen, expandedArgs, callRetTy)
+                | _ -> e'
+            | _ -> e'
+
+    for round in 0..1 do
+        for fn in List.ofSeq state.Fns do
+            fn.Body <-
+                rewriteCalls round Map.empty fn.Body
+                |> foldKnownClosures fns state.Curried2 Map.empty
+                |> dropDeadClosures
+                |> cleanup
+
+    for fn in state.Fns do
+        polishFn fn
+
+    // Prune local helper functions left dead after specialization / closure folding.
+    let stripRaw (s: string) =
+        if s.StartsWith("@raw:", System.StringComparison.Ordinal) then
+            s.Substring 5
+        else
+            s
+
+    let live = HashSet<string>()
+    let work = Queue<string>()
+
+    let enqueue name =
+        if fns.ContainsKey name && live.Add name then
+            work.Enqueue name
+
+    for fn in state.Fns do
+        if not fn.IsLocal || fn.IsEntryPoint || hooks.Contains fn.Name then
+            enqueue fn.Name
+
+    for (_, _, name) in state.Values do
+        enqueue name
+
+    for (_, name) in state.Tests do
+        enqueue name
+
+    for objDecl in state.Objs do
+        for table in objDecl.Tables do
+            match table with
+            | Some(_, entries) ->
+                for (_, target, _, _) in entries do
+                    enqueue (stripRaw target)
+            | None -> ()
+
+        match objDecl.ToString with
+        | Some(target, _) -> enqueue (stripRaw target)
+        | None -> ()
+
+        for (_, fn) in objDecl.Overrides do
+            enqueue fn
+
+    while work.Count > 0 do
+        let fn = fns[work.Dequeue()]
+
+        exists
+            (fun x ->
+                match x with
+                | ECall(f, _, _, _) -> enqueue f
+                | EClosure(f, _, _, ty) ->
+                    enqueue f
+
+                    match ty with
+                    | TFn([ _ ], TFn([ _ ], _)) ->
+                        match state.Curried2.TryGetValue f with
+                        | true, f2 -> enqueue f2
+                        | _ -> ()
+                    | _ -> ()
+                | EIface(_, _, slots) ->
+                    for (_, (f, _)) in slots do
+                        enqueue (stripRaw f)
+                | _ -> ()
+
+                false
+            )
+            fn.Body
+        |> ignore
+
+    let kept =
+        state.Fns
+        |> Seq.filter (fun fn -> not fn.IsLocal || live.Contains fn.Name)
+        |> List.ofSeq
+
+    state.Fns.Clear()
+    state.Fns.AddRange kept
+
 /// Run the ownership passes on every function of a file.
 let run (state: FileState) : unit =
+    // The hooks of a resource only borrow the value they are given: the runtime calls them when
+    // it gives the value up or copies it, and a hook that took it would give it up again.
+    let hooks =
+        state.Ents.Values
+        |> Seq.choose (fun e -> e.Hooks)
+        |> Seq.collect (fun (destroy, dup) -> destroy :: Option.toList dup)
+        |> HashSet
+
+    for fn in state.Fns do
+        fn.Body <- cleanup fn.Body
+
+    specializeHofs state hooks
+
     let p =
         {
             State = state
@@ -1677,10 +2334,11 @@ let run (state: FileState) : unit =
         with ZigError(msg, None) ->
             raise (ZigError(msg, fn.Range))
 
-    for fn in state.Fns do
-        fn.Body <- cleanup fn.Body
-
     inferRaises p
+
+    for fn in state.Fns do
+        fn.Body <- fn.Body |> elideDeadTry p |> cleanup
+
     inferStores p
 
     for fn in state.Fns do
@@ -1697,14 +2355,6 @@ let run (state: FileState) : unit =
             )
 
     inferBorrows p
-
-    // The hooks of a resource only borrow the value they are given: the runtime calls them when
-    // it gives the value up or copies it, and a hook that took it would give it up again.
-    let hooks =
-        state.Ents.Values
-        |> Seq.choose (fun e -> e.Hooks)
-        |> Seq.collect (fun (destroy, dup) -> destroy :: Option.toList dup)
-        |> HashSet
 
     for fn in state.Fns do
         if hooks.Contains fn.Name then

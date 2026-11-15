@@ -269,7 +269,14 @@ let call
     | "Microsoft.FSharp.Collections.ArrayModule", "Create", [ n; x ] ->
         rt "fable_rt.arrayCreate($R, $0, $1)" [ n; x ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ArrayModule", "Initialize", [ n; f ] ->
-        rt "fable_rt.arrayInit($R, $0, $1)" [ n; f ] (mapType ctx r t)
+        Fable.Transforms.Zig.Lower.trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (fun args' -> rt "fable_rt.arrayInit($R, $0, $1)" args' (mapType ctx r t))
+        |> Option.defaultWith (fun () -> rt "fable_rt.arrayInit($R, $0, $1)" [ n; f ] (mapType ctx r t))
     | "Microsoft.FSharp.Collections.ArrayModule", "Copy", [ a ] ->
         pure' "fable_rt.arrayCopy($0)" [ a ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ArrayModule", "Append", [ a; b ] ->
@@ -296,18 +303,77 @@ let call
     | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Iterate", [ f; a ] ->
         rt "fable_rt.arrayParallelIter($0, $1)" [ f; a ] tVoid
     | "Microsoft.FSharp.Collections.ArrayModule", "Map", [ f; a ] ->
-        rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
+        Fable.Transforms.Zig.Lower.trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (fun args' -> rt "fable_rt.arrayMap($R, $0, $1)" args' (mapType ctx r t))
+        |> Option.defaultWith (fun () -> rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t))
     | "Microsoft.FSharp.Collections.ArrayModule", "MapIndexed", [ f; a ] ->
-        rt "fable_rt.arrayMapi($R, $0, $1)" [ f; a ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ArrayModule", "Iterate", [ f; a ] -> rt "fable_rt.arrayIter($0, $1)" [ f; a ] tVoid
+        Fable.Transforms.Zig.Lower.trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (fun args' -> rt "fable_rt.arrayMapi($R, $0, $1)" args' (mapType ctx r t))
+        |> Option.defaultWith (fun () -> rt "fable_rt.arrayMapi($R, $0, $1)" [ f; a ] (mapType ctx r t))
+    | "Microsoft.FSharp.Collections.ArrayModule", "Iterate", [ f; a ] ->
+        Fable.Transforms.Zig.Lower.trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (fun args' -> rt "fable_rt.arrayIter($0, $1)" args' tVoid)
+        |> Option.defaultWith (fun () -> rt "fable_rt.arrayIter($0, $1)" [ f; a ] tVoid)
     | "Microsoft.FSharp.Collections.ArrayModule", "IterateIndexed", [ f; a ] ->
-        rt "fable_rt.arrayIteri($0, $1)" [ f; a ] tVoid
+        Fable.Transforms.Zig.Lower.trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (fun args' -> rt "fable_rt.arrayIteri($0, $1)" args' tVoid)
+        |> Option.defaultWith (fun () -> rt "fable_rt.arrayIteri($0, $1)" [ f; a ] tVoid)
     | "Microsoft.FSharp.Collections.ArrayModule", "Fold", [ f; state; a ] ->
-        rt "fable_rt.arrayFold($0, @as($R, $1), $2)" [ f; state; a ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ArrayModule", "Filter", [ f; a ] ->
-        rt "fable_rt.arrayFilter($0, $1)" [ f; a ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ArrayModule", "Exists", [ f; a ] -> rt "fable_rt.arrayExists($0, $1)" [ f; a ] tBool
-    | "Microsoft.FSharp.Collections.ArrayModule", "ForAll", [ f; a ] -> rt "fable_rt.arrayForall($0, $1)" [ f; a ] tBool
+        Fable.Transforms.Zig.Lower.trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (fun args' -> rt "fable_rt.arrayFold($0, @as($R, $1), $2)" args' (mapType ctx r t))
+        |> Option.defaultWith (fun () -> rt "fable_rt.arrayFold($0, @as($R, $1), $2)" [ f; state; a ] (mapType ctx r t))
+    | "Microsoft.FSharp.Collections.ArrayModule", ("Filter" | "Where"), [ f; a ] ->
+        Fable.Transforms.Zig.Lower.trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (fun args' -> rt "fable_rt.arrayFilter($0, $1)" args' (mapType ctx r t))
+        |> Option.defaultWith (fun () -> rt "fable_rt.arrayFilter($0, $1)" [ f; a ] (mapType ctx r t))
+    | "Microsoft.FSharp.Collections.ArrayModule", "Exists", [ f; a ] ->
+        Fable.Transforms.Zig.Lower.trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (fun args' -> rt "fable_rt.arrayExists($0, $1)" args' tBool)
+        |> Option.defaultWith (fun () -> rt "fable_rt.arrayExists($0, $1)" [ f; a ] tBool)
+    | "Microsoft.FSharp.Collections.ArrayModule", "ForAll", [ f; a ] ->
+        Fable.Transforms.Zig.Lower.trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (fun args' -> rt "fable_rt.arrayForall($0, $1)" args' tBool)
+        |> Option.defaultWith (fun () -> rt "fable_rt.arrayForall($0, $1)" [ f; a ] tBool)
 
     // ---- .NET's mutable collections ----
     | "System.Collections.Generic.List`1", ".ctor", ([] | [ _ ]) when

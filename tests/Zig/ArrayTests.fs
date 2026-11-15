@@ -1707,3 +1707,27 @@ let ``test UInt64 arrays roundtrip through their backing storage`` () =
     Array.sort xs |> equal [| 1UL; 2UL; System.UInt64.MaxValue |]
     Array.contains System.UInt64.MaxValue xs |> equal true
     Array.zeroCreate<uint64> 2 |> equal [| 0UL; 0UL |]
+
+[<Fact>]
+let ``test specialized Array HOFs handle capturing lambdas and heap strings`` () =
+    let tag = "a" + string 5
+    let xs = Array.init 5 (fun i -> tag + "-" + string i)
+    xs |> equal [| "a5-0"; "a5-1"; "a5-2"; "a5-3"; "a5-4" |]
+    xs |> Array.map (fun s -> s + "!") |> equal [| "a5-0!"; "a5-1!"; "a5-2!"; "a5-3!"; "a5-4!" |]
+    xs |> Array.mapi (fun i s -> string i + ":" + s) |> equal [| "0:a5-0"; "1:a5-1"; "2:a5-2"; "3:a5-3"; "4:a5-4" |]
+    xs |> Array.filter (fun s -> s.EndsWith("1") || s.EndsWith("3")) |> equal [| "a5-1"; "a5-3" |]
+    xs |> Array.where (fun s -> s.EndsWith("0") || s.EndsWith("4")) |> equal [| "a5-0"; "a5-4" |]
+    xs |> Array.fold (fun acc s -> acc + "," + s) "begin" |> equal "begin,a5-0,a5-1,a5-2,a5-3,a5-4"
+    xs |> Array.exists (fun s -> s.EndsWith("2")) |> equal true
+    xs |> Array.forall (fun s -> s.StartsWith(tag)) |> equal true
+    xs |> Array.sumBy (fun s -> s.Length) |> equal 20
+
+[<Fact>]
+let ``test specialized Array HOFs handle negative counts and abandon buffers on mid-loop exception`` () =
+    let tag = "z" + string 9
+    raisedExceptionType (fun () -> Array.init -1 (fun i -> tag + "-" + string i)) |> equal "ArgumentException"
+    throwsError "arr-init-boom" (fun () -> Array.init 6 (fun i -> if i = 4 then failwith "arr-init-boom" else tag + "-" + string i) |> ignore)
+    let xs = Array.init 6 (fun i -> tag + "-" + string i)
+    throwsError "arr-map-boom" (fun () -> xs |> Array.map (fun s -> if s.EndsWith("4") then failwith "arr-map-boom" else s + "!") |> ignore)
+    throwsError "arr-mapi-boom" (fun () -> xs |> Array.mapi (fun i s -> if i = 4 then failwith "arr-mapi-boom" else string i + ":" + s) |> ignore)
+    throwsError "arr-filter-boom" (fun () -> xs |> Array.filter (fun s -> if s.EndsWith("4") then failwith "arr-filter-boom" else true) |> ignore)

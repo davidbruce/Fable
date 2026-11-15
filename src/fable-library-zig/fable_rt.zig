@@ -1827,6 +1827,16 @@ pub const arrayParallelMap = arrays.arrayParallelMap;
 pub const arrayParallelMapi = arrays.arrayParallelMapi;
 pub const arrayParallelInit = arrays.arrayParallelInit;
 pub const arrayParallelIter = arrays.arrayParallelIter;
+pub const ArrayBuf = arrays.ArrayBuf;
+pub const arrayBufNew = arrays.arrayBufNew;
+pub const arrayBufPush = arrays.arrayBufPush;
+pub const arrayBufFinish = arrays.arrayBufFinish;
+pub const arrayBufAbandon = arrays.arrayBufAbandon;
+pub const FilterBuf = arrays.FilterBuf;
+pub const arrayFilterNew = arrays.arrayFilterNew;
+pub const arrayFilterSet = arrays.arrayFilterSet;
+pub const arrayFilterFinish = arrays.arrayFilterFinish;
+pub const arrayFilterAbandon = arrays.arrayFilterAbandon;
 pub const indexOutside = arrays.indexOutside;
 const listOf = arrays.listOf;
 test {
@@ -5261,27 +5271,50 @@ pub fn countNegative(count: i32) Raised {
     return raise(ArgumentException, format(.{ "The input must be non-negative.\ncount = ", count, " (Parameter 'count')" }));
 }
 
-/// Apply a function value to two values: at once if it takes both, one after the other if it
-/// is a function that gives a function.
 /// Apply a function value to three values, as `apply2` does to two.
 pub inline fn apply3(comptime R: type, f: anytype, a: anytype, b: anytype, c: anytype) Raised!R {
     const Code = @typeInfo(@FieldType(@TypeOf(f), "code")).pointer.child;
     const n = @typeInfo(Code).@"fn".param_types.len;
     if (comptime n == 4) return f.code(f.env, a, b, c);
     if (comptime n == 3) {
-        const g = try f.code(f.env, a, b);
+        const g = f.code(f.env, a, b) catch |err| {
+            drop(c);
+            return err;
+        };
         defer drop(g);
         return g.code(g.env, c);
     }
-    const g = try f.code(f.env, a);
+    if (comptime @hasField(@TypeOf(f), "code2")) {
+        if (f.code2) |c2| {
+            const g = c2(f.env, a, b) catch |err| {
+                drop(c);
+                return err;
+            };
+            defer drop(g);
+            return g.code(g.env, c);
+        }
+    }
+    const g = f.code(f.env, a) catch |err| {
+        drop(b);
+        drop(c);
+        return err;
+    };
     defer drop(g);
     return apply2(R, g, b, c);
 }
 
+/// Apply a function value to two values: at once if it takes both or exposes `code2`, otherwise
+/// one after the other.
 pub inline fn apply2(comptime R: type, f: anytype, a: anytype, b: anytype) Raised!R {
     const Code = @typeInfo(@FieldType(@TypeOf(f), "code")).pointer.child;
     if (comptime @typeInfo(Code).@"fn".param_types.len == 3) return f.code(f.env, a, b);
-    const g = try f.code(f.env, a);
+    if (comptime @hasField(@TypeOf(f), "code2")) {
+        if (f.code2) |c2| return c2(f.env, a, b);
+    }
+    const g = f.code(f.env, a) catch |err| {
+        drop(b);
+        return err;
+    };
     defer drop(g);
     return g.code(g.env, b);
 }
@@ -7083,11 +7116,32 @@ pub const Env = struct {
     stage_type: ?[*:0]const u8 = null,
 };
 
+pub fn Code2Of(comptime Code: type) type {
+    const Fn = @typeInfo(@typeInfo(Code).pointer.child).@"fn";
+    if (Fn.param_types.len != 2 or Fn.return_type == null) return void;
+    const R = Fn.return_type.?;
+    if (!isRaised(R)) return void;
+    const Inner = @typeInfo(R).error_union.payload;
+    if (!isFunc(Inner)) return void;
+    const InnerFn = @typeInfo(@typeInfo(@FieldType(Inner, "code")).pointer.child).@"fn";
+    if (InnerFn.param_types.len != 2 or InnerFn.return_type == null) return void;
+    return *const fn (?*Env, Fn.param_types[1].?, InnerFn.param_types[1].?) InnerFn.return_type.?;
+}
+
 pub fn Func(comptime Code: type) type {
+    const Code2 = Code2Of(Code);
+    if (Code2 == void) {
+        return struct {
+            pub const fable_func = {};
+            env: ?*Env,
+            code: Code,
+        };
+    }
     return struct {
         pub const fable_func = {};
         env: ?*Env,
         code: Code,
+        code2: ?Code2 = null,
     };
 }
 
@@ -7456,6 +7510,26 @@ pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captu
     return .{ .env = &e.header, .code = code };
 }
 
+/// A curried 2-argument function value that owns `captures` and carries a direct 2-arg entry point.
+pub inline fn closure2(
+    comptime F: type,
+    comptime Captures: type,
+    captures: Captures,
+    code: @FieldType(F, "code"),
+    code2: Code2Of(@FieldType(F, "code")),
+) F {
+    const E = EnvOf(Captures);
+    if (comptime E.cyclic) gcTick();
+    const e = allocator.create(E) catch @panic("fable: out of memory");
+    e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
+    if (comptime E.cyclic) {
+        e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
+        e.header.gc = &e.hdr;
+    }
+    if (track) thread.stats.allocs += 1;
+    return .{ .env = &e.header, .code = code, .code2 = code2 };
+}
+
 // ---- stages: a function value of several arguments that is really a function of fewer, which
 // gives a function of the rest (`let doMap setState = ...; setState`, used as a value of type
 // `SetState -> 'model -> Dispatch -> unit`). Uncurried by its type, its first part would run
@@ -7468,7 +7542,11 @@ pub fn withStage(f: anytype, comptime k: u8, s: anytype) @TypeOf(f) {
     const F = @TypeOf(f);
     const S = @TypeOf(s);
     const Caps = struct { inner: F, stage: S };
-    const out = closure(F, Caps, .{ .inner = dup(f), .stage = dup(s) }, Forward(F, Caps).code);
+    const Fwd = Forward(F, Caps);
+    const out = if (comptime @hasField(F, "code2"))
+        closure2(F, Caps, .{ .inner = dup(f), .stage = dup(s) }, Fwd.code, Fwd.code2)
+    else
+        closure(F, Caps, .{ .inner = dup(f), .stage = dup(s) }, Fwd.code);
     const e: *EnvOf(Caps) = @alignCast(@fieldParentPtr("header", out.env.?));
     e.header.stage = @ptrCast(&e.captures.stage);
     e.header.stage_arity = k;
@@ -7501,7 +7579,20 @@ fn Forward(comptime F: type, comptime Caps: type) type {
     const R = Fn.return_type.?;
     const P = Fn.param_types;
     return switch (P.len) {
-        2 => struct {
+        2 => if (comptime @hasField(F, "code2")) struct {
+            const Code2Fn = @typeInfo(Code2Of(@typeInfo(@FieldType(F, "code")).pointer.child)).pointer.child;
+            const Fn2 = @typeInfo(Code2Fn).@"fn";
+            const R2 = Fn2.return_type.?;
+            const B = Fn2.param_types[2].?;
+            fn code(env: ?*Env, a: P[1].?) R {
+                const c = captured(Caps, env);
+                return c.inner.code(c.inner.env, a);
+            }
+            fn code2(env: ?*Env, a: P[1].?, b: B) R2 {
+                const c = captured(Caps, env);
+                return apply2(Unraised(R2), c.inner, a, b);
+            }
+        } else struct {
             fn code(env: ?*Env, a: P[1].?) R {
                 const c = captured(Caps, env);
                 return c.inner.code(c.inner.env, a);
@@ -9782,6 +9873,58 @@ test "fat-pointer interface: zero-alloc class cast, upcast, and round-trip downc
         try std.testing.expect(refEql(@as(Any, obj), boxed_sub));
         try std.testing.expect(refEql(@as(?ISub, null), @as(?ISub, null)));
         try std.testing.expect(!refEql(sub, @as(?ISub, null)));
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "closure2 and apply2: zero intermediate closure alloc and exception-edge drops" {
+    const Inner = Func(*const fn (?*Env, String) Raised!i32);
+    const Outer = Func(*const fn (?*Env, i32) Raised!Inner);
+    const Caps = struct { base: i32 };
+    const Impl = struct {
+        fn innerCode(env: ?*Env, b: String) Raised!i32 {
+            defer drop(b);
+            const c = captured(Caps, env);
+            return c.base + @as(i32, @intCast(unitsOf(b).len));
+        }
+        fn code(env: ?*Env, a: i32) Raised!Inner {
+            const c = captured(Caps, env);
+            return closure(Inner, Caps, .{ .base = c.base + a }, innerCode);
+        }
+        fn code2(env: ?*Env, a: i32, b: String) Raised!i32 {
+            defer drop(b);
+            const c = captured(Caps, env);
+            return c.base + a + @as(i32, @intCast(unitsOf(b).len));
+        }
+        fn raisingFirst(_: ?*Env, _: i32) Raised!Inner {
+            return raise(ArgumentException, str("boom"));
+        }
+    };
+
+    const before = thread.stats;
+    {
+        const f = closure2(Outer, Caps, .{ .base = 10 }, Impl.code, Impl.code2);
+        defer drop(f);
+
+        const s1 = strConcat(str("he"), str("llo"));
+        const after_s1 = thread.stats.allocs;
+        const r1 = try apply2(i32, f, 5, s1);
+        try std.testing.expectEqual(@as(i32, 20), r1);
+        // apply2 invoked code2 directly without allocating an Inner closure Env.
+        try std.testing.expectEqual(after_s1, thread.stats.allocs);
+
+        // Partial application still works through 1-arg code.
+        const g = try f.code(f.env, 5);
+        defer drop(g);
+        const s2 = strConcat(str("wo"), str("rld"));
+        try std.testing.expectEqual(@as(i32, 20), try g.code(g.env, s2));
+
+        // When 1-arg code raises inside apply2, owned second argument b must be dropped.
+        const failing: Outer = .{ .env = null, .code = Impl.raisingFirst };
+        const s3 = strConcat(str("le"), str("ak?"));
+        const res = apply2(i32, failing, 1, s3);
+        try std.testing.expectError(error.Raised, res);
+        drop(take());
     }
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }

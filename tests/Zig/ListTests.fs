@@ -1364,3 +1364,31 @@ let ``test List.removeManyAt works and removes nothing for a count that is not p
     List.removeManyAt 1 -1 xs |> equal [1; 2; 3]
     List.removeManyAt 3 0 xs |> equal [1; 2; 3]
     List.removeManyAt 0 0 ([]: int list) |> equal []
+
+[<Fact>]
+let ``test specialized List HOFs handle capturing lambdas and heap strings`` () =
+    let p = "p" + string 3
+    let xs = List.init 5 (fun i -> p + "-" + string i)
+    xs |> equal [ "p3-0"; "p3-1"; "p3-2"; "p3-3"; "p3-4" ]
+    xs |> List.map (fun s -> s + "!") |> equal [ "p3-0!"; "p3-1!"; "p3-2!"; "p3-3!"; "p3-4!" ]
+    xs |> List.mapi (fun i s -> string i + ":" + s) |> equal [ "0:p3-0"; "1:p3-1"; "2:p3-2"; "3:p3-3"; "4:p3-4" ]
+    xs |> List.filter (fun s -> s.EndsWith("1") || s.EndsWith("3")) |> equal [ "p3-1"; "p3-3" ]
+    xs |> List.where (fun s -> s.EndsWith("0") || s.EndsWith("4")) |> equal [ "p3-0"; "p3-4" ]
+    xs |> List.choose (fun s -> if s.EndsWith("2") || s.EndsWith("4") then Some(s + "?") else None) |> equal [ "p3-2?"; "p3-4?" ]
+    xs |> List.fold (fun acc s -> acc + "," + s) "start" |> equal "start,p3-0,p3-1,p3-2,p3-3,p3-4"
+    xs |> List.tryFind (fun s -> s.EndsWith("3")) |> equal (Some "p3-3")
+    xs |> List.tryFind (fun s -> s.EndsWith("9")) |> equal None
+    xs |> List.exists (fun s -> s.EndsWith("4")) |> equal true
+    xs |> List.forall (fun s -> s.StartsWith(p)) |> equal true
+    xs |> List.sumBy (fun s -> s.Length) |> equal 20
+
+[<Fact>]
+let ``test specialized List HOFs plug TRMC and drop elements on mid-loop exception`` () =
+    let tag = "k" + string 7
+    throwsError "init-boom" (fun () -> List.init 6 (fun i -> if i = 4 then failwith "init-boom" else tag + "-" + string i) |> ignore)
+    let xs = List.init 6 (fun i -> tag + "-" + string i)
+    throwsError "map-boom" (fun () -> xs |> List.map (fun s -> if s.EndsWith("4") then failwith "map-boom" else s + "!") |> ignore)
+    throwsError "filter-boom" (fun () -> xs |> List.filter (fun s -> if s.EndsWith("4") then failwith "filter-boom" else true) |> ignore)
+    throwsError "choose-boom" (fun () ->
+        xs |> List.choose (fun s -> if s.EndsWith("4") then failwith "choose-boom" elif s.EndsWith("0") then None else Some(s + "?")) |> ignore
+    )

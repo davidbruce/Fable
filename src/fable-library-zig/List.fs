@@ -248,13 +248,13 @@ let initialize<'T> (length: int) (initializer: int -> 'T) : 'T list =
     if length < 0 then
         invalidArg "count" ("The input must be non-negative.\ncount = " + string length)
 
-    let rec go (i: int) (acc: 'T list) : 'T list =
+    let rec go (i: int) : 'T list =
         if i = length then
-            reverse acc
+            []
         else
-            go (i + 1) (initializer i :: acc)
+            initializer i :: go (i + 1)
 
-    go 0 []
+    go 0
 
 let replicate<'T> (count: int) (initial: 'T) : 'T list =
     if count < 0 then

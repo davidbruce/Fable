@@ -29,6 +29,8 @@ type Adapter =
     {
         Name: string
         Target: string
+        /// optional direct 2-arg flat companion function for curried 2-arg function values
+        Target2: string option
         TypeArgs: Ty list
         NCaptures: int
         /// the types of the captured values (needed for a function of another file)
@@ -67,6 +69,7 @@ type Em =
         /// the function being emitted, and the functions of the file by name
         Self: FnInfo
         Fns: Dictionary<string, FnInfo>
+        Curried2: Dictionary<string, string>
         /// a call that ends the function can be a jump (see `tailTarget`)
         CanTail: bool
         /// the labels of the `try` bodies around the code being emitted
@@ -330,7 +333,7 @@ let rec ex (em: Em) (e: Expr) : string =
                         ".plain", ex em x
                     else
                         match x with
-                        | EDup(inner, _) -> ".keep", ex em inner
+                        | EDup(inner, _) when not (touchesMutable inner) -> ".keep", ex em inner
                         | _ -> ".give", ex em x
                 )
                 |> List.unzip
@@ -344,10 +347,15 @@ let rec ex (em: Em) (e: Expr) : string =
         else
             let args = xs |> List.map (ex em) |> String.concat ", "
             $"%s{fnRef f typeArgs}(%s{args})"
-    | ECallClo(f, xs, _) ->
+    | ECallClo(f, xs, resTy) ->
         let fn = ex em f
-        let args = $"%s{fn}.env" :: (xs |> List.map (ex em)) |> String.concat ", "
-        $"%s{fn}.code(%s{args})"
+
+        match typeOf f, xs with
+        | TFn([ _ ], TFn([ _ ], _)), [ a0; a1 ] ->
+            $"fable_rt.apply2(%s{zigType resTy}, %s{fn}, %s{ex em a0}, %s{ex em a1})"
+        | _ ->
+            let args = $"%s{fn}.env" :: (xs |> List.map (ex em)) |> String.concat ", "
+            $"%s{fn}.code(%s{args})"
     | ECallVt(f, s, xs, _) ->
         let fn = ex em f
 
@@ -420,7 +428,43 @@ let rec ex (em: Em) (e: Expr) : string =
         | ISrcUpcast sub ->
             $"fable_rt.ifaceBox(%s{zigType ifaceTy}, %s{zigType (typeOf sub)}, %s{ex em sub}, &%s{ns}.vt)"
     | EClosure(target, typeArgs, caps, ty) ->
-        let key = target + "<" + (typeArgs |> List.map tyKey |> String.concat ",") + ">"
+        let target2 =
+            match ty with
+            | TFn([ tyA ], TFn([ tyB ], tyR)) ->
+                match em.Curried2.TryGetValue target with
+                | true, t2 ->
+                    match em.Fns.TryGetValue t2 with
+                    | true, fn2 when fn2.Params.Length = caps.Length + 2 ->
+                        let inst =
+                            if fn2.TypeParams.Length = typeArgs.Length then
+                                Map.ofList (List.zip fn2.TypeParams typeArgs)
+                            else
+                                Map.empty
+
+                        let rest2 = List.skip caps.Length fn2.Params
+
+                        if
+                            zigType (substTy inst rest2[0].Ty) = zigType tyA
+                            && zigType (substTy inst rest2[1].Ty) = zigType tyB
+                            && zigType (substTy inst fn2.Ret) = zigType tyR
+                        then
+                            Some t2
+                        else
+                            None
+                    | _ -> None
+                | _ -> None
+            | _ -> None
+
+        let key =
+            target
+            + "<"
+            + (typeArgs |> List.map tyKey |> String.concat ",")
+            + ">"
+            + (
+                match target2 with
+                | Some t2 -> "#2:" + t2
+                | None -> ""
+            )
 
         let adapter =
             match em.Adapters.TryGetValue key with
@@ -430,6 +474,7 @@ let rec ex (em: Em) (e: Expr) : string =
                     {
                         Name = $"@\"%s{target}$fn%d{em.Adapters.Count}\""
                         Target = target
+                        Target2 = target2
                         TypeArgs = typeArgs
                         NCaptures = caps.Length
                         CaptureTys = caps |> List.map typeOf
@@ -443,7 +488,15 @@ let rec ex (em: Em) (e: Expr) : string =
 
         let ns = adapterRef adapter
 
-        if caps.IsEmpty then
+        if adapter.Target2.IsSome then
+            if caps.IsEmpty then
+                $"%s{zigType ty}{{ .env = null, .code = %s{ns}.code, .code2 = %s{ns}.code2 }}"
+            else
+                let inits =
+                    caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
+
+                $"fable_rt.closure2(%s{zigType ty}, %s{ns}.Env, .{{ %s{inits} }}, %s{ns}.code, %s{ns}.code2)"
+        elif caps.IsEmpty then
             $"%s{zigType ty}{{ .env = null, .code = %s{ns}.code }}"
         else
             let inits =
@@ -1239,6 +1292,7 @@ let emitFunction
     (adapters: Dictionary<string, Adapter>)
     (ifaceVts: Dictionary<string, IfaceVt>)
     (fns: Dictionary<string, FnInfo>)
+    (curried2: Dictionary<string, string>)
     (fn: FnInfo)
     =
     // Is there a self call, or `let r = self(..) in Case(.., r, ..)`, where the function ends?
@@ -1321,6 +1375,7 @@ let emitFunction
             Loop = loop
             Self = fn
             Fns = fns
+            Curried2 = curried2
             TryLabels = Stack()
             CanTail =
                 not trmc
@@ -1645,6 +1700,45 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
             )
 
         finish $"%s{fnRef a.Target a.TypeArgs}(%s{args})" fn.RetFrom.IsSome dropAfter
+
+        match a.Target2, a.FnTy with
+        | Some t2, TFn([ tyA ], TFn([ tyB ], tyR)) ->
+            match fns.TryGetValue t2 with
+            | true, fn2 ->
+                line "}"
+                let captured2, rest2 = List.splitAt a.NCaptures (List.zip fn2.Params fn2.Modes)
+
+                line
+                    $"fn code2(env: ?*fable_rt.Env, a0: %s{zigType tyA}, a1: %s{zigType tyB}) fable_rt.Raised!%s{zigType tyR} {{"
+
+                if a.NCaptures > 0 then
+                    line "    const c = fable_rt.captured(Env, env);"
+                else
+                    line "    _ = env;"
+
+                let capturedArgs2 =
+                    captured2
+                    |> List.mapi (fun i (_, m) ->
+                        if m = MOwned then
+                            dupCode $"c.c%d{i}"
+                        else
+                            $"c.c%d{i}"
+                    )
+
+                let args2 = capturedArgs2 @ [ "a0"; "a1" ] |> String.concat ", "
+
+                let dropAfter2 =
+                    List.zip [ "a0"; "a1" ] rest2
+                    |> List.choose (fun (n, (_, m)) ->
+                        if m = MBorrowed then
+                            Some n
+                        else
+                            None
+                    )
+
+                finish $"%s{fnRef t2 a.TypeArgs}(%s{args2})" fn2.RetFrom.IsSome dropAfter2
+            | _ -> ()
+        | _ -> ()
     | _ ->
         // a function of another file: what it borrows is settled when the Zig is compiled
         if a.NCaptures > 0 then
@@ -2364,7 +2458,7 @@ let emitFile (state: FileState) : string =
 
     for fn in state.Fns do
         try
-            emitFunction out rootNames adapters ifaceVts fns fn
+            emitFunction out rootNames adapters ifaceVts fns state.Curried2 fn
         with ZigError(msg, None) ->
             raise (ZigError(msg, fn.Range))
 
@@ -2427,6 +2521,7 @@ let emitFile (state: FileState) : string =
                     {
                         Name = $"@\"%s{target}$fn%d{adapters.Count}\""
                         Target = target
+                        Target2 = None
                         TypeArgs = typeArgs
                         NCaptures = 0
                         CaptureTys = []
