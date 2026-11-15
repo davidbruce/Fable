@@ -32,7 +32,49 @@ let call
     let decLit = decLit ctx
     let contents = contents r
 
+    // `Console.Write`/`WriteLine`: the text as `String.Format` makes it (a lone value as `{0}`),
+    // to standard output or error
+    let console (toErr: bool) (newline: bool) (rest: Fable.Expr list) =
+        let text =
+            match rest with
+            | [] -> lw ctx (Fable.Value(Fable.StringConstant "", r))
+            | [ x ] when unwrapNullness x.Type = Fable.String -> lw ctx x
+            | [ x ] -> compositeFormat ctx r "{0}" [ x ] Fable.String
+            | (Fable.Value(Fable.StringConstant fmt, _)) :: values -> compositeFormat ctx r fmt values Fable.String
+            | _ -> fail r "the Zig target cannot write a format known only when the program runs to the console yet"
+
+        ctx.State.UsesRuntime <- true
+
+        let err =
+            if toErr then
+                "true"
+            else
+                "false"
+
+        let nl =
+            if newline then
+                "true"
+            else
+                "false"
+
+        bindArgs ctx [ text ] (fun xs -> EEmit($"fable_rt.io.consoleWrite($0, %s{err}, %s{nl})", xs, tVoid))
+
     match entity, name, args with
+    // ---- the console ----
+    | "System.Console", ("Write" | "WriteLine"), _ -> console false (name = "WriteLine") args
+    // (`Console.Error.WriteLine`, `Console.Out.Write`: the writer is the console's)
+    | "System.IO.TextWriter",
+      ("Write" | "WriteLine"),
+      (Fable.Call(Fable.Import({
+                                   Selector = ("get_Error" | "get_Out") as which
+                                   Path = path
+                               },
+                               _,
+                               _),
+                  _,
+                  _,
+                  _)) :: rest when path.EndsWith("System.Console", System.StringComparison.Ordinal) ->
+        console (which = "get_Error") (name = "WriteLine") rest
     // ---- StringBuilder ----
     | "System.Text.StringBuilder", ".ctor", [] -> pure' "fable_rt.sbNew(null)" [] (mapType ctx r t)
     | "System.Text.StringBuilder", ".ctor", [ init ] when init.Type = Fable.String ->

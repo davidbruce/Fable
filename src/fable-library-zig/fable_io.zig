@@ -23,6 +23,14 @@ pub fn programArgs(args: std.process.Args) rt.Array(String) {
     return rt.arrayFrom(rt.Array(String), items.toOwnedSlice(rt.allocator) catch @panic("fable: out of memory"));
 }
 
+// ---- the console ----
+
+/// `Console.Write`/`WriteLine` (and `Console.Error`'s): the text to standard output or error,
+/// through the sinks `printf` uses
+pub fn consoleWrite(s: String, to_err: bool, newline: bool) void {
+    rt.writeText(if (to_err) rt.write_err else rt.write_out, s, newline);
+}
+
 // ---- strings and paths ----
 
 /// The UTF-8 of `s`, ended by a zero (the caller frees it)
