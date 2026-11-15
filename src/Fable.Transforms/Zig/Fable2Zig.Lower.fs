@@ -1618,7 +1618,6 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         | Some e when e.IsInterface -> TOpt ty
         | _ -> ty
     | Fable.Any -> tAny
-    | _ -> fail r "the Zig target does not support this type yet (%A)" t
 
 /// A type argument (`obj`, as for the item type of something empty, is `obj` here too).
 and mapTypeArg (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
@@ -1643,24 +1642,11 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
             | Some e -> e
             | None -> fail r "the Zig target cannot find the type %s" entRef.FullName
 
-        // A class is a reference: a counted cell of its fields, which can all be assigned. An
-        // interface is a struct of function values, one for each of its members.
-        let isClass =
-            not (ent.IsFSharpRecord || ent.IsFSharpUnion || ent.IsInterface || ent.IsFSharpModule)
+        let isStruct =
+            ent.IsValueType
+            && not (ent.IsFSharpRecord || ent.IsFSharpUnion || ent.IsInterface || ent.IsFSharpModule)
 
-        if isClass then
-            match ent.BaseType with
-            // (a struct's base is System.ValueType: it is a plain value here)
-            | Some bt when bt.Entity.FullName = "System.ValueType" && ent.IsValueType -> ()
-            | Some bt when bt.Entity.FullName <> "System.Object" ->
-                fail
-                    r
-                    "the Zig target does not support inheritance yet (%s inherits %s)"
-                    entRef.FullName
-                    bt.Entity.FullName
-            | _ -> ()
-
-        if not (ent.IsFSharpRecord || ent.IsFSharpUnion || ent.IsInterface || isClass) then
+        if not (ent.IsFSharpRecord || ent.IsFSharpUnion || ent.IsInterface || isStruct) then
             fail r "the Zig target does not support the type %s yet" entRef.FullName
 
         let recursive = reachesSelf ctx.Com true ent
@@ -1684,13 +1670,12 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
         // A record that can be assigned to (and is not a struct), or that contains itself, is a
         // reference: a pointer to a counted cell.
         let isReference =
-            (isClass && not ent.IsValueType)
-            || ent.IsFSharpRecord
-               && (byReference
-                   || (recursive && reachesSelf ctx.Com false ent)
-                   || (not ent.IsValueType
-                       && (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
-                          |> List.exists (fun f -> f.IsMutable)))
+            ent.IsFSharpRecord
+            && (byReference
+                || (recursive && reachesSelf ctx.Com false ent)
+                || (not ent.IsValueType
+                    && (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                       |> List.exists (fun f -> f.IsMutable)))
 
         // a name in this file, or `alias.name` for a type another file declares
         let name, isLocal =
@@ -1715,10 +1700,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 TypeParams = ent.GenericParameters |> List.map (fun g -> g.Name)
                 Cases = []
                 MutableFields =
-                    if isClass then
-                        (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
-                        |> List.map (fun f -> f.Name)
-                    elif ent.IsFSharpRecord then
+                    if ent.IsFSharpRecord || isStruct then
                         (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
                         |> List.filter (fun f -> f.IsMutable)
                         |> List.map (fun f -> f.Name)
@@ -1906,14 +1888,7 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
                 match ctx.Com.TryGetEntity entRef with
                 // (a struct is a value, not an object; a class deriving from System.Exception is
                 // an exception)
-                | Some ent when isClassEntity ent && not ent.IsValueType && not (isExceptionClass ent) ->
-                    let derives =
-                        match ent.BaseType with
-                        | Some bt -> bt.Entity.FullName <> "System.Object"
-                        | None -> false
-
-                    ignore derives
-                    Some ent
+                | Some ent when isClassEntity ent && not ent.IsValueType && not (isExceptionClass ent) -> Some ent
                 | _ -> None
             | _ -> None
 

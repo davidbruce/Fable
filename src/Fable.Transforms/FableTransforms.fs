@@ -307,6 +307,13 @@ let isReferencedInsideQuote identName body =
         | _ -> false
     )
 
+let private isByRefEntityName (fullName: string) =
+    fullName = "Microsoft.FSharp.Core.byref`1"
+    || fullName = "Microsoft.FSharp.Core.byref`2"
+    || fullName = "Microsoft.FSharp.Core.inref`1"
+    || fullName = "Microsoft.FSharp.Core.outref`1"
+    || fullName = "System.ByRef`1"
+
 let canInlineArg (com: Compiler) identName value body =
     if isReferencedInsideQuote identName body then
         false
@@ -315,7 +322,8 @@ let canInlineArg (com: Compiler) identName value body =
         match value with
         // (`let t = r` where r is a byref copies the value it points at: an assignment through r
         // after it must not change t)
-        | IdentExpr { Type = DeclaredType(ent, _) } when ent.FullName = "Microsoft.FSharp.Core.byref`2" -> false
+        | IdentExpr { Type = DeclaredType(ent, _) } when com.Options.Language = Zig && isByRefEntityName ent.FullName ->
+            false
         | _ ->
 
             match value with
@@ -425,8 +433,10 @@ module private Transforms =
 
         let canInlineBinding =
             match value with
-            // (a read of another file's mutable value stays in place, as below)
-            | Import(i, _, _) -> i.IsCompilerGenerated && not (readsMutableValue value)
+            // (Zig keeps a read of another file's mutable value in place, as below)
+            | Import(i, _, _) ->
+                i.IsCompilerGenerated
+                && not (com.Options.Language = Zig && readsMutableValue value)
             | Call(callee, info, _, _) when List.isEmpty info.Args && List.contains "value" info.Tags ->
                 if readsMutableValue callee then
                     canInlineArg com ident.Name value letBody
