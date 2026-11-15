@@ -54,6 +54,9 @@ type Ctx =
         /// variables that hold an object made where they were bound (a constructor's call, an
         /// object expression) and are never assigned: not null, so used without a check
         NonNull: HashSet<string>
+        /// whole-number variables known to be greater than zero where they are used (a guard
+        /// tested it): a divisor that needs no test
+        Positive: HashSet<string>
         /// inside a `for ... in` loop: the enumerator's name, and the variable that holds the
         /// item of this round
         Enumerators: Dictionary<string, Var>
@@ -3907,53 +3910,125 @@ let rec neverNull (e: Fable.Expr) : bool =
     | Fable.Value(Fable.StringTemplate _, _) -> true
     | _ -> false
 
-/// What a condition tells of nulls: the variables (immutable, of a type that can be null) known
-/// not to be null where it is true, and where it is false. `isNull x`, `x = null`, `x <> null`,
-/// `String.IsNullOrEmpty x`, `not`, and `&&` / `||`
-let rec nullFacts (cond: Fable.Expr) : string list * string list =
+/// What a condition tells, from what its leaves tell (`atom`): the variables (immutable) of
+/// which something is known where it is true, and where it is false; through `not`, `&&` and
+/// `||` (also as F# compiles them: `if a then true else b`, `if a then b else false`)
+let rec factsOf (atom: Fable.Expr -> string list * string list) (cond: Fable.Expr) : string list * string list =
+    match cond with
+    | Fable.Operation(Fable.Unary(UnaryNot, x), _, _, _) ->
+        let t, f = factsOf atom x
+        f, t
+    | Fable.Operation(Fable.Logical(LogicalAnd, a, b), _, _, _)
+    | Fable.IfThenElse(a, b, Fable.Value(Fable.BoolConstant false, _), _) ->
+        let ta, _ = factsOf atom a
+        let tb, _ = factsOf atom b
+        ta @ tb, []
+    | Fable.Operation(Fable.Logical(LogicalOr, a, b), _, _, _)
+    | Fable.IfThenElse(a, Fable.Value(Fable.BoolConstant true, _), b, _) ->
+        let _, fa = factsOf atom a
+        let _, fb = factsOf atom b
+        [], fa @ fb
+    | _ -> atom cond
+
+let private namedImmutable (e: Fable.Expr) =
+    match e with
+    | Fable.IdentExpr i when not i.IsMutable -> Some i.Name
+    | _ -> None
+
+/// What a condition tells of nulls: the variables known not to be null where it is true, and
+/// where it is false. `isNull x`, `x = null`, `x <> null`, `String.IsNullOrEmpty x`
+let nullFacts (cond: Fable.Expr) : string list * string list =
     let isNullValue (e: Fable.Expr) =
         match e with
         | Fable.Value(Fable.Null _, _) -> true
         | Fable.Call(Fable.Import(imp, _, _), info, _, _) -> imp.Selector = "DefaultOf" && info.Args.IsEmpty
         | _ -> false
 
-    let named (e: Fable.Expr) =
+    let named = namedImmutable
+
+    factsOf
+        (fun cond ->
+            match cond with
+            | Fable.Call(Fable.Import(imp, _, _), info, _, _) ->
+                match imp.Selector, info.Args with
+                | ("IsNull" | "IsNullOrEmpty" | "IsNullOrWhiteSpace"), [ x ] -> [], Option.toList (named x)
+                | "op_Equality", [ x; n ] when isNullValue n -> [], Option.toList (named x)
+                | "op_Equality", [ n; x ] when isNullValue n -> [], Option.toList (named x)
+                | "op_Inequality", [ x; n ] when isNullValue n -> Option.toList (named x), []
+                | "op_Inequality", [ n; x ] when isNullValue n -> Option.toList (named x), []
+                | _ -> [], []
+            | Fable.Operation(Fable.Binary(BinaryEqual, x, n), _, _, _) when isNullValue n ->
+                [], Option.toList (named x)
+            | Fable.Operation(Fable.Binary(BinaryUnequal, x, n), _, _, _) when isNullValue n ->
+                Option.toList (named x), []
+            | _ -> [], []
+        )
+        cond
+
+/// What a condition tells of whole numbers: the variables known to be greater than zero (a
+/// divisor that is neither zero nor -1) where it is true, and where it is false. `x > 0`,
+/// `x >= 1`, `0 < x`, `x <= 0`, `x < 1`, and of an unsigned `x`, `x <> 0` and `x = 0`
+let positiveFacts (cond: Fable.Expr) : string list * string list =
+    let constOf (e: Fable.Expr) : int64 option =
         match e with
-        | Fable.IdentExpr i when not i.IsMutable -> Some i.Name
+        | Fable.Value(Fable.NumberConstant(v, _), _) ->
+            match v with
+            | Fable.NumberValue.Int8 n -> Some(int64 n)
+            | Fable.NumberValue.Int16 n -> Some(int64 n)
+            | Fable.NumberValue.Int32 n -> Some(int64 n)
+            | Fable.NumberValue.Int64 n -> Some n
+            | Fable.NumberValue.UInt8 n -> Some(int64 n)
+            | Fable.NumberValue.UInt16 n -> Some(int64 n)
+            | Fable.NumberValue.UInt32 n -> Some(int64 n)
+            | Fable.NumberValue.UInt64 n when n <= uint64 System.Int64.MaxValue -> Some(int64 n)
+            | _ -> None
         | _ -> None
 
-    match cond with
-    | Fable.Operation(Fable.Unary(UnaryNot, x), _, _, _) ->
-        let t, f = nullFacts x
-        f, t
-    | Fable.Operation(Fable.Logical(LogicalAnd, a, b), _, _, _) ->
-        let ta, _ = nullFacts a
-        let tb, _ = nullFacts b
-        ta @ tb, []
-    | Fable.Operation(Fable.Logical(LogicalOr, a, b), _, _, _) ->
-        let _, fa = nullFacts a
-        let _, fb = nullFacts b
-        [], fa @ fb
-    // (`a || b` and `a && b` as F# compiles them)
-    | Fable.IfThenElse(a, Fable.Value(Fable.BoolConstant true, _), b, _) ->
-        let _, fa = nullFacts a
-        let _, fb = nullFacts b
-        [], fa @ fb
-    | Fable.IfThenElse(a, b, Fable.Value(Fable.BoolConstant false, _), _) ->
-        let ta, _ = nullFacts a
-        let tb, _ = nullFacts b
-        ta @ tb, []
-    | Fable.Call(Fable.Import(imp, _, _), info, _, _) ->
-        match imp.Selector, info.Args with
-        | ("IsNull" | "IsNullOrEmpty" | "IsNullOrWhiteSpace"), [ x ] -> [], Option.toList (named x)
-        | "op_Equality", [ x; n ] when isNullValue n -> [], Option.toList (named x)
-        | "op_Equality", [ n; x ] when isNullValue n -> [], Option.toList (named x)
-        | "op_Inequality", [ x; n ] when isNullValue n -> Option.toList (named x), []
-        | "op_Inequality", [ n; x ] when isNullValue n -> Option.toList (named x), []
-        | _ -> [], []
-    | Fable.Operation(Fable.Binary(BinaryEqual, x, n), _, _, _) when isNullValue n -> [], Option.toList (named x)
-    | Fable.Operation(Fable.Binary(BinaryUnequal, x, n), _, _, _) when isNullValue n -> Option.toList (named x), []
-    | _ -> [], []
+    let isUnsigned (t: Fable.Type) =
+        match t with
+        | Fable.Number((UInt8 | UInt16 | UInt32 | UInt64), _) -> true
+        | _ -> false
+
+    let named (e: Fable.Expr) =
+        match e with
+        | Fable.IdentExpr i when not i.IsMutable ->
+            match i.Type with
+            | Fable.Number((Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64), _) -> Some i.Name
+            | _ -> None
+        | _ -> None
+
+    let leaf (op: BinaryOperator) (x: Fable.Expr) (c: int64) : string list * string list =
+        match named x with
+        | None -> [], []
+        | Some n ->
+            match op with
+            | BinaryGreater when c >= 0L -> [ n ], []
+            | BinaryGreaterOrEqual when c >= 1L -> [ n ], []
+            | BinaryLessOrEqual when c <= 0L -> [], [ n ]
+            | BinaryLess when c <= 1L -> [], [ n ]
+            | BinaryUnequal when c = 0L && isUnsigned x.Type -> [ n ], []
+            | BinaryEqual when c = 0L && isUnsigned x.Type -> [], [ n ]
+            | _ -> [], []
+
+    let flip (op: BinaryOperator) =
+        match op with
+        | BinaryGreater -> BinaryLess
+        | BinaryGreaterOrEqual -> BinaryLessOrEqual
+        | BinaryLess -> BinaryGreater
+        | BinaryLessOrEqual -> BinaryGreaterOrEqual
+        | o -> o
+
+    factsOf
+        (fun cond ->
+            match cond with
+            | Fable.Operation(Fable.Binary(op, x, k), _, _, _) ->
+                match constOf k, constOf x with
+                | Some c, _ -> leaf op x c
+                | None, Some c -> leaf (flip op) k c
+                | _ -> [], []
+            | _ -> [], []
+        )
+        cond
 
 /// Does this always raise (`raise`, `failwith`, `nullArg`, `invalidArg`, `invalidOp`)?
 let rec alwaysRaises (e: Fable.Expr) : bool =
@@ -3976,12 +4051,12 @@ let rec alwaysRaises (e: Fable.Expr) : bool =
     | Fable.TypeCast(x, _) -> alwaysRaises x
     | _ -> false
 
-/// What a statement leaves known of nulls for what follows it: a guard whose other branch
-/// always raises (`if isNull s then nullArg "s"`)
-let nullFactsAfter (stmt: Fable.Expr) : string list =
+/// What a statement leaves known for what follows it (by `facts`): a guard whose other branch
+/// always raises (`if isNull s then nullArg "s"`, `if n <= 0 then invalidArg ...`)
+let factsAfter (facts: Fable.Expr -> string list * string list) (stmt: Fable.Expr) : string list =
     match stmt with
     | Fable.IfThenElse(guard, thenExpr, elseExpr, _) ->
-        let whenTrue, whenFalse = nullFacts guard
+        let whenTrue, whenFalse = facts guard
 
         (if alwaysRaises thenExpr then
              whenFalse
@@ -3993,15 +4068,19 @@ let nullFactsAfter (stmt: Fable.Expr) : string list =
                [])
     | _ -> []
 
-/// `f ()` with these variables known not to be null (`Ctx.NonNull`) while it runs
-let withNonNull (ctx: Ctx) (names: string list) (f: unit -> 'a) : 'a =
-    let added = names |> List.filter (fun n -> ctx.NonNull.Add n)
+/// `f ()` with these names in `set` (what is known of them) while it runs
+let withFacts (set: HashSet<string>) (names: string list) (f: unit -> 'a) : 'a =
+    let added = names |> List.filter (fun n -> set.Add n)
 
     try
         f ()
     finally
         for n in added do
-            ctx.NonNull.Remove n |> ignore
+            set.Remove n |> ignore
+
+/// `f ()` with these variables known not to be null, and these known positive
+let withKnown (ctx: Ctx) (nonNull: string list) (positive: string list) (f: unit -> 'a) : 'a =
+    withFacts ctx.NonNull nonNull (fun () -> withFacts ctx.Positive positive f)
 
 /// `neverNull`, or a variable bound to such a string and never assigned (`Ctx.NonNull`)
 let neverNullIn (ctx: Ctx) (e: Fable.Expr) : bool =
@@ -5829,6 +5908,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         else
             ctx.NonNull.Remove id.Name |> ignore
 
+        // (a name bound again is not the one a guard tested)
+        ctx.Positive.Remove id.Name |> ignore
+
         let rhs = lw ctx (adaptTo ctx.Com id.Type value)
         let ty = mapType ctx id.Range id.Type
 
@@ -5899,14 +5981,18 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         before |> List.rev |> List.fold (fun acc s -> ESeq(lwStmt ctx s, acc)) raiseIr
     // (a guard that raises when something is null: it is not null in what follows)
-    | Fable.Sequential es when es |> List.exists (fun x -> not (nullFactsAfter x).IsEmpty) ->
+    | Fable.Sequential es when
+        es
+        |> List.exists (fun x -> not (factsAfter nullFacts x).IsEmpty || not (factsAfter positiveFacts x).IsEmpty)
+        ->
         let rec go (stmts: Fable.Expr list) : Expr =
             match stmts with
             | [] -> EUnit
             | [ last ] -> lw ctx last
             | x :: rest ->
                 let ir = lwStmt ctx x
-                ESeq(ir, withNonNull ctx (nullFactsAfter x) (fun () -> go rest))
+
+                ESeq(ir, withKnown ctx (factsAfter nullFacts x) (factsAfter positiveFacts x) (fun () -> go rest))
 
         go es
     | Fable.Sequential es ->
@@ -5929,6 +6015,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         // (what the guard tells of nulls holds in its branches)
         let whenTrue, whenFalse = nullFacts guard
+        let posTrue, posFalse = positiveFacts guard
 
         bindArgs
             ctx
@@ -5936,8 +6023,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             (fun xs ->
                 EIf(
                     xs.Head,
-                    coerceTy ctx ty (withNonNull ctx whenTrue (fun () -> lw ctx thenExpr)),
-                    coerceTy ctx ty (withNonNull ctx whenFalse (fun () -> lw ctx elseExpr)),
+                    coerceTy ctx ty (withKnown ctx whenTrue posTrue (fun () -> lw ctx thenExpr)),
+                    coerceTy ctx ty (withKnown ctx whenFalse posFalse (fun () -> lw ctx elseExpr)),
                     ty
                 )
             )
@@ -5999,6 +6086,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     | Fable.NumberValue.UInt32 n -> n <> 0u
                     | Fable.NumberValue.UInt64 n -> n <> 0UL
                     | _ -> false
+                // (a variable a guard has shown to be greater than zero)
+                | Fable.IdentExpr i -> ctx.Positive.Contains i.Name
                 | _ -> false
 
             match name, operandTy with
@@ -10383,6 +10472,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             DecisionTargets = []
             Boxed = HashSet()
             NonNull = HashSet()
+            Positive = HashSet()
             Enumerators = Dictionary()
             OutTuples = Dictionary()
             CaughtExn = None
