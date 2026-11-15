@@ -859,7 +859,7 @@ let ``test String.Join with indices works`` () =
     String.Join("*", [|"a"; "b"; "c"; "d"|], 1, 3)
     |> equal "b*c*d"
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
+#if !FABLE_COMPILER_ZIG // (a char given as obj: chars are u16 in the Zig target, and a boxed one is not told from a UInt16)
 [<Fact>]
 let ``test String.Join works with chars`` () =
     String.Join("--", 'a', 'b', 'c')
@@ -872,14 +872,12 @@ let ``test String.Join works with chars`` () =
     |> equal "***********"
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
 [<Fact>]
 let ``test String.Join with big integers works`` () =
     String.Join("--", [|3I; 5I|])
     |> equal "3--5"
     String.Join("--", 3I, 5I)
     |> equal "3--5"
-#endif
 
 [<Fact>]
 let ``test String.Join with single argument works`` () =
@@ -1149,7 +1147,6 @@ let ``test printf.cont works with single argument`` () =
 
     result |> equal "Hello World"
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
 [<Fact>]
 let ``test printf.cont raises exception via continuation`` () =
     let fail msg = failwith msg
@@ -1163,7 +1160,6 @@ let ``test printf.cont raises exception via continuation`` () =
         ex.Message |> equal "Error: test error"
 
     exceptionRaised |> equal true
-#endif
 
 [<Fact>]
 let ``test failwithf works`` () =
