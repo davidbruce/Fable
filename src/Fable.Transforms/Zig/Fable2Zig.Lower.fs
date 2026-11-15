@@ -51,6 +51,9 @@ type Ctx =
         /// the `let mutable` variables that a function inside the function assigns or reads:
         /// each is a ref cell, as F# makes it on .NET
         Boxed: HashSet<string>
+        /// variables that hold an object made where they were bound (a constructor's call, an
+        /// object expression) and are never assigned: not null, so used without a check
+        NonNull: HashSet<string>
         /// inside a `for ... in` loop: the enumerator's name, and the variable that holds the
         /// item of this round
         Enumerators: Dictionary<string, Var>
@@ -983,6 +986,25 @@ let asObj (x: Expr) : Expr =
     match typeOf x with
     | TOpt t when t = tObj -> ERt("fable_rt.objNonNull($0)", [ x ], tObj)
     | _ -> x
+
+/// Is the expression an object made right there (never null)?
+let isMadeObject (e: Fable.Expr) : bool =
+    match e with
+    | Fable.Call(_, { MemberRef = Some(Fable.MemberRef(_, m)) }, _, _) -> m.CompiledName = ".ctor"
+    | Fable.ObjectExpr _ -> true
+    | _ -> false
+
+/// `asObj` of what `x` lowered to: no check where `x` is known not to be null (an object made
+/// there, or a variable bound to one: `Ctx.NonNull`), only the object read out of the option
+let asObjOf (ctx: Ctx) (x: Fable.Expr) (ir: Expr) : Expr =
+    let known =
+        match x with
+        | Fable.IdentExpr i -> ctx.NonNull.Contains i.Name
+        | _ -> isMadeObject x
+
+    match typeOf ir with
+    | TOpt t when t = tObj && known -> EGet(ir, PSome, tObj)
+    | _ -> asObj ir
 
 /// The names that `e` reads. (Not those read only by a binding of a read that is itself never
 /// read: such bindings are left out.) One walk of `e`.
@@ -4385,7 +4407,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 // (the object: checked for null)
                 bindArgs
                     ctx
-                    [ asObj given.Head ]
+                    [ asObjOf ctx x given.Head ]
                     (fun o ->
                         let xs = o.Head :: given.Tail
 
@@ -4427,7 +4449,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 // (the object: checked for null)
                 bindArgs
                     ctx
-                    [ asObj given.Head ]
+                    [ asObjOf ctx x given.Head ]
                     (fun xs ->
                         let fn =
                             EGet(
@@ -4464,7 +4486,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 // (the object: checked for null)
                 bindArgs
                     ctx
-                    (List.map asObj given)
+                    (List.map (asObjOf ctx x) given)
                     (fun xs ->
                         EGet(
                             EEmit($"fable_rt.objPart($R, &[_]type{{ %s{parts} }}, $0)", xs, TPtr(part, false)),
@@ -4494,7 +4516,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 // (the object: checked for null)
                 bindArgs
                     ctx
-                    [ asObj given[0] ]
+                    [ asObjOf ctx x given[0] ]
                     (fun o ->
                         let place =
                             if ctx.InCtor then
@@ -5207,6 +5229,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ->
         lw ctx body
     | Fable.Let(id, value, body) ->
+        // (a variable bound to an object made there, and never assigned: not null)
+        if not id.IsMutable && isMadeObject value then
+            ctx.NonNull.Add id.Name |> ignore
+        else
+            ctx.NonNull.Remove id.Name |> ignore
+
         let rhs = lw ctx (adaptTo ctx.Com id.Type value)
         let ty = mapType ctx id.Range id.Type
 
@@ -5574,7 +5602,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     // (the object: checked for null)
                     bindArgs
                         ctx
-                        [ asObj xs.Head ]
+                        [ asObjOf ctx inner xs.Head ]
                         (fun this ->
                             ECall(target, genArgs |> List.map (mapTypeArg ctx r), this @ xs.Tail, mapType ctx r t)
                         )
@@ -6720,10 +6748,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 )
                 ->
                 match first with
-                | EVar _ -> asObj first :: rest
+                | EVar _ -> asObjOf ctx x first :: rest
                 | _ ->
                     let v = ctx.State.NewVar("obj", typeOf first, VLocal, false)
-                    ELet(v, first, asObj (EVar v)) :: rest
+                    ELet(v, first, asObjOf ctx x (EVar v)) :: rest
             | _ -> args
 
         match tryCallable ctx callee, callee with
@@ -9433,6 +9461,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             Reserved = reserved
             DecisionTargets = []
             Boxed = HashSet()
+            NonNull = HashSet()
             Enumerators = Dictionary()
             OutTuples = Dictionary()
             CaughtExn = None
