@@ -286,3 +286,12 @@ let ``test A shared array item read while another thread stores into it stays al
     reader.Join()
     seen |> equal 20_000
     slots.[0] |> equal [ 20_000; 20_000; 20_000 ]
+
+[<Fact>]
+let ``test Async.Parallel of many computations gives every result in order`` () =
+    let results =
+        [ for i in 1..100 -> async { return i * i } ]
+        |> Async.Parallel
+        |> Async.RunSynchronously
+
+    results |> equal [| for i in 1..100 -> i * i |]

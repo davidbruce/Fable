@@ -834,31 +834,55 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
                 && tryShare results
                 && tryShare firstFail
             then
+                // (at most eight threads, as Parallel.For: each takes the next computation that
+                // no thread has taken until none is left)
+                let next: int[] = [| 0 |]
+
+                if not (tryShare next) then
+                    failwith "unreachable"
+
+                let take () =
+                    lock
+                        next
+                        (fun () ->
+                            let i = next.[0]
+                            next.[0] <- i + 1
+                            i
+                        )
+
                 let threads =
                     Array.init
-                        n
-                        (fun i ->
+                        (if n < 8 then
+                             n
+                         else
+                             8)
+                        (fun _ ->
                             System.Threading.Thread(fun () ->
-                                let r, _ = runHere cs.[i] (tokenNone ())
+                                let mutable i = take ()
 
-                                // (an exception that reaches what cannot be shared comes back as
-                                // a new one with its message)
-                                let r =
+                                while i < n do
+                                    let r, _ = runHere cs.[i] (tokenNone ())
+
+                                    // (an exception that reaches what cannot be shared comes back as
+                                    // a new one with its message)
+                                    let r =
+                                        match r with
+                                        | Some(Error e) when not (tryShare e) ->
+                                            Some(Error(System.Exception(e.Message)))
+                                        | _ -> r
+
                                     match r with
-                                    | Some(Error e) when not (tryShare e) -> Some(Error(System.Exception(e.Message)))
-                                    | _ -> r
+                                    | Some(Error _) ->
+                                        lock
+                                            firstFail
+                                            (fun () ->
+                                                if firstFail.[0] < 0 then
+                                                    firstFail.[0] <- i
+                                            )
+                                    | _ -> ()
 
-                                match r with
-                                | Some(Error _) ->
-                                    lock
-                                        firstFail
-                                        (fun () ->
-                                            if firstFail.[0] < 0 then
-                                                firstFail.[0] <- i
-                                        )
-                                | _ -> ()
-
-                                results.[i] <- r
+                                    results.[i] <- r
+                                    i <- take ()
                             )
                         )
 
