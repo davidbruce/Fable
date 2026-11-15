@@ -232,6 +232,15 @@ let call
         pure' "fable_rt.arrayToList($0)" [ a ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ArrayModule", "Contains", [ x; a ] ->
         pure' "fable_rt.arrayContains(@as(fable_rt.ItemOf(@TypeOf($1)), $0), $1)" [ x; a ] tBool
+    // `Array.Parallel`: on threads (the runtime's parallelFor)
+    | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Map", [ f; a ] ->
+        rt "fable_rt.arrayParallelMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "MapIndexed", [ f; a ] ->
+        rt "fable_rt.arrayParallelMapi($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Initialize", [ n; f ] ->
+        rt "fable_rt.arrayParallelInit($R, $0, $1)" [ n; f ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Iterate", [ f; a ] ->
+        rt "fable_rt.arrayParallelIter($0, $1)" [ f; a ] tVoid
     | "Microsoft.FSharp.Collections.ArrayModule", "Map", [ f; a ] ->
         rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ArrayModule", "MapIndexed", [ f; a ] ->

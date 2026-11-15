@@ -110,3 +110,26 @@ let ``test Interlocked counts from several threads and swaps values`` () =
     Interlocked.CompareExchange(&local, 9, 3) |> equal 3
     Interlocked.CompareExchange(&local, 1, 3) |> equal 9
     Interlocked.Decrement(&local) |> equal 8
+
+[<Fact>]
+let ``test Array.Parallel works on threads and gives what Array gives`` () =
+    let xs = [| 1..100_000 |]
+    xs |> Array.Parallel.map (fun x -> int64 x * 2L) |> Array.sum |> equal 10_000_100_000L
+    let names = Array.Parallel.init 5_000 (fun i -> string i)
+    names.[4999] |> equal "4999"
+    names |> Array.Parallel.mapi (fun i s -> s.Length + i) |> Array.sum |> equal 12_516_390
+    let hits = ref 0
+    let gate = obj ()
+    xs |> Array.Parallel.iter (fun _ -> lock gate (fun () -> hits.Value <- hits.Value + 1))
+    hits.Value |> equal 100_000
+
+[<Fact>]
+let ``test An exception in Array.Parallel is raised inside an AggregateException`` () =
+    let message =
+        try
+            Array.Parallel.init 5_000 (fun i -> if i = 4321 then failwith "boom" else i) |> ignore
+            "no"
+        with e ->
+            e.Message
+
+    message |> equal "One or more errors occurred. (boom)"

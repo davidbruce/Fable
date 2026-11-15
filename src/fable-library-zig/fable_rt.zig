@@ -313,6 +313,76 @@ pub fn objectNew() Obj {
 const PlainObjectChain = struct { own: struct {} };
 const object_type: ObjType = objType(PlainObjectChain, "System.Object", null, &.{}, null);
 
+/// `step(ctx, i)` for each `i` below `n`, in chunks on up to eight threads (the calling one
+/// among them); what `ctx` holds must be shared already, and so must what a step leaves behind.
+/// The first exception stops the others and is raised here. (Few items: here, in order.)
+pub fn parallelFor(n: usize, ctx: anytype, comptime step: fn (@TypeOf(ctx), usize) Raised!void) Raised!void {
+    const cpus = std.Thread.getCpuCount() catch 1;
+    const workers = @min(@min(cpus, 8), n / 256);
+    if (workers < 2) {
+        var i: usize = 0;
+        while (i < n) : (i += 1) step(ctx, i) catch return aggregated(take());
+        return;
+    }
+    const State = struct {
+        failed: ?Exn = null,
+        stop: u32 = 0,
+
+        fn chunk(st: *@This(), c: @TypeOf(ctx), lo: usize, hi: usize) void {
+            var i = lo;
+            while (i < hi) : (i += 1) {
+                if (@atomicLoad(u32, &st.stop, .acquire) != 0) return;
+                step(c, i) catch {
+                    const e = take();
+                    if (@cmpxchgStrong(u32, &st.stop, 0, 1, .acq_rel, .acquire) == null) {
+                        // (the exception goes to the calling thread)
+                        markShared(e) catch drop(take());
+                        st.failed = e;
+                    } else drop(e);
+                    return;
+                };
+            }
+        }
+
+        fn worker(st: *@This(), c: @TypeOf(ctx), lo: usize, hi: usize) void {
+            st.chunk(c, lo, hi);
+            collectorDeinit();
+            if (track) _ = @atomicRmw(i64, &ended_threads_live, .Add, thread.stats.allocs - thread.stats.frees, .monotonic);
+        }
+    };
+    var state: State = .{};
+    var threads: [8]std.Thread = undefined;
+    var started: usize = 0;
+    const size = (n + workers - 1) / workers;
+    var w: usize = 1;
+    while (w < workers) : (w += 1) {
+        const lo = @min(n, w * size);
+        const hi = @min(n, lo + size);
+        threads[started] = std.Thread.spawn(.{}, State.worker, .{ &state, ctx, lo, hi }) catch {
+            // (no thread: this one does that chunk too)
+            state.chunk(ctx, lo, hi);
+            continue;
+        };
+        started += 1;
+    }
+    state.chunk(ctx, 0, @min(n, size));
+    for (threads[0..started]) |t| t.join();
+    if (state.failed) |e| return aggregated(e);
+}
+
+/// (as .NET's Parallel raises an exception of its work: an AggregateException with it inside)
+fn aggregated(e: Exn) Raised {
+    defer drop(e);
+    const inner_text = exnMessage(e);
+    defer drop(inner_text);
+    const head = strConcat(str("One or more errors occurred. ("), inner_text);
+    defer drop(head);
+    const agg = AggregateException.new(.{ .Message = strConcat(head, str(")")) });
+    defer drop(agg);
+    throw(exnWithInner(agg, e));
+    return error.Raised;
+}
+
 fn notShareable(what: []const u8) Raised {
     var b: TextBuilder = .{};
     b.addAscii("The Zig target cannot share ");
@@ -1310,6 +1380,10 @@ pub const arraySub = arrays.arraySub;
 pub const arrayToList = arrays.arrayToList;
 pub const arrayZero = arrays.arrayZero;
 pub const arrayResize = arrays.arrayResize;
+pub const arrayParallelMap = arrays.arrayParallelMap;
+pub const arrayParallelMapi = arrays.arrayParallelMapi;
+pub const arrayParallelInit = arrays.arrayParallelInit;
+pub const arrayParallelIter = arrays.arrayParallelIter;
 pub const indexOutside = arrays.indexOutside;
 const listOf = arrays.listOf;
 test {

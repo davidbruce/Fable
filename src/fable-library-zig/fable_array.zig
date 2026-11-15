@@ -366,6 +366,83 @@ pub fn arrayMap(comptime A: type, f: anytype, a: anytype) Raised!A {
     return arrayFrom(A, items);
 }
 
+// ---- `Array.Parallel`: on threads (fable_rt.parallelFor); the function and the array are
+// shared first, and so is each item made ----
+
+fn parallelItems(comptime A: type, n: usize, f: anytype, a: anytype, comptime make: fn (@TypeOf(f), @TypeOf(a), usize) Raised!ItemOf(A)) Raised!A {
+    try rt.markShared(f);
+    try rt.markShared(a);
+    const items = arrayItems(A, n);
+    const T = ItemOf(A);
+    // (an item not made yet is all zero: what an exception leaves is given up as far as made)
+    const done = rt.allocator.alloc(bool, n) catch @panic("fable: out of memory");
+    defer rt.allocator.free(done);
+    @memset(done, false);
+    const Ctx = struct { f: @TypeOf(f), a: @TypeOf(a), items: []T, done: []bool };
+    const S = struct {
+        fn step(c: Ctx, i: usize) Raised!void {
+            const x = try make(c.f, c.a, i);
+            try rt.markShared(x);
+            c.items[i] = x;
+            c.done[i] = true;
+        }
+    };
+    rt.parallelFor(n, Ctx{ .f = f, .a = a, .items = items, .done = done }, S.step) catch |e| {
+        for (items, done) |x, d| if (d) rt.drop(x);
+        rt.allocator.free(items);
+        return e;
+    };
+    return arrayFrom(A, items);
+}
+
+/// `Array.Parallel.map f a`
+pub fn arrayParallelMap(comptime A: type, f: anytype, a: anytype) Raised!A {
+    const S = struct {
+        fn make(g: @TypeOf(f), xs: @TypeOf(a), i: usize) Raised!ItemOf(A) {
+            return g.code(g.env, dup(xs.items[i]));
+        }
+    };
+    return parallelItems(A, a.items.len, f, a, S.make);
+}
+
+/// `Array.Parallel.mapi f a`
+pub fn arrayParallelMapi(comptime A: type, f: anytype, a: anytype) Raised!A {
+    const S = struct {
+        fn make(g: @TypeOf(f), xs: @TypeOf(a), i: usize) Raised!ItemOf(A) {
+            return apply2(ItemOf(A), g, @as(i32, @intCast(i)), dup(xs.items[i]));
+        }
+    };
+    return parallelItems(A, a.items.len, f, a, S.make);
+}
+
+/// `Array.Parallel.init n f`
+pub fn arrayParallelInit(comptime A: type, n: i32, f: anytype) Raised!A {
+    if (n < 0) return countNegative(n);
+    const S = struct {
+        fn make(g: @TypeOf(f), _: void, i: usize) Raised!ItemOf(A) {
+            return g.code(g.env, @as(i32, @intCast(i)));
+        }
+    };
+    return parallelItems(A, @intCast(n), f, {}, S.make);
+}
+
+/// `Array.Parallel.iter f a`
+pub fn arrayParallelIter(f: anytype, a: anytype) Raised!void {
+    try rt.markShared(f);
+    try rt.markShared(a);
+    const Ctx = struct { f: @TypeOf(f), a: @TypeOf(a) };
+    const S = struct {
+        fn step(c: Ctx, i: usize) Raised!void {
+            return c.f.code(c.f.env, dup(c.a.items[i]));
+        }
+    };
+    return rt.parallelFor(c_len(a), Ctx{ .f = f, .a = a }, S.step);
+}
+
+inline fn c_len(a: anytype) usize {
+    return a.items.len;
+}
+
 /// `Array.mapi f a`
 pub fn arrayMapi(comptime A: type, f: anytype, a: anytype) Raised!A {
     const items = arrayItems(A, a.items.len);
