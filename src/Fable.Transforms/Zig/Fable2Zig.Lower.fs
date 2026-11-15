@@ -3934,6 +3934,15 @@ let rec nullFacts (cond: Fable.Expr) : string list * string list =
         let _, fa = nullFacts a
         let _, fb = nullFacts b
         [], fa @ fb
+    // (`a || b` and `a && b` as F# compiles them)
+    | Fable.IfThenElse(a, Fable.Value(Fable.BoolConstant true, _), b, _) ->
+        let _, fa = nullFacts a
+        let _, fb = nullFacts b
+        [], fa @ fb
+    | Fable.IfThenElse(a, b, Fable.Value(Fable.BoolConstant false, _), _) ->
+        let ta, _ = nullFacts a
+        let tb, _ = nullFacts b
+        ta @ tb, []
     | Fable.Call(Fable.Import(imp, _, _), info, _, _) ->
         match imp.Selector, info.Args with
         | ("IsNull" | "IsNullOrEmpty" | "IsNullOrWhiteSpace"), [ x ] -> [], Option.toList (named x)
@@ -3945,6 +3954,44 @@ let rec nullFacts (cond: Fable.Expr) : string list * string list =
     | Fable.Operation(Fable.Binary(BinaryEqual, x, n), _, _, _) when isNullValue n -> [], Option.toList (named x)
     | Fable.Operation(Fable.Binary(BinaryUnequal, x, n), _, _, _) when isNullValue n -> Option.toList (named x), []
     | _ -> [], []
+
+/// Does this always raise (`raise`, `failwith`, `nullArg`, `invalidArg`, `invalidOp`)?
+let rec alwaysRaises (e: Fable.Expr) : bool =
+    match e with
+    | Fable.Extended(Fable.Throw _, _) -> true
+    | Fable.Call(Fable.Import(imp, _, _), _, _, _) ->
+        imp.Path.EndsWith("Microsoft.FSharp.Core.Operators", System.StringComparison.Ordinal)
+        && (
+            match imp.Selector with
+            | "Raise"
+            | "FailWith"
+            | "InvalidArg"
+            | "InvalidOp"
+            | "NullArg" -> true
+            | _ -> false
+        )
+    | Fable.Sequential es -> not es.IsEmpty && alwaysRaises (List.last es)
+    | Fable.Let(_, _, body) -> alwaysRaises body
+    | Fable.IfThenElse(_, a, b, _) -> alwaysRaises a && alwaysRaises b
+    | Fable.TypeCast(x, _) -> alwaysRaises x
+    | _ -> false
+
+/// What a statement leaves known of nulls for what follows it: a guard whose other branch
+/// always raises (`if isNull s then nullArg "s"`)
+let nullFactsAfter (stmt: Fable.Expr) : string list =
+    match stmt with
+    | Fable.IfThenElse(guard, thenExpr, elseExpr, _) ->
+        let whenTrue, whenFalse = nullFacts guard
+
+        (if alwaysRaises thenExpr then
+             whenFalse
+         else
+             [])
+        @ (if alwaysRaises elseExpr then
+               whenTrue
+           else
+               [])
+    | _ -> []
 
 /// `f ()` with these variables known not to be null (`Ctx.NonNull`) while it runs
 let withNonNull (ctx: Ctx) (names: string list) (f: unit -> 'a) : 'a =
@@ -5851,6 +5898,17 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             bindArgs ctx [ lw ctx thrown ] (fun xs -> ERaise(xs.Head, mapType ctx e.Range e.Type))
 
         before |> List.rev |> List.fold (fun acc s -> ESeq(lwStmt ctx s, acc)) raiseIr
+    // (a guard that raises when something is null: it is not null in what follows)
+    | Fable.Sequential es when es |> List.exists (fun x -> not (nullFactsAfter x).IsEmpty) ->
+        let rec go (stmts: Fable.Expr list) : Expr =
+            match stmts with
+            | [] -> EUnit
+            | [ last ] -> lw ctx last
+            | x :: rest ->
+                let ir = lwStmt ctx x
+                ESeq(ir, withNonNull ctx (nullFactsAfter x) (fun () -> go rest))
+
+        go es
     | Fable.Sequential es ->
         match List.rev es with
         | [] -> EUnit
