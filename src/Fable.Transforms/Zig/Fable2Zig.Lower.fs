@@ -1428,6 +1428,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "Stopwatch" "StopwatchOf", [])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Core.CompilerServices.ListCollector`1" ->
+        TEnt(libRecordEnt ctx "ListCollector" "ListCollectorOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Queue`1" ->
         TEnt(libRecordEnt ctx "Queue" "QueueOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Control.FSharpAsync`1" ->
@@ -10292,6 +10294,7 @@ and libraryCall
                 || file = "HashSet"
                 || file = "Stack"
                 || file = "Queue"
+                || file = "ListCollector"
                 ->
                 arg
             | Fable.Value(Fable.NewOption(None, Fable.Any, isStruct), r) ->
@@ -10422,6 +10425,7 @@ and libraryCall
             || file = "HashSet"
             || file = "Stack"
             || file = "Queue"
+            || file = "ListCollector"
             ->
             lw ctx arg
         // (a sequence given to a function that takes a list: the list of what it gives)

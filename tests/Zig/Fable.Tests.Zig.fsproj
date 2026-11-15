@@ -92,5 +92,6 @@
     <Compile Include="QuotationTests.fs" />
     <Compile Include="ElmishParserTests.fs" />
     <Compile Include="EnvironmentTests.fs" />
+    <Compile Include="ListCollectorTests.fs" />
   </ItemGroup>
 </Project>

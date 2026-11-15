@@ -2129,6 +2129,43 @@ let call
                 r
             ))
     // ---- .NET's stack and queue: the library's Stack.fs and Queue.fs ----
+    // `ListCollector<'T>`: the library's ListCollector.fs
+    | "Microsoft.FSharp.Core.CompilerServices.ListCollector`1", name, args ->
+        match name with
+        | ".ctor" -> libraryCall ctx r "ListCollector" "create" { info with Args = [] } [] t
+        | "Add" -> libraryCall ctx r "ListCollector" "add" info args t
+        | "AddMany"
+        | "AddManyAndClose" ->
+            // (what is added: a sequence, whatever collection it is)
+            let args =
+                match args with
+                | [ c; xs ] ->
+                    let item =
+                        match c.Type with
+                        | Fable.DeclaredType(_, [ item ]) -> item
+                        | _ -> Fable.Any
+
+                    let seqT =
+                        Fable.DeclaredType(
+                            {
+                                FullName = "System.Collections.Generic.IEnumerable`1"
+                                Path = Fable.CoreAssemblyName "System.Runtime"
+                            },
+                            [ item ]
+                        )
+
+                    [ c; Fable.TypeCast(xs, seqT) ]
+                | _ -> args
+
+            let fn =
+                if name = "AddMany" then
+                    "addMany"
+                else
+                    "addManyAndClose"
+
+            libraryCall ctx r "ListCollector" fn info args t
+        | "Close" -> libraryCall ctx r "ListCollector" "close" info args t
+        | _ -> fail r "the Zig target does not support ListCollector.%s yet" name
     | ("System.Collections.Generic.Stack`1" | "System.Collections.Generic.Queue`1"), _, _ ->
         let file =
             if entity.EndsWith("Stack`1", System.StringComparison.Ordinal) then

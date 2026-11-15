@@ -636,6 +636,22 @@ let call
                 }
                 [ Fable.Value(Fable.UnitConstant, None) ]
                 t
+        // (a struct `ListCollector<'T>()`: an empty collector)
+        | Fable.DeclaredType(entRef, [ item ]) when
+            entRef.FullName = "Microsoft.FSharp.Core.CompilerServices.ListCollector`1"
+            ->
+            libraryCall
+                ctx
+                r
+                "ListCollector"
+                "create"
+                { info with
+                    ThisArg = None
+                    Args = []
+                    GenericArgs = [ item ]
+                }
+                []
+                t
         | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.Uri" ->
             libraryCall
                 ctx
