@@ -7,7 +7,6 @@ open Fable.Tests.Util.Testing
 type MyRefType(i: int) =
     member x.Value = i
 
-#if !FABLE_COMPILER_ZIG // (custom equality comparers are not supported by the Zig target yet)
 type MyRefTypeComparer() =
     interface IEqualityComparer<MyRefType> with
         member _.Equals(x, y) = x.Value = y.Value
@@ -20,7 +19,6 @@ type IgnoreCaseComparer() =
 
         member _.GetHashCode(s) =
             if System.String.IsNullOrEmpty(s) then 0 else s.ToLowerInvariant().GetHashCode()
-#endif
 
 let inline hashSet l =
     let xs = HashSet<_>()
@@ -58,7 +56,6 @@ let ``test HashSet ctor with capacity works`` () =
     let xs = HashSet<int>(10)
     xs.Count |> equal 0
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom equality comparers, comparison by a culture)
 [<Fact>]
 let ``test HashSet with IEqualityComparer works`` () =
     let x = MyRefType(4)
@@ -74,7 +71,6 @@ let ``test HashSet with IEqualityComparer works`` () =
     set2.Contains(x) |> equal true
     set2.Contains(y) |> equal true
     set2.Contains(z) |> equal false
-#endif
 
 [<Fact>]
 let ``test HashSet.Add returns true if not present`` () =
@@ -116,7 +112,6 @@ let ``test HashSet.IntersectWith works`` () =
     xs.Contains 1 |> equal false
     xs.Contains 2 |> equal true
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom equality comparers, comparison by a culture)
 [<Fact>]
 let ``test HashSet.IntersectWith works with custom comparison`` () = // See #2566
     let xs = new HashSet<string>(["Foo"; "bar"], IgnoreCaseComparer())
@@ -128,7 +123,6 @@ let ``test HashSet.IntersectWith works with custom comparison`` () = // See #256
     xs.Count |> equal 2
     xs.IntersectWith(["Foo"; "Bar"])
     xs.Count |> equal 2
-#endif
 
 [<Fact>]
 let ``test HashSet.ExceptWith works`` () =
@@ -138,7 +132,6 @@ let ``test HashSet.ExceptWith works`` () =
     xs.Contains 1 |> equal true
     xs.Contains 2 |> equal false
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom equality comparers, comparison by a culture)
 [<Fact>]
 let ``test HashSet.ExceptWith works with custom comparison`` () =
     let xs = HashSet<string>(["Foo"; "bar"], IgnoreCaseComparer())
@@ -147,7 +140,6 @@ let ``test HashSet.ExceptWith works with custom comparison`` () =
     xs.Contains("foo") |> equal false
     xs.Contains("bar") |> equal true
     xs.Contains("baz") |> equal false
-#endif
 
 [<Fact>]
 let ``test HashSet.SymmetricExceptWith works`` () =
@@ -159,7 +151,6 @@ let ``test HashSet.SymmetricExceptWith works`` () =
     xs.Contains 2 |> equal false
     xs.Contains 4 |> equal true
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom equality comparers, comparison by a culture)
 [<Fact>]
 let ``test HashSet.SymmetricExceptWith works with custom comparison`` () =
     let xs = HashSet<string>(["Foo"; "bar"], IgnoreCaseComparer())
@@ -168,7 +159,6 @@ let ``test HashSet.SymmetricExceptWith works with custom comparison`` () =
     xs.Contains("foo") |> equal false
     xs.Contains("bar") |> equal true
     xs.Contains("baz") |> equal true
-#endif
 
 [<Fact>]
 let ``test HashSet.Overlaps works`` () =
@@ -176,13 +166,11 @@ let ``test HashSet.Overlaps works`` () =
     xs.Overlaps [2; 4] |> equal true
     xs.Overlaps [3; 4] |> equal false
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom equality comparers, comparison by a culture)
 [<Fact>]
 let ``test HashSet.Overlaps works with custom comparison`` () =
     let xs = HashSet<string>(["Foo"; "bar"], IgnoreCaseComparer())
     xs.Overlaps ["foo"; "baz"] |> equal true
     xs.Overlaps ["baz"; "qux"] |> equal false
-#endif
 
 [<Fact>]
 let ``test HashSet.SetEquals works`` () =
@@ -190,13 +178,11 @@ let ``test HashSet.SetEquals works`` () =
     xs.SetEquals [2; 1; 1] |> equal true
     xs.SetEquals [2; 3] |> equal false
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: custom equality comparers, comparison by a culture)
 [<Fact>]
 let ``test HashSet.SetEquals works with custom comparison`` () =
     let xs = HashSet<string>(["Foo"; "bar"], IgnoreCaseComparer())
     xs.SetEquals ["foo"; "BAR"; "foo"] |> equal true
     xs.SetEquals ["foo"; "baz"] |> equal false
-#endif
 
 [<Fact>]
 let ``test HashSet iteration works`` () =

@@ -381,12 +381,66 @@ let call
       [ xs ] -> pure' "fable_rt.listCount($0)" [ xs ] tI32
     | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"), ".ctor", [] ->
         pure' "fable_rt.htNew($R)" [] (mapType ctx r t)
+    // (with an IEqualityComparer, after a capacity or not: its Equals and GetHashCode hash and
+    // compare the keys)
+    | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"),
+      ".ctor",
+      ([ cmp ] | [ _; cmp ]) when
+        (args.Length = 1 || isInt args.Head)
+        && (let comparerName = "System.Collections.Generic.IEqualityComparer`1"
+
+            match cmp.Type with
+            | Fable.DeclaredType(e, _) when e.FullName = comparerName -> true
+            | other -> implements ctx.Com other comparerName = Some true)
+        ->
+        let key =
+            match t with
+            | Fable.DeclaredType(_, k :: _) -> k
+            | _ -> Fable.Any
+
+        let iface =
+            Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEqualityComparer`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ key ]
+            )
+
+        let cmp =
+            match cmp.Type with
+            | Fable.DeclaredType(e, _) when e.FullName = "System.Collections.Generic.IEqualityComparer`1" -> cmp
+            | _ -> Fable.TypeCast(cmp, iface)
+
+        pure' "fable_rt.htNewWith($R, $0)" [ cmp ] (mapType ctx r t)
     | "System.Collections.Generic.HashSet`1", ".ctor", [ Uncast xs ] when (listItem xs.Type).IsSome ->
         pure' "fable_rt.setOfList($R, $0)" [ xs ] (mapType ctx r t)
     // (a capacity: nothing to do here)
     | "System.Collections.Generic.HashSet`1", ".ctor", [ n ] when isInt n ->
         bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.htNew($R)" [] (mapType ctx r t))
     | "System.Collections.Generic.HashSet`1", ".ctor", [ _ ] -> libraryCall ctx r "HashSet" "ofSeq" info args t
+    // (items and an IEqualityComparer: the library's HashSet.ofSeqWith)
+    | "System.Collections.Generic.HashSet`1", ".ctor", [ xs; cmp ] when not (isInt xs) ->
+        let key =
+            match t with
+            | Fable.DeclaredType(_, k :: _) -> k
+            | _ -> Fable.Any
+
+        let iface =
+            Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEqualityComparer`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ key ]
+            )
+
+        let cmp =
+            match cmp.Type with
+            | Fable.DeclaredType(e, _) when e.FullName = "System.Collections.Generic.IEqualityComparer`1" -> cmp
+            | _ -> Fable.TypeCast(cmp, iface)
+
+        libraryCall ctx r "HashSet" "ofSeqWith" { info with GenericArgs = [ key ] } [ xs; cmp ] t
     | "System.Collections.Generic.Dictionary`2", _, d :: rest ->
         match name, rest with
         | "Add", [ k; v ] -> rt "fable_rt.dictAdd($0, $1, $2)" [ d; k; v ] tVoid

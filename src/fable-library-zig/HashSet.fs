@@ -13,6 +13,26 @@ let private ofItems<'T when 'T: equality> (items: LibSeq.SeqOf<'T>) : HashSet<'T
 
 let ofSeq<'T when 'T: equality> (items: LibSeq.SeqOf<'T>) : HashSet<'T> = ofItems items
 
+/// `HashSet(items, comparer)`
+let ofSeqWith<'T when 'T: equality> (items: LibSeq.SeqOf<'T>) (comparer: IEqualityComparer<'T>) : HashSet<'T> =
+    let s = HashSet<'T>(comparer)
+    items |> LibSeq.iterate (fun x -> s.Add x |> ignore)
+    s
+
+#if FABLE_COMPILER
+/// (an empty set that compares as `s` does: its comparer, if it was given one)
+[<Fable.Core.Emit("fable_rt.htEmptyLike($0)")>]
+let private emptyLike<'T when 'T: equality> (_s: HashSet<'T>) : HashSet<'T> = Fable.Core.Util.nativeOnly
+#else
+let private emptyLike<'T when 'T: equality> (s: HashSet<'T>) : HashSet<'T> = HashSet<'T>(s.Comparer)
+#endif
+
+/// The items in a set that compares as `s` does
+let private itemsLike<'T when 'T: equality> (s: HashSet<'T>) (items: LibSeq.SeqOf<'T>) : HashSet<'T> =
+    let o = emptyLike s
+    items |> LibSeq.iterate (fun x -> o.Add x |> ignore)
+    o
+
 let unionWith<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T>) : unit =
     other |> LibSeq.iterate (fun x -> s.Add x |> ignore)
 
@@ -20,7 +40,7 @@ let exceptWith<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T>) 
     other |> LibSeq.iterate (fun x -> s.Remove x |> ignore)
 
 let intersectWith<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T>) : unit =
-    let o = ofItems other
+    let o = itemsLike s other
     let gone = ResizeArray<'T>()
 
     for x in s do
@@ -31,7 +51,7 @@ let intersectWith<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T
         s.Remove gone.[i] |> ignore
 
 let symmetricExceptWith<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T>) : unit =
-    let o = ofItems other
+    let o = itemsLike s other
 
     for x in o do
         if not (s.Remove x) then
@@ -50,22 +70,22 @@ let private countIn<'T when 'T: equality> (s: HashSet<'T>) (o: HashSet<'T>) : in
     n
 
 let setEquals<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T>) : bool =
-    let o = ofItems other
+    let o = itemsLike s other
     o.Count = s.Count && countIn s o = s.Count
 
 let isSubsetOf<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T>) : bool =
-    let o = ofItems other
+    let o = itemsLike s other
     countIn s o = s.Count
 
 let isProperSubsetOf<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T>) : bool =
-    let o = ofItems other
+    let o = itemsLike s other
     countIn s o = s.Count && o.Count > s.Count
 
 let isSupersetOf<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T>) : bool =
     other |> LibSeq.forAll (fun x -> s.Contains x)
 
 let isProperSupersetOf<'T when 'T: equality> (s: HashSet<'T>) (other: LibSeq.SeqOf<'T>) : bool =
-    let o = ofItems other
+    let o = itemsLike s other
     countIn o s = o.Count && s.Count > o.Count
 
 /// `s.CopyTo(array)` and `s.CopyTo(array, index)`

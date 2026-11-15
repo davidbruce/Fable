@@ -1662,6 +1662,9 @@ pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type
         free_count: i32 = 0,
         /// what F#'s `dict` and `readOnlyDict` make: changing it raises
         read_only: bool = false,
+        /// an IEqualityComparer's members, when one was given: they hash and compare the keys
+        cmp_eq: ?Func(*const fn (?*Env, K, K) Raised!bool) = null,
+        cmp_hash: ?Func(*const fn (?*Env, K) Raised!i32) = null,
 
         pub fn fable_free(c: *Self) void {
             if (c.capacity != 0) {
@@ -1739,6 +1742,39 @@ fn htNextSize(min: usize) usize {
     }
 }
 
+/// A new dictionary or set whose keys an IEqualityComparer hashes and compares
+pub fn htNewWith(comptime D: type, comparer: anytype) D {
+    const d = htNew(D);
+    // (an interface's value may be null: then the keys' own equality, as .NET's default)
+    const c = if (comptime @typeInfo(@TypeOf(comparer)) == .optional) (comparer orelse return d) else comparer;
+    d.cmp_eq = dup(@field(c, "Equals"));
+    d.cmp_hash = dup(@field(c, "GetHashCode"));
+    return d;
+}
+
+/// An empty dictionary or set that compares keys as `d` does
+pub fn htEmptyLike(d: anytype) @TypeOf(d) {
+    const e = htNew(@TypeOf(d));
+    if (d.cmp_eq) |f| e.cmp_eq = dup(f);
+    if (d.cmp_hash) |f| e.cmp_hash = dup(f);
+    return e;
+}
+
+/// (what a comparer raises cannot leave a lookup here)
+fn comparerFailed() noreturn {
+    @panic("fable: an IEqualityComparer raised an exception (not supported inside a dictionary or set)");
+}
+
+fn htHash(d: anytype, key: KeyOf(@TypeOf(d))) i32 {
+    const f = d.cmp_hash orelse return hash(key);
+    return f.code(f.env, dup(key)) catch comparerFailed();
+}
+
+fn htEql(d: anytype, a: KeyOf(@TypeOf(d)), b: KeyOf(@TypeOf(d))) bool {
+    const f = d.cmp_eq orelse return eql(a, b);
+    return f.code(f.env, dup(a), dup(b)) catch comparerFailed();
+}
+
 pub fn htBucket(d: anytype, h: i32) usize {
     return @as(u32, @bitCast(h)) % @as(u32, @intCast(d.buckets.len));
 }
@@ -1765,11 +1801,11 @@ pub fn htResize(d: anytype, size: usize) void {
 
 pub fn htFind(d: anytype, key: KeyOf(@TypeOf(d))) ?usize {
     if (d.buckets.len == 0) return null;
-    const h = hash(key);
+    const h = htHash(d, key);
     var i = d.buckets[htBucket(d, h)] - 1;
     while (i >= 0) {
         const e = &d.entries[@intCast(i)];
-        if (e.hash == h and eql(e.kv.?.key, key)) return @intCast(i);
+        if (e.hash == h and htEql(d, e.kv.?.key, key)) return @intCast(i);
         i = e.next;
     }
     return null;
@@ -1790,7 +1826,7 @@ fn htPut(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d)), replace
         return true;
     }
     if (d.buckets.len == 0) htResize(d, htNextSize(0));
-    const h = hash(key);
+    const h = htHash(d, key);
     var at: usize = undefined;
     if (d.free_count > 0) {
         at = @intCast(d.free_list);
@@ -1877,13 +1913,13 @@ pub fn dictContainsValue(d: anytype, value: ValueOf(@TypeOf(d))) bool {
 pub fn htRemove(d: anytype, key: KeyOf(@TypeOf(d))) Raised!bool {
     if (d.read_only) return notMutable();
     if (d.buckets.len == 0) return false;
-    const h = hash(key);
+    const h = htHash(d, key);
     const bucket = htBucket(d, h);
     var last: i32 = -1;
     var i = d.buckets[bucket] - 1;
     while (i >= 0) {
         const e = &d.entries[@intCast(i)];
-        if (e.hash == h and eql(e.kv.?.key, key)) {
+        if (e.hash == h and htEql(d, e.kv.?.key, key)) {
             if (last < 0) d.buckets[bucket] = e.next + 1 else d.entries[@intCast(last)].next = e.next;
             const old = e.kv.?;
             e.kv = null;
