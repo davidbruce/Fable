@@ -60,6 +60,7 @@ pub const thread = if (sgc.per_thread) struct {
     pub threadlocal var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
     pub threadlocal var book: ?std.mem.Allocator = null;
     pub threadlocal var null_arrays: std.ArrayList(NullArray) = .empty;
+    pub threadlocal var async_state: ?*ObjHeader = null;
 } else struct {
     pub var stats: Stats = .{};
     pub var collector: sgc.Gc = undefined;
@@ -68,6 +69,7 @@ pub const thread = if (sgc.per_thread) struct {
     pub var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
     pub var book: ?std.mem.Allocator = null;
     pub var null_arrays: std.ArrayList(NullArray) = .empty;
+    pub var async_state: ?*ObjHeader = null;
 };
 
 /// A null array of a type whose arrays the collector follows, kept until the collector goes
@@ -3497,7 +3499,27 @@ pub fn liveCells() i32 {
 
 /// Give back the collector's own bookkeeping, and the table of weak references. Nothing they
 /// look after may be alive.
+/// The state of this thread's async scheduler (Async.fs: its timers and trampoline), made
+/// when the thread first runs an async computation: each thread waits on its own timers
+pub fn asyncState() Any {
+    return dup(thread.async_state);
+}
+
+pub fn asyncStateSet(x: Any) void {
+    const old = thread.async_state;
+    thread.async_state = dup(x);
+    drop(old);
+}
+
+/// (given up when the thread ends, and before the program counts what it never freed)
+fn asyncStateRelease() void {
+    const old = thread.async_state;
+    thread.async_state = null;
+    drop(old);
+}
+
 pub fn collectorDeinit() void {
+    asyncStateRelease();
     // (the null arrays this thread made: given up before the collector goes)
     for (thread.null_arrays.items) |n| n.free(n.cell);
     thread.null_arrays.deinit(bookkeeping());
@@ -6892,6 +6914,7 @@ var ended_threads_live: i64 = 0;
 /// Called when the program's entry point has returned: true, with a message, if cells are
 /// still allocated. Only checks in builds that keep counters.
 pub fn leaked() bool {
+    asyncStateRelease();
     // (cycles that died without anything noticing yet are not leaks)
     _ = collect();
     if (!track or live() == 0) return false;

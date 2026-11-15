@@ -97,11 +97,53 @@ let private sleepMilliseconds (ms: int64) : unit = System.Threading.Thread.Sleep
 let private nowMs () : int64 =
     Fable.Library.Zig.DateTime.nowUtcTicks () / 10_000L
 
-let mutable private timerOrder = 0
-let private timers = ResizeArray<Timer>()
+/// What one thread's scheduler keeps: its timers, and its trampoline (see `bounce`). Each thread
+/// that runs async computations has its own (the runtime keeps it per thread)
+type private Sched =
+    {
+        mutable timerOrder: int
+        timers: ResizeArray<Timer>
+        mutable depth: int
+        pending: ResizeArray<unit -> unit>
+        /// how many `drive`s are running (the outermost lets the scheduler go when it is idle)
+        mutable drives: int
+    }
+
+#if FABLE_COMPILER
+[<Fable.Core.Emit("fable_rt.asyncState()")>]
+let private stateGet () : obj = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.asyncStateSet($0)")>]
+let private stateSet (_s: obj) : unit = Fable.Core.Util.nativeOnly
+#else
+let mutable private state: obj = null
+let private stateGet () : obj = state
+let private stateSet (s: obj) : unit = state <- s
+#endif
+
+/// This thread's scheduler, made when it first needs one
+let private sched () : Sched =
+    let s = stateGet ()
+
+    if isNull s then
+        let made =
+            {
+                timerOrder = 0
+                timers = ResizeArray()
+                depth = 0
+                pending = ResizeArray()
+                drives = 0
+            }
+
+        stateSet (box made)
+        made
+    else
+        unbox<Sched> s
 
 /// `action` at `ms` from now
 let private schedule (ms: int) (action: unit -> unit) : Timer =
+    let st = sched ()
+
     let t =
         {
             due =
@@ -110,17 +152,18 @@ let private schedule (ms: int) (action: unit -> unit) : Timer =
                        int64 ms
                    else
                        0L)
-            order = timerOrder
+            order = st.timerOrder
             action = action
             live = true
         }
 
-    timerOrder <- timerOrder + 1
-    timers.Add t
+    st.timerOrder <- st.timerOrder + 1
+    st.timers.Add t
     t
 
 /// Run the earliest timer (once it is due); false when there is none
 let private runNextTimer () : bool =
+    let timers = (sched ()).timers
     let mutable best = -1
 
     for i in 0 .. timers.Count - 1 do
@@ -207,33 +250,36 @@ let tokenRegister (t: CancellationTokenOf) (f: unit -> unit) : System.IDisposabl
 /// The trampoline: a continuation called deeper than this many nested binds is run after the
 /// stack has unwound to the entry point that started the computation (as .NET's trampoline
 /// does), so that a long chain of binds runs in bounded stack. The order of effects is kept.
-let mutable private depth = 0
 let private maxDepth = 200
-let private pending = ResizeArray<unit -> unit>()
 
 let private bounce (f: unit -> unit) : unit =
-    if depth >= maxDepth then
-        pending.Add f
+    let st = sched ()
+
+    if st.depth >= maxDepth then
+        st.pending.Add f
     else
-        depth <- depth + 1
+        st.depth <- st.depth + 1
 
         try
             f ()
         finally
-            depth <- depth - 1
+            st.depth <- st.depth - 1
 
 /// Run `f` from an entry point, then what it left for the trampoline, then the timers in the
 /// order of their time until `finished` (what the entry point waits for) or none is left
 let private drive (finished: unit -> bool) (f: unit -> unit) : unit =
-    let saved = depth
+    let st = sched ()
+    let pending = st.pending
+    let saved = st.depth
     let mark = pending.Count
-    depth <- 0
+    st.depth <- 0
+    st.drives <- st.drives + 1
 
     let drain () =
         while pending.Count > mark do
             let next = pending.[mark]
             pending.RemoveAt mark
-            depth <- 0
+            st.depth <- 0
             next ()
 
     try
@@ -241,16 +287,21 @@ let private drive (finished: unit -> bool) (f: unit -> unit) : unit =
         drain ()
 
         while not (finished ()) && runNextTimer () do
-            depth <- 0
+            st.depth <- 0
             drain ()
     finally
-        depth <- saved
+        st.depth <- saved
+        st.drives <- st.drives - 1
+
+        // (an idle thread keeps no scheduler: made again when it runs async code again)
+        if st.drives = 0 && st.timers.Count = 0 && st.pending.Count = 0 then
+            stateSet null
 
 /// The time the earliest timer that is still live is due (Int64.MaxValue when there is none)
 let private earliestDue () : int64 =
     let mutable due = System.Int64.MaxValue
 
-    for t in timers do
+    for t in (sched ()).timers do
         if t.live && t.due < due then
             due <- t.due
 

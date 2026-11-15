@@ -186,3 +186,33 @@ let ``test An exception in Task.Run is raised by Result inside an AggregateExcep
             e.Message
 
     message |> equal "One or more errors occurred. (oops)"
+
+[<Fact>]
+let ``test Threads run async computations with their own timers`` () =
+    // (each thread waits on its own timers: two at once do not take each other's)
+    let results: int[] = Array.zeroCreate 4
+
+    let work (k: int) =
+        async {
+            let mutable total = 0
+
+            for i in 1..5 do
+                do! Async.Sleep 2
+                total <- total + i * (k + 1)
+
+            return total
+        }
+
+    let threads =
+        [
+            for k in 0..3 ->
+                Thread(fun () -> results.[k] <- Async.RunSynchronously(work k))
+        ]
+
+    for t in threads do
+        t.Start()
+
+    for t in threads do
+        t.Join()
+
+    results |> equal [| 15; 30; 45; 60 |]
