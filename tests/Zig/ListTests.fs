@@ -501,8 +501,6 @@ let ``test List.sum with non numeric types works`` () =
   let p2 = {x=2; y=20}
   [p1; p2] |> List.sum |> (=) {x=3;y=30} |> equal true
 
-#if !FABLE_COMPILER_ZIG // (sums of a type's own + and Zero (statically resolved members) are not supported yet)
-#endif
 [<Fact>]
 let ``test List.sumBy with non numeric types works`` () =
   let p1 = {x=1; y=10}
