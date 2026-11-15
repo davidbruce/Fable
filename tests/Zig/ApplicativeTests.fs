@@ -741,7 +741,7 @@ let ``test Function generic type alias works II`` () =
     bind three (fun i -> three) "environment"
     |> equal 3
 
-#if !FABLE_COMPILER_ZIG // (a generic value holding a generic function, `let f_option = Some f`, used at another type)
+#if !FABLE_COMPILER_ZIG // (a generic function value passed through a local function that Fable types with obj (`let defaultValue x = Option.defaultValue x`))
 [<Fact>]
 let ``test Piping to an alias of a function which returns a function works`` () = // See #2657
     let f a b = sprintf $"{a} {b}"
