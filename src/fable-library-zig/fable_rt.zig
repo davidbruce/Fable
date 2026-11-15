@@ -1412,8 +1412,19 @@ pub fn lazyState(l: anytype, new_state: @TypeOf(l.state)) void {
     drop(old);
 }
 
-/// `l.Force()`, `l.Value`
+/// `l.Force()`, `l.Value`. A lazy value shared between threads is made once, as .NET's
+/// default (thread-safe) one is: under its lock, the state looked at again there.
 pub fn lazyForce(l: anytype) Raised!@FieldType(@TypeOf(l.state), "value") {
+    if (isShared(l)) {
+        const key = @intFromPtr(l);
+        lockEnter(key);
+        defer lockExit(key);
+        return lazyForceHere(l);
+    }
+    return lazyForceHere(l);
+}
+
+fn lazyForceHere(l: anytype) Raised!@FieldType(@TypeOf(l.state), "value") {
     switch (l.state) {
         .value => |v| return dup(v),
         .failed => |e| {

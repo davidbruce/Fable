@@ -295,3 +295,28 @@ let ``test Async.Parallel of many computations gives every result in order`` () 
         |> Async.RunSynchronously
 
     results |> equal [| for i in 1..100 -> i * i |]
+
+[<Fact>]
+let ``test A lazy value forced on several threads is made once`` () =
+    let runs = ref 0
+    let gate = obj ()
+
+    let value =
+        lazy
+            (lock gate (fun () -> runs.Value <- runs.Value + 1)
+             Thread.Sleep 20
+             42)
+
+    let results: int[] = Array.zeroCreate 4
+
+    let threads =
+        [ for k in 0..3 -> Thread(fun () -> results.[k] <- value.Value) ]
+
+    for t in threads do
+        t.Start()
+
+    for t in threads do
+        t.Join()
+
+    results |> equal [| 42; 42; 42; 42 |]
+    runs.Value |> equal 1
