@@ -1584,3 +1584,49 @@ let ``test Parsed guids with different case are considered the same`` () = // Se
     let lowerGuid = Guid.Parse lower
     let upperGuid = Guid.Parse upper
     lowerGuid = upperGuid |> equal true
+
+// System.Text.Encoding (from tests/Js/Main/ConvertTests.fs)
+
+[<Fact>]
+let ``test Encoding.Unicode.GetBytes works`` () =
+    System.Text.Encoding.Unicode.GetBytes("zăǽβ񏳿")
+    |> equal [| 0x7Auy; 0x00uy; 0x61uy; 0x00uy; 0x06uy; 0x03uy; 0xFDuy; 0x01uy; 0xB2uy; 0x03uy; 0xFFuy; 0xD8uy; 0xFFuy; 0xDCuy |]
+
+[<Fact>]
+let ``test Encoding.Unicode.GetBytes for range works`` () =
+    System.Text.Encoding.Unicode.GetBytes("zăǽβ񏳿".ToCharArray(), 4, 3)
+    |> equal [| 0xB2uy; 0x03uy; 0xFFuy; 0xD8uy; 0xFFuy; 0xDCuy |]
+
+[<Fact>]
+let ``test Encoding.Unicode.GetString works`` () =
+    let bytes = [| 0x7Auy; 0x00uy; 0x61uy; 0x00uy; 0x06uy; 0x03uy; 0xFDuy; 0x01uy; 0xB2uy; 0x03uy; 0xFFuy; 0xD8uy; 0xFFuy; 0xDCuy |]
+    System.Text.Encoding.Unicode.GetString(bytes)
+    |> equal "zăǽβ񏳿"
+
+[<Fact>]
+let ``test Encoding.Unicode.GetString for range works`` () =
+    let bytes = [| 0x7Auy; 0x00uy; 0x61uy; 0x00uy; 0x06uy; 0x03uy; 0xFDuy; 0x01uy; 0xB2uy; 0x03uy; 0xFFuy; 0xD8uy; 0xFFuy; 0xDCuy |]
+    System.Text.Encoding.Unicode.GetString(bytes, 8, 6)
+    |> equal "β񏳿"
+
+[<Fact>]
+let ``test Encoding.UTF8.GetBytes works`` () =
+    System.Text.Encoding.UTF8.GetBytes("zăǽβ񏳿")
+    |> equal [| 0x7Auy; 0x61uy; 0xCCuy; 0x86uy; 0xC7uy; 0xBDuy; 0xCEuy; 0xB2uy; 0xF1uy; 0x8Fuy; 0xB3uy; 0xBFuy |]
+
+[<Fact>]
+let ``test Encoding.UTF8.GetBytes for range works`` () =
+    System.Text.Encoding.UTF8.GetBytes("zăǽβ񏳿".ToCharArray(), 4, 3)
+    |> equal [| 0xCEuy; 0xB2uy; 0xF1uy; 0x8Fuy; 0xB3uy; 0xBFuy |]
+
+[<Fact>]
+let ``test Encoding.UTF8.GetString works`` () =
+    let bytes = [| 0x7Auy; 0x61uy; 0xCCuy; 0x86uy; 0xC7uy; 0xBDuy; 0xCEuy; 0xB2uy; 0xF1uy; 0x8Fuy; 0xB3uy; 0xBFuy |]
+    System.Text.Encoding.UTF8.GetString(bytes)
+    |> equal "zăǽβ񏳿"
+
+[<Fact>]
+let ``test Encoding.UTF8.GetString for range works`` () =
+    let bytes = [| 0x7Auy; 0x61uy; 0xCCuy; 0x86uy; 0xC7uy; 0xBDuy; 0xCEuy; 0xB2uy; 0xF1uy; 0x8Fuy; 0xB3uy; 0xBFuy |]
+    System.Text.Encoding.UTF8.GetString(bytes, 6, 6)
+    |> equal "β񏳿"

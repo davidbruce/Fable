@@ -357,7 +357,6 @@ let ``test ResizeArray.ToArray works`` () =
     equal 3. li[0]
     equal 2. ar[0]
 
-#if !FABLE_COMPILER_ZIG // (System.Text.Encoding is not supported by the Zig target yet)
 [<Fact>]
 let ``test ResizeArray<byte>.ToArray works`` () =
     let li = ResizeArray<byte>()
@@ -366,7 +365,6 @@ let ``test ResizeArray<byte>.ToArray works`` () =
     let text = ar |> Encoding.UTF8.GetString
     equal text "fable"
 
-#endif
 [<Fact>]
 let ``test ResizeArray.Item is undefined when index is out of range`` () =
     let xs = ResizeArray [0]

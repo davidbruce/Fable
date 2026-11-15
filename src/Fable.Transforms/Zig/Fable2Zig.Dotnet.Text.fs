@@ -634,6 +634,29 @@ let call
             ctx.State.UsesRuntime <- true
             EEmit("fable_rt.defaultOf($R)", [], mapType ctx r t)
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
+    // ---- System.Text.Encoding: UTF-8 and UTF-16 (the runtime's TextEncoding) ----
+    | "System.Text.Encoding", "get_UTF8", [] ->
+        ctx.State.UsesRuntime <- true
+        EEmit("fable_rt.TextEncoding.utf8", [], TPrim "fable_rt.TextEncoding")
+    | "System.Text.Encoding", "get_Unicode", [] ->
+        ctx.State.UsesRuntime <- true
+        EEmit("fable_rt.TextEncoding.utf16le", [], TPrim "fable_rt.TextEncoding")
+    | ("System.Text.Encoding" | "System.Text.UTF8Encoding" | "System.Text.UnicodeEncoding"), "GetBytes", [ enc; s ] when
+        s.Type = Fable.String
+        ->
+        rt "fable_rt.encodingGetBytes($0, $1)" [ enc; s ] (mapType ctx r t)
+    | ("System.Text.Encoding" | "System.Text.UTF8Encoding" | "System.Text.UnicodeEncoding"),
+      "GetBytes",
+      [ enc; chars; i; n ] -> rt "fable_rt.encodingGetBytesRange($0, $1, $2, $3)" [ enc; chars; i; n ] (mapType ctx r t)
+    | ("System.Text.Encoding" | "System.Text.UTF8Encoding" | "System.Text.UnicodeEncoding"), "GetString", [ enc; bytes ] ->
+        rt "fable_rt.encodingGetString($0, $1)" [ enc; bytes ] tStr
+    | ("System.Text.Encoding" | "System.Text.UTF8Encoding" | "System.Text.UnicodeEncoding"),
+      "GetString",
+      [ enc; bytes; i; n ] -> rt "fable_rt.encodingGetStringRange($0, $1, $2, $3)" [ enc; bytes; i; n ] tStr
+    | ("System.Text.Encoding" | "System.Text.UTF8Encoding" | "System.Text.UnicodeEncoding"), "GetByteCount", [ enc; s ] when
+        s.Type = Fable.String
+        ->
+        rt "fable_rt.encodingGetByteCount($0, $1)" [ enc; s ] tI32
     | "Microsoft.FSharp.Core.Operators", "IsNull", [ x ] when
         unwrapNullness x.Type = Fable.String || unwrapNullness x.Type = Fable.Any
         ->

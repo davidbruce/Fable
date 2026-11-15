@@ -3658,6 +3658,127 @@ pub const TextBuilder = struct {
     }
 };
 
+// ---- System.Text.Encoding: UTF-8 and UTF-16 (little-endian, .NET's Encoding.Unicode) ----
+
+pub const TextEncoding = enum(u8) {
+    utf8,
+    utf16le,
+    /// (the name .NET prints for it)
+    pub fn fable_show(b: *Shower, x: TextEncoding, depth: i32) *Layout {
+        _ = depth;
+        return b.word(if (x == .utf8) "System.Text.UTF8Encoding" else "System.Text.UnicodeEncoding");
+    }
+};
+
+/// (a code unit, or a pair of them, as a code point; a lone surrogate is U+FFFD, as .NET encodes it)
+fn nextCodePoint(units: []const u16, i: *usize) u21 {
+    const u = units[i.*];
+    i.* += 1;
+    if (u >= 0xD800 and u <= 0xDBFF and i.* < units.len) {
+        const lo = units[i.*];
+        if (lo >= 0xDC00 and lo <= 0xDFFF) {
+            i.* += 1;
+            return 0x10000 + ((@as(u21, u) - 0xD800) << 10) + (lo - 0xDC00);
+        }
+    }
+    if (u >= 0xD800 and u <= 0xDFFF) return 0xFFFD;
+    return u;
+}
+
+fn encodeUnits(enc: TextEncoding, units: []const u16) Array(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    switch (enc) {
+        .utf16le => for (units) |u| {
+            out.append(allocator, @truncate(u)) catch @panic("fable: out of memory");
+            out.append(allocator, @truncate(u >> 8)) catch @panic("fable: out of memory");
+        },
+        .utf8 => {
+            var i: usize = 0;
+            while (i < units.len) {
+                const cp = nextCodePoint(units, &i);
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &buf) catch 0;
+                out.appendSlice(allocator, buf[0..n]) catch @panic("fable: out of memory");
+            }
+        },
+    }
+    return arrayFrom(Array(u8), out.toOwnedSlice(allocator) catch @panic("fable: out of memory"));
+}
+
+fn rangeOf(len: usize, index: i32, count: i32) Raised![2]usize {
+    if (index < 0 or count < 0) return raise(ArgumentOutOfRangeException, str("Non-negative number required."));
+    if (@as(usize, @intCast(index)) + @as(usize, @intCast(count)) > len) return raise(ArgumentOutOfRangeException, str("Index and count must refer to a location within the buffer."));
+    return .{ @intCast(index), @as(usize, @intCast(index)) + @as(usize, @intCast(count)) };
+}
+
+/// `enc.GetBytes(s)`
+pub fn encodingGetBytes(enc: TextEncoding, s: String) Raised!Array(u8) {
+    if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
+    return encodeUnits(enc, unitsOf(s));
+}
+
+/// `enc.GetBytes(chars, index, count)`
+pub fn encodingGetBytesRange(enc: TextEncoding, chars: Array(u16), index: i32, count: i32) Raised!Array(u8) {
+    const r = try rangeOf(chars.items.len, index, count);
+    return encodeUnits(enc, chars.items[r[0]..r[1]]);
+}
+
+/// `enc.GetString(bytes)`: invalid bytes are U+FFFD, as .NET decodes them
+fn decodeBytes(enc: TextEncoding, bytes: []const u8) String {
+    var b: TextBuilder = .{};
+    switch (enc) {
+        .utf16le => {
+            var i: usize = 0;
+            while (i + 1 < bytes.len) : (i += 2) b.addOne(@as(u16, bytes[i]) | (@as(u16, bytes[i + 1]) << 8));
+            if (i < bytes.len) b.addOne(0xFFFD);
+        },
+        .utf8 => {
+            var i: usize = 0;
+            while (i < bytes.len) {
+                const n = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
+                    b.addOne(0xFFFD);
+                    i += 1;
+                    continue;
+                };
+                if (i + n > bytes.len) {
+                    b.addOne(0xFFFD);
+                    i += 1;
+                    continue;
+                }
+                const cp = std.unicode.utf8Decode(bytes[i .. i + n]) catch {
+                    b.addOne(0xFFFD);
+                    i += 1;
+                    continue;
+                };
+                if (cp >= 0x10000) {
+                    const v = cp - 0x10000;
+                    b.addOne(@intCast(0xD800 + (v >> 10)));
+                    b.addOne(@intCast(0xDC00 + (v & 0x3FF)));
+                } else b.addOne(@intCast(cp));
+                i += n;
+            }
+        },
+    }
+    return b.finish();
+}
+
+pub fn encodingGetString(enc: TextEncoding, bytes: Array(u8)) Raised!String {
+    if (arrayIsNull(bytes)) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 'bytes')"));
+    return decodeBytes(enc, bytes.items);
+}
+
+pub fn encodingGetStringRange(enc: TextEncoding, bytes: Array(u8), index: i32, count: i32) Raised!String {
+    const r = try rangeOf(bytes.items.len, index, count);
+    return decodeBytes(enc, bytes.items[r[0]..r[1]]);
+}
+
+/// `enc.GetByteCount(s)`
+pub fn encodingGetByteCount(enc: TextEncoding, s: String) Raised!i32 {
+    const a = try encodingGetBytes(enc, s);
+    defer drop(a);
+    return @intCast(a.items.len);
+}
+
 pub fn strEql(a: String, b: String) bool {
     if (a == b) return true;
     const x = a orelse return false;

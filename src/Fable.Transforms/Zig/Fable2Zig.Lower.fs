@@ -1398,6 +1398,13 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
                 },
                 [ item ]
             ))
+    // (.NET's text encodings: the runtime's TextEncoding, UTF-8 or UTF-16)
+    | Fable.DeclaredType(ent, []) when
+        ent.FullName = "System.Text.Encoding"
+        || ent.FullName = "System.Text.UTF8Encoding"
+        || ent.FullName = "System.Text.UnicodeEncoding"
+        ->
+        TPrim "fable_rt.TextEncoding"
     // (.NET's threads: the runtime's ThreadOf)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Thread" -> TPrim "fable_rt.ThreadOf"
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Diagnostics.Stopwatch" ->
