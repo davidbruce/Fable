@@ -668,15 +668,16 @@ let call
 
         bindArgs ctx [ parsed ] (fun xs -> ERt("fable_rt.unbox($R, $0)", xs, mapType ctx r enumT))
     // (`Enum.GetNames(t)` and the others of a Type)
-    | "System.Enum", ("GetUnderlyingType" | "GetNames" | "GetName" | "IsDefined" | "Parse"), (t0 :: _ as args) when
-        t0.Type = Fable.MetaType
-        ->
+    | "System.Enum",
+      ("GetUnderlyingType" | "GetNames" | "GetValues" | "GetName" | "IsDefined" | "Parse"),
+      (t0 :: _ as args) when t0.Type = Fable.MetaType ->
         ctx.State.UsesRuntime <- true
 
         match name, args with
         | "GetUnderlyingType", [ x ] ->
             rt "fable_rt.reflect.enumUnderlyingType($0)" [ x ] (TPrim "fable_rt.reflect.Type")
         | "GetNames", [ x ] -> rt "fable_rt.reflect.enumNames($0)" [ x ] (mapType ctx r t)
+        | "GetValues", [ x ] -> rt "fable_rt.reflect.enumValues($0)" [ x ] (mapType ctx r t)
         | "GetName", [ x; v ] -> rt "fable_rt.reflect.enumName($0, $1)" [ x; Fable.TypeCast(v, Fable.Any) ] tStr
         | "IsDefined", [ x; v ] -> rt "fable_rt.reflect.enumIsDefined($0, $1)" [ x; Fable.TypeCast(v, Fable.Any) ] tBool
         | "Parse", [ x; v ] -> rt "fable_rt.reflect.enumParse($0, $1, false)" [ x; v ] tAny
@@ -929,6 +930,7 @@ let call
         | _, "GetInterface", [ x; n; ignoreCase ] -> pureRfl "getInterface" [ x; n; ignoreCase ] tType
         | _, "GetEnumUnderlyingType", [ x ] -> rfl "enumUnderlyingType" [ x ] tType
         | _, "GetEnumNames", [ x ] -> rfl "enumNames" [ x ] resultTy
+        | _, "GetEnumValues", [ x ] -> rfl "enumValues" [ x ] resultTy
         | _, "IsAssignableFrom", [ a; b ] -> pureRfl "isAssignableFrom" [ a; b ] tBool
         // (a value whose type cannot hold others (a record, a union, a number...): by that type;
         // an object: by its class)

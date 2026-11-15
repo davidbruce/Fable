@@ -225,7 +225,6 @@ let ``test Decision targets in nested pattern matching can be found`` () =
         | _ -> 0
     test 2 |> equal 1
 
-#if !FABLE_COMPILER_ZIG // (System.Array as a value (Enum.GetValues))
 [<Fact>]
 let ``test Enum.GetValues works`` () =
     let check (ar: Array) =
@@ -236,7 +235,6 @@ let ``test Enum.GetValues works`` () =
     let t = typeof<MyEnum>
     Enum.GetValues(t) |> check
     t.GetEnumValues() |> check
-#endif
 
 [<Fact>]
 let ``test Enum.GetNames works`` () =

@@ -6421,6 +6421,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         // (an `IList<'T>`: the array it is here)
         | Fable.DeclaredType(il, [ item ]) when il.FullName = "System.Collections.Generic.IList`1" ->
             lw ctx (Fable.TypeCast(Fable.TypeCast(x, Fable.Array(item, Fable.MutableArray)), e.Type))
+        // (a `System.Array`: an array of objects here)
+        | Fable.DeclaredType(arr, []) when arr.FullName = "System.Array" ->
+            lw ctx (Fable.TypeCast(Fable.TypeCast(x, Fable.Array(Fable.Any, Fable.MutableArray)), e.Type))
         // (the matches and the groups of a regular expression)
         | Fable.DeclaredType(coll, []) when
             coll.FullName = "System.Text.RegularExpressions.MatchCollection"
@@ -6519,6 +6522,35 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | _ -> buildFrom xs.Head
             )
 
+    // (a `System.Array` or an `IList<'T>` seen as something else, a sequence: as the array it is
+    // here)
+    | Fable.TypeCast(x, target) when
+        (match x.Type, target with
+         | Fable.DeclaredType(a, []), Fable.DeclaredType(b, _) when a.FullName = "System.Array" ->
+             b.FullName <> "System.Array"
+         | Fable.DeclaredType(a, [ _ ]), Fable.DeclaredType(b, _) when a.FullName = "System.Collections.Generic.IList`1" ->
+             b.FullName <> "System.Collections.Generic.IList`1"
+         | _ -> false)
+        ->
+        let asArray =
+            match x.Type with
+            | Fable.DeclaredType(_, [ item ]) -> Fable.Array(item, Fable.MutableArray)
+            | _ -> Fable.Array(Fable.Any, Fable.MutableArray)
+
+        // (the non-generic IEnumerable, as `Seq.cast` takes it: a sequence of objects)
+        let target =
+            match target with
+            | Fable.DeclaredType(e, []) when e.FullName = "System.Collections.IEnumerable" ->
+                Fable.DeclaredType(
+                    {
+                        FullName = "System.Collections.Generic.IEnumerable`1"
+                        Path = Fable.CoreAssemblyName "System.Runtime"
+                    },
+                    [ Fable.Any ]
+                )
+            | t -> t
+
+        lw ctx (Fable.TypeCast(Fable.TypeCast(x, asArray), target))
     // (an array seen as `IList<'T>`: the same array)
     | Fable.TypeCast(x, Fable.DeclaredType(i, [ _ ])) when
         i.FullName = "System.Collections.Generic.IList`1"

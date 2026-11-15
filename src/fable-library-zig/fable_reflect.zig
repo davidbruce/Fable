@@ -655,6 +655,23 @@ pub fn enumNames(t: Type) Raised!rt.Array(String) {
     return rt.arrays.arrayFrom(rt.Array(String), items);
 }
 
+/// `Enum.GetValues(t)`: the values, each boxed as the enum's underlying integer (as an enum's
+/// value is boxed here)
+pub fn enumValues(t: Type) Raised!rt.Array(Any) {
+    if (t.kind != .@"enum") return notEnum();
+    const under: []const u8 = if (t.underlying) |u| u.full_name else "System.Int32";
+    const items = rt.arrays.arrayItems(rt.Array(Any), t.enum_values.len);
+    for (t.enum_values, 0..) |v, i| items[i] = boxInteger(under, v);
+    return rt.arrays.arrayFrom(rt.Array(Any), items);
+}
+
+fn boxInteger(type_name: []const u8, v: i64) Any {
+    inline for (.{ i8, u8, i16, c_ushort, i32, u32, i64, u64 }) |N| {
+        if (std.mem.eql(u8, rt.boxType(N).name, type_name)) return rt.box(@as(N, @intCast(v)));
+    }
+    return rt.box(@as(i32, @intCast(v)));
+}
+
 /// The number a boxed integer holds (an enum's value is boxed as its number)
 fn boxedInteger(o: Any) ?i64 {
     const p = o orelse return null;

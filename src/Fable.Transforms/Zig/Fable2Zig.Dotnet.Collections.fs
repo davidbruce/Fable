@@ -119,6 +119,53 @@ let call
         | [ i; n; v; c ] -> arrayLib "binarySearchWith" [ a; i; n; v; c ]
         | _ -> fail r "the Zig target does not support this Array.BinarySearch yet"
     // `Seq.cast<'T> xs` of a collection whose items are `'T` already: the collection as a sequence
+    // `Seq.cast<'T>` of objects (a `System.Array`, an array of `obj`): each unboxed
+    | "Microsoft.FSharp.Collections.SeqModule", "Cast", [ Uncast source ] when
+        (match t, source.Type with
+         | Fable.DeclaredType(_, [ item ]), Fable.DeclaredType(a, []) ->
+             a.FullName = "System.Array" && item <> Fable.Any
+         | Fable.DeclaredType(_, [ item ]), Fable.Array(Fable.Any, _) -> item <> Fable.Any
+         | _ -> false)
+        ->
+        let item =
+            match t with
+            | Fable.DeclaredType(_, [ item ]) -> item
+            | _ -> Fable.Any
+
+        let objSeq =
+            Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEnumerable`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ Fable.Any ]
+            )
+
+        let o = AST.makeTypedIdent Fable.Any "item"
+
+        lw
+            ctx
+            (Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "Map"
+                        Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Collections.SeqModule"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(
+                    args =
+                        [
+                            Fable.Lambda(o, Fable.TypeCast(Fable.IdentExpr o, item), None)
+                            Fable.TypeCast(source, objSeq)
+                        ],
+                    genArgs = [ Fable.Any; item ]
+                ),
+                t,
+                r
+            ))
     | "Microsoft.FSharp.Collections.SeqModule", "Cast", [ Uncast source ] when
         (match t with
          | Fable.DeclaredType(seqRef, [ item ]) when seqRef.FullName = "System.Collections.Generic.IEnumerable`1" ->
