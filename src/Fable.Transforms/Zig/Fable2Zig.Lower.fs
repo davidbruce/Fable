@@ -3907,6 +3907,55 @@ let rec neverNull (e: Fable.Expr) : bool =
     | Fable.Value(Fable.StringTemplate _, _) -> true
     | _ -> false
 
+/// What a condition tells of nulls: the variables (immutable, of a type that can be null) known
+/// not to be null where it is true, and where it is false. `isNull x`, `x = null`, `x <> null`,
+/// `String.IsNullOrEmpty x`, `not`, and `&&` / `||`
+let rec nullFacts (cond: Fable.Expr) : string list * string list =
+    let isNullValue (e: Fable.Expr) =
+        match e with
+        | Fable.Value(Fable.Null _, _) -> true
+        | Fable.Call(Fable.Import(imp, _, _), info, _, _) -> imp.Selector = "DefaultOf" && info.Args.IsEmpty
+        | _ -> false
+
+    let named (e: Fable.Expr) =
+        match e with
+        | Fable.IdentExpr i when not i.IsMutable -> Some i.Name
+        | _ -> None
+
+    match cond with
+    | Fable.Operation(Fable.Unary(UnaryNot, x), _, _, _) ->
+        let t, f = nullFacts x
+        f, t
+    | Fable.Operation(Fable.Logical(LogicalAnd, a, b), _, _, _) ->
+        let ta, _ = nullFacts a
+        let tb, _ = nullFacts b
+        ta @ tb, []
+    | Fable.Operation(Fable.Logical(LogicalOr, a, b), _, _, _) ->
+        let _, fa = nullFacts a
+        let _, fb = nullFacts b
+        [], fa @ fb
+    | Fable.Call(Fable.Import(imp, _, _), info, _, _) ->
+        match imp.Selector, info.Args with
+        | ("IsNull" | "IsNullOrEmpty" | "IsNullOrWhiteSpace"), [ x ] -> [], Option.toList (named x)
+        | "op_Equality", [ x; n ] when isNullValue n -> [], Option.toList (named x)
+        | "op_Equality", [ n; x ] when isNullValue n -> [], Option.toList (named x)
+        | "op_Inequality", [ x; n ] when isNullValue n -> Option.toList (named x), []
+        | "op_Inequality", [ n; x ] when isNullValue n -> Option.toList (named x), []
+        | _ -> [], []
+    | Fable.Operation(Fable.Binary(BinaryEqual, x, n), _, _, _) when isNullValue n -> [], Option.toList (named x)
+    | Fable.Operation(Fable.Binary(BinaryUnequal, x, n), _, _, _) when isNullValue n -> Option.toList (named x), []
+    | _ -> [], []
+
+/// `f ()` with these variables known not to be null (`Ctx.NonNull`) while it runs
+let withNonNull (ctx: Ctx) (names: string list) (f: unit -> 'a) : 'a =
+    let added = names |> List.filter (fun n -> ctx.NonNull.Add n)
+
+    try
+        f ()
+    finally
+        for n in added do
+            ctx.NonNull.Remove n |> ignore
+
 /// `neverNull`, or a variable bound to such a string and never assigned (`Ctx.NonNull`)
 let neverNullIn (ctx: Ctx) (e: Fable.Expr) : bool =
     match e with
@@ -5820,10 +5869,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let thenExpr = wrapNullCast merged thenExpr
         let elseExpr = wrapNullCast merged elseExpr
 
+        // (what the guard tells of nulls holds in its branches)
+        let whenTrue, whenFalse = nullFacts guard
+
         bindArgs
             ctx
             [ lw ctx guard ]
-            (fun xs -> EIf(xs.Head, coerceTy ctx ty (lw ctx thenExpr), coerceTy ctx ty (lw ctx elseExpr), ty))
+            (fun xs ->
+                EIf(
+                    xs.Head,
+                    coerceTy ctx ty (withNonNull ctx whenTrue (fun () -> lw ctx thenExpr)),
+                    coerceTy ctx ty (withNonNull ctx whenFalse (fun () -> lw ctx elseExpr)),
+                    ty
+                )
+            )
 
     | Fable.Operation(kind, _, t, r) ->
         let ty = mapType ctx r t
