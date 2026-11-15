@@ -57,6 +57,9 @@ type Ctx =
         /// whole-number variables known to be greater than zero where they are used (a guard
         /// tested it): a divisor that needs no test
         Positive: HashSet<string>
+        /// `coll|i`: inside `for i in 0 .. coll.Length - 1` (coll an immutable string or array),
+        /// `coll.[i]` is in range (and the string not null: its length was read)
+        InBounds: HashSet<string>
         /// inside a `for ... in` loop: the enumerator's name, and the variable that holds the
         /// item of this round
         Enumerators: Dictionary<string, Var>
@@ -5911,6 +5914,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         // (a name bound again is not the one a guard tested)
         ctx.Positive.Remove id.Name |> ignore
 
+        ctx.InBounds.RemoveWhere(fun k -> k.StartsWith(id.Name + "|") || k.EndsWith("|" + id.Name))
+        |> ignore
+
         let rhs = lw ctx (adaptTo ctx.Com id.Type value)
         let ty = mapType ctx id.Range id.Type
 
@@ -7988,7 +7994,48 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.ForLoop(id, start, limit, body, isUp, _) ->
         let iv = ctx.State.NewVar(id.Name, mapType ctx id.Range id.Type, VLocal, false)
         ctx.Vars[id.Name] <- iv
-        bindArgs ctx [ lw ctx start; lw ctx limit ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, lwStmt ctx body))
+
+        // (`for i in 0 .. c.Length - 1`: `c.[i]` is in range in the body)
+        let lengthOf (e: Fable.Expr) : Fable.Ident option =
+            let ofArgs (info: Fable.CallInfo) =
+                match info.ThisArg, info.Args with
+                | Some(Fable.IdentExpr c), []
+                | None, [ Fable.IdentExpr c ] when not c.IsMutable -> Some c
+                | _ -> None
+
+            match e with
+            | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
+                imp.Selector = "get_Length" || imp.Selector = "Length"
+                ->
+                ofArgs info
+            | _ -> None
+
+        let covered =
+            match start, limit with
+            | Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 n, _), _),
+              Fable.Operation(Fable.Binary(BinaryMinus,
+                                           len,
+                                           Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 1, _), _)),
+                              _,
+                              _,
+                              _) when isUp && n >= 0 && not id.IsMutable -> lengthOf len
+            | _ -> None
+
+        let lowerBody () = lwStmt ctx body
+
+        let bodyIr =
+            match covered with
+            | Some c ->
+                let nonNull =
+                    if unwrapNullness c.Type = Fable.String then
+                        [ c.Name ]
+                    else
+                        []
+
+                withFacts ctx.InBounds [ c.Name + "|" + id.Name ] (fun () -> withKnown ctx nonNull [] lowerBody)
+            | None -> lowerBody ()
+
+        bindArgs ctx [ lw ctx start; lw ctx limit ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, bodyIr))
 
     // (`box e.InnerException`: null when there is none)
     | Fable.TypeCast(Fable.Call(Fable.Import(imp, _, _), info, _, _), Fable.Any) when
@@ -10473,6 +10520,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             Boxed = HashSet()
             NonNull = HashSet()
             Positive = HashSet()
+            InBounds = HashSet()
             Enumerators = Dictionary()
             OutTuples = Dictionary()
             CaughtExn = None

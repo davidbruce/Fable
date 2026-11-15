@@ -724,6 +724,12 @@ let call
     | "System.String", "get_Length", [ s ] when neverNullIn ctx s -> pure' "fable_rt.strLength($0)" [ s ] tI32
     | "System.String", "get_Length", [ s ] -> rt "fable_rt.strLen($0)" [ s ] tI32
     | "Microsoft.FSharp.Core.StringModule", "Length", [ s ] -> pure' "fable_rt.strLength($0)" [ s ] tI32
+    // (`for i in 0 .. s.Length - 1`: in range, and the string not null)
+    | "System.String", "get_Chars", [ (Fable.IdentExpr si) as s; (Fable.IdentExpr ii) as i ]
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions",
+      "GetString",
+      [ (Fable.IdentExpr si) as s; (Fable.IdentExpr ii) as i ] when ctx.InBounds.Contains(si.Name + "|" + ii.Name) ->
+        pure' "$0.?.units()[@as(usize, @intCast($1))]" [ s; i ] tChar
     | "System.String", "get_Chars", [ s; i ]
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetString", [ s; i ] ->
         rt "fable_rt.strAt($0, $1)" [ s; i ] tChar
