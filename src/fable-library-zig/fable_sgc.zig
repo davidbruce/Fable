@@ -172,8 +172,8 @@ pub const Meta = packed struct(u32) {
     flags: u5,
 };
 
-/// Embedded in every cycle-capable cell. 36 bytes, alignment 4, so that a
-/// cell's 32-bit count in front of it makes 40.
+/// Embedded in every cycle-capable cell. 36 bytes on 64-bit targets (24 bytes on 32-bit),
+/// alignment 4, so that a cell's 32-bit count in front of it stays 4-byte aligned.
 pub const Hdr = extern struct {
     prev: *Hdr align(4),
     next: *Hdr align(4),
@@ -187,7 +187,7 @@ pub const Hdr = extern struct {
     /// for the root); 0: the cell is on its own.
     st: u32,
     meta: Meta,
-    /// Low 32 bits of the allocation sequence number (see Gc.birth).
+    /// Low 32 bits of the allocation sequence number (see Gc.setBirth/getBirth).
     age: u32,
 
     pub inline fn desc(h: *const Hdr) *const Desc {
@@ -197,7 +197,7 @@ pub const Hdr = extern struct {
 };
 
 comptime {
-    assert(@sizeOf(Hdr) == 36 and @alignOf(Hdr) == 4);
+    assert(@sizeOf(Hdr) == 3 * @sizeOf(*Hdr) + 12 and @alignOf(Hdr) == 4);
     assert(@alignOf(Desc) == desc_align and @alignOf(@TypeOf(anchor)) == 1);
 }
 
@@ -232,7 +232,7 @@ pub const Structure = struct {
     grow: usize = 0,
     /// Checks in a row that found nothing dead (at most 6). Each one doubles
     /// the growth the next check waits for.
-    quiet: u6 = 0,
+    quiet: std.math.Log2Int(usize) = 0,
     due: u64 = 0,
     dirty: bool = false,
     dead: bool = false,
@@ -514,12 +514,25 @@ pub const Gc = struct {
     }
 
     /// A cell on its own that has never been in a structure keeps its full
-    /// 64-bit allocation number in the (otherwise unused) `prev` link. That
-    /// is the only cell whose exact age rule (A) needs: for the other end of
-    /// the store 32 bits are enough, because taking a cell for younger than
-    /// it is only makes the rule ignore less.
-    inline fn birth(h: *Hdr) *align(4) u64 {
-        return @ptrCast(&h.prev);
+    /// 64-bit allocation number across `prev` (high 32 bits on 32-bit targets,
+    /// or all 64 bits on 64-bit) and `age` (low 32 bits). That is the only
+    /// cell whose exact age rule (A) needs: for the other end of the store 32
+    /// bits are enough, because taking a cell for younger than it is only
+    /// makes the rule ignore less.
+    inline fn setBirth(h: *Hdr, seq: u64) void {
+        if (@sizeOf(*Hdr) == 8) {
+            @as(*align(4) u64, @ptrCast(&h.prev)).* = seq;
+        } else {
+            @as(*u32, @ptrCast(&h.prev)).* = @intCast(seq >> 32);
+        }
+    }
+
+    inline fn getBirth(h: *const Hdr) u64 {
+        if (@sizeOf(*Hdr) == 8) {
+            return @as(*align(4) const u64, @ptrCast(&h.prev)).*;
+        } else {
+            return (@as(u64, @as(*const u32, @ptrCast(&h.prev)).*) << 32) | h.age;
+        }
     }
 
     /// The record with number `n` (1-based).
@@ -559,7 +572,7 @@ pub const Gc = struct {
             .meta = .{ .desc_off = @intCast(@divExact(off, desc_align)), .state = .idle, .flags = if (leaf) F_LEAF else 0 },
             .age = @truncate(gc.allocs),
         };
-        birth(&h).* = gc.allocs;
+        setBirth(&h, gc.allocs);
         return h;
     }
 
@@ -727,7 +740,7 @@ pub const Gc = struct {
             // young) otherwise, which only makes this test fail.
             const now: u32 = @truncate(gc.allocs);
             const child_birth = gc.allocs - (now -% child.age);
-            if (child_birth < birth(owner).*) {
+            if (child_birth < getBirth(owner)) {
                 gc.counters.stores_ignored += 1;
                 return;
             }

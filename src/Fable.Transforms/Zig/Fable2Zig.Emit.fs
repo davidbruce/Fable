@@ -230,7 +230,9 @@ let rec ex (em: Em) (e: Expr) : string =
 
         // .NET masks the shift count to the width of the shifted value
         let shiftCount (y: string) =
-            $"@intCast(%s{y} & %d{max 1 (intBits argT) - 1})"
+            match argT with
+            | TPrim("isize" | "usize") -> $"@intCast(%s{y} & (@bitSizeOf(usize) - 1))"
+            | _ -> $"@intCast(%s{y} & %d{max 1 (intBits argT) - 1})"
 
         match op, a with
         | "add", [ x; y ] -> $"""(%s{x} %s{wrap "+"} %s{y})"""

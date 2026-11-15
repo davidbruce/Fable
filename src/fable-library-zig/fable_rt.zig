@@ -255,7 +255,7 @@ fn threadMain(f: ThreadStart, finished: *u32, t: ThreadOf) void {
     @atomicStore(u32, finished, 1, .release);
     drop(t);
     collectorDeinit();
-    if (track) _ = @atomicRmw(i64, &ended_threads_live, .Add, thread.stats.allocs - thread.stats.frees, .monotonic);
+    if (track) _ = @atomicRmw(isize, &ended_threads_live, .Add, @intCast(thread.stats.allocs - thread.stats.frees), .monotonic);
 }
 
 fn threadRan(_: ?*Env, _: void) Raised!void {}
@@ -381,7 +381,7 @@ pub fn parallelFor(n: usize, ctx: anytype, comptime step: fn (@TypeOf(ctx), usiz
         fn worker(st: *@This(), c: @TypeOf(ctx), lo: usize, hi: usize) void {
             st.chunk(c, lo, hi);
             collectorDeinit();
-            if (track) _ = @atomicRmw(i64, &ended_threads_live, .Add, thread.stats.allocs - thread.stats.frees, .monotonic);
+            if (track) _ = @atomicRmw(isize, &ended_threads_live, .Add, @intCast(thread.stats.allocs - thread.stats.frees), .monotonic);
         }
     };
     var state: State = .{};
@@ -4156,9 +4156,9 @@ pub fn hash(x: anytype) i32 {
         .void => return 0,
         .bool => return @intFromBool(x),
         .int => |info| {
-            if (info.bits <= 32) return if (info.signedness == .signed) @as(i32, x) else @bitCast(@as(u32, x));
+            if (info.bits <= 32) return if (info.signedness == .signed) @as(i32, @intCast(x)) else @bitCast(@as(u32, @intCast(x)));
             // (as .NET folds a 64-bit number)
-            const wide: u64 = @bitCast(@as(i64, @intCast(x)));
+            const wide: u64 = if (info.signedness == .signed) @bitCast(@as(i64, @intCast(x))) else @as(u64, @intCast(x));
             return @bitCast(@as(u32, @truncate(wide)) ^ @as(u32, @truncate(wide >> 32)));
         },
         .float => {
@@ -7080,12 +7080,12 @@ pub inline fn across(
 
 /// Cells that were allocated and not freed (0 when counters are not kept).
 pub fn live() i64 {
-    return thread.stats.allocs - thread.stats.frees + @atomicLoad(i64, &ended_threads_live, .monotonic);
+    return thread.stats.allocs - thread.stats.frees + @atomicLoad(isize, &ended_threads_live, .monotonic);
 }
 
 /// What threads that have ended allocated and did not free themselves: a cell made on one
 /// thread may be freed on another (the last to let go of a shared value).
-var ended_threads_live: i64 = 0;
+var ended_threads_live: isize = 0;
 
 /// Called when the program's entry point has returned: true, with a message, if cells are
 /// still allocated. Only checks in builds that keep counters.
@@ -8685,4 +8685,18 @@ test "a value shared between threads is counted atomically and freed once" {
     drop(r);
     // (allocations on this thread; frees happened on whichever thread let go last: this one)
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "native integers and SGC header compile cleanly across pointer widths" {
+    try std.testing.expectEqual(@sizeOf(sgc.Hdr), 3 * @sizeOf(*sgc.Hdr) + 12);
+    const n: isize = -7;
+    const u: usize = 42;
+    try std.testing.expectEqual(@as(i32, -7), conv(i32, n));
+    try std.testing.expectEqual(@as(u32, 42), conv(u32, u));
+    try std.testing.expectEqual(@as(usize, 42), conv(usize, @as(u64, 42)));
+    try std.testing.expectEqual(@as(isize, -7), conv(isize, @as(i64, -7)));
+    try std.testing.expectEqual(@as(i32, 42), hash(u));
+    try std.testing.expectEqual(if (@bitSizeOf(isize) == 64) @as(i32, 6) else @as(i32, -7), hash(n));
+    const big_u: u64 = std.math.maxInt(u64);
+    _ = hash(big_u);
 }

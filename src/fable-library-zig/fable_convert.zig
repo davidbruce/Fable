@@ -631,7 +631,8 @@ pub fn conv(comptime To: type, x: anytype) To {
                 const bits = @max(to.bits, from.bits);
                 const WideFrom = @Int(from.signedness, bits);
                 const WideTo = @Int(to.signedness, bits);
-                return @truncate(@as(WideTo, @bitCast(@as(WideFrom, x))));
+                const truncated: @Int(to.signedness, to.bits) = @truncate(@as(WideTo, @bitCast(@as(WideFrom, @intCast(x)))));
+                return @intCast(truncated);
             },
             .float => {
                 if (std.math.isNan(x)) return 0;

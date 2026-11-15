@@ -336,6 +336,16 @@ let run () : int =
             && Checked.int 7L = 7
             && Checked.(+) 1.5 1.0 = 2.5
         )
+        + check (
+            let s = 3
+
+            (1n <<< 3) = 8n
+            && (1n <<< s) = 8n
+            && (16un >>> 2) = 4un
+            && (16un >>> s) = 2un
+            && int 7n = 7
+            && unativeint 42 = 42un
+        )
 
     printfn "numbers: %d" failed
     failed

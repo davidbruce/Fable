@@ -92,12 +92,12 @@ pub fn randomNew(seed: i32) Random {
     return c;
 }
 
-pub var random_count: u64 = 0;
+pub var random_count: usize = 0;
 
 /// `Random()`: seeded from what differs between runs and calls here: where the stack and the
 /// heap are (the system places them anew each run) and a count of the generators made
 pub fn randomUnseeded() Random {
-    const count = @atomicRmw(u64, &random_count, .Add, 1, .monotonic) +% 1;
+    const count = @atomicRmw(usize, &random_count, .Add, 1, .monotonic) +% 1;
     const r = randomNew(0);
     var local: u8 = 0;
     const mix = [_]u64{ @intFromPtr(&local), @intFromPtr(r), count };
