@@ -10,6 +10,19 @@ const String = rt.String;
 const Raised = rt.Raised;
 const sys = std.posix.system;
 
+// ---- the program's arguments ----
+
+/// The arguments of `[<EntryPoint>] main argv`: the command line without the program's name, as
+/// .NET gives them
+pub fn programArgs(args: std.process.Args) rt.Array(String) {
+    var it = std.process.Args.Iterator.initAllocator(args, rt.allocator) catch @panic("fable: out of memory");
+    defer it.deinit();
+    _ = it.skip();
+    var items: std.ArrayList(String) = .empty;
+    while (it.next()) |a| items.append(rt.allocator, fromUtf8(a)) catch @panic("fable: out of memory");
+    return rt.arrayFrom(rt.Array(String), items.toOwnedSlice(rt.allocator) catch @panic("fable: out of memory"));
+}
+
 // ---- strings and paths ----
 
 /// The UTF-8 of `s`, ended by a zero (the caller frees it)

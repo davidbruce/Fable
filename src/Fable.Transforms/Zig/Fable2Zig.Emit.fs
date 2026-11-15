@@ -2058,14 +2058,32 @@ let emitFile (state: FileState) : string =
     // In builds that count cells, a program that ends with cells still allocated says so.
     for fn in state.Fns do
         if fn.IsEntryPoint then
+            // (`main argv`: the command line's arguments, which the program owns or which
+            // are given up after it)
+            let takesArgs = not fn.Params.IsEmpty
+
             out
-                .AppendLine("pub fn main() u8 {")
+                .AppendLine(
+                    if takesArgs then
+                        "pub fn main(init: @import(\"std\").process.Init.Minimal) u8 {"
+                    else
+                        "pub fn main() u8 {"
+                )
                 .AppendLine(
                     "    if (comptime fable_rt.isRaised(@TypeOf(@\"$init\"()))) (@\"$init\"() catch { fable_rt.uncaught(); return 134; }) else @\"$init\"();"
                 )
             |> ignore
 
-            let call = $"%s{topIdent fn.Name}()"
+            if takesArgs then
+                out.AppendLine("    const argv = fable_rt.io.programArgs(init.args);") |> ignore
+
+            let call =
+                if takesArgs then
+                    $"%s{topIdent fn.Name}(argv)"
+                else
+                    $"%s{topIdent fn.Name}()"
+
+            let argvOwned = takesArgs && (fn.Modes |> List.tryHead = Some MOwned)
 
             // (an exception that nothing handled ends the program, as on .NET)
             let guarded =
@@ -2080,6 +2098,9 @@ let emitFile (state: FileState) : string =
                 |> ignore
             else
                 out.AppendLine($"    const code: i32 = %s{guarded};") |> ignore
+
+            if takesArgs && not argvOwned then
+                out.AppendLine("    fable_rt.drop(argv);") |> ignore
 
             out
                 .AppendLine("    @\"$deinit\"();")

@@ -10866,8 +10866,11 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         d.Args
 
                 let ps =
-                    if entry then
-                        [] // (the argument array is not available yet)
+                    if
+                        entry
+                        && (d.Args.IsEmpty || d.Args |> List.forall (fun a -> a.Type = Fable.Unit))
+                    then
+                        [] // (`main ()`)
                     else
                         args
                         |> List.map (fun a ->
