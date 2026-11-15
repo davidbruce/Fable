@@ -452,11 +452,9 @@ let inline inlineLambdaWithAnonRecord callback =
 
 let sideEffect() = ()
 
-#if !FABLE_COMPILER_ZIG // (a function of unit called through a generic interpolation ($"{a}" of unit))
 let inline inlineToString (f: 'T -> string): 'T -> string =
     let unused = f
     fun a -> $"{a}"
-#endif
 
 type MyIntDelegate = delegate of unit -> int
 

@@ -152,12 +152,10 @@ let ``test Seq.average works with custom types`` () =
     seq {MyNumber 1; MyNumber 2; MyNumber 3}
     |> Seq.average |> equal (MyNumber 2)
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: sums through a type's own +, a Seq.empty whose item type F# leaves open)
 [<Fact>]
 let ``test Seq.averageBy works with custom types`` () =
     seq {{ MyNumber = MyNumber 5 }; { MyNumber = MyNumber 4 }; { MyNumber = MyNumber 3 }}
     |> Seq.averageBy (fun x -> x.MyNumber) |> equal (MyNumber 4)
-#endif
 
 [<Fact>]
 let ``test Seq.choose works`` () =
@@ -557,13 +555,11 @@ let ``test Seq.sum with non numeric types works`` () =
     let p2 = {x=2; y=20}
     [p1; p2] |> Seq.sum |> (=) {x=3;y=30} |> equal true
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: sums through a type's own +, a Seq.empty whose item type F# leaves open)
 [<Fact>]
 let ``test Seq.sumBy with non numeric types works`` () =
     let p1 = {x=1; y=10}
     let p2 = {x=2; y=20}
     [p1; p2] |> Seq.sumBy Point.Neg |> (=) {x = -3; y = -30} |> equal true
-#endif
 
 [<Fact>]
 let ``test Seq.sumBy with numeric projection works`` () =

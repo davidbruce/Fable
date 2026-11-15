@@ -1668,7 +1668,6 @@ let ``test IsInstanceOfType works with primitives`` () =
     |> equal false
 
 #if FABLE_COMPILER
-#if !FABLE_COMPILER_ZIG // (Fable.Core.Reflection)
 [<Fact>]
 let ``test Choice with arity 3+ is represented correctly`` () = // See #2485
     Choice2Of3 55
@@ -1678,7 +1677,6 @@ let ``test Choice with arity 3+ is represented correctly`` () = // See #2485
     Choice3Of3 55
     |> Fable.Core.Reflection.getCaseName
     |> equal "Choice3Of3"
-#endif
 #endif
 
 [<Fact>]

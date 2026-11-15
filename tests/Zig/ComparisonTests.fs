@@ -11,9 +11,7 @@ open FSharp.Data.UnitSystems.SI.UnitSymbols
 
 type UTest = A of int | B of int
 type RTest = { a: int; b: int }
-#if !FABLE_COMPILER_ZIG // (struct types with val fields are not supported by the Zig target yet)
 type STest = struct val A: int; new(a: int) = { A = a }; end
-#endif
 type OTest(a) = member val A = a with get, set
 
 [<CustomEquality; CustomComparison>]
@@ -737,7 +735,6 @@ let ``Equals with primitives works`` () =
     (1.m).Equals(1.m) |> equal true
     ("1").Equals("1") |> equal true
 
-#if !FABLE_COMPILER_ZIG // (comparison by a culture is not supported by the Zig target yet)
 [<Fact>]
 let ``CompareTo with primitives works`` () =
     (true).CompareTo(true) |> equal 0
@@ -755,7 +752,6 @@ let ``CompareTo with primitives works`` () =
     (1.).CompareTo(1.) |> equal 0
     (1.m).CompareTo(1.m) |> equal 0
     ("1").CompareTo("1") |> equal 0
-#endif
 
 [<Fact>]
 let ``test GetHashCode with wide numeric types works`` () =
