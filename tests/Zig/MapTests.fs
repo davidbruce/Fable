@@ -272,7 +272,6 @@ let ``test Map.toSeq generates sequences that can be iterated multiple times`` (
     pr someSeq |> equal "a, b"
     pr someSeq |> equal "a, b"
 
-#if !FABLE_COMPILER_ZIG // (Map as an IDictionary or an ICollection is not supported by the Zig target yet)
 [<Fact>]
 let ``test Map.keys works`` () =
     let xs = [|1,1.; 2,4.; 3,9.; 4,16.|]
@@ -280,9 +279,7 @@ let ``test Map.keys works`` () =
     let zs = Map.keys ys
     zs.Count |> equal xs.Length
     Seq.item 2 zs |> equal (fst xs.[2])
-#endif
 
-#if !FABLE_COMPILER_ZIG // (Map as an IDictionary or an ICollection is not supported by the Zig target yet)
 [<Fact>]
 let ``test Map.values works`` () =
     let xs = [|1,1.; 2,4.; 3,9.; 4,16.|]
@@ -290,7 +287,6 @@ let ``test Map.values works`` () =
     let zs = Map.values ys
     zs.Count |> equal xs.Length
     Seq.item 2 zs |> equal (snd xs.[2])
-#endif
 
 [<Fact>]
 let ``test Map.minKeyValue works`` () =
@@ -306,7 +302,6 @@ let ``test Map.maxKeyValue works`` () =
     xs |> Map.ofList|> Map.maxKeyValue |> equal (5, "e")
     ys |> Map.ofList|> Map.maxKeyValue |> equal ("e", 5)
 
-#if !FABLE_COMPILER_ZIG // (Map as an IDictionary or an ICollection is not supported by the Zig target yet)
 [<Fact>]
 let ``test Map can be casted to IDictionary`` () =
      let map = Map [ "a", 1; "b", 2; "c", 3]
@@ -315,7 +310,6 @@ let ``test Map can be casted to IDictionary`` () =
      dic.TryGetValue("d") |> fst |> equal false
      dic.Keys |> Seq.toList |> equal ["a"; "b"; "c"]
      dic.Values |> Seq.toList |> equal [1; 2; 3]
-#endif
 
 [<Fact>]
 let ``test KeyValuePair can be referenced`` () =
@@ -356,19 +350,15 @@ let ``test Map iteration with KeyValue yields key-value pairs`` () =
     keys |> List.sort |> equal ["bar"; "baz"; "foo"]
     values |> List.sort |> equal [1; 2; 3]
 
-#if !FABLE_COMPILER_ZIG // (Map as an IDictionary or an ICollection is not supported by the Zig target yet)
 [<Fact>]
 let ``test Map keys and values work correctly`` () =
     let myMap = Map [ "a", 10; "b", 20 ] :> IDictionary<_,_>
     myMap.Keys |> Seq.toList |> equal ["a"; "b"]
     myMap.Values |> Seq.toList |> equal [10; 20]
-#endif
 
-#if !FABLE_COMPILER_ZIG // (Map as an IDictionary or an ICollection is not supported by the Zig target yet)
 [<Fact>]
 let ``test Map enumerator Current raises InvalidOperationException outside the enumeration`` () =
     let e = (Map [1, "a"] :> seq<_>).GetEnumerator()
     raisedExceptionType (fun () -> e.Current) |> equal "InvalidOperationException"
     while e.MoveNext() do ()
     raisedExceptionType (fun () -> e.Current) |> equal "InvalidOperationException"
-#endif

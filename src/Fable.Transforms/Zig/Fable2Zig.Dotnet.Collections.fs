@@ -414,7 +414,7 @@ let call
             rt "fable_rt.htClear($0)" [ d ] tVoid
         else
             pure' "fable_rt.htCount($0)" [ d ] tI32
-    | ("System.Collections.Generic.Dictionary`2.KeyCollection" | "System.Collections.Generic.Dictionary`2.ValueCollection"),
+    | ("System.Collections.Generic.Dictionary`2.KeyCollection" | "System.Collections.Generic.Dictionary`2.ValueCollection" | "System.Collections.Generic.ICollection`1"),
       "get_Count",
       [ xs ] -> pure' "fable_rt.listCount($0)" [ xs ] tI32
     | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"), ".ctor", [] ->

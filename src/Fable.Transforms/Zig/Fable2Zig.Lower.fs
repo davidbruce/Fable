@@ -6014,7 +6014,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         && (
             match info.ThisArg.Value with
             | Unboxed inner ->
-                (implements ctx.Com inner.Type (imp.Path.Substring Replacements.DotnetPrefix.Length)) = Some true
+                // (a type of the program's: those of .NET and FSharp.Core are the runtime's)
+                (match inner.Type with
+                 | Fable.DeclaredType({ Path = Fable.SourcePath _ }, _) -> true
+                 | _ -> false)
+                && (implements ctx.Com inner.Type (imp.Path.Substring Replacements.DotnetPrefix.Length)) = Some true
         )
         ->
         let (Unboxed inner) = info.ThisArg.Value
@@ -6199,6 +6203,80 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                                 fail r "the Zig target cannot find the member %s of this interface (%A)" info.Name t
                     )
             )
+
+    // (an F# map seen as a sequence: of its entries, in order, as Map.toSeq gives them)
+    | Fable.TypeCast(m, (Fable.DeclaredType(target, [ _ ]) as targetType)) when
+        target.FullName = "System.Collections.Generic.IEnumerable`1"
+        && (
+            match m.Type with
+            | Fable.DeclaredType(ent, [ _; _ ]) -> ent.FullName = "Microsoft.FSharp.Collections.FSharpMap`2"
+            | _ -> false
+        )
+        ->
+        let k, v =
+            match m.Type with
+            | Fable.DeclaredType(_, [ k; v ]) -> k, v
+            | _ -> Fable.Any, Fable.Any
+
+        lw
+            ctx
+            (Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "ToSeq"
+                        Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Collections.MapModule"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(args = [ m ], genArgs = [ k; v ]),
+                targetType,
+                e.Range
+            ))
+
+    // (an F# map seen as `IDictionary` or `IReadOnlyDictionary`: a read-only dictionary of its
+    // entries, in its order, as `dict` makes; the map cannot change, so neither can it)
+    | Fable.TypeCast(m, (Fable.DeclaredType(target, _) as targetType)) when
+        isDictionaryName target.FullName
+        && (
+            match m.Type with
+            | Fable.DeclaredType(ent, [ _; _ ]) -> ent.FullName = "Microsoft.FSharp.Collections.FSharpMap`2"
+            | _ -> false
+        )
+        ->
+        let k, v =
+            match m.Type with
+            | Fable.DeclaredType(_, [ k; v ]) -> k, v
+            | _ -> Fable.Any, Fable.Any
+
+        let import entity selector =
+            Fable.Import(
+                {
+                    Selector = selector
+                    Path = Replacements.DotnetPrefix + entity
+                    Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                },
+                Fable.Any,
+                None
+            )
+
+        let pairs =
+            Fable.Call(
+                import "Microsoft.FSharp.Collections.MapModule" "ToList",
+                Fable.CallInfo.Create(args = [ m ], genArgs = [ k; v ]),
+                Fable.List(Fable.Tuple([ k; v ], false)),
+                None
+            )
+
+        lw
+            ctx
+            (Fable.Call(
+                import "Microsoft.FSharp.Core.ExtraTopLevelOperators" "CreateReadOnlyDictionary",
+                Fable.CallInfo.Create(args = [ pairs ], genArgs = [ k; v ]),
+                targetType,
+                e.Range
+            ))
 
     // (a dictionary seen as `IDictionary` or `IReadOnlyDictionary`: the same here)
     | Fable.TypeCast(x, Fable.DeclaredType(target, _)) when
