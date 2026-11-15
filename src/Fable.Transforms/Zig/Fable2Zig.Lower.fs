@@ -4378,6 +4378,29 @@ let rec peelArgs (t: Fable.Type) (k: int) : Fable.Type =
 
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
+    // (a unit that does something, the one argument of a call (`box (ignore (f ()))`): it is done,
+    // then the call made of `()`)
+    | Fable.Call(callee,
+                 ({
+                      Args = [ x ]
+                      ThisArg = None
+                  } as info),
+                 t,
+                 r) when
+        x.Type = Fable.Unit
+        && (
+            match x with
+            | Fable.Value(Fable.UnitConstant, _) -> false
+            | _ -> true
+        )
+        ->
+        lw
+            ctx
+            (Fable.Sequential
+                [
+                    x
+                    Fable.Call(callee, { info with Args = [ Fable.Value(Fable.UnitConstant, None) ] }, t, r)
+                ])
     // (a function cast to a type that is not a function and then applied, as the inliner
     // leaves an SRTP operator's result (Aether's `(Set ^= optic) value`): the function applied)
     | Fable.CurriedApply(Fable.TypeCast(f, castTo), args, t, r) when

@@ -1497,12 +1497,10 @@ let ``test While with isNone doesn't hang with Some ()`` () =
 let ``test Removing optional arguments not in tail position works`` () =
     Internal.MyType.Add(y=6) |> equal 26
 
-#if !FABLE_COMPILER_ZIG // (internal: this expression is not part of the Zig target yet)
 [<Fact>]
 let ``test Ignore shouldn't return value`` () = // See #1360
     let producer () = 7
     equal (box ()) (box(ignore(producer())))
-#endif
 
 [<Fact>]
 let ``test Can import files specified via globbing patterns`` () = // See #1942
