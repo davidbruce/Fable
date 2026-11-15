@@ -478,6 +478,25 @@ let call
             }
             [ x ]
             t
+    // `Task.Run(fun () -> ...)`: on a thread of its own (the library's Task.run)
+    | "System.Threading.Tasks.Task", "Run", [ f ] ->
+        let item =
+            match t with
+            | Fable.DeclaredType(_, [ item ]) -> item
+            | _ -> Fable.Unit
+
+        libraryCall
+            ctx
+            r
+            "Task"
+            "run"
+            { info with
+                GenericArgs = [ item ]
+                SignatureArgTypes = []
+                MemberRef = None
+            }
+            [ f ]
+            t
     | "System.Threading.Tasks.Task", "Delay", [ ms ] ->
         libraryCall
             ctx

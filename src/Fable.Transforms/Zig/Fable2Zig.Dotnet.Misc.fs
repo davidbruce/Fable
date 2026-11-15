@@ -1260,6 +1260,7 @@ let call
         pure' "fable_rt.threadNew($0)" [ start ] (TPrim "fable_rt.ThreadOf")
     | "System.Threading.Thread", "Start", [ th ] -> rt "fable_rt.threadStart($0)" [ th ] tVoid
     | "System.Threading.Thread", "Join", [ th ] -> pure' "fable_rt.threadJoin($0)" [ th ] tVoid
+    | "System.Threading.Thread", "get_IsAlive", [ th ] -> pure' "fable_rt.threadIsAlive($0)" [ th ] tBool
     | "System.Threading.Thread", "get_CurrentThread", [] -> ELit("{}", tVoid)
     | "System.Threading.Thread", "get_ManagedThreadId", _ -> pure' "fable_rt.threadId()" [] tI32
     // ---- `System.Diagnostics.Stopwatch` and `Thread.Sleep`: the library's Stopwatch.fs ----

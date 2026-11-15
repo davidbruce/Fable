@@ -10,13 +10,23 @@ module Fable.Library.Zig.Task
 open Fable.Library.Zig.Seq
 
 /// (None while pending)
-type TaskOf<'T> = { mutable fable_task: Result<'T, exn> option }
+/// (a task of `Task.Run` runs on a thread of its own: `fable_thread`, which waiting joins before
+/// what it ended with is read)
+type TaskOf<'T> =
+    {
+        mutable fable_task: Result<'T, exn> option
+        mutable fable_thread: System.Threading.Thread option
+    }
 
 /// What the builder makes of the body of `task { }` before it runs.
 type TaskCode<'T> = { code: unit -> 'T }
 
 /// What the task ended with, once it has (the timers run until then)
 let private outcome (t: TaskOf<'T>) : Result<'T, exn> =
+    match t.fable_thread with
+    | Some th -> th.Join()
+    | None -> ()
+
     match t.fable_task with
     | Some r -> r
     | None ->
@@ -33,7 +43,11 @@ let private value (t: TaskOf<'T>) : 'T =
     | Ok v -> v
     | Error e -> raise e
 
-let private done' (r: Result<'T, exn>) : TaskOf<'T> = { fable_task = Some r }
+let private done' (r: Result<'T, exn>) : TaskOf<'T> =
+    {
+        fable_task = Some r
+        fable_thread = None
+    }
 
 let builderRun<'T> (c: TaskCode<'T>) : TaskOf<'T> =
     try
@@ -121,7 +135,33 @@ let waitFor<'T> (task: TaskOf<'T>) : unit =
     | Ok _ -> ()
     | Error e -> aggregate e
 
-let isCompleted<'T> (task: TaskOf<'T>) : bool = task.fable_task.IsSome
+let isCompleted<'T> (task: TaskOf<'T>) : bool =
+    match task.fable_thread with
+    | Some th when th.IsAlive -> false
+    | _ -> task.fable_task.IsSome
+
+/// `Task.Run(fun () -> ...)`: on a thread of its own (what the function captured is shared)
+let run<'T> (f: unit -> 'T) : TaskOf<'T> =
+    let t: TaskOf<'T> =
+        {
+            fable_task = None
+            fable_thread = None
+        }
+
+    let th =
+        System.Threading.Thread(fun () ->
+            let r =
+                try
+                    Ok(f ())
+                with e ->
+                    Error e
+
+            t.fable_task <- Some r
+        )
+
+    t.fable_thread <- Some th
+    th.Start()
+    t
 
 let isFaulted<'T> (task: TaskOf<'T>) : bool =
     match task.fable_task with
@@ -137,7 +177,11 @@ let delay (millisecondsDelay: int) : TaskOf<unit> =
     if millisecondsDelay <= 0 then
         done' (Ok())
     else
-        let t: TaskOf<unit> = { fable_task = None }
+        let t: TaskOf<unit> =
+            {
+                fable_task = None
+                fable_thread = None
+            }
 
         Fable.Library.Zig.Async.startImmediate (
             Fable.Library.Zig.Async.builderBind
@@ -162,7 +206,15 @@ let whenAll<'T> (tasks: SeqOf<TaskOf<'T>>) : TaskOf<'T[]> =
 
 type TaskSourceOf<'T> = { task: TaskOf<'T> }
 
-let sourceCreate<'T> () : TaskSourceOf<'T> = { task = { fable_task = None } }
+let sourceCreate<'T> () : TaskSourceOf<'T> =
+    {
+        task =
+            {
+                fable_task = None
+                fable_thread = None
+            }
+    }
+
 let sourceTask<'T> (s: TaskSourceOf<'T>) : TaskOf<'T> = s.task
 
 let private alreadyCompleted () =
@@ -219,7 +271,11 @@ let startAsTaskToken<'T>
     (token: Fable.Library.Zig.Async.CancellationTokenOf option)
     : TaskOf<'T>
     =
-    let t: TaskOf<'T> = { fable_task = None }
+    let t: TaskOf<'T> =
+        {
+            fable_task = None
+            fable_thread = None
+        }
 
     Fable.Library.Zig.Async.startWithContinuationsToken
         computation

@@ -159,3 +159,30 @@ let ``test Parallel.For runs the body for each index on threads`` () =
             e.Message
 
     message |> equal "One or more errors occurred. (bad)"
+
+[<Fact>]
+let ``test Task.Run runs on a thread and gives its result`` () =
+    let tasks =
+        [| for k in 1..4 -> System.Threading.Tasks.Task.Run(fun () -> [ for i in 1 .. k * 1000 -> string i ] |> List.length) |]
+
+    tasks |> Array.map (fun t -> t.Result) |> equal [| 1000; 2000; 3000; 4000 |]
+    let unitTask = System.Threading.Tasks.Task.Run(fun () -> ())
+    unitTask.Wait()
+    unitTask.IsCompleted |> equal true
+    let t = task {
+        let! x = System.Threading.Tasks.Task.Run(fun () -> 40)
+        return x + 2
+    }
+    t.Result |> equal 42
+
+[<Fact>]
+let ``test An exception in Task.Run is raised by Result inside an AggregateException`` () =
+    let t = System.Threading.Tasks.Task.Run(fun () -> failwith "oops": int)
+
+    let message =
+        try
+            string t.Result
+        with e ->
+            e.Message
+
+    message |> equal "One or more errors occurred. (oops)"

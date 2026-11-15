@@ -2055,7 +2055,11 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                     "disposed", tBool
                 ]
             | "CancellationTokenOf" -> [ "source", TEnt(libRecordEnt ctx "Async" "CancellationSource", []) ]
-            | "TaskOf_1" -> [ "fable_task", TOpt(TEnt(resultEnt ctx.State, [ TGen "T"; tExn ])) ]
+            | "TaskOf_1" ->
+                [
+                    "fable_task", TOpt(TEnt(resultEnt ctx.State, [ TGen "T"; tExn ]))
+                    "fable_thread", TOpt(TPrim "fable_rt.ThreadOf")
+                ]
             | "TaskSourceOf_1" -> [ "task", TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ TGen "T" ]) ]
             | "ReplyChannelOf_1" -> [ "reply", TFn([ TGen "T" ], tVoid) ]
             // (its body takes the mailbox itself: what a program sees of it is a cell)
@@ -2107,7 +2111,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "HandOver" -> [ "handedOver" ]
             | "Timer" -> [ "live" ]
             | "StopwatchOf" -> [ "elapsed"; "startedAt"; "running" ]
-            | "TaskOf_1" -> [ "fable_task" ]
+            | "TaskOf_1" -> [ "fable_task"; "fable_thread" ]
             | "MailboxOf_1" -> [ "waiting"; "started" ]
             | _ -> []
 

@@ -199,6 +199,8 @@ pub const ThreadOf = *struct {
     /// the thread, once started and until joined
     handle: ?*std.Thread = null,
     started: bool = false,
+    /// set (atomically) when the thread's function has ended
+    finished: u32 = 0,
 };
 
 /// `Thread(fun () -> ...)`
@@ -209,9 +211,10 @@ pub fn threadNew(start: ThreadStart) ThreadOf {
 /// `t.Start()`
 pub fn threadStart(t: ThreadOf) Raised!void {
     if (t.started) return raise(ThreadStateException, str("Thread is running or terminated; it cannot restart."));
-    try markShared(t.start);
+    // (the thread object too: the new thread holds it, and the flag in it, until it ends)
+    try markShared(t);
     const h = allocator.create(std.Thread) catch @panic("fable: out of memory");
-    h.* = std.Thread.spawn(.{}, threadMain, .{dup(t.start)}) catch {
+    h.* = std.Thread.spawn(.{}, threadMain, .{ dup(t.start), &t.finished, dup(t) }) catch {
         allocator.destroy(h);
         return raise(OutOfMemoryException, str("Thread failed to start."));
     };
@@ -221,15 +224,27 @@ pub fn threadStart(t: ThreadOf) Raised!void {
 
 /// (what a thread runs: its function, then what it kept for itself is given up; an exception
 /// that leaves it ends the program, as on .NET)
-fn threadMain(f: ThreadStart) void {
+fn threadMain(f: ThreadStart, finished: *u32, t: ThreadOf) void {
     f.code(f.env, {}) catch {
         uncaught();
         std.process.exit(134);
     };
     drop(f);
+    // (the thread object lets go of its function once it has run: what the function captured
+    // may hold the thread object, as a task of Task.Run does, and shared values are not
+    // collected in cycles)
+    const old = t.start;
+    t.start = .{ .env = null, .code = threadRan };
+    drop(old);
+    // (what the function wrote is seen by whoever sees this; the thread object is kept alive
+    // until then, as it holds the flag)
+    @atomicStore(u32, finished, 1, .release);
+    drop(t);
     collectorDeinit();
     if (track) _ = @atomicRmw(i64, &ended_threads_live, .Add, thread.stats.allocs - thread.stats.frees, .monotonic);
 }
+
+fn threadRan(_: ?*Env, _: void) Raised!void {}
 
 /// `t.Join()`: waits for the thread to end
 pub fn threadJoin(t: ThreadOf) void {
@@ -237,6 +252,11 @@ pub fn threadJoin(t: ThreadOf) void {
     h.join();
     allocator.destroy(h);
     t.handle = null;
+}
+
+/// `t.IsAlive`: started and not ended
+pub fn threadIsAlive(t: ThreadOf) bool {
+    return t.started and @atomicLoad(u32, &t.finished, .acquire) == 0;
 }
 
 /// `Thread.CurrentThread.ManagedThreadId`
