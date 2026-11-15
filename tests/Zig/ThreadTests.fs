@@ -244,3 +244,19 @@ let ``test A shared field read while another thread stores into it stays alive``
     reader.Join()
     seen |> equal 20_000
     box.Items |> equal [ 20_000; 20_000; 20_000 ]
+
+[<Fact>]
+let ``test Async.Parallel runs its computations at once`` () =
+    // (each blocks its thread for 200 ms: one after another that would be 800 ms)
+    let sw = System.Diagnostics.Stopwatch.StartNew()
+
+    let results =
+        [ for i in 1..4 -> async {
+              Thread.Sleep 200
+              return i * i
+          } ]
+        |> Async.Parallel
+        |> Async.RunSynchronously
+
+    results |> equal [| 1; 4; 9; 16 |]
+    (sw.ElapsedMilliseconds < 600L) |> equal true

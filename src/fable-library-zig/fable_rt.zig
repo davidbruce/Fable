@@ -180,6 +180,16 @@ pub fn markShared(x: anytype) Raised!void {
     }
 }
 
+/// `markShared`, or false where the value reaches a cell the cycle collector follows (what was
+/// marked before it stays marked: its counts are atomic from then on, which is still right)
+pub fn tryMarkShared(x: anytype) bool {
+    markShared(x) catch {
+        drop(take());
+        return false;
+    };
+    return true;
+}
+
 /// A value stored into a shared cell is shared too. (Reading and writing a shared cell's
 /// fields from several threads at once needs a `lock`, as on .NET.)
 pub fn shareStored(value: anytype) void {

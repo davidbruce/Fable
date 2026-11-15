@@ -794,9 +794,24 @@ let sequential<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
 
     make (fun k -> start (loop (Seq.toList computations) []) k)
 
-/// `Async.Parallel`: all start (each runs until it waits, then they go on as their timers come
-/// due), the results in order; the first failure cancels the others and is the result, as on
-/// .NET
+#if FABLE_COMPILER
+[<Fable.Core.Emit("fable_rt.tryMarkShared($0)")>]
+let private tryShare (_x: 'a) : bool = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("(comptime !fable_rt.holdsCyclic(@TypeOf($0)))")>]
+let private holdsNoCycles (_x: 'a) : bool = Fable.Core.Util.nativeOnly
+#else
+let private tryShare (_x: 'a) : bool = false
+let private holdsNoCycles (_x: 'a) : bool = false
+#endif
+
+/// `Async.Parallel`: the results in order; the first failure is the result, as on .NET. Where
+/// the computations can be shared between threads (nothing they reach is followed by the cycle
+/// collector) and their results can come back (a type that holds no such cells), each runs on
+/// a thread of its own, on its own scheduler, and this one waits for all of them; a failure
+/// there does not stop the others early (their results are left). Otherwise they run here:
+/// all start (each runs until it waits, then they go on as their timers come due), and the
+/// first failure cancels the others.
 let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
     make (fun k ->
         let cs = Array.ofList (Seq.toList computations)
@@ -805,40 +820,109 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
         if n = 0 then
             k.ok [||]
         else
-            let results: 'T option[] = Array.create n None
-            let mutable remaining = n
-            let mutable finished = false
-            // (the computations' own source: cancelled with the caller's token, or by a failure)
-            let inner = sourceCreate ()
-            let link = tokenRegister k.token (fun () -> sourceCancel inner)
+            let results: Result<'T, exn> option[] = Array.create n None
+            // (which failed first, in time)
+            let firstFail: int[] = [| -1 |]
 
-            let finish (f: unit -> unit) =
-                if not finished then
-                    finished <- true
-                    link.Dispose()
-                    f ()
+            // (only the type of the results decides: an exception is checked when it comes back)
+            let resultType: 'T[] = [||]
 
-            for i in 0 .. n - 1 do
-                start
-                    cs.[i]
-                    {
-                        ok =
-                            fun x ->
-                                results.[i] <- Some x
-                                remaining <- remaining - 1
+            if
+                n > 1
+                && holdsNoCycles resultType
+                && tryShare cs
+                && tryShare results
+                && tryShare firstFail
+            then
+                let threads =
+                    Array.init
+                        n
+                        (fun i ->
+                            System.Threading.Thread(fun () ->
+                                let r, _ = runHere cs.[i] (tokenNone ())
 
-                                if remaining = 0 then
-                                    finish (fun () -> k.ok (results |> Array.map Option.get))
-                        fail =
-                            fun e ->
-                                finish (fun () ->
-                                    sourceCancel inner
-                                    k.fail e
-                                )
-                        cancel = fun e -> finish (fun () -> k.cancel e)
-                        token = sourceToken inner
-                        handOver = None
-                    }
+                                // (an exception that reaches what cannot be shared comes back as
+                                // a new one with its message)
+                                let r =
+                                    match r with
+                                    | Some(Error e) when not (tryShare e) -> Some(Error(System.Exception(e.Message)))
+                                    | _ -> r
+
+                                match r with
+                                | Some(Error _) ->
+                                    lock
+                                        firstFail
+                                        (fun () ->
+                                            if firstFail.[0] < 0 then
+                                                firstFail.[0] <- i
+                                        )
+                                | _ -> ()
+
+                                results.[i] <- r
+                            )
+                        )
+
+                for t in threads do
+                    t.Start()
+
+                for t in threads do
+                    t.Join()
+
+                if isCancelled k then
+                    k.cancel (canceled ())
+                elif firstFail.[0] >= 0 then
+                    match results.[firstFail.[0]] with
+                    | Some(Error e) -> k.fail e
+                    | _ -> k.fail (System.InvalidOperationException "Async.Parallel" :> exn)
+                elif results |> Array.forall (fun r -> r.IsSome) then
+                    k.ok (
+                        results
+                        |> Array.map (fun r ->
+                            match r with
+                            | Some(Ok x) -> x
+                            | _ -> failwith "unreachable"
+                        )
+                    )
+                else
+                    k.fail (
+                        System.InvalidOperationException "A computation of Async.Parallel did not finish on its thread"
+                        :> exn
+                    )
+            else
+                let results: 'T option[] = Array.create n None
+                let mutable remaining = n
+                let mutable finished = false
+                // (the computations' own source: cancelled with the caller's token, or by a failure)
+                let inner = sourceCreate ()
+                let link = tokenRegister k.token (fun () -> sourceCancel inner)
+
+                let finish (f: unit -> unit) =
+                    if not finished then
+                        finished <- true
+                        link.Dispose()
+                        f ()
+
+                for i in 0 .. n - 1 do
+                    start
+                        cs.[i]
+                        {
+                            ok =
+                                fun x ->
+                                    results.[i] <- Some x
+                                    remaining <- remaining - 1
+
+                                    if remaining = 0 then
+                                        finish (fun () -> k.ok (results |> Array.map Option.get))
+                            fail =
+                                fun e ->
+                                    finish (fun () ->
+                                        sourceCancel inner
+                                        k.fail e
+                                    )
+                            cancel = fun e -> finish (fun () -> k.cancel e)
+                            token = sourceToken inner
+                            handOver = None
+                        }
     )
 
 let returnValue<'T> (value: 'T) : AsyncOf<'T> = builderReturn value
