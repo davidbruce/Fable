@@ -320,3 +320,36 @@ let ``test A lazy value forced on several threads is made once`` () =
 
     results |> equal [| 42; 42; 42; 42 |]
     runs.Value |> equal 1
+
+#if FABLE_COMPILER_ZIG // (the Zig target refuses what .NET allows here: see fable_weak.zig)
+[<Fact>]
+let ``test A weak reference to a value shared between threads is refused, and the other way round`` () =
+    let gate = obj ()
+    let t = Thread(fun () -> lock gate (fun () -> ()))
+    t.Start()
+    t.Join()
+
+    let first =
+        try
+            System.WeakReference<obj>(gate) |> ignore
+            "none"
+        with :? System.NotSupportedException ->
+            "NotSupported"
+
+    first |> equal "NotSupported"
+
+    let o = obj ()
+    let w = System.WeakReference<obj>(o)
+
+    let second =
+        try
+            let t2 = Thread(fun () -> lock o (fun () -> ()))
+            t2.Start()
+            t2.Join()
+            "none"
+        with :? System.NotSupportedException ->
+            "NotSupported"
+
+    second |> equal "NotSupported"
+    w |> ignore
+#endif

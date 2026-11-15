@@ -443,6 +443,8 @@ fn notShareable(what: []const u8) Raised {
 fn markCell(c: anytype) Raised!bool {
     // (shared already: other threads may be changing the count; until then, no other has it)
     if (isShared(c)) return false;
+    // (a weak reference to it is this thread's: another thread that freed it would not empty it)
+    if (thread.weak.contains(@intFromPtr(c))) return notShareable("a value that a weak reference points to");
     // (a cell the collector follows leaves it when it is shared, unless it is part of a
     // structure of cells already, where its count is the collector's business)
     // (a cell the collector follows leaves it when it is shared, unless it is part of a
@@ -8257,15 +8259,15 @@ test "weak references see their target go" {
     const before = thread.stats;
     const R = *struct { @"$rc": u32 = 1, value: i32 };
     const a = new(R, .{ .value = 7 });
-    const w = weakNew(Weak(R), a);
-    const w2 = weakNew(Weak(R), a);
+    const w = try weakNew(Weak(R), a);
+    const w2 = try weakNew(Weak(R), a);
     const got = weakTryGet(w).?;
     try std.testing.expectEqual(@as(i32, 7), got.value);
     drop(got);
     drop(a);
     try std.testing.expect(weakTryGet(w) == null and weakTryGet(w2) == null);
     const b = new(R, .{ .value = 8 });
-    weakSet(w, b);
+    try weakSet(w, b);
     try std.testing.expectEqual(@as(i32, 8), weakTryGet(w).?.value);
     drop(b);
     drop(b);

@@ -717,8 +717,8 @@ let call
     | "System.MemoryExtensions", "SequenceEqual", [ a; b ] -> pure' "fable_rt.eql($0, $1)" [ a; b ] tBool
 
     // ---- weak references ----
-    | "System.WeakReference`1", ".ctor", [ target ] -> pure' "fable_rt.weakNew($R, $0)" [ target ] (mapType ctx r t)
-    | "System.WeakReference`1", "SetTarget", [ w; target ] -> pure' "fable_rt.weakSet($0, $1)" [ w; target ] tVoid
+    | "System.WeakReference`1", ".ctor", [ target ] -> rt "fable_rt.weakNew($R, $0)" [ target ] (mapType ctx r t)
+    | "System.WeakReference`1", "SetTarget", [ w; target ] -> rt "fable_rt.weakSet($0, $1)" [ w; target ] tVoid
     | "System.WeakReference`1",
       "TryGetTarget",
       [ w; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when

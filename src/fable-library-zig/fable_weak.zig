@@ -3,6 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rt = @import("fable_rt.zig");
 const Layout = rt.Layout;
+const Raised = rt.Raised;
 const Shower = rt.Shower;
 const bookkeeping = rt.bookkeeping;
 const dup = rt.dup;
@@ -90,8 +91,20 @@ pub fn Weak(comptime T: type) type {
     };
 }
 
+/// (a weak reference is to a value of this thread: the table of them is the thread's own, and a
+/// value shared between threads may be freed by another, which would not empty it)
+fn notShared(target: anytype) Raised!void {
+    const T = @TypeOf(target);
+    if (comptime @typeInfo(T) == .optional) {
+        const p = target orelse return;
+        return notShared(p);
+    }
+    if (rt.isShared(target)) return rt.raise(rt.NotSupportedException, rt.str("The Zig target cannot make a weak reference to a value shared between threads."));
+}
+
 /// `WeakReference<'T>(target)`
-pub fn weakNew(comptime W: type, target: @typeInfo(W).pointer.child.fable_weak) W {
+pub fn weakNew(comptime W: type, target: @typeInfo(W).pointer.child.fable_weak) Raised!W {
+    try notShared(target);
     const c = rt.allocator.create(@typeInfo(W).pointer.child) catch @panic("fable: out of memory");
     c.* = .{ .handle = handleOf(target) };
     if (track) thread.stats.allocs += 1;
@@ -107,7 +120,8 @@ pub fn weakTryGet(w: anytype) ?@typeInfo(@TypeOf(w)).pointer.child.fable_weak {
 }
 
 /// `w.SetTarget(target)`
-pub fn weakSet(w: anytype, target: @typeInfo(@TypeOf(w)).pointer.child.fable_weak) void {
+pub fn weakSet(w: anytype, target: @typeInfo(@TypeOf(w)).pointer.child.fable_weak) Raised!void {
+    try notShared(target);
     const old = w.handle;
     w.handle = handleOf(target);
     weakLetGo(old);
