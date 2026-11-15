@@ -138,7 +138,7 @@ let readThenCalleeStores () : int =
         chainSum second
     | None -> 0
 
-// 6. a walk that only reads does no reference counting
+// 6. a walk that only reads: each read of the assignable `Next` takes its own reference
 let readOnlyWalk () : int =
     let head = buildChain 50
     let before = counted ()
@@ -279,7 +279,15 @@ let run () : int =
         + expect 1700 (valueOutlivesItsField ())
         + expect 15 (appendInPlace ())
         + expect 3 (readThenCalleeStores ())
-        + expect 1275 (readOnlyWalk ())
+        // (1275, and where cells are counted, a count up and down for each of the 50 reads of
+        // `Next`: a field that can be assigned is read with its own reference, so that another
+        // thread storing into it cannot free what is being read; Koka's protocol)
+        + expect
+            (if counting () then
+                 1375
+             else
+                 1275)
+            (readOnlyWalk ())
         + expect 5051 (immutableChain ())
         + expect 55154 (shelves ())
         + expect 47 (refCells ())

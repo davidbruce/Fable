@@ -216,3 +216,31 @@ let ``test Threads run async computations with their own timers`` () =
         t.Join()
 
     results |> equal [| 15; 30; 45; 60 |]
+
+type private Box = { mutable Items: int list }
+
+[<Fact>]
+let ``test A shared field read while another thread stores into it stays alive`` () =
+    // (no lock: a reader may see the old list or the new one, never one that was freed)
+    let box = { Items = [ 1; 2; 3 ] }
+    let mutable seen = 0
+
+    let writer =
+        Thread(fun () ->
+            for i in 1..20_000 do
+                box.Items <- [ i; i; i ]
+        )
+
+    let reader =
+        Thread(fun () ->
+            for _ in 1..20_000 do
+                let xs = box.Items
+                seen <- seen + (if List.length xs = 3 then 1 else 0)
+        )
+
+    writer.Start()
+    reader.Start()
+    writer.Join()
+    reader.Join()
+    seen |> equal 20_000
+    box.Items |> equal [ 20_000; 20_000; 20_000 ]

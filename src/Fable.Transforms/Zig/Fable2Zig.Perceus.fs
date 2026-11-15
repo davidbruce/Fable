@@ -480,6 +480,103 @@ let rec private hoistRaising (p: P) (e: Expr) : Expr =
         let binds, e' = lift true e
         wrap binds e'
 
+/// A read of an assignable field that holds a counted value, of a value that may be shared
+/// between threads (a reference record, an object): it is read with its own reference
+/// (`loadIn`, `objLoad`; Koka's protocol), so it is never left as a borrow.
+let private isSharedFieldRead (e: Expr) =
+    match e with
+    | EGet(owner, PField f, t) when isManaged t ->
+        match typeOf owner with
+        | TEnt({ Kind = KRefRecord } as ent, _) -> List.contains f ent.MutableFields
+        | TPtr(TEnt(ent, _), _) ->
+            List.contains f ent.MutableFields
+            && (
+                match owner with
+                | EEmit(m, [ _ ], _) -> m.StartsWith("fable_rt.objPart(", System.StringComparison.Ordinal)
+                | _ -> false
+            )
+        | _ -> false
+    | _ -> false
+
+/// Every such read (see `isSharedFieldRead`) is given a name first, in the order of evaluation,
+/// so that it holds its own reference while it is in use.
+let rec private hoistMutableReads (p: P) (e: Expr) : Expr =
+    let hr = hoistMutableReads p
+    let raising (x: Expr) = isSharedFieldRead x
+    let hasRaising (x: Expr) = exists raising x
+
+    /// the bindings to put before `x`, and what is left of `x`
+    let rec lift (keepRoot: bool) (x: Expr) : (Var * Expr) list * Expr =
+        if not (hasRaising x) then
+            [], x
+        else
+            let kids = flatKids x
+
+            let last = kids |> List.tryFindIndexBack hasRaising |> Option.defaultValue -1
+
+            let binds = List<Var * Expr>()
+
+            let kids' =
+                kids
+                |> List.mapi (fun i k ->
+                    if i > last then
+                        k
+                    else
+                        let inner, k' = lift false k
+                        binds.AddRange inner
+
+                        if isPure k' then
+                            k'
+                        else
+                            let v = p.State.NewVar(tempName k', typeOf k', VLocal, false)
+                            binds.Add((v, k'))
+                            EVar v
+                )
+
+            let x' = withFlatKids x kids'
+
+            if raising x' && not keepRoot then
+                let v = p.State.NewVar(tempName x', typeOf x', VLocal, false)
+                binds.Add((v, x'))
+                List.ofSeq binds, EVar v
+            else
+                List.ofSeq binds, x'
+
+    let wrap (binds: (Var * Expr) list) (k: Expr) =
+        List.foldBack (fun (v, x) acc -> ELet(v, x, acc)) binds k
+
+    match e with
+    | ELet(v, rhs, body) when isFlat rhs ->
+        let binds, rhs' = lift true rhs
+        wrap binds (ELet(v, rhs', hr body))
+    | ELet(v, rhs, body) -> ELet(v, hr rhs, hr body)
+    | ESeq(a, b) when isFlat a ->
+        let binds, a' = lift true a
+        wrap binds (ESeq(a', hr b))
+    | ESeq(a, b) -> ESeq(hr a, hr b)
+    | EIf(c, t, f, ty) ->
+        let binds, c' = lift false c
+        wrap binds (EIf(c', hr t, hr f, ty))
+    | EWhile(c, b) -> EWhile(c, hr b)
+    | EFor(i, a, b, up, body) ->
+        let bindsA, a' = lift false a
+        let bindsB, b' = lift false b
+        wrap (bindsA @ bindsB) (EFor(i, a', b', up, hr body))
+    | EAssign(v, r) when isFlat r ->
+        let binds, r' = lift true r
+        wrap binds (EAssign(v, r'))
+    | EAssign(v, r) -> EAssign(v, hr r)
+    | EStore(lv, r) ->
+        let binds, r' = lift true r
+        wrap binds (EStore(lv, r'))
+    | ERaise(x, t) ->
+        let binds, x' = lift false x
+        wrap binds (ERaise(x', t))
+    | ETry(b, v, h, t) -> ETry(hr b, v, hr h, t)
+    | _ ->
+        let binds, e' = lift true e
+        wrap binds e'
+
 // =============================================================================================
 // Reference records: which code can assign a field. A value read from such a field is only a
 // borrow while nothing can assign.
@@ -1386,6 +1483,7 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
                 && not v.FMutable
                 && isStablePath x
                 && (not (touchesMutable rhs) || not (mayStore p body))
+                && not (isSharedFieldRead rhs)
                 ->
                 let env1 =
                     match rootOf x with
@@ -1539,6 +1637,7 @@ let run (state: FileState) : unit =
                 fn.Body <-
                     fn.Body
                     |> hoistRaising p
+                    |> hoistMutableReads p
                     |> nameProjections state
                     |> splitPathsIn state Map.empty
                     |> cleanup

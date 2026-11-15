@@ -963,17 +963,70 @@ pub inline fn store(place: anytype, value: @TypeOf(place.*)) void {
 /// Store into a field of a reference record. The collector is told what the record no longer
 /// points at and what it points at now: this is where a cycle can be closed.
 pub inline fn storeIn(owner: anytype, comptime field: []const u8, value: @FieldType(@TypeOf(owner.*), field)) void {
+    if (isShared(owner)) {
+        // (Koka's protocol: the value is shared before another thread can read it, and swapped
+        // in under the field's lock, so no reader holds the old one uncounted when it goes)
+        shareStored(value);
+        const l = fieldLock(owner);
+        lockField(l);
+        const prev = @field(owner, field);
+        @field(owner, field) = value;
+        unlockField(l);
+        drop(prev);
+        return;
+    }
     const old = @field(owner, field);
     @field(owner, field) = value;
-    if (isShared(owner)) {
-        shareStored(value);
-    } else if (gcOf(owner)) |h| {
+    if (gcOf(owner)) |h| {
         eachHdr(old, h, unstored);
         storeValue(h, value);
     } else {
         touch(value);
     }
     drop(old);
+}
+
+// ---- reading and writing the assignable fields of shared values (Koka's protocol) ----
+//
+// A field that can be assigned is read with its own reference (`loadIn`, `objLoad`): where the
+// value it belongs to is shared between threads, the read and its count are made under the
+// field's lock, which a store takes to swap the value in; the old value is given up after.
+// Without it a thread could read a value another thread has just replaced and freed. The
+// locks are a table of their own, never held while waiting for anything else, so they cannot
+// deadlock with each other or with `lock`.
+
+var field_locks: [64]u32 = @splat(0);
+
+inline fn fieldLock(owner: anytype) *u32 {
+    return &field_locks[(@intFromPtr(owner) >> 4) % field_locks.len];
+}
+
+inline fn lockField(l: *u32) void {
+    while (@cmpxchgWeak(u32, l, 0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+
+inline fn unlockField(l: *u32) void {
+    @atomicStore(u32, l, 0, .release);
+}
+
+/// `owner.field` of a reference record, with its own reference
+pub inline fn loadIn(owner: anytype, comptime field: []const u8) @FieldType(@TypeOf(owner.*), field) {
+    if (!isShared(owner)) return dup(@field(owner, field));
+    const l = fieldLock(owner);
+    lockField(l);
+    const v = dup(@field(owner, field));
+    unlockField(l);
+    return v;
+}
+
+/// a field of an object (`place` in its class's part), with its own reference
+pub inline fn objLoad(o: Obj, place: anytype) @TypeOf(place.*) {
+    if (!isShared(o)) return dup(place.*);
+    const l = fieldLock(o);
+    lockField(l);
+    const v = dup(place.*);
+    unlockField(l);
+    return v;
 }
 
 pub fn unstored(owner: *sgc.Hdr, old: *sgc.Hdr) void {
@@ -3051,11 +3104,19 @@ pub fn objCast(any: Any, ty: *const ObjType) Raised!Any {
 /// Store into a field of an object: the collector is told, as for a field of a reference
 /// record.
 pub inline fn objStore(o: Obj, place: anytype, value: @TypeOf(place.*)) void {
-    const old = place.*;
-    place.* = value;
     if (isShared(o)) {
         shareStored(value);
-    } else if (o.gc) |h| {
+        const l = fieldLock(o);
+        lockField(l);
+        const prev = place.*;
+        place.* = value;
+        unlockField(l);
+        drop(prev);
+        return;
+    }
+    const old = place.*;
+    place.* = value;
+    if (o.gc) |h| {
         eachHdr(old, h, unstored);
         storeValue(h, value);
     } else {

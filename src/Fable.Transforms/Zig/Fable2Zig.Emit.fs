@@ -479,6 +479,19 @@ let rec ex (em: Em) (e: Expr) : string =
 
             $"(%s{ex em x} %s{op} null)"
         | _ -> $"(%s{ex em x} == .%s{fieldIdent c})"
+    // (an assignable field of a value that may be shared between threads: read with its own
+    // reference under the field's lock when it is shared; Koka's protocol)
+    | EDup(EGet(owner, PField f, _), _) when
+        (match typeOf owner with
+         | TEnt({ Kind = KRefRecord } as ent, _) -> List.contains f ent.MutableFields
+         | _ -> false)
+        ->
+        $"fable_rt.loadIn(%s{ex em owner}, \"%s{f}\")"
+    | EDup(EGet(EEmit(m, [ o ], TPtr(TEnt(ent, _), _)) as part, PField f, t), _) when
+        m.StartsWith("fable_rt.objPart(", System.StringComparison.Ordinal)
+        && List.contains f ent.MutableFields
+        ->
+        $"fable_rt.objLoad(%s{ex em o}, &%s{ex em (EGet(part, PField f, t))})"
     | EDup(x, _) -> dupCode (ex em x)
     // (`&x` and what a byref points at)
     | EAddr(x, _) -> "&" + ex em x
