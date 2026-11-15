@@ -41,6 +41,22 @@ type Adapter =
         Gens: string list
     }
 
+type IfaceVtKind =
+    | IVtObj
+    | IVtBox of Ty
+    | IVtCaptures of Ty list
+    | IVtUpcast of Ty
+
+/// A static vtable for a fat-pointer interface (`fable_rt.Iface(Vt)`).
+type IfaceVt =
+    {
+        Name: string
+        IfaceTy: Ty
+        Kind: IfaceVtKind
+        Slots: (string * (string * Ty list)) list
+        Gens: string list
+    }
+
 type Em =
     {
         Out: StringBuilder
@@ -57,6 +73,8 @@ type Em =
         TryLabels: Stack<string>
         /// the code of the function values made so far
         Adapters: Dictionary<string, Adapter>
+        /// static vtables of fat-pointer interfaces built so far
+        IfaceVts: Dictionary<string, IfaceVt>
         mutable Counter: int
     }
 
@@ -142,6 +160,12 @@ let adapterRef (a: Adapter) =
     match a.Gens with
     | [] -> a.Name
     | gens -> gens |> List.map genName |> String.concat ", " |> sprintf "%s(%s)" a.Name
+
+/// The namespace of a static interface vtable, where it is used.
+let ifaceVtRef (v: IfaceVt) =
+    match v.Gens with
+    | [] -> v.Name
+    | gens -> gens |> List.map genName |> String.concat ", " |> sprintf "%s(%s)" v.Name
 
 /// The result type of a function: `Raised!T` if it can raise, `T` if it cannot, and if that
 /// depends on functions of other files, a type that Zig works out from theirs.
@@ -331,6 +355,70 @@ let rec ex (em: Em) (e: Expr) : string =
             $"%s{fn}.env" :: ex em s :: (xs |> List.map (ex em)) |> String.concat ", "
 
         $"%s{fn}.code(%s{args})"
+    | ECallIface(r, slot, xs, _) ->
+        let recv = ex em r
+        let args = $"%s{recv}.data" :: (xs |> List.map (ex em)) |> String.concat ", "
+        $"%s{recv}.vt.%s{fieldIdent slot}(%s{args})"
+    | EIface(ifaceTy, src, slots) ->
+        let kind, srcKey, srcTys =
+            match src with
+            | ISrcValue v ->
+                let vty = typeOf v
+
+                if vty = TPrim "fable_rt.Obj" then
+                    IVtObj, "obj", []
+                else
+                    IVtBox vty, "box:" + tyKey vty, [ vty ]
+            | ISrcCaptures caps ->
+                let ctys = caps |> List.map typeOf
+                IVtCaptures ctys, "cap:" + (ctys |> List.map tyKey |> String.concat ","), ctys
+            | ISrcUpcast sub ->
+                let sty = typeOf sub
+                IVtUpcast sty, "up:" + tyKey sty, [ sty ]
+
+        let slotKeyStr =
+            slots
+            |> List.map (fun (s, (t, tys)) -> s + "=" + t + "<" + (tys |> List.map tyKey |> String.concat ",") + ">")
+            |> String.concat ";"
+
+        let key = tyKey ifaceTy + "|" + srcKey + "|" + slotKeyStr
+
+        let vt =
+            match em.IfaceVts.TryGetValue key with
+            | true, v -> v
+            | _ ->
+                let slotTypeArgs = slots |> List.collect (fun (_, (_, tys)) -> tys)
+
+                let v =
+                    {
+                        Name = $"@\"fable_iface_vt$%d{em.IfaceVts.Count}\""
+                        IfaceTy = ifaceTy
+                        Kind = kind
+                        Slots = slots
+                        Gens = freeGens (ifaceTy :: srcTys @ slotTypeArgs)
+                    }
+
+                em.IfaceVts[key] <- v
+                v
+
+        let ns = ifaceVtRef vt
+
+        match src with
+        | ISrcValue v ->
+            let vty = typeOf v
+
+            if vty = TPrim "fable_rt.Obj" then
+                $"%s{zigType ifaceTy}{{ .data = @ptrCast(%s{ex em v}), .vt = &%s{ns}.vt }}"
+            else
+                $"fable_rt.ifaceBox(%s{zigType ifaceTy}, %s{zigType vty}, %s{ex em v}, &%s{ns}.vt)"
+        | ISrcCaptures [] -> $"%s{zigType ifaceTy}{{ .data = null, .vt = &%s{ns}.vt }}"
+        | ISrcCaptures caps ->
+            let inits =
+                caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
+
+            $"fable_rt.ifaceClosure(%s{zigType ifaceTy}, %s{ns}.Env, .{{ %s{inits} }}, &%s{ns}.vt)"
+        | ISrcUpcast sub ->
+            $"fable_rt.ifaceBox(%s{zigType ifaceTy}, %s{zigType (typeOf sub)}, %s{ex em sub}, &%s{ns}.vt)"
     | EClosure(target, typeArgs, caps, ty) ->
         let key = target + "<" + (typeArgs |> List.map tyKey |> String.concat ",") + ">"
 
@@ -394,6 +482,7 @@ let rec ex (em: Em) (e: Expr) : string =
             match call with
             | ECallClo _
             | ECallVt _
+            | ECallIface _
             | ERt _ -> true
             | ECall(f, _, _, _) ->
                 match em.Fns.TryGetValue f with
@@ -1148,6 +1237,7 @@ let emitFunction
     (out: StringBuilder)
     (rootNames: HashSet<string>)
     (adapters: Dictionary<string, Adapter>)
+    (ifaceVts: Dictionary<string, IfaceVt>)
     (fns: Dictionary<string, FnInfo>)
     (fn: FnInfo)
     =
@@ -1243,6 +1333,7 @@ let emitFunction
                         fn.Body
                 )
             Adapters = adapters
+            IfaceVts = ifaceVts
             Counter = 0
         }
 
@@ -1620,6 +1711,323 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
 
     out.AppendLine() |> ignore
 
+/// Emit a static vtable struct (and optional captured `Env`) for a fat-pointer interface.
+let emitIfaceVt (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (vt: IfaceVt) =
+    let line (text: string) = out.AppendLine(text) |> ignore
+
+    match vt.Gens with
+    | [] -> line $"const %s{vt.Name} = struct {{"
+    | gens ->
+        let comptimeParams =
+            gens
+            |> List.map (fun g -> $"comptime %s{genName g}: type")
+            |> String.concat ", "
+
+        line $"fn %s{vt.Name}(%s{comptimeParams}) type {{"
+        line "    return struct {"
+
+    let ind =
+        if vt.Gens.IsEmpty then
+            "    "
+        else
+            "        "
+
+    let line (text: string) = line (ind + text)
+
+    let finishInd (extra: string) (call: string) (resultBorrowed: bool) (dropAfter: string list) =
+        let drops = dropAfter |> List.map (fun n -> dropCode n + " ") |> String.concat ""
+        line $"%s{extra}    const raw = %s{call};"
+
+        line
+            $"%s{extra}    const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch |err| {{ %s{drops}return err; }} else raw;"
+
+        let result =
+            if resultBorrowed then
+                dupCode "r"
+            else
+                "r"
+
+        if dropAfter.IsEmpty then
+            line $"%s{extra}    return %s{result};"
+        else
+            line $"%s{extra}    const result = %s{result};"
+
+            for name in dropAfter do
+                line ($"%s{extra}    " + dropCode name)
+
+            line $"%s{extra}    return result;"
+
+    let tuple (items: string list) =
+        match items with
+        | [] -> ".{}"
+        | _ -> items |> String.concat ", " |> sprintf ".{ %s }"
+
+    match vt.Kind with
+    | IVtCaptures capTys when not capTys.IsEmpty ->
+        let fields =
+            capTys |> List.mapi (fun i t -> $"c%d{i}: %s{zigType t}") |> String.concat ", "
+
+        line $"const Env = struct {{ %s{fields} }};"
+    | _ -> ()
+
+    let slotTys = caseFields vt.IfaceTy "" |> dict
+
+    for (slotIdx, (slotName, (targetFn, typeArgs))) in List.indexed vt.Slots do
+        let argTys, ret =
+            match slotTys.TryGetValue slotName with
+            | true, (TSlot(argTys, ret) | TFn(argTys, ret)) -> argTys, ret
+            | _ -> fail None "internal: missing slot `%s` on interface `%A`" slotName vt.IfaceTy
+
+        let wrapperName = $"@\"slot_%d{slotIdx}_%s{cleanIdent slotName}\""
+        let ps = argTys |> List.mapi (fun i t -> $"a%d{i}", t)
+
+        let sigParams =
+            "d: ?*anyopaque" :: (ps |> List.map (fun (n, t) -> $"%s{n}: %s{zigType t}"))
+            |> String.concat ", "
+
+        line $"fn %s{wrapperName}(%s{sigParams}) fable_rt.Raised!%s{zigType ret} {{"
+
+        match vt.Kind with
+        | IVtUpcast subTy ->
+            line $"    const sub = fable_rt.boxed(%s{zigType subTy}, @ptrCast(@alignCast(d.?))).value;"
+            let callArgs = "sub.data" :: (ps |> List.map fst) |> String.concat ", "
+            line $"    return sub.vt.%s{fieldIdent targetFn}(%s{callArgs});"
+        | IVtObj ->
+            line "    const self: fable_rt.Obj = @ptrCast(@alignCast(d.?));"
+
+            match fns.TryGetValue targetFn with
+            | true, fn ->
+                let inst =
+                    if fn.TypeParams.Length = typeArgs.Length then
+                        Map.ofList (List.zip fn.TypeParams typeArgs)
+                    else
+                        Map.empty
+
+                ignore inst
+
+                match List.zip fn.Params fn.Modes with
+                | (_, thisMode) :: rest ->
+                    let a0 =
+                        if thisMode = MOwned then
+                            dupCode "self"
+                        else
+                            "self"
+
+                    let args = a0 :: (ps |> List.map fst) |> String.concat ", "
+
+                    let dropAfter =
+                        List.zip ps rest
+                        |> List.choose (fun ((n, _), (_, m)) ->
+                            if m = MBorrowed then
+                                Some n
+                            else
+                                None
+                        )
+
+                    finishInd "" $"%s{fnRef targetFn typeArgs}(%s{args})" fn.RetFrom.IsSome dropAfter
+                | [] -> fail None "internal: object interface method `%s` has no self parameter" targetFn
+            | _ ->
+                let uses =
+                    ".keep"
+                    :: (argTys
+                        |> List.map (fun t ->
+                            if isManaged t then
+                                ".give"
+                            else
+                                ".plain"
+                        ))
+
+                let callArgs = tuple ("self" :: (ps |> List.map fst))
+
+                finishInd
+                    ""
+                    $"fable_rt.across(%s{fnRef targetFn typeArgs}, %s{sigName targetFn}, %s{tuple uses}, %s{callArgs})"
+                    false
+                    []
+        | IVtBox valTy ->
+            let valZ = zigType valTy
+            line $"    const box_ptr = fable_rt.boxed(%s{valZ}, @ptrCast(@alignCast(d.?)));"
+
+            match fns.TryGetValue targetFn with
+            | true, fn ->
+                let inst =
+                    if fn.TypeParams.Length = typeArgs.Length then
+                        Map.ofList (List.zip fn.TypeParams typeArgs)
+                    else
+                        Map.empty
+
+                match List.zip fn.Params fn.Modes with
+                | (thisParam, thisMode) :: rest ->
+                    let thisIsPtr =
+                        match substTy inst thisParam.Ty with
+                        | TPtr _ -> true
+                        | _ -> false
+
+                    let a0 =
+                        if thisIsPtr then
+                            "&box_ptr.value"
+                        elif thisMode = MOwned then
+                            dupCode "box_ptr.value"
+                        else
+                            "box_ptr.value"
+
+                    let args = a0 :: (ps |> List.map fst) |> String.concat ", "
+
+                    let dropAfter =
+                        List.zip ps rest
+                        |> List.choose (fun ((n, _), (_, m)) ->
+                            if m = MBorrowed then
+                                Some n
+                            else
+                                None
+                        )
+
+                    finishInd "" $"%s{fnRef targetFn typeArgs}(%s{args})" fn.RetFrom.IsSome dropAfter
+                | [] -> fail None "internal: boxed interface method `%s` has no self parameter" targetFn
+            | _ ->
+                let target = fnRef targetFn typeArgs
+                line $"    const SelfP = @typeInfo(@TypeOf(%s{target})).@\"fn\".param_types[0].?;"
+                line $"    if (comptime SelfP == *%s{valZ} or SelfP == *const %s{valZ}) {{"
+
+                if isManaged ret || argTys |> List.exists isManaged then
+                    let ptrUses =
+                        ".plain"
+                        :: (argTys
+                            |> List.map (fun t ->
+                                if isManaged t then
+                                    ".give"
+                                else
+                                    ".plain"
+                            ))
+
+                    let callArgs = tuple ("&box_ptr.value" :: (ps |> List.map fst))
+
+                    finishInd
+                        "    "
+                        $"fable_rt.across(%s{target}, %s{sigName targetFn}, %s{tuple ptrUses}, %s{callArgs})"
+                        false
+                        []
+                else
+                    let args = "&box_ptr.value" :: (ps |> List.map fst) |> String.concat ", "
+                    finishInd "    " $"%s{target}(%s{args})" false []
+
+                line "    } else {"
+
+                if isManaged valTy || isManaged ret || argTys |> List.exists isManaged then
+                    let valUses =
+                        (if isManaged valTy then
+                             ".keep"
+                         else
+                             ".plain")
+                        :: (argTys
+                            |> List.map (fun t ->
+                                if isManaged t then
+                                    ".give"
+                                else
+                                    ".plain"
+                            ))
+
+                    let callArgs = tuple ("box_ptr.value" :: (ps |> List.map fst))
+
+                    finishInd
+                        "    "
+                        $"fable_rt.across(%s{target}, %s{sigName targetFn}, %s{tuple valUses}, %s{callArgs})"
+                        false
+                        []
+                else
+                    let args = "box_ptr.value" :: (ps |> List.map fst) |> String.concat ", "
+                    finishInd "    " $"%s{target}(%s{args})" false []
+
+                line "    }"
+        | IVtCaptures capTys ->
+            if capTys.IsEmpty then
+                line "    _ = d;"
+            else
+                line "    const c = fable_rt.captured(Env, @ptrCast(@alignCast(d)));"
+
+            match fns.TryGetValue targetFn with
+            | true, fn ->
+                let captured, rest = List.splitAt capTys.Length (List.zip fn.Params fn.Modes)
+
+                let capturedArgs =
+                    captured
+                    |> List.mapi (fun i (_, m) ->
+                        if m = MOwned then
+                            dupCode $"c.c%d{i}"
+                        else
+                            $"c.c%d{i}"
+                    )
+
+                let args = capturedArgs @ (ps |> List.map fst) |> String.concat ", "
+
+                let dropAfter =
+                    List.zip ps rest
+                    |> List.choose (fun ((n, _), (_, m)) ->
+                        if m = MBorrowed then
+                            Some n
+                        else
+                            None
+                    )
+
+                finishInd "" $"%s{fnRef targetFn typeArgs}(%s{args})" fn.RetFrom.IsSome dropAfter
+            | _ ->
+                let capturedArgs = capTys |> List.mapi (fun i _ -> $"c.c%d{i}")
+
+                if
+                    isManaged ret
+                    || argTys |> List.exists isManaged
+                    || capTys |> List.exists isManaged
+                then
+                    let uses =
+                        (capTys
+                         |> List.map (fun t ->
+                             if isManaged t then
+                                 ".keep"
+                             else
+                                 ".plain"
+                         ))
+                        @ (argTys
+                           |> List.map (fun t ->
+                               if isManaged t then
+                                   ".give"
+                               else
+                                   ".plain"
+                           ))
+
+                    finishInd
+                        ""
+                        $"fable_rt.across(%s{fnRef targetFn typeArgs}, %s{sigName targetFn}, %s{tuple uses}, %s{tuple (capturedArgs @ (ps |> List.map fst))})"
+                        false
+                        []
+                else
+                    let args = capturedArgs @ (ps |> List.map fst) |> String.concat ", "
+                    finishInd "" $"%s{fnRef targetFn typeArgs}(%s{args})" false []
+
+        line "}"
+
+    let vtSlots =
+        vt.Slots
+        |> List.mapi (fun i (slotName, _) -> $".%s{fieldIdent slotName} = @\"slot_%d{i}_%s{cleanIdent slotName}\"")
+
+    let metaExpr =
+        match vt.Kind with
+        | IVtObj -> "&fable_rt.obj_iface_meta"
+        | IVtBox _ -> "&fable_rt.box_iface_meta"
+        | IVtCaptures [] -> "&fable_rt.empty_iface_meta"
+        | IVtCaptures _ -> "&fable_rt.env_iface_meta"
+        | IVtUpcast subTy -> $"fable_rt.upcastIfaceMeta(%s{zigType subTy})"
+
+    let vtFields = $".@\"$meta\" = %s{metaExpr}" :: vtSlots |> String.concat ", "
+    line $"const Vt = @typeInfo(@FieldType(%s{zigType vt.IfaceTy}, \"vt\")).pointer.child;"
+    line $"const vt: Vt = .{{ %s{vtFields} }};"
+
+    if vt.Gens.IsEmpty then
+        out.AppendLine("};") |> ignore
+    else
+        out.AppendLine("    };").AppendLine("}") |> ignore
+
+    out.AppendLine() |> ignore
+
 /// A resource's hooks, as declarations the runtime looks for: `fable_destroy`, `fable_dup`.
 /// `fable_rt.Hook(file, "name")` of a function of this file or of another (`alias.name`)
 let hookOf (fn: string) =
@@ -1785,6 +2193,22 @@ let emitFile (state: FileState) : string =
                 $"pub const %s{topIdent e.Name} = fable_rt.ExnOf(\"%s{e.Ref.DisplayName}\", struct {{ %s{payload} }})"
             )
             |> ignore
+        | KIface ->
+            let ifaceFields =
+                "@\"$meta\": *const fable_rt.IfaceMeta" :: fields (snd e.Cases.Head)
+                |> String.concat ", "
+
+            match e.TypeParams with
+            | [] ->
+                out.Append($"pub const %s{topIdent e.Name} = fable_rt.Iface(struct {{ %s{ifaceFields} }})")
+                |> ignore
+            | typeParams ->
+                let comptimeParams = typeParams |> List.map comptimeParam |> String.concat ", "
+
+                out.Append(
+                    $"pub fn %s{topIdent e.Name}(%s{comptimeParams}) type {{\n    return fable_rt.Iface(struct {{ %s{ifaceFields} }});\n}}"
+                )
+                |> ignore
         | KRecord ->
             out.AppendLine(opening "struct") |> ignore
             out.Append(hookDecls e ind) |> ignore
@@ -1834,7 +2258,7 @@ let emitFile (state: FileState) : string =
                     out.AppendLine($"%s{ind}    %s{fieldIdent c}: *struct {{ %s{payload} }},")
                     |> ignore
 
-        if e.Kind = KRefRecord then
+        if e.Kind = KRefRecord || e.Kind = KIface then
             (if e.TypeParams.IsEmpty then
                  out.AppendLine(";")
              else
@@ -1853,7 +2277,9 @@ let emitFile (state: FileState) : string =
     if state.Consts.Count > 0 then
         out.AppendLine() |> ignore
 
-    // the anonymous records the file uses: the runtime's type of each shape
+    // the anonymous records and `.NET` fat-pointer interfaces the file uses
+    let emittedIfaceAliases = HashSet<string>()
+
     for kv in state.Ents do
         if kv.Key.StartsWith("$anon:", System.StringComparison.Ordinal) then
             let names = kv.Key.Substring(6).Split(',')
@@ -1863,6 +2289,20 @@ let emitFile (state: FileState) : string =
 
             out.AppendLine($"const %s{alias} = fable_rt.Anon%d{names.Length}(.{{ %s{quoted} }});")
             |> ignore
+        elif kv.Key.StartsWith("$iface:", System.StringComparison.Ordinal) then
+            let rest = kv.Key.Substring(7)
+
+            if rest = "" then
+                if emittedIfaceAliases.Add "fable_iface_0" then
+                    out.AppendLine("const fable_iface_0 = fable_rt.IfaceAnon0();") |> ignore
+            else
+                let safe = rest.Split(',') |> Array.map cleanIdent
+                let quoted = safe |> Array.map (fun n -> "\"" + n + "\"") |> String.concat ", "
+                let alias = "fable_iface_" + String.concat "_" safe
+
+                if emittedIfaceAliases.Add alias then
+                    out.AppendLine($"const %s{alias} = fable_rt.IfaceAnon%d{safe.Length}(.{{ %s{quoted} }});")
+                    |> ignore
 
     // Module-level values that are computed: each has a place, filled when the program starts
     // (after the values of the files this one uses) and given up when it ends.
@@ -1916,6 +2356,7 @@ let emitFile (state: FileState) : string =
     out.AppendLine("}").AppendLine() |> ignore
 
     let adapters = Dictionary<string, Adapter>()
+    let ifaceVts = Dictionary<string, IfaceVt>()
     let fns = Dictionary<string, FnInfo>()
 
     for fn in state.Fns do
@@ -1923,7 +2364,7 @@ let emitFile (state: FileState) : string =
 
     for fn in state.Fns do
         try
-            emitFunction out rootNames adapters fns fn
+            emitFunction out rootNames adapters ifaceVts fns fn
         with ZigError(msg, None) ->
             raise (ZigError(msg, fn.Range))
 
@@ -2081,6 +2522,9 @@ let emitFile (state: FileState) : string =
 
     for a in adapters.Values do
         emitAdapter out fns a
+
+    for vt in ifaceVts.Values do
+        emitIfaceVt out fns vt
 
     // (a file that uses async: at the end of each test, the work it started and left waiting
     // is run on, so that it finishes within the test)

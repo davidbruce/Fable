@@ -31,6 +31,8 @@ type EntKind =
     | KRefRecord
     /// an F# `exception` declaration: its values have the type `exn`
     | KExn
+    /// an interface: fat pointer `{ data, vt }` with static vtable
+    | KIface
 
 [<ReferenceEquality>]
 type Ent =
@@ -75,6 +77,8 @@ type Ty =
     | TSlice of Ty * isConst: bool
     | TArr of Ty * int
     | TFn of Ty list * Ty
+    /// Raw vtable slot pointer in a fat-pointer interface: `*const fn (?*anyopaque, ...) fable_rt.Raised!R`.
+    | TSlot of Ty list * Ty
     /// Perceus reuse token: a dead cell of a case of a recursive union, or nothing
     | TTok of Ty * string
 
@@ -180,7 +184,8 @@ let rec mayHoldCyclic (t: Ty) : bool =
     | TPrim "fable_rt.Exn"
     | TPrim "fable_rt.Obj" -> true
     | TEnt(e, args) ->
-        e.Cyclic
+        e.Kind = KIface
+        || e.Cyclic
         || e.ReachesOpaque
         || List.exists mayHoldCyclic args
         || (e.Kind <> KHeapUnion
@@ -203,6 +208,7 @@ let rec tyKey (t: Ty) : string =
     | TSlice(t, c) -> $"[]%b{c}%s{tyKey t}"
     | TArr(t, n) -> $"[%d{n}]%s{tyKey t}"
     | TFn(args, ret) -> "fn(" + (args |> List.map tyKey |> String.concat ",") + ")" + tyKey ret
+    | TSlot(args, ret) -> "slot(" + (args |> List.map tyKey |> String.concat ",") + ")" + tyKey ret
     | TTok(t, c) -> $"tok:%s{tyKey t}.%s{c}"
 
 /// Replace type parameters by what they stand for.
@@ -222,6 +228,7 @@ let rec substTy (m: Map<string, Ty>) (t: Ty) : Ty =
         | TSlice(t, c) -> TSlice(substTy m t, c)
         | TArr(t, n) -> TArr(substTy m t, n)
         | TFn(args, ret) -> TFn(args |> List.map (substTy m), substTy m ret)
+        | TSlot(args, ret) -> TSlot(args |> List.map (substTy m), substTy m ret)
         | TTok(t, c) -> TTok(substTy m t, c)
         | TPrim _ -> t
 
@@ -241,7 +248,8 @@ let freeGens (ts: Ty list) : string list =
         | TArr(t, _)
         | TTok(t, _) -> go t
         | TTuple ts -> List.iter go ts
-        | TFn(args, ret) ->
+        | TFn(args, ret)
+        | TSlot(args, ret) ->
             List.iter go args
             go ret
         | TPrim _ -> ()
@@ -321,8 +329,12 @@ type Proj =
     | PItem of int
     | PSome
 
-[<NoEquality; NoComparison>]
-type Expr =
+type IfaceSource =
+    | ISrcValue of Expr
+    | ISrcCaptures of Expr list
+    | ISrcUpcast of Expr
+
+and [<NoEquality; NoComparison>] Expr =
     // ---- flat expressions (no control flow) ----
     | EVar of Var
     | ELit of string * Ty
@@ -338,6 +350,10 @@ type Expr =
     /// arguments, the values it captures (they are that function's first parameters), and its
     /// type
     | EClosure of string * Ty list * Expr list * Ty
+    /// a fat-pointer interface value backed by a class Obj / boxed value, captures, or upcast sub-interface
+    | EIface of Ty * IfaceSource * (string * (string * Ty list)) list
+    /// method call through a fat-pointer interface: `iface` (borrowed), `slot`, `args` (owned), result type
+    | ECallIface of Expr * string * Expr list * Ty
     | ECon of Ty * string * Expr list * Var option
     | EGet of Expr * Proj * Ty
     | ETest of Expr * string * Ty
@@ -437,6 +453,8 @@ let rec typeOf (e: Expr) : Ty =
     | ECallClo(_, _, t)
     | ECallVt(_, _, _, t)
     | EClosure(_, _, _, t)
+    | EIface(t, _, _)
+    | ECallIface(_, _, _, t)
     | ECon(t, _, _, _)
     | EGet(_, _, t)
     | EDeref(_, t)
@@ -505,6 +523,10 @@ let flatKids (e: Expr) : Expr list =
     | ECon(_, _, xs, _) -> xs
     | ECallClo(f, xs, _) -> f :: xs
     | ECallVt(f, s, xs, _) -> f :: s :: xs
+    | EIface(_, ISrcValue x, _)
+    | EIface(_, ISrcUpcast x, _) -> [ x ]
+    | EIface(_, ISrcCaptures xs, _) -> xs
+    | ECallIface(r, _, xs, _) -> r :: xs
     | EExnTest(x, _)
     | EExnGet(x, _, _, _)
     | EOnRaise(x, _)
@@ -532,6 +554,10 @@ let withFlatKids (e: Expr) (xs: Expr list) : Expr =
     | ERaise(_, t), [ x ] -> ERaise(x, t)
     | ECallClo(_, _, t), f :: rest -> ECallClo(f, rest, t)
     | ECallVt(_, _, _, t), f :: s :: rest -> ECallVt(f, s, rest, t)
+    | EIface(t, ISrcValue _, s), [ x ] -> EIface(t, ISrcValue x, s)
+    | EIface(t, ISrcUpcast _, s), [ x ] -> EIface(t, ISrcUpcast x, s)
+    | EIface(t, ISrcCaptures _, s), _ -> EIface(t, ISrcCaptures xs, s)
+    | ECallIface(_, slot, _, t), r :: rest -> ECallIface(r, slot, rest, t)
     | EGet(_, p, t), [ x ] -> EGet(x, p, t)
     | ETest(_, c, t), [ x ] -> ETest(x, c, t)
     | EAddr(_, c), [ x ] -> EAddr(x, c)
@@ -575,6 +601,7 @@ let rec isPure (e: Expr) =
     | EPrim(_, xs, _) -> List.forall isPure xs
     // (a function value that captures nothing is a constant; one that captures allocates)
     | EClosure(_, _, xs, _) -> xs.IsEmpty
+    | EIface(_, ISrcCaptures [], _) -> true
     // (a constructor that allocates a cell is not pure)
     | ECon(TEnt({ Kind = KRefRecord }, _), _, _, _) -> false
     | ECon(t, _, xs, None) -> (not (isHeapTy t) || xs.IsEmpty) && List.forall isPure xs
@@ -869,6 +896,17 @@ let genName (n: string) = $"@\"'%s{n}\""
 let rec zigType (t: Ty) : string =
     match t with
     | TPrim s -> s
+    | TEnt(e, args) when
+        e.Kind = KIface
+        && e.Name.StartsWith("fable_iface_", System.StringComparison.Ordinal)
+        ->
+        let inner =
+            args
+            |> List.map zigType
+            |> String.concat ", "
+            |> sprintf "%s(%s)" (callTarget e.Name)
+
+        $"fable_rt.Iface(%s{inner})"
     | TEnt(e, []) -> callTarget e.Name
     | TEnt(e, args) ->
         args
@@ -895,4 +933,7 @@ let rec zigType (t: Ty) : string =
     | TFn(args, ret) ->
         let ps = "?*fable_rt.Env" :: (args |> List.map zigType) |> String.concat ", "
         $"fable_rt.Func(*const fn (%s{ps}) fable_rt.Raised!%s{zigType ret})"
+    | TSlot(args, ret) ->
+        let ps = "?*anyopaque" :: (args |> List.map zigType) |> String.concat ", "
+        $"*const fn (%s{ps}) fable_rt.Raised!%s{zigType ret}"
     | TTok(t, c) -> $"?*fable_rt.Cell(%s{zigType t}, .%s{fieldIdent c})"

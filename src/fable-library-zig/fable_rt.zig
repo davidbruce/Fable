@@ -152,6 +152,9 @@ pub fn markShared(x: anytype) Raised!void {
         if (!try markCell(e)) return;
         return e.share(e);
     }
+    if (comptime isIface(T)) {
+        return x.vt.@"$meta".share(x.data);
+    }
     if (T == Obj) {
         if (!try markCell(x)) return;
         return x.type.share(x);
@@ -675,6 +678,7 @@ pub fn isManaged(comptime T: type) bool {
     if (comptime isResource(T)) return true;
     if (isCellPtr(T)) return true;
     if (comptime isFunc(T)) return true;
+    if (comptime isIface(T)) return true;
     if (isSlice(T)) return isManaged(@typeInfo(T).pointer.child);
     switch (@typeInfo(T)) {
         .optional => |o| return isManaged(o.child),
@@ -744,6 +748,10 @@ pub fn retainAll(x: anytype) void {
         if (x.env) |e| retain(e);
         return;
     }
+    if (comptime isIface(T)) {
+        x.vt.@"$meta".retain(x.data);
+        return;
+    }
     if (T == String) return strRetain(x);
     // (a shared resource is told it is copied)
     if (comptime isResource(T) and @hasDecl(T, "fable_dup")) {
@@ -770,6 +778,10 @@ pub fn drop(x: anytype) void {
         if (x.env) |e| {
             if (releaseIsLast(e)) e.destroy(e);
         }
+        return;
+    }
+    if (comptime isIface(T)) {
+        x.vt.@"$meta".drop(x.data);
         return;
     }
     if (T == Exn or T == Obj) {
@@ -986,6 +998,13 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     // (F# does not compare function values; what does is an interface value, a struct of them
     // that stands for an object, which .NET compares by identity: the same code and environment)
     if (comptime isFunc(T)) return a.env == b.env and a.code == b.code;
+    if (comptime isIface(T)) {
+        if (a.data == b.data and a.vt == b.vt) return true;
+        if (ifaceToObjBorrow(a)) |oa| {
+            if (ifaceToObjBorrow(b)) |ob| return objEql(oa, ob);
+        }
+        return false;
+    }
     if (T == Obj) return objEql(a, b);
     if (T == Exn) return a == b or (a.type == b.type and if (a.type.eql) |f| f(a, b) else false);
     if (T == String) return strEql(a, b);
@@ -1439,6 +1458,214 @@ pub fn Anon24(comptime names: [24][]const u8) type {
     return struct {
         pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type, comptime T23: type, comptime T24: type) type {
             return @Struct(.auto, null, &names, &.{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23, T24 }, &@splat(.{}));
+        }
+    };
+}
+
+fn ifaceVtStruct(comptime N: usize, comptime names: [N][]const u8, comptime types: [N]type) type {
+    const meta_name: [1][]const u8 = .{"$meta"};
+    const all_names = meta_name ++ names;
+    const meta_type: [1]type = .{*const IfaceMeta};
+    const all_types = meta_type ++ types;
+    return @Struct(.auto, null, &all_names, &all_types, &@splat(.{}));
+}
+
+pub fn IfaceAnon0() type {
+    return struct {
+        pub fn of() type {
+            return ifaceVtStruct(0, .{}, .{});
+        }
+    };
+}
+
+pub fn IfaceAnon1(comptime names: [1][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type) type {
+            return ifaceVtStruct(1, names, .{T1});
+        }
+    };
+}
+
+pub fn IfaceAnon2(comptime names: [2][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type) type {
+            return ifaceVtStruct(2, names, .{ T1, T2 });
+        }
+    };
+}
+
+pub fn IfaceAnon3(comptime names: [3][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type) type {
+            return ifaceVtStruct(3, names, .{ T1, T2, T3 });
+        }
+    };
+}
+
+pub fn IfaceAnon4(comptime names: [4][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type) type {
+            return ifaceVtStruct(4, names, .{ T1, T2, T3, T4 });
+        }
+    };
+}
+
+pub fn IfaceAnon5(comptime names: [5][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type) type {
+            return ifaceVtStruct(5, names, .{ T1, T2, T3, T4, T5 });
+        }
+    };
+}
+
+pub fn IfaceAnon6(comptime names: [6][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type) type {
+            return ifaceVtStruct(6, names, .{ T1, T2, T3, T4, T5, T6 });
+        }
+    };
+}
+
+pub fn IfaceAnon7(comptime names: [7][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type) type {
+            return ifaceVtStruct(7, names, .{ T1, T2, T3, T4, T5, T6, T7 });
+        }
+    };
+}
+
+pub fn IfaceAnon8(comptime names: [8][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type) type {
+            return ifaceVtStruct(8, names, .{ T1, T2, T3, T4, T5, T6, T7, T8 });
+        }
+    };
+}
+
+pub fn IfaceAnon9(comptime names: [9][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type) type {
+            return ifaceVtStruct(9, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9 });
+        }
+    };
+}
+
+pub fn IfaceAnon10(comptime names: [10][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type) type {
+            return ifaceVtStruct(10, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10 });
+        }
+    };
+}
+
+pub fn IfaceAnon11(comptime names: [11][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type) type {
+            return ifaceVtStruct(11, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11 });
+        }
+    };
+}
+
+pub fn IfaceAnon12(comptime names: [12][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type) type {
+            return ifaceVtStruct(12, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12 });
+        }
+    };
+}
+
+pub fn IfaceAnon13(comptime names: [13][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type) type {
+            return ifaceVtStruct(13, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13 });
+        }
+    };
+}
+
+pub fn IfaceAnon14(comptime names: [14][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type) type {
+            return ifaceVtStruct(14, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14 });
+        }
+    };
+}
+
+pub fn IfaceAnon15(comptime names: [15][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type) type {
+            return ifaceVtStruct(15, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15 });
+        }
+    };
+}
+
+pub fn IfaceAnon16(comptime names: [16][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type) type {
+            return ifaceVtStruct(16, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16 });
+        }
+    };
+}
+
+pub fn IfaceAnon17(comptime names: [17][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type) type {
+            return ifaceVtStruct(17, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17 });
+        }
+    };
+}
+
+pub fn IfaceAnon18(comptime names: [18][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type) type {
+            return ifaceVtStruct(18, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18 });
+        }
+    };
+}
+
+pub fn IfaceAnon19(comptime names: [19][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type) type {
+            return ifaceVtStruct(19, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19 });
+        }
+    };
+}
+
+pub fn IfaceAnon20(comptime names: [20][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type) type {
+            return ifaceVtStruct(20, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20 });
+        }
+    };
+}
+
+pub fn IfaceAnon21(comptime names: [21][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type) type {
+            return ifaceVtStruct(21, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21 });
+        }
+    };
+}
+
+pub fn IfaceAnon22(comptime names: [22][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type) type {
+            return ifaceVtStruct(22, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22 });
+        }
+    };
+}
+
+pub fn IfaceAnon23(comptime names: [23][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type, comptime T23: type) type {
+            return ifaceVtStruct(23, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23 });
+        }
+    };
+}
+
+pub fn IfaceAnon24(comptime names: [24][]const u8) type {
+    return struct {
+        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type, comptime T23: type, comptime T24: type) type {
+            return ifaceVtStruct(24, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23, T24 });
         }
     };
 }
@@ -2036,7 +2263,18 @@ pub fn htNewWith(comptime D: type, comparer: anytype) D {
     const d = htNew(D);
     // (an interface's value may be null: then the keys' own equality, as .NET's default)
     const c = if (comptime @typeInfo(@TypeOf(comparer)) == .optional) (comparer orelse return d) else comparer;
-    htInitComparers(d, @field(c, "Equals"), @field(c, "GetHashCode"));
+    if (comptime isIface(@TypeOf(c))) {
+        const HT = @typeInfo(D).pointer.child;
+        const EqFn = @typeInfo(@FieldType(HT, "cmp_eq")).optional.child;
+        const HashFn = @typeInfo(@FieldType(HT, "cmp_hash")).optional.child;
+        const eq = ifaceMethod(EqFn, c, "Equals");
+        defer drop(eq);
+        const h = ifaceMethod(HashFn, c, "GetHashCode");
+        defer drop(h);
+        htInitComparers(d, eq, h);
+    } else {
+        htInitComparers(d, @field(c, "Equals"), @field(c, "GetHashCode"));
+    }
     return d;
 }
 
@@ -2671,6 +2909,12 @@ pub const ObjType = struct {
     /// starting field bit index of each part in the initialization bitset, and byte offset of the bitset
     part_field_bases: []const usize = &.{},
     init_offset: usize = 0,
+    /// unwraps a boxed interface wrapper holding a boxed value of `target_ty` (when `Box(Iface)`)
+    unwrap_box: ?*const fn (Obj, *const ObjType) ?Obj = null,
+    /// unwraps a boxed interface wrapper holding a class `Obj` (when `Box(Iface)`)
+    unwrap_obj: ?*const fn (Obj) ?Obj = null,
+    /// identity pointer of a boxed interface wrapper (when `Box(Iface)`)
+    iface_id: ?*const fn (Obj) ?*anyopaque = null,
 };
 
 pub const ObjHeader = struct {
@@ -2972,6 +3216,18 @@ fn netTypeName(comptime T: type) [:0]const u8 {
 /// The type of the objects that hold a boxed `T`
 pub fn boxType(comptime T: type) *const ObjType {
     return &struct {
+        fn unwrapIfaceBox(o: Obj, target_ty: *const ObjType) ?Obj {
+            const v = boxed(T, o).value;
+            return v.vt.@"$meta".find_box(v.data, target_ty);
+        }
+        fn unwrapIfaceObj(o: Obj) ?Obj {
+            return ifaceToObjBorrow(boxed(T, o).value);
+        }
+        fn ifaceBoxId(o: Obj) ?*anyopaque {
+            const v = boxed(T, o).value;
+            if (ifaceToObjBorrow(v)) |obj| return @ptrCast(obj);
+            return v.data;
+        }
         const ty: ObjType = .{
             .name = netTypeName(T),
             .parent = null,
@@ -2984,6 +3240,9 @@ pub fn boxType(comptime T: type) *const ObjType {
             .compare = if (comparable(T)) boxCompare else null,
             .is_array = @typeInfo(T) == .pointer and @hasDecl(@typeInfo(T).pointer.child, "fable_array"),
             .reflect = if (reflection) &reflectOf else null,
+            .unwrap_box = if (isIface(T)) &unwrapIfaceBox else null,
+            .unwrap_obj = if (isIface(T)) &unwrapIfaceObj else null,
+            .iface_id = if (isIface(T)) &ifaceBoxId else null,
         };
         pub fn reflectOf() reflect.Type {
             return reflect.typeOf(T);
@@ -3020,7 +3279,7 @@ pub fn comparable(comptime T: type) bool {
 /// that holds itself is looked into that far)
 fn comparableTo(comptime T: type, comptime depth: u8) bool {
     @setEvalBranchQuota(1_000_000);
-    if (isFunc(T) or T == Exn or T == Obj or (isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity"))) return false;
+    if (isFunc(T) or isIface(T) or T == Exn or T == Obj or (isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity"))) return false;
     if (depth == 0 or T == String) return true;
     switch (@typeInfo(T)) {
         .@"struct" => |st| {
@@ -3050,9 +3309,17 @@ pub fn box(x: anytype) Any {
     if (T == void) return null;
     if (T == Any) return dup(x);
     if (T == Obj) return dup(x);
+    if (comptime isIface(T)) {
+        return objNew(boxType(T), BoxChain(T){ .own = .{ .value = x } });
+    }
     if (T == String and x == null) return null;
     if (comptime @typeInfo(T) == .optional and T != String) {
         if (x == null) return null;
+        if (comptime isIface(@typeInfo(T).optional.child)) {
+            const C = @typeInfo(T).optional.child;
+            const v = x.?;
+            return objNew(boxType(C), BoxChain(C){ .own = .{ .value = v } });
+        }
     }
     // (an array's null is null as an object too)
     if (comptime isArrayPtr(T)) {
@@ -3065,7 +3332,18 @@ pub fn box(x: anytype) Any {
 pub fn isType(comptime T: type, o: Any) bool {
     if (T == void) return o == null;
     const p = o orelse return false;
-    return p.type == boxType(T);
+    if (p.type == boxType(T)) return true;
+    if (comptime @typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child)) {
+        const C = @typeInfo(T).optional.child;
+        if (p.type == boxType(C)) return true;
+        if (p.type.unwrap_box) |f| {
+            if (f(p, boxType(C)) != null) return true;
+        }
+    }
+    if (p.type.unwrap_box) |f| {
+        if (f(p, boxType(T)) != null) return true;
+    }
+    return false;
 }
 
 /// `o :? T` with what it holds: `?T`, null when it is not a `T` (`OT` is `?T`)
@@ -3073,8 +3351,23 @@ pub fn tryUnbox(comptime OT: type, o: Any) OT {
     const T = @typeInfo(OT).optional.child;
     if (T == void) return if (o == null) {} else null;
     const p = o orelse return null;
-    if (T == Any or T == Obj) return dup(p);
+    if (T == Any or T == Obj) {
+        if (p.type.unwrap_obj) |f| {
+            if (f(p)) |inner| return dup(inner);
+        }
+        return dup(p);
+    }
     if (p.type == boxType(T)) return dup(boxed(T, p).value);
+    if (comptime @typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child)) {
+        const C = @typeInfo(T).optional.child;
+        if (p.type == boxType(C)) return @as(T, dup(boxed(C, p).value));
+        if (p.type.unwrap_box) |f| {
+            if (f(p, boxType(C))) |bp| return @as(T, dup(boxed(C, bp).value));
+        }
+    }
+    if (p.type.unwrap_box) |f| {
+        if (f(p, boxType(T))) |bp| return dup(boxed(T, bp).value);
+    }
     return null;
 }
 
@@ -3122,6 +3415,16 @@ pub fn unbox(comptime T: type, x: anytype) Raised!T {
     };
     if (T == Obj) return dup(p);
     if (p.type == boxType(T)) return dup(boxed(T, p).value);
+    if (comptime @typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child)) {
+        const C = @typeInfo(T).optional.child;
+        if (p.type == boxType(C)) return dup(boxed(C, p).value);
+        if (p.type.unwrap_box) |f| {
+            if (f(p, boxType(C))) |bp| return dup(boxed(C, bp).value);
+        }
+    }
+    if (p.type.unwrap_box) |f| {
+        if (f(p, boxType(T))) |bp| return dup(boxed(T, bp).value);
+    }
     // (a tuple FSharpValue.MakeTuple made of a type MakeTupleType made)
     if (comptime @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".is_tuple and T != reflect.LooseTuple) {
         if (p.type == boxType(reflect.LooseTuple)) return reflect.tupleOfLoose(T, boxed(reflect.LooseTuple, p).value);
@@ -3236,6 +3539,10 @@ pub fn genericText(x: anytype) Raised!String {
     if (T == u16) return format(.{arg(.{ .kind = 'c' }, x)});
     if (T == Any) return anyToString(x, true);
     if (T == Obj) return objText(x);
+    if (comptime isIface(T)) {
+        if (ifaceToObjBorrow(x)) |o| return objText(o);
+        return anyText(x);
+    }
     if (comptime hookOf(T, "fable_to_string")) return hookType(T).fable_to_string.call(.{x});
     return switch (@typeInfo(T)) {
         .int, .float, .bool => format(.{x}),
@@ -3315,8 +3622,10 @@ pub fn optOfObj(x: anytype) ?@TypeOf(x) {
 }
 
 pub fn objEql(a: Obj, b: Obj) bool {
-    if (a == b) return true;
-    if (a.type.equals) |f| return f(a, b);
+    const ua = if (a.type.unwrap_obj) |f| (f(a) orelse a) else a;
+    const ub = if (b.type.unwrap_obj) |f| (f(b) orelse b) else b;
+    if (ua == ub) return true;
+    if (ua.type.equals) |f| return f(ua, ub);
     return false;
 }
 
@@ -3324,7 +3633,28 @@ pub fn objEql(a: Obj, b: Obj) bool {
 /// value that is not a cell is boxed anew on .NET: never the same object.)
 pub fn refEql(a: anytype, b: @TypeOf(a)) bool {
     const T = @TypeOf(a);
-    if (comptime T == String or T == Any or T == Obj or T == Exn or isCellPtr(T)) return a == b;
+    if (comptime @typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child)) {
+        if (a == null or b == null) return a == null and b == null;
+        return refEql(a.?, b.?);
+    }
+    if (comptime isIface(T)) {
+        const oa = ifaceToObjBorrow(a);
+        const ob = ifaceToObjBorrow(b);
+        if (oa != null or ob != null) return oa != null and oa == ob;
+        return (a.data != null and a.data == b.data) or (a.data == null and b.data == null and a.vt == b.vt);
+    }
+    if (comptime T == Any) {
+        const pa = a orelse return b == null;
+        const pb = b orelse return false;
+        return refEql(pa, pb);
+    }
+    if (comptime T == Obj) {
+        if (a == b) return true;
+        const id_a: ?*anyopaque = if (a.type.iface_id) |f| f(a) else @ptrCast(a);
+        const id_b: ?*anyopaque = if (b.type.iface_id) |f| f(b) else @ptrCast(b);
+        return id_a != null and id_a == id_b;
+    }
+    if (comptime T == String or T == Exn or isCellPtr(T)) return a == b;
     if (comptime @typeInfo(T) == .@"union" and @hasDecl(T, "fable_cyclic")) return std.meta.eql(a, b);
     return false;
 }
@@ -3463,7 +3793,8 @@ pub inline fn objVt(comptime P: type, o: Obj, comptime depth: usize) P {
 /// `o :? C`: is the object of class `ty`, or of a class that derives from it?
 pub fn objIs(o: Any, ty: *const ObjType) bool {
     // (null is of no type)
-    const p = o orelse return false;
+    const p0 = o orelse return false;
+    const p = if (p0.type.unwrap_obj) |f| (f(p0) orelse return false) else p0;
     var t: ?*const ObjType = p.type;
     while (t) |class| : (t = class.parent) {
         if (class == ty) return true;
@@ -3473,7 +3804,8 @@ pub fn objIs(o: Any, ty: *const ObjType) bool {
 
 /// `o :?> C`: null stays null, as on .NET
 pub fn objCast(any: Any, ty: *const ObjType) Raised!Any {
-    const o = any orelse return null;
+    const o0 = any orelse return null;
+    const o = if (o0.type.unwrap_obj) |f| (f(o0) orelse o0) else o0;
     if (objIs(o, ty)) return dup(o);
     // (.NET names a class nested in a module without the module here)
     const Short = struct {
@@ -3690,6 +4022,7 @@ pub fn holdsCyclic(comptime T: type) bool {
         .optional => |o| return holdsCyclic(o.child),
         .@"struct" => |s| {
             if (@hasDecl(T, "fable_func")) return functions_in_cycles;
+            if (@hasDecl(T, "fable_iface")) return functions_in_cycles;
             inline for (s.field_types) |F| {
                 if (holdsCyclic(F)) return true;
             }
@@ -3718,6 +4051,10 @@ pub fn eachHdr(x: anytype, ctx: anytype, comptime f: anytype) void {
         if (x.env) |e| {
             if (e.gc) |h| f(ctx, h);
         }
+        return;
+    }
+    if (comptime isIface(T)) {
+        if (x.vt.@"$meta".hdr_of(x.data)) |h| f(ctx, h);
         return;
     }
     if (comptime isSlice(T)) {
@@ -3757,6 +4094,12 @@ fn dropOutside(x: anytype) void {
             if (e.gc) |h| {
                 if (sgc.isGarbage(h)) return;
             }
+        }
+        return drop(x);
+    }
+    if (comptime isIface(T)) {
+        if (x.vt.@"$meta".hdr_of(x.data)) |h| {
+            if (sgc.isGarbage(h)) return;
         }
         return drop(x);
     }
@@ -4306,6 +4649,14 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
     if (T == bool) return @as(i32, @intFromBool(a)) - @as(i32, @intFromBool(b));
     if (T == void) return 0;
     if (T == Exn) @compileError("fable: exceptions cannot be compared");
+    if (comptime isIface(T)) {
+        if (ifaceToObjBorrow(a)) |oa| {
+            if (ifaceToObjBorrow(b)) |ob| {
+                if (oa.type.compare) |f| return f(oa, ob);
+            }
+        }
+        @panic("fable: At least one object must implement IComparable.");
+    }
     if (comptime isFunc(T)) @compileError("fable: function values cannot be compared");
     switch (@typeInfo(T)) {
         .int, .float, .comptime_int, .comptime_float => {
@@ -4468,6 +4819,10 @@ pub fn hash(x: anytype) i32 {
     if (T == Exn or T == Obj) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
     if (comptime isDecimal(T)) return decHash(x);
     if (comptime isFunc(T)) return @truncate(@as(isize, @bitCast(@intFromPtr(x.env) ^ @intFromPtr(x.code))));
+    if (comptime isIface(T)) {
+        if (ifaceToObjBorrow(x)) |o| return hash(o);
+        return @truncate(@as(isize, @bitCast(@intFromPtr(x.data) ^ @intFromPtr(x.vt))));
+    }
     switch (@typeInfo(T)) {
         .void => return 0,
         .bool => return @intFromBool(x),
@@ -6190,6 +6545,10 @@ pub const Shower = struct {
         }
         if (T == Exn) return x.type.show(b, x, prec, depth);
         if (T == Obj) return b.word(x.type.name);
+        if (comptime isIface(T)) {
+            if (ifaceToObjBorrow(x)) |o| return b.word(o.type.name);
+            return b.word("<iface>");
+        }
         if (comptime isFunc(T)) return b.word("<fun>");
         const node: ShowNode = if (node_idx < shape.nodes.len) shape.nodes[node_idx] else .{};
         switch (@typeInfo(T)) {
@@ -6490,6 +6849,10 @@ fn writeNetShape(out: *TextBuilder, x: anytype, comptime shape: TypeShape, node_
         return out.addOne(x);
     }
     if (T == Obj) return writeObj(out, x);
+    if (comptime isIface(T)) {
+        if (ifaceToObjBorrow(x)) |o| return writeObj(out, o);
+        return out.addAscii("<iface>");
+    }
     // (`Append(chars)`: the chars; `Append(builder)`: what it holds)
     if (comptime T == Array(u16)) return out.add(x.items);
     if (comptime T == StringBuilder) return out.add(x.units.items);
@@ -6730,6 +7093,325 @@ pub fn Func(comptime Code: type) type {
 
 pub fn isFunc(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "fable_func");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Interfaces: fat pointer `{ data, vt }` with a static vtable and metadata hooks
+// ---------------------------------------------------------------------------------------------
+
+pub const IfaceMeta = struct {
+    retain: *const fn (?*anyopaque) void,
+    drop: *const fn (?*anyopaque) void,
+    share: *const fn (?*anyopaque) Raised!void,
+    hdr_of: *const fn (?*anyopaque) ?*sgc.Hdr,
+    as_obj: *const fn (?*anyopaque) ?Obj,
+    find_box: *const fn (?*anyopaque, *const ObjType) ?Obj,
+};
+
+fn emptyRetain(_: ?*anyopaque) void {}
+fn emptyDrop(_: ?*anyopaque) void {}
+fn emptyShare(_: ?*anyopaque) Raised!void {}
+fn emptyHdr(_: ?*anyopaque) ?*sgc.Hdr {
+    return null;
+}
+fn emptyAsObj(_: ?*anyopaque) ?Obj {
+    return null;
+}
+fn emptyFindBox(_: ?*anyopaque, _: *const ObjType) ?Obj {
+    return null;
+}
+
+pub const empty_iface_meta: IfaceMeta = .{
+    .retain = emptyRetain,
+    .drop = emptyDrop,
+    .share = emptyShare,
+    .hdr_of = emptyHdr,
+    .as_obj = emptyAsObj,
+    .find_box = emptyFindBox,
+};
+
+fn objIfaceRetain(d: ?*anyopaque) void {
+    if (d) |p| retain(@as(Obj, @ptrCast(@alignCast(p))));
+}
+fn objIfaceDrop(d: ?*anyopaque) void {
+    if (d) |p| drop(@as(Obj, @ptrCast(@alignCast(p))));
+}
+fn objIfaceShare(d: ?*anyopaque) Raised!void {
+    if (d) |p| try markShared(@as(Obj, @ptrCast(@alignCast(p))));
+}
+fn objIfaceHdr(d: ?*anyopaque) ?*sgc.Hdr {
+    const p = d orelse return null;
+    const o: Obj = @ptrCast(@alignCast(p));
+    return o.gc;
+}
+fn objIfaceAsObj(d: ?*anyopaque) ?Obj {
+    const p = d orelse return null;
+    return @ptrCast(@alignCast(p));
+}
+fn objIfaceFindBox(d: ?*anyopaque, target_ty: *const ObjType) ?Obj {
+    const p = d orelse return null;
+    const o: Obj = @ptrCast(@alignCast(p));
+    if (o.type == target_ty) return o;
+    if (o.type.unwrap_box) |f| return f(o, target_ty);
+    return null;
+}
+
+pub const obj_iface_meta: IfaceMeta = .{
+    .retain = objIfaceRetain,
+    .drop = objIfaceDrop,
+    .share = objIfaceShare,
+    .hdr_of = objIfaceHdr,
+    .as_obj = objIfaceAsObj,
+    .find_box = objIfaceFindBox,
+};
+
+pub const box_iface_meta = obj_iface_meta;
+
+fn envIfaceRetain(d: ?*anyopaque) void {
+    if (d) |p| retain(@as(*Env, @ptrCast(@alignCast(p))));
+}
+fn envIfaceDrop(d: ?*anyopaque) void {
+    if (d) |p| {
+        const e: *Env = @ptrCast(@alignCast(p));
+        if (releaseIsLast(e)) e.destroy(e);
+    }
+}
+fn envIfaceShare(d: ?*anyopaque) Raised!void {
+    if (d) |p| {
+        const e: *Env = @ptrCast(@alignCast(p));
+        if (!try markCell(e)) return;
+        return e.share(e);
+    }
+}
+fn envIfaceHdr(d: ?*anyopaque) ?*sgc.Hdr {
+    const p = d orelse return null;
+    const e: *Env = @ptrCast(@alignCast(p));
+    return e.gc;
+}
+
+pub const env_iface_meta: IfaceMeta = .{
+    .retain = envIfaceRetain,
+    .drop = envIfaceDrop,
+    .share = envIfaceShare,
+    .hdr_of = envIfaceHdr,
+    .as_obj = emptyAsObj,
+    .find_box = emptyFindBox,
+};
+
+pub fn upcastIfaceMeta(comptime SubIface: type) *const IfaceMeta {
+    return &struct {
+        fn asObj(d: ?*anyopaque) ?Obj {
+            const p = d orelse return null;
+            const o: Obj = @ptrCast(@alignCast(p));
+            const sub = boxed(SubIface, o).value;
+            return sub.vt.@"$meta".as_obj(sub.data);
+        }
+        fn findBox(d: ?*anyopaque, target_ty: *const ObjType) ?Obj {
+            const p = d orelse return null;
+            const o: Obj = @ptrCast(@alignCast(p));
+            if (o.type == target_ty) return o;
+            const sub = boxed(SubIface, o).value;
+            return sub.vt.@"$meta".find_box(sub.data, target_ty);
+        }
+        const meta: IfaceMeta = .{
+            .retain = objIfaceRetain,
+            .drop = objIfaceDrop,
+            .share = objIfaceShare,
+            .hdr_of = objIfaceHdr,
+            .as_obj = asObj,
+            .find_box = findBox,
+        };
+    }.meta;
+}
+
+pub fn Iface(comptime Vt: type) type {
+    return struct {
+        pub const fable_iface = {};
+        data: ?*anyopaque,
+        vt: *const Vt,
+    };
+}
+
+pub fn isIface(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "fable_iface");
+}
+
+/// Box `val` directly into a fat-pointer interface (consumes `val`).
+pub inline fn ifaceBox(comptime I: type, comptime T: type, val: T, vt: @FieldType(I, "vt")) I {
+    const o = ObjCell(BoxChain(T)).new(boxType(T), .{ .own = .{ .value = val } });
+    return .{ .data = @ptrCast(o), .vt = vt };
+}
+
+/// Allocate an environment holding `captures` for an object-expression fat-pointer interface (consumes `captures`).
+pub inline fn ifaceClosure(comptime I: type, comptime Captures: type, captures: Captures, vt: @FieldType(I, "vt")) I {
+    if (@sizeOf(Captures) == 0) return .{ .data = null, .vt = vt };
+    const E = EnvOf(Captures);
+    if (comptime E.cyclic) gcTick();
+    const e = allocator.create(E) catch @panic("fable: out of memory");
+    e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
+    if (comptime E.cyclic) {
+        e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
+        e.header.gc = &e.hdr;
+    }
+    if (track) thread.stats.allocs += 1;
+    return .{ .data = @ptrCast(&e.header), .vt = vt };
+}
+
+/// Extract a first-class `Func` closure from a fat-pointer interface method slot (borrows `iface`).
+pub fn ifaceMethod(comptime F: type, iface: anytype, comptime field: []const u8) F {
+    const I = @TypeOf(iface);
+    const Caps = struct { iface: I };
+    const Fn = @typeInfo(@typeInfo(@FieldType(F, "code")).pointer.child).@"fn";
+    const R = Fn.return_type.?;
+    const P = Fn.param_types;
+    const M = switch (P.len) {
+        1 => struct {
+            fn code(env: ?*Env) R {
+                const c = captured(Caps, env);
+                return @field(c.iface.vt, field)(c.iface.data);
+            }
+        },
+        2 => struct {
+            fn code(env: ?*Env, a0: P[1].?) R {
+                const c = captured(Caps, env);
+                return @field(c.iface.vt, field)(c.iface.data, a0);
+            }
+        },
+        3 => struct {
+            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?) R {
+                const c = captured(Caps, env);
+                return @field(c.iface.vt, field)(c.iface.data, a0, a1);
+            }
+        },
+        4 => struct {
+            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?) R {
+                const c = captured(Caps, env);
+                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2);
+            }
+        },
+        5 => struct {
+            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?) R {
+                const c = captured(Caps, env);
+                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3);
+            }
+        },
+        6 => struct {
+            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?, a4: P[5].?) R {
+                const c = captured(Caps, env);
+                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3, a4);
+            }
+        },
+        7 => struct {
+            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?, a4: P[5].?, a5: P[6].?) R {
+                const c = captured(Caps, env);
+                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3, a4, a5);
+            }
+        },
+        8 => struct {
+            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?, a4: P[5].?, a5: P[6].?, a6: P[7].?) R {
+                const c = captured(Caps, env);
+                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3, a4, a5, a6);
+            }
+        },
+        9 => struct {
+            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?, a4: P[5].?, a5: P[6].?, a6: P[7].?, a7: P[8].?) R {
+                const c = captured(Caps, env);
+                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3, a4, a5, a6, a7);
+            }
+        },
+        else => @compileError("fable: interface method of this many arguments"),
+    };
+    return closure(F, Caps, .{ .iface = dup(iface) }, M.code);
+}
+
+/// Borrow the underlying `Obj` from an interface value or optional interface, if any.
+pub inline fn ifaceToObjBorrow(x: anytype) ?Obj {
+    const T = @TypeOf(x);
+    if (comptime @typeInfo(T) == .optional) {
+        const v = x orelse return null;
+        return v.vt.@"$meta".as_obj(v.data);
+    }
+    return x.vt.@"$meta".as_obj(x.data);
+}
+
+pub fn ifaceToAnyBorrow(x: anytype) Any {
+    return ifaceToObjBorrow(x);
+}
+
+pub fn ifaceIsClass(x: anytype, ty: *const ObjType) bool {
+    const o = ifaceToObjBorrow(x) orelse return false;
+    return objIs(o, ty);
+}
+
+pub fn ifaceCastClass(x: anytype, ty: *const ObjType) Raised!Any {
+    if (comptime @typeInfo(@TypeOf(x)) == .optional) {
+        if (x == null) return null;
+    }
+    if (ifaceToObjBorrow(x)) |o| return objCast(o, ty);
+    const Short = struct {
+        pub fn of(name: []const u8) []const u8 {
+            return if (std.mem.lastIndexOfScalar(u8, name, '+')) |i| name[i + 1 ..] else name;
+        }
+    };
+    var b: TextBuilder = .{};
+    b.addAscii("Unable to cast object of type '<iface>' to type '");
+    b.addAscii(Short.of(ty.name));
+    b.addAscii("'.");
+    return raise(InvalidCastException, b.finish());
+}
+
+pub fn ifaceTryUnbox(comptime OT: type, x: anytype) OT {
+    const T = @typeInfo(OT).optional.child;
+    const v = if (comptime @typeInfo(@TypeOf(x)) == .optional)
+        (x orelse return if (T == void) {} else null)
+    else
+        x;
+    if (T == void) return null;
+    const V = @TypeOf(v);
+    if (comptime V == T) return dup(v);
+    if (comptime (@typeInfo(T) == .optional and @typeInfo(T).optional.child == V)) return @as(T, dup(v));
+    if (T == Any or T == Obj) {
+        if (ifaceToObjBorrow(v)) |o| return dup(o);
+        return box(v);
+    }
+    if (comptime (@typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child))) {
+        const C = @typeInfo(T).optional.child;
+        if (v.vt.@"$meta".find_box(v.data, boxType(C))) |bp| return @as(T, dup(boxed(C, bp).value));
+    }
+    if (v.vt.@"$meta".find_box(v.data, boxType(T))) |bp| return dup(boxed(T, bp).value);
+    if (ifaceToObjBorrow(v)) |o| return tryUnbox(OT, @as(Any, o));
+    return null;
+}
+
+pub fn ifaceUnbox(comptime T: type, x: anytype) Raised!T {
+    const v = if (comptime @typeInfo(@TypeOf(x)) == .optional)
+        (x orelse {
+            if (T == void) return {};
+            if (comptime @typeInfo(T) == .optional) return null;
+            if (comptime isArrayPtr(T)) return arrayNull(T);
+            return nullRef();
+        })
+    else
+        x;
+    const V = @TypeOf(v);
+    if (comptime V == T) return dup(v);
+    if (comptime (@typeInfo(T) == .optional and @typeInfo(T).optional.child == V)) return @as(T, dup(v));
+    if (T == Any) return box(v);
+    if (T == Obj) {
+        if (ifaceToObjBorrow(v)) |o| return dup(o);
+        return box(v).?;
+    }
+    if (comptime (@typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child))) {
+        const C = @typeInfo(T).optional.child;
+        if (v.vt.@"$meta".find_box(v.data, boxType(C))) |bp| return @as(T, dup(boxed(C, bp).value));
+    }
+    if (v.vt.@"$meta".find_box(v.data, boxType(T))) |bp| return dup(boxed(T, bp).value);
+    if (ifaceToObjBorrow(v)) |o| return unbox(T, @as(Any, o));
+    var b: TextBuilder = .{};
+    b.addAscii("Unable to cast object of type '<iface>' to type '");
+    b.addAscii(netTypeName(T));
+    b.addAscii("'.");
+    return raise(InvalidCastException, b.finish());
 }
 
 pub fn EnvOf(comptime Captures: type) type {
@@ -9015,4 +9697,91 @@ test "native integers and SGC header compile cleanly across pointer widths" {
     try std.testing.expectEqual(if (@bitSizeOf(isize) == 64) @as(i32, 6) else @as(i32, -7), hash(n));
     const big_u: u64 = std.math.maxInt(u64);
     _ = hash(big_u);
+}
+
+test "fat-pointer interface: zero-alloc class cast, upcast, and round-trip downcast" {
+    const Part = struct { x: i32 };
+    const Chain = struct { own: Part };
+    const cls_ty: ObjType = objType(Chain, "RtTestClass", null, &.{}, null);
+
+    const ISubVt = struct {
+        @"$meta": *const IfaceMeta,
+        Get: *const fn (?*anyopaque, void) Raised!i32,
+    };
+    const ISub = Iface(ISubVt);
+    const IBaseVt = struct {
+        @"$meta": *const IfaceMeta,
+        Get: *const fn (?*anyopaque, void) Raised!i32,
+    };
+    const IBase = Iface(IBaseVt);
+
+    const SubClsImpl = struct {
+        fn get(d: ?*anyopaque, _: void) Raised!i32 {
+            const o: Obj = @ptrCast(@alignCast(d.?));
+            return objPart(*Part, &.{Part}, o).x;
+        }
+        const vt: ISubVt = .{
+            .@"$meta" = &obj_iface_meta,
+            .Get = &get,
+        };
+    };
+    const BaseUpcastImpl = struct {
+        fn get(d: ?*anyopaque, u: void) Raised!i32 {
+            const sub = boxed(ISub, @ptrCast(@alignCast(d.?))).value;
+            return sub.vt.Get(sub.data, u);
+        }
+        const vt: IBaseVt = .{
+            .@"$meta" = upcastIfaceMeta(ISub),
+            .Get = &get,
+        };
+    };
+
+    const before = thread.stats;
+    {
+        const obj = objNew(&cls_ty, Chain{ .own = .{ .x = 42 } });
+        const after_obj = thread.stats.allocs;
+
+        // Zero-alloc class -> interface view
+        const sub: ?ISub = ISub{ .data = @ptrCast(obj), .vt = &SubClsImpl.vt };
+        try std.testing.expectEqual(after_obj, thread.stats.allocs);
+        try std.testing.expectEqual(@as(i32, 42), try sub.?.vt.Get(sub.?.data, {}));
+        try std.testing.expect(ifaceIsClass(sub, &cls_ty));
+
+        // Round-trip class downcast
+        const back_any = try ifaceCastClass(sub, &cls_ty);
+        defer drop(back_any);
+        try std.testing.expectEqual(obj, back_any.?);
+
+        // Upcast ISub -> IBase & round-trip downcasts to both ISub and class
+        const base: ?IBase = ifaceBox(IBase, ISub, sub.?, &BaseUpcastImpl.vt);
+        defer drop(base);
+        try std.testing.expectEqual(@as(i32, 42), try base.?.vt.Get(base.?.data, {}));
+        try std.testing.expect(ifaceIsClass(base, &cls_ty));
+
+        const back_sub = try ifaceUnbox(?ISub, base);
+        defer drop(back_sub);
+        try std.testing.expectEqual(@as(i32, 42), try back_sub.?.vt.Get(back_sub.?.data, {}));
+
+        const back_cls = try ifaceCastClass(base, &cls_ty);
+        defer drop(back_cls);
+        try std.testing.expectEqual(obj, back_cls.?);
+
+        // Boxed interface preserves wrapper for unbox(?ISub) while delegating class identity & refEql
+        const boxed_sub = box(sub);
+        defer drop(boxed_sub);
+        try std.testing.expect(isType(?ISub, boxed_sub));
+        const unboxed_sub = try unbox(?ISub, boxed_sub);
+        defer drop(unboxed_sub);
+        try std.testing.expectEqual(@as(i32, 42), try unboxed_sub.?.vt.Get(unboxed_sub.?.data, {}));
+        try std.testing.expect(anyIsClass(boxed_sub, &cls_ty));
+        const cast_cls = try anyToClass(boxed_sub, &cls_ty);
+        defer drop(cast_cls);
+        try std.testing.expectEqual(obj, cast_cls.?);
+        try std.testing.expect(refEql(sub, sub));
+        try std.testing.expect(refEql(sub, back_sub));
+        try std.testing.expect(refEql(@as(Any, obj), boxed_sub));
+        try std.testing.expect(refEql(@as(?ISub, null), @as(?ISub, null)));
+        try std.testing.expect(!refEql(sub, @as(?ISub, null)));
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }

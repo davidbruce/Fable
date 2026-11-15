@@ -149,7 +149,7 @@ pub fn hasZero(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .int, .float, .bool, .void, .optional => true,
         .@"struct" => |s| blk: {
-            if (@hasDecl(T, "fable_func")) break :blk false;
+            if (@hasDecl(T, "fable_func") or @hasDecl(T, "fable_iface")) break :blk false;
             for (s.field_types) |F| {
                 if (!hasZero(F)) break :blk false;
             }

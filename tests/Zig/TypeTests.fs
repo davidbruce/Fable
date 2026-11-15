@@ -1251,7 +1251,6 @@ let ``test A type overloading an interface method can be inherited`` () =
     (foo :> IFoo).Foo() |> equal "BARFOO"
     mangleFoo foo |> equal "BARFOO"
 
-#if !FABLE_COMPILER_ZIG // (this type test)
 [<Fact>]
 let ``test Interface casting round-trip`` () = // See #1452
     let d = new DowncastTest(3) :> System.IDisposable
@@ -1262,7 +1261,6 @@ let ``test Interface casting round-trip`` () = // See #1452
     <| match d with
        | :? DowncastTest as t2 -> t2.Value
        | _ -> 5
-#endif
 
 [<Fact>]
 let ``test Calling default implementation of base members don't cause infinite recursion`` () = // See #701

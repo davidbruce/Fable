@@ -231,7 +231,8 @@ let private nameProjections (state: FileState) (body: Expr) : Expr =
                 if isFlat a then
                     rw a |> ignore
 
-                scan rest
+                if isPure a then
+                    scan rest
             | EIf(c, _, _, _) -> rw c |> ignore
             | EAssign(_, r) ->
                 if isFlat r then
@@ -260,7 +261,11 @@ let private nameProjections (state: FileState) (body: Expr) : Expr =
                 match afterRoot.TryGetValue v.Id with
                 | true, binds -> ELet(v, rhs', wrap binds rest')
                 | _ -> ELet(v, rhs', rest')
-            | ESeq(a, rest) -> ESeq(inner a, rewrite rest)
+            | ESeq(a, rest) ->
+                if isPure a then
+                    ESeq(inner a, rewrite rest)
+                else
+                    ESeq(inner a, arm names rest)
             | EIf(c, t, f, ty) -> EIf(rw c, arm names t, arm names f, ty)
             | EWhile(c, b) -> EWhile(sub c, arm names b)
             | EFor(i, a, b, up, loopBody) -> EFor(i, sub a, sub b, up, arm names loopBody)
@@ -348,6 +353,7 @@ let private callRaises (p: P) (e: Expr) : Raises =
     match e with
     | ECallClo _
     | ECallVt _
+    | ECallIface _
     | ERt _ -> RAlways
     | ECall(f, tyArgs, _, _) ->
         match p.Fns.TryGetValue f with
@@ -371,7 +377,8 @@ let rec private raisesOf (p: P) (e: Expr) : Raises =
     | ECall _
     | ERt _
     | ECallClo _
-    | ECallVt _ -> joinRaises (callRaises p e) (many (flatKids e))
+    | ECallVt _
+    | ECallIface _ -> joinRaises (callRaises p e) (many (flatKids e))
     | ELet(_, r, b)
     | ESeq(r, b)
     | EWhile(r, b)
@@ -604,7 +611,8 @@ let rec private mayStore (p: P) (e: Expr) : bool =
          | _ -> true)
         || any xs
     | ECallClo _
-    | ECallVt _ -> true
+    | ECallVt _
+    | ECallIface _ -> true
     | ELet(_, r, b)
     | ESeq(r, b)
     | EWhile(r, b) -> any [ r; b ]
@@ -673,6 +681,10 @@ let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
                 go false f
                 go false s
                 List.iter (go true) xs
+            | ECallIface(r, _, xs, _) ->
+                go false r
+                List.iter (go true) xs
+            | EIface _ -> List.iter (go true) (flatKids e)
             | EClosure(_, _, xs, _)
             | EExnNew(_, xs)
             | ECon(_, _, xs, _) -> List.iter (go true) xs
@@ -1202,6 +1214,8 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
                 | ECall(f, _, xs, _) -> modesOf p f xs |> List.map (fun m -> m = MOwned)
                 | ECallClo(_, xs, _) -> false :: (xs |> List.map (fun _ -> true))
                 | ECallVt(_, _, xs, _) -> false :: false :: (xs |> List.map (fun _ -> true))
+                | ECallIface(_, _, xs, _) -> false :: (xs |> List.map (fun _ -> true))
+                | EIface _ -> kids |> List.map (fun _ -> true)
                 | EEmit(m, _ :: rest, _) when ownsFirst m -> true :: (rest |> List.map (fun _ -> false))
                 | EClosure(_, _, xs, _)
                 | EExnNew(_, xs)
@@ -1214,7 +1228,8 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
                 match e with
                 | ECall _
                 | ECallClo _
-                | ECallVt _ ->
+                | ECallVt _
+                | ECallIface _ ->
                     List.zip flags kids
                     |> List.fold
                         (fun s (own, k) ->
@@ -1279,7 +1294,8 @@ let private wrapRaising (p: P) (env: PEnv) (e: Expr) (stillOwned: Set<int>) : Ex
     | ECall _
     | ERt _
     | ECallClo _
-    | ECallVt _ when callRaises p e <> RNever -> EOnRaise(e, raiseEdgeDrops p env stillOwned)
+    | ECallVt _
+    | ECallIface _ when callRaises p e <> RNever -> EOnRaise(e, raiseEdgeDrops p env stillOwned)
     | EDup((ECall _ as call), t) when callRaises p call <> RNever ->
         EDup(EOnRaise(call, raiseEdgeDrops p env stillOwned), t)
     | _ -> e

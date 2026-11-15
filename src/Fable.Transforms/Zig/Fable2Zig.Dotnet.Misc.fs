@@ -151,30 +151,48 @@ let call
                  ->
                  this.Type
              | _ -> Fable.Unit)
+        && isFatIfaceTy (mapType ctx r this.Type)
         ->
-        bindArgs
-            ctx
-            (lw ctx this :: (rest |> List.map (lw ctx)))
-            (fun given ->
-                bindArgs
-                    ctx
-                    [ unwrapIface ctx given.Head ]
-                    (fun xs ->
-                        match caseFields (typeOf xs.Head) "" |> List.tryFind (fun (f, _) -> f = name) with
-                        | Some(f, fty) ->
-                            let args =
-                                if given.Tail.IsEmpty then
-                                    [ EUnit ]
-                                else
-                                    match fty with
-                                    | TFn(ptys, _) when ptys.Length = given.Tail.Length ->
-                                        List.map2 (coerceTy ctx) ptys given.Tail
-                                    | _ -> given.Tail
+        let ifaceStructTy =
+            match mapType ctx r this.Type with
+            | TOpt s -> s
+            | s -> s
 
-                            bindArgs ctx args (fun ys -> ECallClo(EGet(xs.Head, PField f, fty), ys, mapType ctx r t))
-                        | None -> fail r "the Zig target cannot find the member %s of %s" name entity
-                    )
-            )
+        match caseFields ifaceStructTy "" |> List.tryFind (fun (f, _) -> f = name) with
+        | Some(f, fty) ->
+            let ptys, ret =
+                match fty with
+                | TSlot(ptys, ret)
+                | TFn(ptys, ret) -> ptys, ret
+                | _ -> [], mapType ctx r t
+
+            let rawArgs =
+                match rest with
+                | [ a ] when isUnit a.Type -> []
+                | xs -> xs
+
+            let args =
+                if rawArgs.IsEmpty then
+                    [ EUnit ]
+                else
+                    let lowered = rawArgs |> List.map (lw ctx)
+
+                    if ptys.Length = lowered.Length then
+                        List.map2 (coerceTy ctx) ptys lowered
+                    else
+                        lowered
+
+            bindArgs
+                ctx
+                (lw ctx this :: args)
+                (fun given ->
+                    withBorrowedIface
+                        ctx
+                        this
+                        given.Head
+                        (fun iface -> coerceTy ctx (mapType ctx r t) (ECallIface(iface, f, given.Tail, ret)))
+                )
+        | None -> fail r "the Zig target cannot find the member %s of %s" name entity
     // (a value boxed and unboxed to its own type, as `use` does with an interface value)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxGeneric" | "UnboxFast"), [ Unboxed inner ] when
         unwrapNullness inner.Type <> Fable.Any

@@ -308,6 +308,7 @@ let settleManaged (state: FileState) =
             let m =
                 e.Kind = KHeapUnion
                 || e.Kind = KRefRecord
+                || e.Kind = KIface
                 || e.Hooks.IsSome
                 || e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> isManagedDecl))
                 // (a record of the library whose fields this file does not know, as `RegexOf`:
@@ -373,6 +374,7 @@ let settleCyclic (state: FileState) =
         | TFn _
         | TPrim "fable_rt.Exn"
         | TPrim "fable_rt.Obj" -> [], true
+        | TEnt(e, _) when e.Kind = KIface -> [], true
         | TEnt(e, args) ->
             let own =
                 if isCell e then
@@ -486,7 +488,8 @@ let settleCycles (state: FileState) =
         | TPrim "fable_rt.Exn"
         | TPrim "fable_rt.Obj" -> true
         | TEnt(e, args) ->
-            List.exists reachesOpaque args
+            e.Kind = KIface
+            || List.exists reachesOpaque args
             || (if e.Kind = KHeapUnion || e.Kind = KRefRecord then
                     e.ReachesOpaque
                 else
@@ -594,6 +597,24 @@ let settleCycles (state: FileState) =
 
             for c in caps do
                 checkOpaquePayload (typeOf c)
+        | EIface(ty, src, _) ->
+            let typeArgs =
+                match ty with
+                | TEnt(_, args) -> args
+                | _ -> []
+
+            if List.exists reachesOpaque typeArgs then
+                instantiated <- true
+
+            if List.exists reachesAssignable typeArgs then
+                capInstantiated <- true
+
+            match src with
+            | ISrcCaptures caps ->
+                for c in caps do
+                    checkOpaquePayload (typeOf c)
+            | ISrcValue v
+            | ISrcUpcast v -> checkOpaquePayload (typeOf v)
         | ECall(_, typeArgs, _, _) ->
             if List.exists reachesOpaque typeArgs then
                 instantiated <- true
@@ -984,6 +1005,49 @@ let anonEnt (state: FileState) (names: string[]) : Ent =
         state.UsesRuntime <- true
         e
 
+/// A .NET interface type of known member names, emitted as `fable_rt.Iface(fable_iface_<N>(...))`.
+let ifaceAnonEnt (state: FileState) (names: string[]) : Ent =
+    let key = "$iface:" + String.concat "," names
+
+    match state.Ents.TryGetValue key with
+    | true, e -> e
+    | false, _ ->
+        let safeNames = names |> Array.map cleanIdent
+
+        let alias =
+            if safeNames.Length = 0 then
+                "fable_iface_0"
+            else
+                "fable_iface_" + String.concat "_" safeNames
+
+        let typeParams = Array.init names.Length (fun i -> "T" + string i) |> List.ofArray
+
+        let e =
+            {
+                // (`Emit.zigType` turns `fable_iface_<name>.of` into `fable_rt.Iface(fable_iface_<name>.of(...))`)
+                Name = alias + ".of"
+                Ref =
+                    {
+                        FullName = key
+                        Path = Fable.CoreAssemblyName "FSharp.Core"
+                    }
+                Kind = KIface
+                TypeParams = typeParams
+                Cases = [ "", List.zip (List.ofArray names) (typeParams |> List.map TGen) ]
+                MutableFields = []
+                Managed = true
+                Cyclic = false
+                ReachesOpaque = true
+                Copyable = true
+                IsLocal = false
+                Hooks = None
+                Overrides = []
+            }
+
+        state.Ents[key] <- e
+        state.UsesRuntime <- true
+        e
+
 /// `lazy`: a cell of the runtime library that holds the code, then the value.
 let lazyEnt (state: FileState) : Ent =
     match state.Ents.TryGetValue "$lazy" with
@@ -1127,6 +1191,38 @@ let withBorrowedObj (ctx: Ctx) (x: Fable.Expr) (ir: Expr) (k: Expr -> Expr) : Ex
         | EVar _ -> step ir
         | _ ->
             let v = ctx.State.NewVar("obj", typeOf ir, VLocal, false)
+            ELet(v, ir, step (EVar v))
+    | _ -> k ir
+
+let isFatIfaceTy (ty: Ty) : bool =
+    match ty with
+    | TEnt({ Kind = KIface }, _)
+    | TOpt(TEnt({ Kind = KIface }, _)) -> true
+    | _ -> false
+
+/// Check `ir` (the lowered fat-pointer interface receiver of `x`) for null when needed and
+/// project its `fable_rt.Iface(Vt)` as a borrow without `dup`/`drop`.
+let withBorrowedIface (ctx: Ctx) (x: Fable.Expr) (ir: Expr) (k: Expr -> Expr) : Expr =
+    let known =
+        match x with
+        | Fable.IdentExpr i -> ctx.NonNull.Contains i.Name
+        | _ -> isMadeObject x
+
+    match typeOf ir with
+    | TOpt(TEnt({ Kind = KIface }, _) as ifaceTy) ->
+        let step (vExpr: Expr) =
+            let proj = EGet(vExpr, PSome, ifaceTy)
+
+            if known then
+                k proj
+            else
+                ctx.State.UsesRuntime <- true
+                ESeq(ERt("fable_rt.checkNonNull($0)", [ vExpr ], tVoid), k proj)
+
+        match ir with
+        | EVar _ -> step ir
+        | _ ->
+            let v = ctx.State.NewVar("iface", typeOf ir, VLocal, false)
             ELet(v, ir, step (EVar v))
     | _ -> k ir
 
@@ -1627,11 +1723,11 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
 
         TOpt(
             TEnt(
-                anonEnt ctx.State (members |> List.map (fun (_, n, _, _) -> n) |> Array.ofList),
+                ifaceAnonEnt ctx.State (members |> List.map (fun (_, n, _, _) -> n) |> Array.ofList),
                 // (functions in the signatures as values have them: uncurried)
                 members
                 |> List.map (fun (_, _, args, ret) ->
-                    TFn(
+                    TSlot(
                         args |> List.map (FableTransforms.uncurryType >> mapType ctx r),
                         mapType ctx r (FableTransforms.uncurryType ret)
                     )
@@ -1716,7 +1812,9 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 Name = name
                 Ref = entRef
                 Kind =
-                    if isReference then
+                    if ent.IsInterface then
+                        KIface
+                    elif isReference then
                         KRefRecord
                     elif not ent.IsFSharpUnion then
                         KRecord
@@ -1733,14 +1831,17 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                         |> List.map (fun f -> f.Name)
                     else
                         []
-                Managed = false
+                Managed = ent.IsInterface
                 Cyclic = false
-                ReachesOpaque = false
+                ReachesOpaque = ent.IsInterface
                 Copyable = true
                 IsLocal = isLocal
                 Hooks = None
                 Overrides = []
             }
+
+        if ent.IsInterface then
+            ctx.State.UsesRuntime <- true
 
         // a resource: `IResource<'T>` (destroyed after its last use, move-only) or
         // `ISharedResource<'T>` (copies share it)
@@ -1853,7 +1954,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                         |> List.map (fun (_, name, args, ret) ->
                             // (functions in the signatures as values have them: uncurried)
                             name,
-                            TFn(
+                            TSlot(
                                 args |> List.map (FableTransforms.uncurryType >> mapType ctx r),
                                 mapType ctx r (FableTransforms.uncurryType ret)
                             )
@@ -2473,7 +2574,9 @@ let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr
                 | ECall _
                 | ECallClo _
                 | ECallVt _
+                | ECallIface _
                 | EClosure _
+                | EIface _
                 | ERt _
                 | EEmit _ -> true
                 // (a constructor argument is an owning position)
@@ -3216,17 +3319,93 @@ let rec (|Unboxed|) (e: Fable.Expr) : Fable.Expr =
         inner
     | _ -> e
 
+let rec (|UnboxedOrBox|) (e: Fable.Expr) : Fable.Expr =
+    match e with
+    | Fable.TypeCast(UnboxedOrBox inner, _) -> inner
+    | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
+        (imp.Selector = "UnboxGeneric"
+         || imp.Selector = "UnboxFast"
+         || imp.Selector = "Box")
+        && info.Args.Length = 1
+        ->
+        let (UnboxedOrBox inner) = info.Args.Head
+        inner
+    | _ -> e
+
 /// Does a declared type (not an interface) implement the interface? None when that is not
 /// known here.
 let implements (com: Compiler) (t: Fable.Type) (ifaceFullName: string) : bool option =
-    match t with
+    match unwrapNullness t with
     | Fable.DeclaredType(entRef, _) ->
         match com.TryGetEntity entRef with
         | Some ent when not ent.IsInterface ->
-            Some(
-                ent.DeclaredInterfaces
-                |> Seq.exists (fun i -> i.Entity.FullName = ifaceFullName)
-            )
+            Some(ent.AllInterfaces |> Seq.exists (fun i -> i.Entity.FullName = ifaceFullName))
+        | _ -> None
+    | _ -> None
+
+let implementsType (com: Compiler) (t: Fable.Type) (ifaceType: Fable.Type) : bool option =
+    let rec hasGenParam (ty: Fable.Type) =
+        match ty with
+        | Fable.GenericParam _ -> true
+        | _ -> ty.Generics |> List.exists hasGenParam
+
+    match unwrapNullness t, unwrapNullness ifaceType with
+    | Fable.DeclaredType(entRef, typeArgs), Fable.DeclaredType(ifaceRef, ifaceArgs) ->
+        match com.TryGetEntity entRef with
+        | Some ent when not ent.IsInterface ->
+            let subst =
+                if ent.GenericParameters.Length = typeArgs.Length then
+                    List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) typeArgs
+                    |> Map.ofList
+                else
+                    Map.empty
+
+            let candidates =
+                ent.AllInterfaces
+                |> Seq.filter (fun i -> i.Entity.FullName = ifaceRef.FullName)
+                |> Seq.map (fun i -> i.GenericArgs |> List.map (substFableType subst))
+                |> Seq.toList
+
+            if candidates.IsEmpty then
+                Some false
+            elif ifaceArgs.IsEmpty then
+                Some true
+            elif
+                ifaceArgs |> List.exists hasGenParam
+                || candidates |> List.exists (List.exists hasGenParam)
+            then
+                if candidates |> List.contains ifaceArgs then
+                    Some true
+                else
+                    None
+            else
+                Some(candidates |> List.contains ifaceArgs)
+        | Some ent when ent.IsInterface ->
+            let subst =
+                if ent.GenericParameters.Length = typeArgs.Length then
+                    List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) typeArgs
+                    |> Map.ofList
+                else
+                    Map.empty
+
+            if
+                entRef.FullName = ifaceRef.FullName
+                && (ifaceArgs.IsEmpty || typeArgs = ifaceArgs)
+            then
+                Some true
+            else
+                let hasBase =
+                    ent.AllInterfaces
+                    |> Seq.exists (fun i ->
+                        i.Entity.FullName = ifaceRef.FullName
+                        && (ifaceArgs.IsEmpty
+                            || (i.GenericArgs |> List.map (substFableType subst)) = ifaceArgs)
+                    )
+
+                if hasBase then
+                    Some true
+                else
+                    None
         | _ -> None
     | _ -> None
 
@@ -3554,6 +3733,56 @@ let interfaceImpl
     match found with
     | Some f -> f
     | None -> implName (classPrefix ctx r classRef (Some iface)) (iface + "." + name)
+
+/// Like `interfaceImpl`, paired with the implementing ancestor's type arguments for `srcType`.
+let interfaceImplSlot
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (srcType: Fable.Type)
+    (classRef: Fable.EntityRef)
+    (iface: string)
+    (name: string)
+    : string * Ty list
+    =
+    match objInfo ctx r classRef with
+    | Some o ->
+        let found =
+            ancestors o
+            |> List.tryPick (fun k ->
+                match ctx.Com.TryGetEntity k.Ref with
+                | Some ent ->
+                    ent.MembersFunctionsAndValues
+                    |> Seq.tryFind (fun m ->
+                        m.IsOverrideOrExplicitInterfaceImplementation
+                        && (if name.Contains "$" then
+                                implementedSlot ctx.Com m = name
+                            else
+                                m.CompiledName.EndsWith("." + name, System.StringComparison.Ordinal))
+                    )
+                    |> Option.map (fun m -> implName k.Prefix (implFnName ctx.Com m), argsOfLevel ctx r o srcType k)
+                | None -> None
+            )
+
+        match found with
+        | Some res -> res
+        | None ->
+            let owner =
+                ancestors o
+                |> List.tryFind (fun k ->
+                    match ctx.Com.TryGetEntity k.Ref with
+                    | Some ent -> ent.DeclaredInterfaces |> Seq.exists (fun d -> d.Entity.FullName = iface)
+                    | None -> false
+                )
+                |> Option.defaultValue o
+
+            implName owner.Prefix (iface + "." + name), argsOfLevel ctx r o srcType owner
+    | None ->
+        let typeArgs =
+            match srcType with
+            | Fable.DeclaredType(_, gs) -> gs |> List.map (mapTypeArg ctx r)
+            | _ -> []
+
+        interfaceImpl ctx r classRef iface name, typeArgs
 
 /// What the file emits for a class that takes part in inheritance that it declares.
 let objDecl (ctx: Ctx) (r: SourceLocation option) (o: ObjInfo) (dotnetName: string) : ObjDecl =
@@ -4719,6 +4948,80 @@ let rec peelArgs (t: Fable.Type) (k: int) : Fable.Type =
         | Fable.DelegateType(ps, ret) when ps.Length <= k -> peelArgs ret (k - ps.Length)
         | _ -> t
 
+/// Resolve an interface member access/call against a `KIface` vtable struct: returns
+/// `(directSlot, getterSlot)` where `directSlot` matches a callable slot (or indexed getter)
+/// and `getterSlot` matches a 0-arg `"get_..."` property slot (e.g. a property returning a function).
+let resolveIfaceSlot
+    (ctx: Ctx)
+    (xType: Fable.Type)
+    (ifaceStructTy: Ty)
+    (infoName: string)
+    (argCount: int option)
+    : (string * Ty list * Ty) option * (string * Ty) option
+    =
+    let fields = caseFields ifaceStructTy ""
+    // (a mangled interface's member is named in full: `Ns.IFoo.get_Bar`)
+    let short = infoName.Substring(infoName.LastIndexOf '.' + 1)
+
+    // (and its overload's hash, `SumZ35CD86D0`)
+    let name =
+        if fields |> List.exists (fun (f, _) -> f = short || f = "get_" + short) then
+            short
+        else
+            System.Text.RegularExpressions.Regex.Replace(short, "Z?[0-9A-F]{8}$", "")
+
+    // (an overload: the one whose hash Fable gave the name, `get_ItemZ524259A4`)
+    let name =
+        if fields |> List.exists (fun (f, _) -> f = name || f = "get_" + name) then
+            name
+        else
+            match unwrapNullness xType with
+            | Fable.DeclaredType(iref, _) ->
+                match ctx.Com.TryGetEntity iref with
+                | Some ient ->
+                    let genParams = ient.GenericParameters |> List.map (fun g -> g.Name)
+
+                    ient.MembersFunctionsAndValues
+                    |> Seq.filter (fun m -> m.IsDispatchSlot && m.CompiledName = name)
+                    |> Seq.tryFind (fun m ->
+                        let groups = m.CurriedParameterGroups |> List.map (List.map (fun p -> p.Type))
+
+                        short = name + OverloadSuffix.getHash genParams groups
+                    )
+                    |> Option.map (fun m -> slotKey ient m.CompiledName (paramTypesOf m))
+                    |> Option.defaultValue name
+                | None -> name
+            | _ -> name
+
+    let directSlot =
+        fields
+        |> List.tryPick (fun (f, fty) ->
+            match fty with
+            | TSlot(ptys, ret) when
+                (f = name
+                 || (argCount.IsSome
+                     && f = "get_" + name
+                     && not (ptys.Length = 1 && isVoid ptys.Head)))
+                && (
+                    match argCount with
+                    | Some n -> ptys.Length = n
+                    | None -> true
+                )
+                ->
+                Some(f, ptys, ret)
+            | _ -> None
+        )
+
+    let getterSlot =
+        fields
+        |> List.tryPick (fun (f, fty) ->
+            match fty with
+            | TSlot([ p ], ret) when isVoid p && (f = "get_" + name || f = name) -> Some(f, ret)
+            | _ -> None
+        )
+
+    directSlot, getterSlot
+
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
     // (a unit that does something, the one argument of a call (`box (ignore (f ()))`): it is done,
@@ -5033,6 +5336,36 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 value,
                 r
             ))
+    // `x :? IDisposable` where the type of x is known (what `use` asks), and interface / fat-pointer type tests
+    | Fable.Test(UnboxedOrBox inner, Fable.TypeTest t, _) when
+        (match unwrapNullness t, unwrapNullness inner.Type with
+         | Fable.DeclaredType(ifaceRef, _), Fable.DeclaredType(e, _) ->
+             ifaceRef.FullName = "System.IDisposable"
+             && e.FullName = "System.Collections.Generic.IEnumerator`1"
+         | _ -> false)
+        ->
+        ESeq(lwStmt ctx inner, ELit("true", tBool))
+    | Fable.Test(UnboxedOrBox inner, Fable.TypeTest t, _) when
+        isInterfaceType ctx.Com (unwrapNullness t)
+        && (implementsType ctx.Com inner.Type t).IsSome
+        ->
+        let impl = (implementsType ctx.Com inner.Type t).Value
+
+        bindArgs
+            ctx
+            [ lw ctx inner ]
+            (fun xs ->
+                if not impl then
+                    ELit("false", tBool)
+                else
+                    match typeOf xs.Head with
+                    | TOpt _ -> EPrim("not", [ ETest(xs.Head, "None", typeOf xs.Head) ], tBool)
+                    | _ -> ELit("true", tBool)
+            )
+    | Fable.Test(UnboxedOrBox inner, Fable.TypeTest t, r) when
+        isInterfaceType ctx.Com inner.Type && isFatIfaceTy (mapType ctx r inner.Type)
+        ->
+        ifaceTypeTest ctx r inner t
     // `o :? T` of an `obj` (not one F# made by boxing a value of a known type, as `use` does)
     | Fable.Test(x, Fable.TypeTest t, r) when
         unwrapNullness x.Type = Fable.Any
@@ -6350,53 +6683,6 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     | PrintfCall(selector, fmt, holes) -> formatted ctx e.Range selector fmt holes e.Type
 
-    // `x :? IDisposable` where the type of x is known (what `use` asks): true if the type
-    // implements the interface
-    // (.NET's enumerators are disposable: what `use e = s.GetEnumerator()` in inlined code asks)
-    | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _)), _) when
-        ifaceRef.FullName = "System.IDisposable"
-        && (
-            match inner.Type with
-            | Fable.DeclaredType(e, _) -> e.FullName = "System.Collections.Generic.IEnumerator`1"
-            | _ -> false
-        )
-        ->
-        ESeq(lwStmt ctx inner, ELit("true", tBool))
-    // (a value of the interface itself: it is one unless null)
-    | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _) as ifaceType), _) when
-        isInterfaceType ctx.Com ifaceType
-        && (
-            match unwrapNullness inner.Type with
-            | Fable.DeclaredType(e, _) -> e.FullName = ifaceRef.FullName
-            | _ -> false
-        )
-        ->
-        bindArgs
-            ctx
-            [ lw ctx inner ]
-            (fun xs ->
-                match typeOf xs.Head with
-                | TOpt _ -> EPrim("not", [ ETest(xs.Head, "None", typeOf xs.Head) ], tBool)
-                | _ -> ELit("true", tBool)
-            )
-    | Fable.Test(Unboxed inner, Fable.TypeTest(Fable.DeclaredType(ifaceRef, _) as ifaceType), _) when
-        isInterfaceType ctx.Com ifaceType
-        && (implements ctx.Com inner.Type ifaceRef.FullName).IsSome
-        ->
-        let impl = (implements ctx.Com inner.Type ifaceRef.FullName).Value
-
-        bindArgs
-            ctx
-            [ lw ctx inner ]
-            (fun xs ->
-                if not impl then
-                    ELit("false", tBool)
-                else
-                    match typeOf xs.Head with
-                    | TOpt _ -> EPrim("not", [ ETest(xs.Head, "None", typeOf xs.Head) ], tBool)
-                    | _ -> ELit("true", tBool)
-            )
-
     // (`Dispose` of an enumerator, as `use e = s.GetEnumerator()` calls it through an unboxing
     // to `IDisposable`: the enumerator's own)
     | Fable.Call(Fable.Import(imp, it, ir), info, t, r) when
@@ -6563,67 +6849,120 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     r
                 )
             ))
-    // a member of an interface: a field of its struct of function values (a property is read
-    // by calling its getter)
-    | Fable.Get(x, Fable.FieldGet info, t, r) when isInterfaceType ctx.Com x.Type ->
+    // calling a member of a fat-pointer interface directly through its vtable slot
+    | Fable.Call(Fable.Get(x, Fable.FieldGet info, _, _), call, t, r) when
+        isInterfaceType ctx.Com x.Type && isFatIfaceTy (mapType ctx r x.Type)
+        ->
+        let ifaceTy = mapType ctx r x.Type
+
+        let ifaceStructTy =
+            match ifaceTy with
+            | TOpt s -> s
+            | s -> s
+
+        let rawArgs =
+            match call.Args with
+            | [ a ] when isUnit a.Type -> []
+            | xs -> xs
+
+        let argCount =
+            if rawArgs.IsEmpty then
+                1
+            else
+                rawArgs.Length
+
+        let wrappedRawArgs =
+            if not rawArgs.IsEmpty && call.SignatureArgTypes.Length = rawArgs.Length then
+                List.map2 wrapNullCast call.SignatureArgTypes rawArgs
+            else
+                rawArgs
+
+        match resolveIfaceSlot ctx x.Type ifaceStructTy info.Name (Some argCount) with
+        | Some(f, ptys, ret), _ ->
+            let args =
+                if rawArgs.IsEmpty then
+                    [ EUnit ]
+                else
+                    let lowered = wrappedRawArgs |> List.map (lw ctx)
+
+                    if ptys.Length = lowered.Length then
+                        List.map2 (coerceTy ctx) ptys lowered
+                    else
+                        lowered
+
+            bindArgs
+                ctx
+                (lw ctx x :: args)
+                (fun given ->
+                    withBorrowedIface
+                        ctx
+                        x
+                        given.Head
+                        (fun iface -> coerceTy ctx (mapType ctx r t) (ECallIface(iface, f, given.Tail, ret)))
+                )
+        | None, Some(f, fnTy) ->
+            let args =
+                if rawArgs.IsEmpty then
+                    [ EUnit ]
+                else
+                    let lowered = wrappedRawArgs |> List.map (lw ctx)
+
+                    match fnTy with
+                    | TFn(ptys, _) when ptys.Length = lowered.Length -> List.map2 (coerceTy ctx) ptys lowered
+                    | _ -> lowered
+
+            bindArgs
+                ctx
+                (lw ctx x :: args)
+                (fun given ->
+                    withBorrowedIface
+                        ctx
+                        x
+                        given.Head
+                        (fun iface ->
+                            bindArgs
+                                ctx
+                                [ ECallIface(iface, f, [ EUnit ], fnTy) ]
+                                (fun cs ->
+                                    coerceTy ctx (mapType ctx r t) (ECallClo(cs.Head, given.Tail, mapType ctx r t))
+                                )
+                        )
+                )
+        | None, None -> fail r "the Zig target cannot find the member %s of this interface (%A)" info.Name t
+    // a member of a fat-pointer interface: a property getter calls its slot; a method as value
+    // binds the interface into a closure with `fable_rt.ifaceMethod`
+    | Fable.Get(x, Fable.FieldGet info, t, r) when isInterfaceType ctx.Com x.Type && isFatIfaceTy (mapType ctx r x.Type) ->
+        let ifaceTy = mapType ctx r x.Type
+
+        let ifaceStructTy =
+            match ifaceTy with
+            | TOpt s -> s
+            | s -> s
+
+        let targetTy = mapType ctx r t
+
         bindArgs
             ctx
             [ lw ctx x ]
             (fun given ->
-                bindArgs
+                withBorrowedIface
                     ctx
-                    [ unwrapIface ctx given.Head ]
-                    (fun xs ->
-                        let fields = caseFields (typeOf xs.Head) ""
-                        // (a mangled interface's member is named in full: `Ns.IFoo.get_Bar`)
-                        let name = info.Name.Substring(info.Name.LastIndexOf '.' + 1)
-
-                        // (and its overload's hash, `SumZ35CD86D0`)
-                        let name =
-                            if fields |> List.exists (fun (f, _) -> f = name || f = "get_" + name) then
-                                name
-                            else
-                                System.Text.RegularExpressions.Regex.Replace(name, "Z?[0-9A-F]{8}$", "")
-
-                        // (an overload: the one whose hash Fable gave the name, `get_ItemZ524259A4`)
-                        let name =
-                            if fields |> List.exists (fun (f, _) -> f = name || f = "get_" + name) then
-                                name
-                            else
-                                let full = info.Name.Substring(info.Name.LastIndexOf '.' + 1)
-
-                                match unwrapNullness x.Type with
-                                | Fable.DeclaredType(iref, _) ->
-                                    match ctx.Com.TryGetEntity iref with
-                                    | Some ient ->
-                                        let genParams = ient.GenericParameters |> List.map (fun g -> g.Name)
-
-                                        ient.MembersFunctionsAndValues
-                                        |> Seq.filter (fun m -> m.IsDispatchSlot && m.CompiledName = name)
-                                        |> Seq.tryFind (fun m ->
-                                            let groups =
-                                                m.CurriedParameterGroups |> List.map (List.map (fun p -> p.Type))
-
-                                            full = name + OverloadSuffix.getHash genParams groups
-                                        )
-                                        |> Option.map (fun m -> slotKey ient m.CompiledName (paramTypesOf m))
-                                        |> Option.defaultValue name
-                                    | None -> name
-                                | _ -> name
-
-                        match fields |> List.tryFind (fun (f, _) -> f = name) with
-                        | Some(f, fty) -> EGet(xs.Head, PField f, fty)
-                        | None ->
-                            match fields |> List.tryFind (fun (f, _) -> f = "get_" + name) with
-                            | Some(f, fty) ->
-                                let retTy =
-                                    match fty with
-                                    | TFn(_, ret) -> ret
-                                    | _ -> mapType ctx r t
-
-                                ECallClo(EGet(xs.Head, PField f, fty), [ EUnit ], retTy)
-                            | None ->
-                                fail r "the Zig target cannot find the member %s of this interface (%A)" info.Name t
+                    x
+                    given.Head
+                    (fun iface ->
+                        match resolveIfaceSlot ctx x.Type ifaceStructTy info.Name None with
+                        | Some(f, [ p ], ret), _ when
+                            isVoid p
+                            && f.StartsWith("get_", System.StringComparison.Ordinal)
+                            && targetTy <> TFn([ tVoid ], ret)
+                            ->
+                            coerceTy ctx targetTy (ECallIface(iface, f, [ EUnit ], ret))
+                        | Some(f, ptys, ret), _ ->
+                            ctx.State.UsesRuntime <- true
+                            EEmit($"fable_rt.ifaceMethod($R, $0, \"%s{cleanIdent f}\")", [ iface ], TFn(ptys, ret))
+                        | None, Some(f, ret) -> coerceTy ctx targetTy (ECallIface(iface, f, [ EUnit ], ret))
+                        | None, None ->
+                            fail r "the Zig target cannot find the member %s of this interface (%A)" info.Name t
                     )
             )
 
@@ -6715,80 +7054,6 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         // arguments F# knows)
         | Fable.Call(callee, info, _, cr) -> lw ctx (Fable.Call(callee, info, e.Type, cr))
         | _ -> lw ctx x
-    // a value of a .NET interface seen as one it inherits (an `IEvent` as an `IObservable`): the
-    // struct of the other's members, taken from it
-    | Fable.TypeCast(x, (Fable.DeclaredType(target, _) as targetType)) when
-        (match target.Path with
-         | Fable.SourcePath _ -> false
-         | _ -> true)
-        && (
-            match x.Type with
-            | Fable.DeclaredType(source, _) ->
-                source.FullName <> target.FullName
-                && (
-                    match source.Path with
-                    | Fable.SourcePath _ -> false
-                    | _ -> true
-                )
-                && (
-                    match ctx.Com.TryGetEntity source, ctx.Com.TryGetEntity target with
-                    | Some s, Some t -> s.IsInterface && t.IsInterface
-                    | _ -> false
-                )
-            | _ -> false
-        )
-        // (both structs of members: not a sequence, a dictionary, ..., which are what they are)
-        && (let isStruct (ty: Ty) =
-                let inner =
-                    match ty with
-                    | TOpt s -> s
-                    | _ -> ty
-
-                match inner with
-                | TEnt(e, _) -> e.Name.StartsWith("fable_anon_", System.StringComparison.Ordinal)
-                | _ -> false
-
-            isStruct (mapType ctx e.Range targetType)
-            && isStruct (mapType ctx e.Range x.Type))
-        ->
-        let targetTy = mapType ctx e.Range targetType
-
-        let targetStructTy =
-            match targetTy with
-            | TOpt s -> s
-            | _ -> targetTy
-
-        let buildFrom (src: Expr) =
-            let fromFields = caseFields (typeOf src) ""
-
-            let values =
-                caseFields targetStructTy ""
-                |> List.map (fun (f, fty) ->
-                    match fromFields |> List.tryFind (fun (g, _) -> g = f) with
-                    | Some(_, gty) -> EDup(EGet(src, PField f, gty), gty)
-                    | None -> fail e.Range "the Zig target cannot see %A as %A yet" x.Type targetType
-                )
-
-            let built = ECon(targetStructTy, "", values, None)
-
-            match targetTy with
-            | TOpt _ -> ECon(targetTy, "Some", [ built ], None)
-            | _ -> built
-
-        bindArgs
-            ctx
-            [ lw ctx x ]
-            (fun xs ->
-                match typeOf xs.Head with
-                | TOpt srcStructTy ->
-                    EIf(
-                        ETest(xs.Head, "None", typeOf xs.Head),
-                        ECon(targetTy, "None", [], None),
-                        bindArgs ctx [ EGet(xs.Head, PSome, srcStructTy) ] (fun ys -> buildFrom ys.Head),
-                        targetTy
-                    )
-                | _ -> buildFrom xs.Head
-            )
     // a collection given where a sequence is expected: a sequence that walks it
     | Fable.TypeCast(x, Fable.DeclaredType(seqRef, [ item ])) when
         seqRef.FullName = "System.Collections.Generic.IEnumerable`1"
@@ -6898,44 +7163,63 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         )
         ->
         libraryCall ctx e.Range "Async" "sourceAsDisposable" (Fable.CallInfo.Create(args = [ x ])) [ x ] e.Type
-    // an interface given where an interface it inherits is expected: the members that one has
+    // an interface given where an interface it inherits is expected: fat-pointer upcast preserving
+    // underlying identity and sub-interface type for round-trip casts
     | Fable.TypeCast(x, (Fable.DeclaredType _ as ifaceType)) when
         isInterfaceType ctx.Com ifaceType
         && isInterfaceType ctx.Com x.Type
+        && isFatIfaceTy (mapType ctx e.Range ifaceType)
+        && isFatIfaceTy (mapType ctx e.Range x.Type)
         && mapType ctx e.Range ifaceType <> mapType ctx e.Range x.Type
         ->
-        let ifaceTy = mapType ctx e.Range ifaceType
+        match x with
+        | Fable.TypeCast(inner, _) when not (isInterfaceType ctx.Com inner.Type) ->
+            lw ctx (Fable.TypeCast(inner, ifaceType))
+        | _ ->
+            let ifaceTy = mapType ctx e.Range ifaceType
 
-        let ifaceStructTy =
-            match ifaceTy with
-            | TOpt s -> s
-            | _ -> ifaceTy
+            let ifaceStructTy =
+                match ifaceTy with
+                | TOpt s -> s
+                | _ -> ifaceTy
 
-        bindArgs
-            ctx
-            [ lw ctx x ]
-            (fun xs ->
-                let buildFrom (src: Expr) =
-                    let members =
-                        caseFields ifaceStructTy ""
-                        |> List.map (fun (f, fty) -> EGet(src, PField f, fty))
+            let srcTy = mapType ctx e.Range x.Type
 
-                    let built = ECon(ifaceStructTy, "", members, None)
+            let srcStructTy =
+                match srcTy with
+                | TOpt s -> s
+                | _ -> srcTy
 
-                    match ifaceTy with
-                    | TOpt _ -> ECon(ifaceTy, "Some", [ built ], None)
-                    | _ -> built
+            let srcFields = caseFields srcStructTy "" |> List.map fst |> Set.ofList
+            let targetFields = caseFields ifaceStructTy ""
 
-                match typeOf xs.Head with
-                | TOpt srcStructTy ->
-                    EIf(
-                        ETest(xs.Head, "None", typeOf xs.Head),
-                        ECon(ifaceTy, "None", [], None),
-                        bindArgs ctx [ EGet(xs.Head, PSome, srcStructTy) ] (fun ys -> buildFrom ys.Head),
-                        ifaceTy
-                    )
-                | _ -> buildFrom xs.Head
-            )
+            for (f, _) in targetFields do
+                if not (srcFields.Contains f) then
+                    fail e.Range "the Zig target cannot see %A as %A yet" x.Type ifaceType
+
+            let slots = targetFields |> List.map (fun (f, _) -> f, (f, []))
+
+            bindArgs
+                ctx
+                [ lw ctx x ]
+                (fun xs ->
+                    let buildFrom (src: Expr) =
+                        let built = EIface(ifaceStructTy, ISrcUpcast src, slots)
+
+                        match ifaceTy with
+                        | TOpt _ -> ECon(ifaceTy, "Some", [ built ], None)
+                        | _ -> built
+
+                    match typeOf xs.Head with
+                    | TOpt _ ->
+                        EIf(
+                            ETest(xs.Head, "None", typeOf xs.Head),
+                            ECon(ifaceTy, "None", [], None),
+                            bindArgs ctx [ EGet(xs.Head, PSome, srcStructTy) ] (fun ys -> buildFrom ys.Head),
+                            ifaceTy
+                        )
+                    | _ -> buildFrom xs.Head
+                )
 
     // (a `System.Array` or an `IList<'T>` seen as something else, a sequence: as the array it is
     // here)
@@ -7005,10 +7289,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
          | _ -> false)
         ->
         lw ctx x
-    // a value given where an interface is expected: each member, a function value that
-    // holds the object
+    // a value given where an interface is expected: fat-pointer `{ data, vt }` built from static
+    // vtable slots (zero allocation for class objects; boxed for value types/records)
     | Fable.TypeCast(x, ifaceTarget) when isInterfaceType ctx.Com ifaceTarget && not (isInterfaceType ctx.Com x.Type) ->
-        let ifaceRef, ifaceType =
+        let ifaceRef, _ =
             match unwrapNullness ifaceTarget with
             | Fable.DeclaredType(r, _) as t -> r, t
             | _ -> fail e.Range "internal: not an interface type"
@@ -7022,34 +7306,26 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         let innerSrcType = unwrapNullness x.Type
 
-        let _, typeArgs =
-            match innerSrcType with
-            | Fable.DeclaredType(classRef, genArgs) ->
-                classPrefix ctx e.Range classRef (Some ifaceRef.FullName), genArgs |> List.map (mapType ctx e.Range)
-            | other -> fail e.Range "the Zig target cannot make an interface of a value of this type yet (%A)" other
-
         let classRef =
             match innerSrcType with
             | Fable.DeclaredType(classRef, _) -> classRef
-            | _ -> fail e.Range "internal: not a declared type"
+            | other -> fail e.Range "the Zig target cannot make an interface of a value of this type yet (%A)" other
+
+        let slots =
+            caseFields ifaceStructTy ""
+            |> List.map (fun (f, _) ->
+                let fn, targs =
+                    interfaceImplSlot ctx e.Range innerSrcType classRef ifaceRef.FullName f
+
+                f, (fn, targs)
+            )
 
         bindArgs
             ctx
             [ lw ctx x ]
             (fun objs ->
                 let buildWith (xs: Expr list) =
-                    let members =
-                        caseFields ifaceStructTy ""
-                        |> List.map (fun (f, fty) ->
-                            EClosure(
-                                interfaceImpl ctx e.Range classRef ifaceRef.FullName f,
-                                typeArgs,
-                                [ xs.Head ],
-                                fty
-                            )
-                        )
-
-                    let built = ECon(ifaceStructTy, "", members, None)
+                    let built = EIface(ifaceStructTy, ISrcValue xs.Head, slots)
 
                     match ifaceTy with
                     | TOpt _ -> ECon(ifaceTy, "Some", [ built ], None)
@@ -7462,165 +7738,222 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 )
             ))
     | Fable.ObjectExpr(members, ifaceType, None) when isInterfaceType ctx.Com ifaceType ->
-        let ifaceTy = mapType ctx e.Range ifaceType
+        // (`fun a b -> (f x) a b`: compute partial applications once when the object is made)
+        let mutable preBindings = []
 
-        let ifaceStructTy =
-            match ifaceTy with
-            | TOpt s -> s
-            | _ -> ifaceTy
-
-        let rec usesIdent (name: string) (e: Fable.Expr) =
-            match e with
-            | Fable.IdentExpr id -> id.Name = name
-            | _ -> getSubExpressions e |> List.exists (usesIdent name)
-
-        // (two members of one name, as `IEnumerator<'T>.Current` and `IEnumerator.Current`: the one
-        // whose result is the type the struct keeps)
-        let candidates =
+        let hoistedMembers =
             members
             |> List.map (fun m ->
-                let compiled =
-                    match ctx.Com.TryGetMember m.MemberRef with
-                    | Some info ->
-                        let slot = implementedSlot ctx.Com info
-
-                        // (the field of the struct: the slot, when the member says which)
-                        if slot.Contains "$" then
-                            slot
-                        else
-                            info.CompiledName
-                    | None -> m.Name
-
-                compiled, m
+                match m.Args with
+                | this :: rawArgs when not rawArgs.IsEmpty ->
+                    match etaHead rawArgs m.Body with
+                    | Some(head, rebuild) ->
+                        let held = AST.makeTypedIdent head.Type "applied"
+                        preBindings <- (held, head) :: preBindings
+                        { m with Body = rebuild (Fable.IdentExpr held) }
+                    | None -> m
+                | _ -> m
             )
 
-        let pick (f: string) (fty: Ty) =
-            match candidates |> List.filter (fun (n, _) -> n = f) with
-            | [] -> None
-            | [ (_, m) ] -> Some m
-            | several ->
-                let returns (m: Fable.ObjectExprMember) =
-                    match fty with
-                    | TFn(_, ret) -> mapType ctx e.Range m.Body.Type = ret
-                    | _ -> false
+        if not preBindings.IsEmpty then
+            let expr =
+                List.fold
+                    (fun body (id, v) -> Fable.Let(id, v, body))
+                    (Fable.ObjectExpr(hoistedMembers, ifaceType, None))
+                    preBindings
 
-                let notObj (m: Fable.ObjectExprMember) = m.Body.Type <> Fable.Any
+            lw ctx expr
+        else
+            let ifaceTy = mapType ctx e.Range ifaceType
 
-                several
-                |> List.tryFind (snd >> returns)
-                |> Option.orElse (several |> List.tryFind (snd >> notObj))
-                |> Option.defaultValue several.Head
-                |> snd
-                |> Some
+            let ifaceStructTy =
+                match ifaceTy with
+                | TOpt s -> s
+                | _ -> ifaceTy
 
-        let closures =
-            caseFields ifaceStructTy ""
-            |> List.map (fun (f, fty) ->
-                match pick f fty with
-                | Some m ->
-                    match m.Args with
-                    | this :: args ->
-                        if usesIdent this.Name m.Body then
-                            fail e.Range "the Zig target does not support `this` in an object expression yet"
+            let rec usesIdent (name: string) (e: Fable.Expr) =
+                match e with
+                | Fable.IdentExpr id -> id.Name = name
+                | _ -> getSubExpressions e |> List.exists (usesIdent name)
 
-                        lw ctx (Fable.Delegate(args, m.Body, None, []))
-                    | [] -> fail e.Range "internal: a member without its object"
-                // (a `[<CLIEvent>]` member: the object expression has its add_ and remove_; its
-                // getter is the event F# makes of them, `RuntimeHelpers.CreateEvent`)
-                | None when
-                    f.StartsWith("get_", System.StringComparison.Ordinal)
-                    && (pick ("add_" + f.Substring 4) fty).IsSome
-                    && (pick ("remove_" + f.Substring 4) fty).IsSome
-                    ->
-                    let name = f.Substring 4
-                    let addM = (pick ("add_" + name) fty).Value
-                    let removeM = (pick ("remove_" + name) fty).Value
+            // (two members of one name, as `IEnumerator<'T>.Current` and `IEnumerator.Current`: the one
+            // whose result is the type the struct keeps)
+            let candidates =
+                hoistedMembers
+                |> List.map (fun m ->
+                    let compiled =
+                        match ctx.Com.TryGetMember m.MemberRef with
+                        | Some info ->
+                            let slot = implementedSlot ctx.Com info
 
-                    let handlerOf (m: Fable.ObjectExprMember) =
+                            // (the field of the struct: the slot, when the member says which)
+                            if slot.Contains "$" then
+                                slot
+                            else
+                                info.CompiledName
+                        | None -> m.Name
+
+                    compiled, m
+                )
+
+            let pick (f: string) (fty: Ty) =
+                match candidates |> List.filter (fun (n, _) -> n = f) with
+                | [] -> None
+                | [ (_, m) ] -> Some m
+                | several ->
+                    let returns (m: Fable.ObjectExprMember) =
+                        match fty with
+                        | TSlot(_, ret)
+                        | TFn(_, ret) -> mapType ctx e.Range m.Body.Type = ret
+                        | _ -> false
+
+                    let notObj (m: Fable.ObjectExprMember) = m.Body.Type <> Fable.Any
+
+                    several
+                    |> List.tryFind (snd >> returns)
+                    |> Option.orElse (several |> List.tryFind (snd >> notObj))
+                    |> Option.defaultValue several.Head
+                    |> snd
+                    |> Some
+
+            let slotDelegates =
+                caseFields ifaceStructTy ""
+                |> List.map (fun (f, fty) ->
+                    match pick f fty with
+                    | Some m ->
                         match m.Args with
-                        | _ :: h :: _ -> Fable.Lambda(h, m.Body, None), h.Type
-                        | _ -> fail e.Range "internal: an event's add or remove without its handler"
+                        | this :: rawArgs ->
+                            if usesIdent this.Name m.Body then
+                                fail e.Range "the Zig target does not support `this` in an object expression yet"
 
-                    let addF, delTy = handlerOf addM
-                    let removeF, _ = handlerOf removeM
+                            let body =
+                                match ctx.Com.TryGetMember m.MemberRef with
+                                | Some info -> wrapNullCast info.ReturnParameter.Type m.Body
+                                | None -> m.Body
 
-                    let argTy =
-                        match delTy with
-                        | Fable.DelegateType([ _; a ], _) -> a
-                        | Fable.DeclaredType(_, [ _; a ]) -> a
-                        | _ -> Fable.Any
+                            let args =
+                                if rawArgs.IsEmpty then
+                                    [ AST.makeTypedIdent Fable.Unit "unitVar" ]
+                                else
+                                    rawArgs
 
-                    let fId =
-                        AST.makeTypedIdent (Fable.LambdaType(Fable.Any, Fable.LambdaType(argTy, Fable.Unit))) "handler"
+                            f, Fable.Delegate(args, body, None, [])
+                        | [] -> fail e.Range "internal: a member without its object"
+                    // (a `[<CLIEvent>]` member: the object expression has its add_ and remove_; its
+                    // getter is the event F# makes of them, `RuntimeHelpers.CreateEvent`)
+                    | None when
+                        f.StartsWith("get_", System.StringComparison.Ordinal)
+                        && (pick ("add_" + f.Substring 4) fty).IsSome
+                        && (pick ("remove_" + f.Substring 4) fty).IsSome
+                        ->
+                        let name = f.Substring 4
+                        let addM = (pick ("add_" + name) fty).Value
+                        let removeM = (pick ("remove_" + name) fty).Value
 
-                    let sId = AST.makeTypedIdent Fable.Any "sender"
-                    let aId = AST.makeTypedIdent argTy "args"
+                        let handlerOf (m: Fable.ObjectExprMember) =
+                            match m.Args with
+                            | _ :: h :: _ -> Fable.Lambda(h, m.Body, None), h.Type
+                            | _ -> fail e.Range "internal: an event's add or remove without its handler"
 
-                    let createF =
-                        Fable.Lambda(
-                            fId,
-                            Fable.Delegate(
-                                [ sId; aId ],
-                                Fable.CurriedApply(
-                                    Fable.IdentExpr fId,
-                                    [ Fable.IdentExpr sId; Fable.IdentExpr aId ],
-                                    Fable.Unit,
+                        let addF, delTy = handlerOf addM
+                        let removeF, _ = handlerOf removeM
+
+                        let argTy =
+                            match delTy with
+                            | Fable.DelegateType([ _; a ], _) -> a
+                            | Fable.DeclaredType(_, [ _; a ]) -> a
+                            | _ -> Fable.Any
+
+                        let fId =
+                            AST.makeTypedIdent
+                                (Fable.LambdaType(Fable.Any, Fable.LambdaType(argTy, Fable.Unit)))
+                                "handler"
+
+                        let sId = AST.makeTypedIdent Fable.Any "sender"
+                        let aId = AST.makeTypedIdent argTy "args"
+
+                        let createF =
+                            Fable.Lambda(
+                                fId,
+                                Fable.Delegate(
+                                    [ sId; aId ],
+                                    Fable.CurriedApply(
+                                        Fable.IdentExpr fId,
+                                        [ Fable.IdentExpr sId; Fable.IdentExpr aId ],
+                                        Fable.Unit,
+                                        None
+                                    ),
+                                    None,
+                                    []
+                                ),
+                                None
+                            )
+
+                        let eventTy =
+                            Fable.DeclaredType(
+                                {
+                                    FullName = "Microsoft.FSharp.Control.IEvent`2"
+                                    Path = Fable.CoreAssemblyName "FSharp.Core"
+                                },
+                                [ delTy; argTy ]
+                            )
+
+                        let create =
+                            Fable.Call(
+                                Fable.Import(
+                                    {
+                                        Selector = "CreateEvent"
+                                        Path =
+                                            Replacements.DotnetPrefix
+                                            + "Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers"
+                                        Kind =
+                                            Fable.LibraryImport(
+                                                Fable.LibraryImportInfo.Create(isInstanceMember = false)
+                                            )
+                                    },
+                                    Fable.Any,
                                     None
                                 ),
-                                None,
-                                []
-                            ),
-                            None
-                        )
+                                Fable.CallInfo.Create(args = [ addF; removeF; createF ], genArgs = [ delTy; argTy ]),
+                                eventTy,
+                                e.Range
+                            )
 
-                    let eventTy =
-                        Fable.DeclaredType(
-                            {
-                                FullName = "Microsoft.FSharp.Control.IEvent`2"
-                                Path = Fable.CoreAssemblyName "FSharp.Core"
-                            },
-                            [ delTy; argTy ]
-                        )
-
-                    let create =
-                        Fable.Call(
-                            Fable.Import(
-                                {
-                                    Selector = "CreateEvent"
-                                    Path =
-                                        Replacements.DotnetPrefix
-                                        + "Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers"
-                                    Kind =
-                                        Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
-                                },
-                                Fable.Any,
-                                None
-                            ),
-                            Fable.CallInfo.Create(args = [ addF; removeF; createF ], genArgs = [ delTy; argTy ]),
-                            eventTy,
+                        f, Fable.Delegate([ AST.makeTypedIdent Fable.Unit "unitVar" ], create, None, [])
+                    | None ->
+                        fail
                             e.Range
-                        )
+                            "the Zig target cannot find the member %s in this object expression (it has %s)"
+                            f
+                            (candidates |> List.map fst |> String.concat ", ")
+                )
 
-                    lw ctx (Fable.Delegate([ AST.makeTypedIdent Fable.Unit "unitVar" ], create, None, []))
-                | None ->
-                    fail
-                        e.Range
-                        "the Zig target cannot find the member %s in this object expression (it has %s)"
-                        f
-                        (candidates |> List.map fst |> String.concat ", ")
-            )
+            let lifted =
+                liftGroup ctx e.Range (slotDelegates |> List.map (fun (f, fnExpr) -> None, cleanIdent f, fnExpr))
 
-        bindArgsIn
-            true
-            ctx
-            closures
-            (fun xs ->
-                let built = ECon(ifaceStructTy, "", xs, None)
+            let captureNames =
+                match lifted with
+                | fn :: _ -> fn.CaptureNames
+                | [] -> []
 
-                match ifaceTy with
-                | TOpt _ -> ECon(ifaceTy, "Some", [ built ], None)
-                | _ -> built
-            )
+            let capExprs = captureExprs ctx e.Range captureNames
+            let typeArgs = ctx.TypeParams |> List.map TGen
+
+            let slots =
+                List.zip (slotDelegates |> List.map fst) lifted
+                |> List.map (fun (f, fn) -> f, (fn.FnName, typeArgs))
+
+            bindArgsIn
+                true
+                ctx
+                capExprs
+                (fun caps ->
+                    let built = EIface(ifaceStructTy, ISrcCaptures caps, slots)
+
+                    match ifaceTy with
+                    | TOpt _ -> ECon(ifaceTy, "Some", [ built ], None)
+                    | _ -> built
+                )
 
     | Fable.Get(x, kind, t, r) ->
         let ty = mapType ctx r t
@@ -8022,38 +8355,39 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | None -> coerceTy ctx targetTy (applyValue ctx r Map.empty (lw ctx applied) applied.Type args t)
 
     // `record.Field <- value`
-    // (a property of an interface: by calling its setter, a field of its struct)
-    | Fable.Set(x, Fable.FieldSet name, t, value, r) when isInterfaceType ctx.Com x.Type ->
+    // (a property of an interface: by calling its setter slot on its vtable)
+    | Fable.Set(x, Fable.FieldSet name, t, value, r) when
+        isInterfaceType ctx.Com x.Type && isFatIfaceTy (mapType ctx r x.Type)
+        ->
         let value = wrapNullCast t value
 
-        bindArgs
-            ctx
-            [ lw ctx x; lw ctx value ]
-            (fun given ->
-                bindArgs
-                    ctx
-                    [ unwrapIface ctx given[0] ]
-                    (fun xs ->
-                        // (a mangled interface's member is named in full: `Ns.IFoo.set_Bar`)
-                        let short = name.Substring(name.LastIndexOf '.' + 1)
+        let ifaceStructTy =
+            match mapType ctx r x.Type with
+            | TOpt s -> s
+            | s -> s
 
-                        let setter =
-                            if short.StartsWith("set_", System.StringComparison.Ordinal) then
-                                short
-                            else
-                                "set_" + short
+        // (a mangled interface's member is named in full: `Ns.IFoo.set_Bar`)
+        let short = name.Substring(name.LastIndexOf '.' + 1)
 
-                        match caseFields (typeOf xs.Head) "" |> List.tryFind (fun (f, _) -> f = setter) with
-                        | Some(f, fty) ->
-                            let argVal =
-                                match fty with
-                                | TFn([ pty ], _) -> coerceTy ctx pty given[1]
-                                | _ -> given[1]
+        let setter =
+            if short.StartsWith("set_", System.StringComparison.Ordinal) then
+                short
+            else
+                "set_" + short
 
-                            bindArgs ctx [ argVal ] (fun ys -> ECallClo(EGet(xs.Head, PField f, fty), ys, tVoid))
-                        | None -> fail r "the Zig target cannot find the setter of %s of this interface" name
-                    )
-            )
+        match caseFields ifaceStructTy "" |> List.tryFind (fun (f, _) -> f = setter) with
+        | Some(f, fty) ->
+            let valIr =
+                match fty with
+                | TSlot([ pty ], _)
+                | TFn([ pty ], _) -> coerceTy ctx pty (lw ctx value)
+                | _ -> lw ctx value
+
+            bindArgs
+                ctx
+                [ lw ctx x; valIr ]
+                (fun given -> withBorrowedIface ctx x given[0] (fun iface -> ECallIface(iface, f, [ given[1] ], tVoid)))
+        | None -> fail r "the Zig target cannot find the setter of %s of this interface" name
     | Fable.Set(x, Fable.FieldSet name, t, value, r) ->
         let fieldFableTy =
             match unwrapNullness x.Type with
@@ -8202,6 +8536,13 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     // `o :?> T` of an `obj`
     | Fable.TypeCast(x, t) when unwrapNullness x.Type = Fable.Any && unwrapNullness t <> Fable.Any ->
         unboxed ctx e.Range x t
+    | Fable.TypeCast(x, t) when
+        isInterfaceType ctx.Com x.Type
+        && isFatIfaceTy (mapType ctx e.Range x.Type)
+        && unwrapNullness t <> Fable.Any
+        && unwrapNullness x.Type <> unwrapNullness t
+        ->
+        ifaceDowncast ctx e.Range x t
     | Fable.TypeCast(Fable.IfThenElse(guard, thenExpr, elseExpr, r), (Fable.Nullable(_, false) as t)) ->
         let ty = mapType ctx r t
 
@@ -8431,6 +8772,43 @@ and unboxed (ctx: Ctx) (r: SourceLocation option) (x: Fable.Expr) (t: Fable.Type
         let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
         bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.anyToClass($0, %s{typeRef})", xs, tAny))
     | _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ERt("fable_rt.unbox($R, $0)", xs, mapType ctx r t))
+
+/// `x :? T` where `x` is a fat-pointer interface.
+and ifaceTypeTest (ctx: Ctx) (r: SourceLocation option) (x: Fable.Expr) (t: Fable.Type) : Expr =
+    ctx.State.UsesRuntime <- true
+
+    match unwrapNullness t with
+    | Fable.DeclaredType(cls, []) when cls.FullName = "System.Array" ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.isArray(fable_rt.ifaceToAnyBorrow($0))", xs, tBool))
+    | Fable.DeclaredType(cls, gs) when (objInfo ctx r cls).IsSome ->
+        let o = (objInfo ctx r cls).Value
+        let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
+        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.ifaceIsClass($0, %s{typeRef})", xs, tBool))
+    | _ ->
+        let ty = mapType ctx r t
+        let found = ctx.State.NewVar("unboxed", TOpt ty, VLocal, false)
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                ELet(
+                    found,
+                    EEmit("fable_rt.ifaceTryUnbox($R, $0)", xs, TOpt ty),
+                    EPrim("not", [ ETest(EVar found, "None", found.Ty) ], tBool)
+                )
+            )
+
+/// `x :?> T` and `unbox<T> x` where `x` is a fat-pointer interface.
+and ifaceDowncast (ctx: Ctx) (r: SourceLocation option) (x: Fable.Expr) (t: Fable.Type) : Expr =
+    ctx.State.UsesRuntime <- true
+
+    match unwrapNullness t with
+    | Fable.DeclaredType(cls, gs) when (objInfo ctx r cls).IsSome ->
+        let o = (objInfo ctx r cls).Value
+        let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
+        bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.ifaceCastClass($0, %s{typeRef})", xs, tAny))
+    | _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ERt("fable_rt.ifaceUnbox($R, $0)", xs, mapType ctx r t))
 
 /// `x.ToString()`, as an expression of Fable's.
 and toStringCall (x: Fable.Expr) : Fable.Expr =
@@ -9423,7 +9801,10 @@ and dotnetCall
     | "Microsoft.FSharp.Core.Operators", "InfinitySingle", [] -> ELit("std.math.inf(f32)", TPrim "f32")
     // `box x :? int`: a test of what an `obj` holds
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
-        unwrapNullness x.Type = Fable.Any && info.GenericArgs.Length = 1
+        info.GenericArgs.Length = 1
+        && (unwrapNullness x.Type = Fable.Any
+            || (isInterfaceType ctx.Com x.Type && isFatIfaceTy (mapType ctx r x.Type))
+            || isInterfaceType ctx.Com (unwrapNullness info.GenericArgs.Head))
         ->
         lw ctx (Fable.Test(x, Fable.TypeTest info.GenericArgs.Head, r))
     // `x :? T` where Fable keeps it a call: of an exception class, or of a class of objects
@@ -9458,6 +9839,9 @@ and dotnetCall
     // (a cast that changes nothing here: an exception of a known class is an `exn`)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ x ] when
         mapType ctx r x.Type = mapType ctx r t
+        && unwrapNullness x.Type <> Fable.Any
+        && (not (isFatIfaceTy (mapType ctx r x.Type))
+            || unwrapNullness x.Type = unwrapNullness t)
         ->
         lw ctx x
     // ---- ranges: `a .. b`, `a .. step .. b` ----
@@ -9736,6 +10120,14 @@ and dotnetCall
     | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
       ("Unbox" | "UnboxGeneric" | "UnboxFast"),
       [ Uncast x ] when unwrapNullness x.Type = Fable.Any && unwrapNullness t <> Fable.Any -> unboxed ctx r x t
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
+      ("Unbox" | "UnboxGeneric" | "UnboxFast"),
+      [ Uncast x ] when
+        isInterfaceType ctx.Com x.Type
+        && isFatIfaceTy (mapType ctx r x.Type)
+        && unwrapNullness t <> Fable.Any
+        ->
+        ifaceDowncast ctx r x t
     // `obj.ReferenceEquals(a, b)` and `PhysicalEquality a b`: the same cell (what F# boxes for
     // the call is looked through: a record is not copied by it on .NET)
     | ("System.Object" | "Microsoft.FSharp.Core.LanguagePrimitives"),

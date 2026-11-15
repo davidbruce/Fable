@@ -152,6 +152,11 @@ fn typesOf(comptime Ts: []const type) []const Type {
     return out;
 }
 
+fn interfaceInfo(comptime T: type) TypeInfo {
+    const tname = @typeName(T);
+    return .{ .full_name = tname, .name = tname, .namespace = "", .kind = .interface };
+}
+
 fn build(comptime T: type) TypeInfo {
     @setEvalBranchQuota(100_000);
     if (T == String) return prim("System.String");
@@ -195,6 +200,8 @@ fn build(comptime T: type) TypeInfo {
         const R = rt.Unraised(F.return_type.?);
         return funcInfo(params, R);
     }
+    if (comptime rt.isIface(T)) return interfaceInfo(T);
+    if (info == .optional and comptime rt.isIface(info.optional.child)) return interfaceInfo(info.optional.child);
     // an option (a string and an object are not: their null is their own)
     if (info == .optional) return optionInfo(info.optional.child);
     // a tuple
