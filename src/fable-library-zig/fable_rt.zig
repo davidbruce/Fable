@@ -370,6 +370,20 @@ pub fn parallelFor(n: usize, ctx: anytype, comptime step: fn (@TypeOf(ctx), usiz
     if (state.failed) |e| return aggregated(e);
 }
 
+/// `Parallel.For(from, to, fun i -> ...)`: the body for each `i` from `from` below `to`, on
+/// threads; what it captured is shared first
+pub fn parallelForRange(from: i32, to: i32, f: anytype) Raised!void {
+    if (to <= from) return;
+    try markShared(f);
+    const Ctx = struct { f: @TypeOf(f), from: i32 };
+    const S = struct {
+        fn step(c: Ctx, i: usize) Raised!void {
+            return c.f.code(c.f.env, c.from + @as(i32, @intCast(i)));
+        }
+    };
+    return parallelFor(@intCast(@as(i64, to) - from), Ctx{ .f = f, .from = from }, S.step);
+}
+
 /// (as .NET's Parallel raises an exception of its work: an AggregateException with it inside)
 fn aggregated(e: Exn) Raised {
     defer drop(e);

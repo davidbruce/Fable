@@ -133,3 +133,29 @@ let ``test An exception in Array.Parallel is raised inside an AggregateException
             e.Message
 
     message |> equal "One or more errors occurred. (boom)"
+
+[<Fact>]
+let ``test Parallel.For runs the body for each index on threads`` () =
+    let total = ref 0L
+    let squares: int64[] = Array.zeroCreate 10_000
+
+    System.Threading.Tasks.Parallel.For(
+        0,
+        10_000,
+        fun i ->
+            squares.[i] <- int64 i * int64 i
+            Interlocked.Add(&total.contents, int64 i) |> ignore
+    )
+    |> ignore
+
+    total.Value |> equal 49_995_000L
+    Array.sum squares |> equal 333_283_335_000L
+
+    let message =
+        try
+            System.Threading.Tasks.Parallel.For(0, 1000, fun i -> if i = 500 then failwith "bad") |> ignore
+            "no"
+        with e ->
+            e.Message
+
+    message |> equal "One or more errors occurred. (bad)"

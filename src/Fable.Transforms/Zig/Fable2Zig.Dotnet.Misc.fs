@@ -1251,6 +1251,10 @@ let call
         match tryAddress (lw ctx place) with
         | Some p -> bindArgs ctx (p :: List.map (lw ctx) rest) (fun xs -> EEmit(macro, xs, mapType ctx r t))
         | None -> fail r "the Zig target cannot take the address of this place for Interlocked yet"
+    // `Parallel.For(from, to, body)`: on threads (the runtime's parallelForRange); what it gives,
+    // ParallelLoopResult, is nothing here
+    | "System.Threading.Tasks.Parallel", "For", [ from; upto; body ] ->
+        rt "fable_rt.parallelForRange($0, $1, $2)" [ from; upto; body ] tVoid
     // ---- threads (the runtime's ThreadOf: what the function captured is shared when it starts) ----
     | "System.Threading.Thread", ".ctor", [ start ] ->
         pure' "fable_rt.threadNew($0)" [ start ] (TPrim "fable_rt.ThreadOf")

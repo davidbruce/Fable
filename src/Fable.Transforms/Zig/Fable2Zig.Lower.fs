@@ -1362,6 +1362,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "Regex" regexTypes[ent.FullName], [])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.IO.DirectoryInfo" ->
         TEnt(libRecordEnt ctx "Path" "DirectoryInfoOf", [])
+    // (what `Parallel.For` gives: nothing here)
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Tasks.ParallelLoopResult" -> tVoid
     // (.NET's threads: the runtime's ThreadOf)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Thread" -> TPrim "fable_rt.ThreadOf"
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Diagnostics.Stopwatch" ->
