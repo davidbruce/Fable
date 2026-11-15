@@ -1291,7 +1291,6 @@ let ``test failwithf is not compiled as function`` () =
     equal "Boom!" x
 
 
-#if !FABLE_COMPILER_ZIG // (a function value of several arrows is kept uncurried: applying it to its first arguments (mapSetState setState) cannot run its body once and keep the rest)
 [<Fact>]
 let ``test Partial Applying caches side-effects`` () = // See #1836
     PseudoElmish.reset()
@@ -1314,7 +1313,6 @@ let ``test Partial Applying caches side-effects`` () = // See #1836
     changedProgram.setState "Bar" (fun _ -> ())
     PseudoElmish.doMapRunTimes |> equal 1
     PseudoElmish.setStateAccumulated |> equal "FooBar"
-#endif
 
 [<Fact>]
 let ``test Partial Applying locally caches side-effects`` () = // See #1836

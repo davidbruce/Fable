@@ -4301,6 +4301,46 @@ let boxQuotationArgs (e: Fable.Expr) : Fable.Expr =
 
     go e
 
+/// The names an expression reads that it does not bind itself (over-approximated where a decision
+/// tree binds them: that only makes a caller more careful)
+let rec freeNamesOf (e: Fable.Expr) : Set<string> =
+    match e with
+    | Fable.IdentExpr i -> Set.singleton i.Name
+    | Fable.Lambda(a, b, _) -> (freeNamesOf b).Remove a.Name
+    | Fable.Delegate(ps, b, _, _) -> ps |> List.fold (fun (acc: Set<string>) p -> acc.Remove p.Name) (freeNamesOf b)
+    | Fable.Let(id, v, b) -> Set.union (freeNamesOf v) ((freeNamesOf b).Remove id.Name)
+    | _ ->
+        AST.getSubExpressions e
+        |> List.fold (fun acc x -> Set.union acc (freeNamesOf x)) Set.empty
+
+/// How many arguments a function value really takes before it gives a function of the rest:
+/// its lambdas' parameters, or a known function's (0 when not known)
+let rec stageArityOf (ctx: Ctx) (g: Fable.Expr) : int =
+    match g with
+    | Fable.Lambda(_, (Fable.Lambda _ as inner), _) -> 1 + stageArityOf ctx inner
+    | Fable.Lambda _ -> 1
+    | Fable.Delegate(ps, _, _, _) -> ps.Length
+    // (a variable that holds a function value: what its type takes at once)
+    | Fable.IdentExpr i when ctx.Vars.ContainsKey i.Name ->
+        match ctx.Vars[i.Name].Ty with
+        | TFn(ps, _) -> ps.Length
+        | _ -> 0
+    | Fable.IdentExpr _ ->
+        match tryCallable ctx g with
+        | Some c -> c.Arity
+        | None -> 0
+    | _ -> 0
+
+/// The type of what a function value gives after `k` of its arguments
+let rec peelArgs (t: Fable.Type) (k: int) : Fable.Type =
+    if k <= 0 then
+        t
+    else
+        match t with
+        | Fable.LambdaType(_, ret) -> peelArgs ret (k - 1)
+        | Fable.DelegateType(ps, ret) when ps.Length <= k -> peelArgs ret (k - ps.Length)
+        | _ -> t
+
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
     // (a function cast to a type that is not a function and then applied, as the inliner
@@ -4925,6 +4965,291 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         lw ctx body
 
+    // A function value of several arguments made of a function of fewer (`doMap` of one,
+    // given as `SetState -> 'model -> Dispatch -> unit`): it carries that first stage, which a
+    // partial application of it calls once (see fable_rt.withStage)
+    | Fable.Delegate(args, Fable.CurriedApply(g, appArgs, retTy, _), name, tags) when
+        not (List.contains "nostage" tags)
+        && args.Length >= 2
+        && appArgs.Length = args.Length
+        && List.forall2
+            (fun (a: Fable.Ident) x ->
+                match x with
+                | Fable.IdentExpr i -> i.Name = a.Name
+                | _ -> false
+            )
+            args
+            appArgs
+        && (let k = stageArityOf ctx g
+            k >= 1 && k < args.Length)
+        ->
+        let k = stageArityOf ctx g
+        let fresh (i: Fable.Ident) = { i with Name = i.Name + "_stage" }
+        let first, rest = List.splitAt k args
+        let firstS = first |> List.map fresh
+        let restS = rest |> List.map fresh
+        let rTy = peelArgs g.Type k
+        let staged = AST.makeTypedIdent rTy "staged"
+
+        let stage =
+            Fable.Delegate(
+                firstS,
+                Fable.Let(
+                    staged,
+                    Fable.CurriedApply(g, firstS |> List.map Fable.IdentExpr, rTy, None),
+                    Fable.Delegate(
+                        restS,
+                        Fable.CurriedApply(Fable.IdentExpr staged, restS |> List.map Fable.IdentExpr, retTy, None),
+                        None,
+                        [ "nostage" ]
+                    )
+                ),
+                None,
+                [ "nostage" ]
+            )
+
+        let inner =
+            Fable.Delegate(args, Fable.CurriedApply(g, appArgs, retTy, None), name, "nostage" :: tags)
+
+        bindArgs
+            ctx
+            [ lw ctx inner; lw ctx stage ]
+            (fun xs -> EEmit($"fable_rt.withStage($0, %d{k}, $1)", xs, typeOf xs.Head))
+
+    // (the same of a function value that is an expression, `fun a b -> (g y)(x, a, b)`: the
+    // value is computed once, when the partial application is made, as F# computes it)
+    | Fable.Delegate(rest, Fable.CurriedApply(fexpr, args, t, r), name, tags) when
+        not (List.contains "nostage" tags)
+        && not rest.IsEmpty
+        && args.Length > rest.Length
+        && (
+            match fexpr with
+            | Fable.IdentExpr _ -> false
+            | Fable.Lambda _
+            | Fable.Delegate _ -> false
+            | _ -> true
+        )
+        && rest |> List.forall (fun p -> not ((freeNamesOf fexpr).Contains p.Name))
+        && List.forall2
+            (fun (p: Fable.Ident) x ->
+                match x with
+                | Fable.IdentExpr i -> i.Name = p.Name
+                | _ -> false
+            )
+            rest
+            (List.skip (args.Length - rest.Length) args)
+        && List.take (args.Length - rest.Length) args
+           |> List.forall (fun x -> rest |> List.forall (fun p -> not ((freeNamesOf x).Contains p.Name)))
+        ->
+        let fixedArgs = List.take (args.Length - rest.Length) args
+        let restArgs = List.skip fixedArgs.Length args
+        let fIr = lw ctx fexpr
+        let v = ctx.State.NewVar("partial", typeOf fIr, VLocal, false)
+        let fv = AST.makeTypedIdent fexpr.Type $"partial$%d{v.Id}"
+        ctx.Vars[fv.Name] <- v
+
+        let body =
+            match v.Ty with
+            // (it takes all the arguments at once: a partial application of it, which may use
+            // its first stage)
+            | TFn(ps, _) when ps.Length = args.Length ->
+                Fable.Delegate(
+                    rest,
+                    Fable.Call(Fable.IdentExpr fv, Fable.CallInfo.Create(args = args), t, r),
+                    name,
+                    tags
+                )
+            // (it takes the fixed arguments first: applied to them once, and the result to the
+            // rest at each call)
+            | TFn(ps, _) when ps.Length <= fixedArgs.Length ->
+                let fixedTy = peelArgs fexpr.Type fixedArgs.Length
+                let applied = AST.makeTypedIdent fixedTy $"applied$%d{v.Id}"
+
+                Fable.Let(
+                    applied,
+                    Fable.CurriedApply(Fable.IdentExpr fv, fixedArgs, fixedTy, r),
+                    Fable.Delegate(
+                        rest,
+                        Fable.CurriedApply(Fable.IdentExpr applied, restArgs, t, r),
+                        name,
+                        "nostage" :: tags
+                    )
+                )
+            | _ -> Fable.Delegate(rest, Fable.CurriedApply(Fable.IdentExpr fv, args, t, r), name, "nostage" :: tags)
+
+        ELet(v, fIr, lw ctx body)
+
+    // An adapter that calls a function value in another shape (`fun b0 b1 -> fun a0 ->
+    // f(b0, b1, a0)`, as Fable passes a function of three arguments where one of two that gives
+    // a function is wanted): it carries the value's first stage, seen in its own shape
+    | Fable.Delegate(args, body, name, tags) when
+        not (List.contains "nostage" tags)
+        && args.Length >= 2
+        && (let rec peel (e: Fable.Expr) acc =
+                match e with
+                | Fable.Lambda(p, b, _) -> peel b (p :: acc)
+                | _ -> List.rev acc, e
+
+            match peel body [] with
+            | extra, Fable.Call(Fable.IdentExpr f, info, _, _) when
+                info.ThisArg.IsNone
+                && ctx.Vars.ContainsKey f.Name
+                && not (ctx.LocalFns.ContainsKey f.Name)
+                && info.Args.Length = args.Length + extra.Length
+                ->
+                List.forall2
+                    (fun (p: Fable.Ident) x ->
+                        match x with
+                        | Fable.IdentExpr i -> i.Name = p.Name
+                        | _ -> false
+                    )
+                    (args @ extra)
+                    info.Args
+            | _ -> false)
+        ->
+        let rec peel (e: Fable.Expr) acc =
+            match e with
+            | Fable.Lambda(p, b, _) -> peel b (p :: acc)
+            | _ -> List.rev acc, e
+
+        let extra, call = peel body []
+
+        let f, retTy =
+            match call with
+            | Fable.Call(Fable.IdentExpr f, _, t, _) -> f, t
+            | _ -> failwith "unreachable"
+
+        let n = ctx.State.NewVar("adapted", tVoid, VLocal, false).Id
+        let fresh (i: Fable.Ident) = { i with Name = $"%s{i.Name}$a%d{n}" }
+        let x1 = fresh args.Head
+
+        let restAll =
+            (args.Tail @ extra)
+            |> List.map (fun i -> { fresh i with Name = (fresh i).Name + "r" })
+
+        let consumer =
+            Fable.Delegate(
+                restAll,
+                Fable.Call(
+                    Fable.IdentExpr f,
+                    Fable.CallInfo.Create(args = (Fable.IdentExpr x1 :: (restAll |> List.map Fable.IdentExpr))),
+                    retTy,
+                    None
+                ),
+                None,
+                []
+            )
+
+        let rTy = Fable.DelegateType(restAll |> List.map (fun i -> i.Type), retTy)
+        let rId = AST.makeTypedIdent rTy $"adaptedRest$%d{n}"
+
+        let tailArgs =
+            args.Tail |> List.map (fun i -> { fresh i with Name = (fresh i).Name + "t" })
+
+        let extraArgs =
+            extra |> List.map (fun i -> { fresh i with Name = (fresh i).Name + "e" })
+
+        let restCall =
+            Fable.Call(
+                Fable.IdentExpr rId,
+                Fable.CallInfo.Create(args = ((tailArgs @ extraArgs) |> List.map Fable.IdentExpr)),
+                retTy,
+                None
+            )
+
+        let restView =
+            Fable.Delegate(
+                tailArgs,
+                List.foldBack (fun i b -> Fable.Lambda(i, b, None)) extraArgs restCall,
+                None,
+                [ "nostage" ]
+            )
+
+        let stage =
+            Fable.Delegate([ x1 ], Fable.Let(rId, Fable.TypeCast(consumer, rTy), restView), None, [ "nostage" ])
+
+        let adapter = Fable.Delegate(args, body, name, "nostage" :: tags)
+
+        bindArgs
+            ctx
+            [ lw ctx (Fable.IdentExpr f); lw ctx adapter; lw ctx stage ]
+            (fun xs -> EEmit("fable_rt.withStageIf($0, $1, 1, $2)", xs, typeOf xs[1]))
+
+    // A partial application of a function value to its first arguments, as Fable writes it
+    // (`fun a b -> f(x, a, b)`): the value's first stage, if it carries one of these arguments,
+    // called once; otherwise a function that calls the value with all of them
+    | Fable.Delegate(rest, Fable.Call(Fable.IdentExpr f, info, t, r), name, tags) when
+        not (List.contains "nostage" tags)
+        && info.ThisArg.IsNone
+        && ctx.Vars.ContainsKey f.Name
+        && not (ctx.LocalFns.ContainsKey f.Name)
+        && not rest.IsEmpty
+        && info.Args.Length > rest.Length
+        && List.forall2
+            (fun (p: Fable.Ident) x ->
+                match x with
+                | Fable.IdentExpr i -> i.Name = p.Name
+                | _ -> false
+            )
+            rest
+            (List.skip (info.Args.Length - rest.Length) info.Args)
+        && List.take (info.Args.Length - rest.Length) info.Args
+           |> List.forall (fun x -> rest |> List.forall (fun p -> not ((freeNamesOf x).Contains p.Name)))
+        ->
+        let k = info.Args.Length - rest.Length
+        let fixedArgs = List.take k info.Args
+        let restFnTy = mapType ctx r e.Type
+
+        // (the fixed arguments, computed once, under names of their own)
+        let bound =
+            fixedArgs
+            |> List.map (fun x ->
+                let ir = lw ctx x
+                let v = ctx.State.NewVar("fixed", typeOf ir, VLocal, false)
+                let id = AST.makeTypedIdent x.Type $"fixed$%d{v.Id}"
+                ctx.Vars[id.Name] <- v
+                id, v, ir
+            )
+
+        let fixedIds = bound |> List.map (fun (id, _, _) -> Fable.IdentExpr id)
+        let fixedVars = bound |> List.map (fun (_, v, _) -> EVar v)
+        let sTy = TFn(bound |> List.map (fun (_, v, _) -> v.Ty), restFnTy)
+        let sv = ctx.State.NewVar("stage", TOpt sTy, VLocal, false)
+
+        let fallback =
+            lw
+                ctx
+                (Fable.Delegate(
+                    rest,
+                    Fable.Call(
+                        Fable.IdentExpr f,
+                        { info with Args = fixedIds @ (rest |> List.map Fable.IdentExpr) },
+                        t,
+                        r
+                    ),
+                    name,
+                    "nostage" :: tags
+                ))
+
+        let body =
+            bindArgs
+                ctx
+                [ lw ctx (Fable.IdentExpr f) ]
+                (fun xs ->
+                    ELet(
+                        sv,
+                        EEmit($"fable_rt.stageOf($R, $0, %d{k})", xs, TOpt sTy),
+                        EIf(
+                            EPrim("not", [ ETest(EVar sv, "None", TOpt sTy) ], tBool),
+                            ECallClo(EGet(EVar sv, PSome, sTy), fixedVars, restFnTy),
+                            fallback,
+                            restFnTy
+                        )
+                    )
+                )
+
+        List.foldBack (fun (_, v, ir) acc -> ELet(v, ir, acc)) bound body
+
     // (a function value made of the partial application of another, `fun a b -> (f x) a b`, as
     // Fable writes it to keep the value uncurried: `f x` is computed once, when the value is
     // made, as F# computes it)
@@ -4971,6 +5296,88 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Some exV -> ERaise(EVar exV, mapType ctx r t)
         | None -> fail r "`reraise ()` is only possible inside a `with` handler"
     // a function with several arguments that is used one argument at a time
+    // (a function value of several arguments made curried: one argument, then the partial
+    // application of the value to it, curried in turn, so that a first stage the value carries
+    // is used, see fable_rt.withStage)
+    | Fable.Extended(Fable.Curry(f, arity), r) when
+        arity >= 2
+        && (tryCallable ctx f).IsNone
+        && (
+            match f.Type, f with
+            | Fable.DelegateType(ps, _), _ -> ps.Length = arity
+            // (a variable typed curried that holds a function of all the arguments at once)
+            | Fable.LambdaType _, Fable.IdentExpr i when ctx.Vars.ContainsKey i.Name ->
+                match ctx.Vars[i.Name].Ty with
+                | TFn(zps, _) -> zps.Length = arity
+                | _ -> false
+            | _ -> false
+        )
+        ->
+        let ps, ret =
+            match f.Type with
+            | Fable.DelegateType(ps, ret) -> ps, ret
+            | t ->
+                let rec peel (t: Fable.Type) k acc =
+                    match t with
+                    | Fable.LambdaType(a, r) when k > 0 -> peel r (k - 1) (a :: acc)
+                    | _ -> List.rev acc, t
+
+                peel t arity []
+
+        // (the value under the type of what it is: a function of all the arguments)
+        let f =
+            match f with
+            | Fable.IdentExpr i -> Fable.IdentExpr { i with Type = Fable.DelegateType(ps, ret) }
+            | _ -> f
+
+        let n = ctx.State.NewVar("curried", tVoid, VLocal, false).Id
+        let fv = AST.makeTypedIdent (Fable.DelegateType(ps, ret)) $"curried$%d{n}"
+        let a1 = AST.makeTypedIdent ps.Head $"curriedArg$%d{n}"
+
+        let restIds =
+            ps.Tail
+            |> List.mapi (fun i t -> AST.makeTypedIdent t $"curriedArg$%d{n}$%d{i + 1}")
+
+        let inner =
+            Fable.Delegate(
+                restIds,
+                Fable.Call(
+                    Fable.IdentExpr fv,
+                    Fable.CallInfo.Create(args = (Fable.IdentExpr a1 :: (restIds |> List.map Fable.IdentExpr))),
+                    ret,
+                    r
+                ),
+                None,
+                []
+            )
+
+        // (after the first argument: the partial application, made once, then the others one at
+        // a time)
+        let innerCurried =
+            if restIds.Length >= 2 then
+                let restTy = Fable.DelegateType(ps.Tail, ret)
+                let g = AST.makeTypedIdent restTy $"curriedRest$%d{n}"
+                let nextIds = restIds |> List.map (fun i -> { i with Name = i.Name + "_c" })
+
+                let call =
+                    Fable.Call(
+                        Fable.IdentExpr g,
+                        Fable.CallInfo.Create(args = (nextIds |> List.map Fable.IdentExpr)),
+                        ret,
+                        r
+                    )
+
+                // (bound as a value, made once for this first argument: a `let` of a lambda would
+                // be a function of the file instead)
+                Fable.Let(
+                    g,
+                    Fable.TypeCast(inner, restTy),
+                    List.foldBack (fun i body -> Fable.Lambda(i, body, None)) nextIds call
+                )
+            else
+                inner
+
+        lw ctx (Fable.Let(fv, f, Fable.Lambda(a1, innerCurried, None)))
     | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
 
     // `match w.TryGetTarget() with | true, x -> ...` where x's type has no default value (null on

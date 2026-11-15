@@ -6106,6 +6106,10 @@ pub const Env = struct {
     destroy: *const fn (*Env) void,
     /// marks what the function captured shared (see `markShared`)
     share: *const fn (*Env) Raised!void,
+    /// (see `withStage`) the function's first stage, its number of arguments and its type
+    stage: ?*const anyopaque = null,
+    stage_arity: u8 = 0,
+    stage_type: ?[*:0]const u8 = null,
 };
 
 pub fn Func(comptime Code: type) type {
@@ -6160,6 +6164,85 @@ pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captu
     }
     if (track) thread.stats.allocs += 1;
     return .{ .env = &e.header, .code = code };
+}
+
+// ---- stages: a function value of several arguments that is really a function of fewer, which
+// gives a function of the rest (`let doMap setState = ...; setState`, used as a value of type
+// `SetState -> 'model -> Dispatch -> unit`). Uncurried by its type, its first part would run
+// again at every call; F# runs it once for each application to its first arguments. The value
+// carries that first stage, which a partial application of it calls (`stageOf`). (fable-library-ts
+// does the same with the curried function its uncurried adapters carry.) ----
+
+/// `f`, carrying `s`: its first `k` arguments, which give a function of the rest
+pub fn withStage(f: anytype, comptime k: u8, s: anytype) @TypeOf(f) {
+    const F = @TypeOf(f);
+    const S = @TypeOf(s);
+    const Caps = struct { inner: F, stage: S };
+    const out = closure(F, Caps, .{ .inner = dup(f), .stage = dup(s) }, Forward(F, Caps).code);
+    const e: *EnvOf(Caps) = @alignCast(@fieldParentPtr("header", out.env.?));
+    e.header.stage = @ptrCast(&e.captures.stage);
+    e.header.stage_arity = k;
+    e.header.stage_type = @typeName(S);
+    return out;
+}
+
+/// `adapter` (a function value that calls `f` with its arguments in another shape), carrying `s`
+/// when `f` carries a stage of its own; otherwise `adapter` as it is
+pub fn withStageIf(f: anytype, adapter: anytype, comptime k: u8, s: anytype) @TypeOf(adapter) {
+    const e = f.env orelse return dup(adapter);
+    if (e.stage_arity == 0) return dup(adapter);
+    return withStage(adapter, k, s);
+}
+
+/// The first stage of `f` of `k` arguments, of type `S`, if it has one (a reference of its own)
+pub fn stageOf(comptime OS: type, f: anytype, comptime k: u8) OS {
+    const S = @typeInfo(OS).optional.child;
+    const e = f.env orelse return null;
+    if (e.stage_arity != k) return null;
+    const t = e.stage_type orelse return null;
+    if (!std.mem.eql(u8, std.mem.span(t), @typeName(S))) return null;
+    const p: *const S = @ptrCast(@alignCast(e.stage.?));
+    return dup(p.*);
+}
+
+/// (the code of a function value that calls the one it holds)
+fn Forward(comptime F: type, comptime Caps: type) type {
+    const Fn = @typeInfo(@typeInfo(@FieldType(F, "code")).pointer.child).@"fn";
+    const R = Fn.return_type.?;
+    const P = Fn.param_types;
+    return switch (P.len) {
+        2 => struct {
+            fn code(env: ?*Env, a: P[1].?) R {
+                const c = captured(Caps, env);
+                return c.inner.code(c.inner.env, a);
+            }
+        },
+        3 => struct {
+            fn code(env: ?*Env, a: P[1].?, b: P[2].?) R {
+                const c = captured(Caps, env);
+                return c.inner.code(c.inner.env, a, b);
+            }
+        },
+        4 => struct {
+            fn code(env: ?*Env, a: P[1].?, b: P[2].?, d: P[3].?) R {
+                const c = captured(Caps, env);
+                return c.inner.code(c.inner.env, a, b, d);
+            }
+        },
+        5 => struct {
+            fn code(env: ?*Env, a: P[1].?, b: P[2].?, d: P[3].?, e4: P[4].?) R {
+                const c = captured(Caps, env);
+                return c.inner.code(c.inner.env, a, b, d, e4);
+            }
+        },
+        6 => struct {
+            fn code(env: ?*Env, a: P[1].?, b: P[2].?, d: P[3].?, e4: P[4].?, e5: P[5].?) R {
+                const c = captured(Caps, env);
+                return c.inner.code(c.inner.env, a, b, d, e4, e5);
+            }
+        },
+        else => @compileError("fable: a staged function value of this many arguments"),
+    };
 }
 
 /// What the function value captured, from inside its code.
