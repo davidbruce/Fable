@@ -10,14 +10,12 @@ let ``test set function works`` () =
     xs |> Set.isEmpty
     |> equal false
 
-#if !FABLE_COMPILER_ZIG // (set [] of an open element type (obj) and enumerators are not supported by the Zig target yet)
 [<Fact>]
 let ``test Set.isEmpty works`` () =
     let xs = set []
     Set.isEmpty xs |> equal true
     let ys = set [1]
     Set.isEmpty ys |> equal false
-#endif
 
 [<Fact>]
 let ``test xs.IsEmpty works`` () =
@@ -350,11 +348,9 @@ let ``test Set.minElement and Set.maxElement raise ArgumentException on empty in
 let ``test Set.intersectMany raises ArgumentException on empty input`` () =
     raisedExceptionType (fun () -> Set.intersectMany ([]: Set<int> list)) |> equal "ArgumentException"
 
-#if !FABLE_COMPILER_ZIG // (set [] of an open element type (obj) and enumerators are not supported by the Zig target yet)
 [<Fact>]
 let ``test Set enumerator Current raises InvalidOperationException outside the enumeration`` () =
     let e = (set [1] :> seq<_>).GetEnumerator()
     raisedExceptionType (fun () -> e.Current) |> equal "InvalidOperationException"
     while e.MoveNext() do ()
     raisedExceptionType (fun () -> e.Current) |> equal "InvalidOperationException"
-#endif

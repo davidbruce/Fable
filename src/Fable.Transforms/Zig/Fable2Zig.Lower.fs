@@ -9765,6 +9765,78 @@ and libraryCall
     (t: Fable.Type)
     : Expr
     =
+    // (an empty generic value of the library made at obj, as a generalized `let xs = Seq.empty`
+    // is: made again at the type the parameter wants. The type arguments are taken in the order
+    // the signature first names its type parameters, and only when every other argument agrees)
+    let args =
+        let rec namesIn (acc: string list) (t: Fable.Type) =
+            match t with
+            | Fable.GenericParam(n, _, _) ->
+                if List.contains n acc then
+                    acc
+                else
+                    acc @ [ n ]
+            | _ -> t.Generics |> List.fold namesIn acc
+
+        let rec hasAny (t: Fable.Type) =
+            match t with
+            | Fable.Any -> true
+            | _ -> t.Generics |> List.exists hasAny
+
+        let isOpenEmpty (a: Fable.Expr) =
+            match a with
+            | Fable.Call(Fable.Import(imp, _, _), ci, typ, _) ->
+                (match imp.Kind with
+                 | Fable.LibraryImport _ -> true
+                 | _ -> false)
+                && ci.Args.IsEmpty
+                && ci.ThisArg.IsNone
+                && hasAny typ
+            | _ -> false
+
+        let names = info.SignatureArgTypes |> List.fold namesIn []
+
+        if
+            args |> List.exists isOpenEmpty
+            && info.SignatureArgTypes.Length = args.Length
+            && not names.IsEmpty
+            && names.Length = info.GenericArgs.Length
+            && not (info.GenericArgs |> List.exists (fun t -> hasAny t || hasTypeParams t))
+        then
+            let subst = List.zip names info.GenericArgs |> Map.ofList
+            let wanted = info.SignatureArgTypes |> List.map (substFableType subst)
+
+            let agrees =
+                List.forall2
+                    (fun (w: Fable.Type) (a: Fable.Expr) ->
+                        isOpenEmpty a
+                        || hasAny a.Type
+                        || (
+                            match w, a.Type with
+                            | (Fable.LambdaType _ | Fable.DelegateType _), _ -> true
+                            | _ -> w = a.Type
+                        )
+                    )
+                    wanted
+                    args
+
+            if agrees then
+                List.map2
+                    (fun (w: Fable.Type) (a: Fable.Expr) ->
+                        match a with
+                        | Fable.Call(callee, ci, _, r) when
+                            isOpenEmpty a && not (hasAny w) && w.Generics.Length = ci.GenericArgs.Length
+                            ->
+                            Fable.Call(callee, { ci with GenericArgs = w.Generics }, w, r)
+                        | _ -> a
+                    )
+                    wanted
+                    args
+            else
+                args
+        else
+            args
+
     let found = Dictionary<string, Fable.Type>()
 
     // `Seq.collect` and `Seq.concat` are generic in the type of the collections too

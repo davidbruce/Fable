@@ -704,14 +704,12 @@ let ``test Seq.scan works`` () =
     let ys = xs |> Seq.scan (+) 0.
     sumFirstTwo ys |> equal 1.
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: sums through a type's own +, a Seq.empty whose item type F# leaves open)
 [<Fact>]
 let ``test Seq.scan works with empty input`` () =
     let xs = Seq.empty
     let ys = xs |> Seq.scan (+) 3
     Seq.head ys |> equal 3
     Seq.length ys |> equal 1
-#endif
 
 [<Fact>]
 let ``test Seq.sort works`` () =
