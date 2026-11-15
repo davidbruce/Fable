@@ -1428,6 +1428,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "Stopwatch" "StopwatchOf", [])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
+    | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Runtime.CompilerServices.ConditionalWeakTable`2" ->
+        TEnt(libRecordEnt ctx "ConditionalWeakTable" "ConditionalWeakTableOf_2", [ mapType ctx r k; mapType ctx r v ])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "Microsoft.FSharp.Core.CompilerServices.ListCollector`1" ->
         TEnt(libRecordEnt ctx "ListCollector" "ListCollectorOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Queue`1" ->

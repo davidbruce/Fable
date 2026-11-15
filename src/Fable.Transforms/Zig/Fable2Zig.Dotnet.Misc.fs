@@ -2129,6 +2129,63 @@ let call
                 r
             ))
     // ---- .NET's stack and queue: the library's Stack.fs and Queue.fs ----
+    // `ConditionalWeakTable<'K, 'V>`: the library's ConditionalWeakTable.fs
+    | "System.Runtime.CompilerServices.ConditionalWeakTable`2", name, args ->
+        let file = "ConditionalWeakTable"
+
+        let genArgs =
+            match args with
+            | t0 :: _ ->
+                match t0.Type with
+                | Fable.DeclaredType(_, [ k; v ]) -> [ k; v ]
+                | _ -> info.GenericArgs
+            | [] ->
+                match t with
+                | Fable.DeclaredType(_, [ k; v ]) -> [ k; v ]
+                | _ -> info.GenericArgs
+
+        let call fn (xs: Fable.Expr list) ty =
+            libraryCall
+                ctx
+                r
+                file
+                fn
+                { info with
+                    ThisArg = None
+                    Args = xs
+                    GenericArgs = genArgs
+                    SignatureArgTypes = []
+                    MemberRef = None
+                }
+                xs
+                ty
+
+        match name, args with
+        | ".ctor", [] -> call "create" [] t
+        | "Add", [ tbl; k; v ] -> call "add" [ tbl; k; v ] t
+        | "AddOrUpdate", [ tbl; k; v ] -> call "addOrUpdate" [ tbl; k; v ] t
+        | "Remove", [ tbl; k ] -> call "remove" [ tbl; k ] t
+        | "Clear", [ tbl ] -> call "clear" [ tbl ] t
+        // (the callback, a .NET delegate: the function it is)
+        | "GetValue", [ tbl; k; f ] -> call "getValue" [ tbl; k; f ] t
+        | "TryGetValue", [ tbl; k; Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr out), _, _, _) ] when
+            ctx.Vars.ContainsKey out.Name
+            ->
+            let outVar = ctx.Vars[out.Name]
+            let tmp = ctx.State.NewVar("found", TOpt outVar.Ty, VLocal, false)
+            let found = call "tryFind" [ tbl; k ] (Fable.Option(out.Type, false))
+
+            ELet(
+                tmp,
+                found,
+                EIf(
+                    EPrim("not", [ ETest(EVar tmp, "None", TOpt outVar.Ty) ], tBool),
+                    ESeq(EAssign(outVar, EGet(EVar tmp, PSome, outVar.Ty)), ELit("true", tBool)),
+                    ELit("false", tBool),
+                    tBool
+                )
+            )
+        | _ -> fail r "the Zig target does not support ConditionalWeakTable.%s yet" name
     // `ListCollector<'T>`: the library's ListCollector.fs
     | "Microsoft.FSharp.Core.CompilerServices.ListCollector`1", name, args ->
         match name with

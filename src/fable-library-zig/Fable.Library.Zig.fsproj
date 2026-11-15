@@ -16,6 +16,7 @@
     <Compile Include="ResizeArray.fs" />
     <Compile Include="HashSet.fs" />
     <Compile Include="ListCollector.fs" />
+    <Compile Include="ConditionalWeakTable.fs" />
     <Compile Include="Stack.fs" />
     <Compile Include="Queue.fs" />
     <Compile Include="Observable.fs" />
