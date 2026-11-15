@@ -89,6 +89,7 @@ fn NullOf(comptime A: type) type {
             const c = arrayFrom(A, &.{});
             c.@"$rc" = null_count;
             rt.thread.null_arrays.append(rt.bookkeeping(), .{ .cell = c, .free = free }) catch @panic("fable: out of memory");
+            rt.uncount();
             made = c;
             return c;
         }
@@ -96,6 +97,7 @@ fn NullOf(comptime A: type) type {
         fn free(p: *anyopaque) void {
             const c: A = @ptrCast(@alignCast(p));
             c.@"$rc" = 1;
+            rt.recount();
             rt.drop(c);
             made = null;
         }

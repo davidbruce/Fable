@@ -310,6 +310,10 @@ let settleManaged (state: FileState) =
                 || e.Kind = KRefRecord
                 || e.Hooks.IsSome
                 || e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> isManagedDecl))
+                // (a record of the library whose fields this file does not know, as `RegexOf`:
+                // counted, as libRecordEnt says; the runtime's dup and drop go by its real type)
+                || (e.Ref.FullName.StartsWith("Fable.Library.Zig.", System.StringComparison.Ordinal)
+                    && e.Cases |> List.forall (fun (_, fs) -> fs.IsEmpty))
 
             if m <> e.Managed then
                 e.Managed <- m

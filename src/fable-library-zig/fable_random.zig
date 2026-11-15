@@ -97,22 +97,39 @@ pub var random_count: u64 = 0;
 /// `Random()`: seeded from what differs between runs and calls here: where the stack and the
 /// heap are (the system places them anew each run) and a count of the generators made
 pub fn randomUnseeded() Random {
-    random_count +%= 1;
+    const count = @atomicRmw(u64, &random_count, .Add, 1, .monotonic) +% 1;
     const r = randomNew(0);
     var local: u8 = 0;
-    const mix = [_]u64{ @intFromPtr(&local), @intFromPtr(r), random_count };
+    const mix = [_]u64{ @intFromPtr(&local), @intFromPtr(r), count };
     const h = std.hash.Wyhash.hash(0x9E3779B97F4A7C15, std.mem.sliceAsBytes(&mix));
     const fresh = randomNew(@intCast(h & 0x7fffffff));
     drop(r);
     return fresh;
 }
 
-pub var random_shared: ?Random = null;
+/// `Random.Shared`: one for each thread, as .NET's is (its generator is thread-local, so that it
+/// can be used from any thread without a lock). It is kept as long as the thread and not counted
+/// as alive (see `rt.uncount`).
+const SharedRandom = if (rt.sgc.per_thread) struct {
+    threadlocal var r: ?Random = null;
+} else struct {
+    var r: ?Random = null;
+};
 
-/// `Random.Shared`: one for the whole program
 pub fn randomShared() Random {
-    if (random_shared == null) random_shared = randomUnseeded();
-    return dup(random_shared.?);
+    if (SharedRandom.r == null) {
+        SharedRandom.r = randomUnseeded();
+        rt.uncount();
+    }
+    return dup(SharedRandom.r.?);
+}
+
+/// (given up when the thread ends, and before the program counts what it never freed)
+pub fn randomSharedRelease() void {
+    const r = SharedRandom.r orelse return;
+    SharedRandom.r = null;
+    rt.recount();
+    drop(r);
 }
 
 /// `r.Next()`

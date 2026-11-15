@@ -3652,6 +3652,7 @@ fn asyncStateRelease() void {
 
 pub fn collectorDeinit() void {
     asyncStateRelease();
+    random.randomSharedRelease();
     // (the null arrays this thread made: given up before the collector goes)
     for (thread.null_arrays.items) |n| n.free(n.cell);
     thread.null_arrays.deinit(bookkeeping());
@@ -6940,6 +6941,36 @@ pub fn testInit(init: anytype) !void {
 
 /// A test that `zig test` runs (an F# function marked `[<Fact>]`): it fails if it raises,
 /// and the exception is written as an unhandled one would be.
+/// A cell the runtime keeps for as long as the thread (a cache: the null array of a type, a
+/// shared Random) is not counted as alive, so that what a program or a test leaves alive is
+/// what it made; `recount` puts it back just before the runtime gives it up.
+pub inline fn uncount() void {
+    if (track) thread.stats.frees += 1;
+}
+
+pub inline fn recount() void {
+    if (track) thread.stats.frees -= 1;
+}
+
+/// Before a test: what is alive (once cycles that died are freed), to compare after it.
+pub fn testLiveBefore() i64 {
+    _ = collect();
+    return live();
+}
+
+/// After a test: every cell it made is freed (what it left waiting has run; cycles that died are
+/// freed first). Only in builds that count cells.
+pub fn testNoLeak(before: i64) !void {
+    if (!track) return;
+    asyncStateRelease();
+    _ = collect();
+    const now = live();
+    if (now != before) {
+        std.debug.print("fable: the test left {d} cell(s) alive\n", .{now - before});
+        return error.TestLeaked;
+    }
+}
+
 pub fn testCase(f: anytype) !void {
     const n = @typeInfo(@TypeOf(f)).@"fn".param_types.len;
     const r = if (n == 0) f() else f({});
@@ -7047,6 +7078,7 @@ var ended_threads_live: i64 = 0;
 /// still allocated. Only checks in builds that keep counters.
 pub fn leaked() bool {
     asyncStateRelease();
+    random.randomSharedRelease();
     // (cycles that died without anything noticing yet are not leaks)
     _ = collect();
     if (!track or live() == 0) return false;

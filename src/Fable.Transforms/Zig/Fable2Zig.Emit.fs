@@ -2059,6 +2059,11 @@ let emitFile (state: FileState) : string =
 
         out
             .AppendLine("test \"" + quoted + "\" {")
+            // (every test is a test of leaks too, where cells are counted: what is alive before the
+            // modules' values are made is what is alive after they are given up again, so what
+            // a test leaves in a module's state is not taken for a leak; each test starts from
+            // the modules' first values)
+            .AppendLine("    const fable_live = fable_rt.testLiveBefore();")
             .AppendLine("    try fable_rt.testInit(@\"$init\");")
             .AppendLine($"    try fable_rt.testCase(%s{callTarget fn});")
         |> ignore
@@ -2066,6 +2071,9 @@ let emitFile (state: FileState) : string =
         match asyncAlias with
         | Some alias -> out.AppendLine($"    try fable_rt.testCase(%s{alias}.finishPending);") |> ignore
         | None -> ()
+
+        out.AppendLine("    @\"$deinit\"();").AppendLine("    try fable_rt.testNoLeak(fable_live);")
+        |> ignore
 
         out.AppendLine("}") |> ignore
 

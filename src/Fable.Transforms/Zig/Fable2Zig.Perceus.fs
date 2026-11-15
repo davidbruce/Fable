@@ -1574,7 +1574,13 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
         let lRhs = Set.remove v.Id Lb
         let rhs' = pc p { env with TailBorrowed = false } rhs lRhs
         let keep = expand env lRhs
-        let owned = Set.intersect env.Owned keep
+        // (a managed variable that the right-hand side assigns and that is still live in the body
+        // is owned again, as after an assignment in a sequence: `let ok = (x <- v; true)`)
+        let reowned =
+            assignedIn rhs
+            |> Set.filter (fun id -> isManaged p.State.Vars[id].Ty && Lb.Contains id)
+
+        let owned = Set.union (Set.intersect env.Owned keep) reowned
 
         let owned =
             if isManaged v.Ty then
