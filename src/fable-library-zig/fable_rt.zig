@@ -61,6 +61,7 @@ pub const thread = if (sgc.per_thread) struct {
     pub threadlocal var book: ?std.mem.Allocator = null;
     pub threadlocal var null_arrays: std.ArrayList(NullArray) = .empty;
     pub threadlocal var async_state: ?*ObjHeader = null;
+    pub threadlocal var arena: ?*Arena = null;
 } else struct {
     pub var stats: Stats = .{};
     pub var collector: sgc.Gc = undefined;
@@ -70,6 +71,7 @@ pub const thread = if (sgc.per_thread) struct {
     pub var book: ?std.mem.Allocator = null;
     pub var null_arrays: std.ArrayList(NullArray) = .empty;
     pub var async_state: ?*ObjHeader = null;
+    pub var arena: ?*Arena = null;
 };
 
 /// A null array of a type whose arrays the collector follows, kept until the collector goes
@@ -78,7 +80,7 @@ pub const NullArray = struct { cell: *anyopaque, free: *const fn (*anyopaque) vo
 /// Where the runtime's own bookkeeping (the collector's, the table of weak references) comes
 /// from: the allocator, unless a stack arena stands in for it now.
 pub fn bookkeeping() std.mem.Allocator {
-    return thread.book orelse allocator;
+    return thread.book orelse (arena_base orelse allocator);
 }
 
 /// This thread's counters (all zero in builds that do not count).
@@ -2078,27 +2080,81 @@ pub fn setToList(h: anytype) List(KeyOf(@TypeOf(h))) {
 // Stack arenas: `[<StackArena(bytes)>]`
 // ---------------------------------------------------------------------------------------------
 
+/// The frame of a `[<StackArena>]` function that is running: its buffer, the arena it was called
+/// inside of (arenas nest), and how many of the cells made in it are still alive. It lives in
+/// that function's own stack frame.
 pub const Arena = struct {
-    saved: std.mem.Allocator,
-    live: i64,
+    fba: *std.heap.FixedBufferAllocator,
+    outer: ?*Arena,
+    live: i64 = 0,
 };
 
-/// A `[<StackArena>]` function starts: its cells come from `buffer` (on its stack) until it
-/// ends. The runtime's own bookkeeping stays where it was.
-pub fn arenaEnter(fba: *std.heap.FixedBufferAllocator) Arena {
-    if (!thread.collector_ready) collectorSetup();
-    const a: Arena = .{ .saved = allocator, .live = live() };
-    thread.book = allocator;
-    allocator = fba.allocator();
-    return a;
+/// What `allocator` was before the first arena: once one runs, `allocator` is the router
+/// below, which sends each thread's allocations to its own innermost arena, or here. (Each
+/// thread has its own arenas: one thread's arena never gives cells to another thread.)
+var arena_base: ?std.mem.Allocator = null;
+var arena_router_installed: u32 = 0;
+
+const arena_router: std.mem.Allocator = .{ .ptr = undefined, .vtable = &.{
+    .alloc = routerAlloc,
+    .resize = routerResize,
+    .remap = routerRemap,
+    .free = routerFree,
+} };
+
+/// (the arena of this thread that holds `memory`, if any)
+fn arenaOwning(memory: []u8) ?*Arena {
+    var f = thread.arena;
+    while (f) |a| : (f = a.outer) if (a.fba.ownsSlice(memory)) return a;
+    return null;
 }
 
-/// ... and ends. (In builds that count, a cell made in the arena that is still alive now
-/// would point into a stack frame that is gone: that is a panic.)
-pub fn arenaLeave(a: Arena) void {
-    allocator = a.saved;
-    thread.book = null;
-    if (track and live() != a.live) @panic("fable: a value made in a [<StackArena>] function outlived it");
+fn routerAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+    if (thread.arena) |a| {
+        const p = a.fba.allocator().rawAlloc(len, alignment, ret_addr) orelse return null;
+        a.live += 1;
+        return p;
+    }
+    return arena_base.?.rawAlloc(len, alignment, ret_addr);
+}
+
+fn routerResize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+    if (arenaOwning(memory)) |a| return a.fba.allocator().rawResize(memory, alignment, new_len, ret_addr);
+    return arena_base.?.rawResize(memory, alignment, new_len, ret_addr);
+}
+
+fn routerRemap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    if (arenaOwning(memory)) |a| return a.fba.allocator().rawRemap(memory, alignment, new_len, ret_addr);
+    return arena_base.?.rawRemap(memory, alignment, new_len, ret_addr);
+}
+
+fn routerFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+    if (arenaOwning(memory)) |a| {
+        a.fba.allocator().rawFree(memory, alignment, ret_addr);
+        a.live -= 1;
+        return;
+    }
+    arena_base.?.rawFree(memory, alignment, ret_addr);
+}
+
+/// A `[<StackArena>]` function starts: the cells this thread makes come from `fba` (a buffer on
+/// its stack) until it ends; an arena it calls stands in for it until that one ends. The
+/// runtime's own bookkeeping stays on the allocator.
+pub fn arenaEnter(frame: *Arena, fba: *std.heap.FixedBufferAllocator) void {
+    if (!thread.collector_ready) collectorSetup();
+    if (@cmpxchgStrong(u32, &arena_router_installed, 0, 1, .acq_rel, .acquire) == null) {
+        arena_base = allocator;
+        allocator = arena_router;
+    } else while (@atomicLoad(u32, &arena_router_installed, .acquire) != 1 or arena_base == null) std.atomic.spinLoopHint();
+    frame.* = .{ .fba = fba, .outer = thread.arena };
+    thread.arena = frame;
+}
+
+/// ... and ends. A cell made in the arena that is still alive now would point into a stack
+/// frame that is gone: that is a panic (counted exactly, cell by cell, in every build).
+pub fn arenaLeave(frame: *Arena) void {
+    thread.arena = frame.outer;
+    if (frame.live != 0) @panic("fable: a value made in a [<StackArena>] function outlived it");
 }
 
 // ---------------------------------------------------------------------------------------------

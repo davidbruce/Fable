@@ -57,6 +57,9 @@ type Ctx =
         /// whole-number variables known to be greater than zero where they are used (a guard
         /// tested it): a divisor that needs no test
         Positive: HashSet<string>
+        /// variables bound to a `Type` that is known here (`typeof<T>`, a `MakeGenericType` of known
+        /// types): what it stands for
+        KnownTypes: Dictionary<string, Fable.Type>
         /// `coll|i`: inside `for i in 0 .. coll.Length - 1` (coll an immutable string or array),
         /// `coll.[i]` is in range (and the string not null: its length was read)
         InBounds: HashSet<string>
@@ -211,6 +214,17 @@ let interfaceMembers (ent: Fable.Entity) : (string * Fable.Type list * Fable.Typ
     |> List.ofSeq
 
 /// Substitute type parameters in a Fable AST type using `subst`.
+/// The constructors of the classes of the file being compiled: their declaration's name, their
+/// member, and the types of their parameters, by the class's full name (see `lowerFile`)
+/// (Fable compiles files at once on several threads, each file whole on a thread of its own, see
+/// Fable2Zig.transformFile: what belongs to the file being compiled is kept per thread)
+let private fileCtorsHere =
+    new System.Threading.ThreadLocal<Dictionary<string, (string * Fable.MemberRef * Fable.Type list) list>>(fun () ->
+        Dictionary()
+    )
+
+let fileCtors () = fileCtorsHere.Value
+
 let rec substFableType (subst: Map<string, Fable.Type>) (t: Fable.Type) : Fable.Type =
     if subst.IsEmpty then
         t
@@ -1036,7 +1050,8 @@ let liveUse (name: string) (e: Fable.Expr) : bool = (namesRead e).Contains name
 /// is a call of a function of its own: otherwise its code would be written out once per leaf,
 /// and a target that holds the rest of a match (as a `when` that fails goes on to) would
 /// multiply with each.
-let mutable sharedTargetCount = 0
+let private sharedTargetCount =
+    new System.Threading.ThreadLocal<int ref>(fun () -> ref 0)
 
 let sharedTargets
     (targets: (Fable.Ident list * Fable.Expr) list)
@@ -1078,7 +1093,7 @@ let sharedTargets
         targets
         |> List.mapi (fun i (ids, body) ->
             if uses[i] > 1 && size 40 body >= 40 then
-                sharedTargetCount <- sharedTargetCount + 1
+                sharedTargetCount.Value.Value <- sharedTargetCount.Value.Value + 1
 
                 let unitArg = AST.makeTypedIdent Fable.Unit "unitVar"
 
@@ -1091,7 +1106,7 @@ let sharedTargets
                 let fnId =
                     AST.makeTypedIdent
                         (Fable.DelegateType(args |> List.map (fun a -> a.Type), body.Type))
-                        $"match_target_%d{sharedTargetCount}"
+                        $"match_target_%d{sharedTargetCount.Value.Value}"
 
                 let call =
                     Fable.CurriedApply(
@@ -2843,7 +2858,7 @@ let kprintf
     | None -> text
 
 /// (for the names of the operands of `Math.DivRem`)
-let mutable divRemTemps = 0
+let private divRemTemps = new System.Threading.ThreadLocal<int ref>(fun () -> ref 0)
 
 /// Is this a culture or a format provider given to a .NET method (`CultureInfo.InvariantCulture`)?
 let isCulture (x: Fable.Expr) =
@@ -2854,7 +2869,8 @@ let isCulture (x: Fable.Expr) =
     | _ -> false
 
 /// (for the names of the values of a printf that is used as a function)
-let mutable printfValues = 0
+let private printfValues =
+    new System.Threading.ThreadLocal<int ref>(fun () -> ref 0)
 
 /// A printf that has not been given all the values its format takes: the printf, and the
 /// values it has.
@@ -4011,8 +4027,8 @@ let positiveFacts (cond: Fable.Expr) : string list * string list =
             match op with
             | BinaryGreater when c >= 0L -> [ n ], []
             | BinaryGreaterOrEqual when c >= 1L -> [ n ], []
-            | BinaryLessOrEqual when c <= 0L -> [], [ n ]
-            | BinaryLess when c <= 1L -> [], [ n ]
+            | BinaryLessOrEqual when c >= 0L -> [], [ n ]
+            | BinaryLess when c >= 1L -> [], [ n ]
             | BinaryUnequal when c = 0L && isUnsigned x.Type -> [ n ], []
             | BinaryEqual when c = 0L && isUnsigned x.Type -> [], [ n ]
             | _ -> [], []
@@ -4088,6 +4104,38 @@ let withFacts (set: HashSet<string>) (names: string list) (f: unit -> 'a) : 'a =
 /// `f ()` with these variables known not to be null, and these known positive
 let withKnown (ctx: Ctx) (nonNull: string list) (positive: string list) (f: unit -> 'a) : 'a =
     withFacts ctx.NonNull nonNull (fun () -> withFacts ctx.Positive positive f)
+
+/// The type a `Type` value stands for, where it is known here: `typeof<T>`, `typedefof<T>`, a
+/// `MakeGenericType` of known types, a variable bound to one (what an ahead-of-time compiler can
+/// see, as .NET's NativeAOT does)
+let rec staticTypeOf (ctx: Ctx) (e: Fable.Expr) : Fable.Type option =
+    match e with
+    | Fable.IdentExpr i when not i.IsMutable ->
+        match ctx.KnownTypes.TryGetValue i.Name with
+        | true, t -> Some t
+        | _ -> None
+    | Fable.Value(Fable.TypeInfo(t, _), _) -> Some t
+    | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
+        (imp.Selector = "TypeOf" || imp.Selector = "TypeDefOf") && info.Args.IsEmpty
+        ->
+        List.tryHead info.GenericArgs
+    | Fable.Call(Fable.Import(imp, _, _), ({ ThisArg = Some def } as info), _, _) when imp.Selector = "MakeGenericType" ->
+        let typeArgs =
+            match info.Args with
+            | [ Fable.Value(Fable.NewArray(Fable.ArrayValues ts, _, _), _) ] -> ts
+            | ts -> ts
+
+        match staticTypeOf ctx def with
+        | Some(Fable.DeclaredType(ent, gs)) when gs.Length = typeArgs.Length ->
+            let known = typeArgs |> List.map (staticTypeOf ctx)
+
+            if known |> List.forall Option.isSome then
+                Some(Fable.DeclaredType(ent, known |> List.map Option.get))
+            else
+                None
+        | _ -> None
+    | Fable.TypeCast(x, _) -> staticTypeOf ctx x
+    | _ -> None
 
 /// `neverNull`, or a variable bound to such a string and never assigned (`Ctx.NonNull`)
 let neverNullIn (ctx: Ctx) (e: Fable.Expr) : bool =
@@ -5918,6 +5966,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         // (a name bound again is not the one a guard tested)
         ctx.Positive.Remove id.Name |> ignore
 
+        // (a `Type` known here: what it stands for, for `Activator.CreateInstance`)
+        match
+            (if id.IsMutable then
+                 None
+             else
+                 staticTypeOf ctx value)
+        with
+        | Some st when unwrapNullness id.Type = Fable.MetaType -> ctx.KnownTypes[id.Name] <- st
+        | _ -> ctx.KnownTypes.Remove id.Name |> ignore
+
         ctx.InBounds.RemoveWhere(fun k -> k.StartsWith(id.Name + "|") || k.EndsWith("|" + id.Name))
         |> ignore
 
@@ -6149,7 +6207,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | ret -> [], ret
 
         let argTypes, ret = split e.Type 0
-        let n = System.Threading.Interlocked.Increment(&printfValues)
+        let n = printfValues.Value.Value + 1
+        printfValues.Value.Value <- n
 
         let names =
             argTypes
@@ -9654,8 +9713,8 @@ and dotnetCall
         pure' $"std.math.%s{f}($0)" [ x ] tBool
     // `Math.DivRem(a, b)`: `struct (a / b, a % b)`; with `&rem`, the remainder goes there
     | ("System.Math" | "System.Numerics.BigInteger"), "DivRem", a :: b :: rest ->
-        let n = divRemTemps
-        divRemTemps <- divRemTemps + 1
+        let n = divRemTemps.Value.Value
+        divRemTemps.Value.Value <- n + 1
         let ai = AST.makeTypedIdent a.Type $"divRemA%d{n}"
         let bi = AST.makeTypedIdent b.Type $"divRemB%d{n}"
 
@@ -10508,6 +10567,50 @@ let isEntryPoint (info: Fable.MemberFunctionOrValue) =
 
 let lowerFile (com: Compiler) (file: Fable.File) : FileState =
     let state = FileState()
+
+    // (the constructors of this file's classes, for `Activator.CreateInstance` of a known type)
+    fileCtors().Clear()
+
+    let rec collectCtors (decls: Fable.Declaration list) =
+        for d in decls do
+            match d with
+            | Fable.MemberDeclaration m ->
+                match com.TryGetMember m.MemberRef with
+                | Some info when info.IsConstructor ->
+                    match info.DeclaringEntity with
+                    | Some ent ->
+                        let ps =
+                            m.Args
+                            |> List.filter (fun a -> not a.IsThisArgument)
+                            |> List.map (fun a -> a.Type)
+
+                        let known =
+                            match fileCtors().TryGetValue ent.FullName with
+                            | true, l -> l
+                            | _ -> []
+
+                        fileCtors().[ent.FullName] <- known @ [ m.Name, m.MemberRef, ps ]
+                    | None -> ()
+                | _ -> ()
+            | Fable.ModuleDeclaration md -> collectCtors md.Members
+            | Fable.ClassDeclaration c ->
+                match c.Constructor with
+                | Some m ->
+                    let ps =
+                        m.Args
+                        |> List.filter (fun a -> not a.IsThisArgument)
+                        |> List.map (fun a -> a.Type)
+
+                    let known =
+                        match fileCtors().TryGetValue c.Entity.FullName with
+                        | true, l -> l
+                        | _ -> []
+
+                    fileCtors().[c.Entity.FullName] <- known @ [ m.Name, m.MemberRef, ps ]
+                | None -> ()
+            | _ -> ()
+
+    collectCtors file.Declarations
     let members = Dictionary<string, MemberKind>()
 
     let reserved = HashSet<string>()
@@ -10526,6 +10629,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             Boxed = HashSet()
             NonNull = HashSet()
             Positive = HashSet()
+            KnownTypes = Dictionary()
             InBounds = HashSet()
             Enumerators = Dictionary()
             OutTuples = Dictionary()

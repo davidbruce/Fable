@@ -1269,6 +1269,69 @@ let call
                 "the Zig target does not support %s.%s with these arguments yet"
                 (entity.Substring(entity.LastIndexOf '.' + 1))
                 name
+    // `Activator.CreateInstance(t, args)` of a type known here (`MakeGenericType` of known types,
+    // see `staticTypeOf`): the constructor of that type with as many parameters, called with the
+    // arguments unboxed to their types, the object boxed
+    | "System.Activator", "CreateInstance", t0 :: rest when
+        (match staticTypeOf ctx t0 with
+         | Some(Fable.DeclaredType(ent, _)) -> fileCtors().ContainsKey ent.FullName
+         | _ -> false)
+        ->
+        let entRef, gargs =
+            match staticTypeOf ctx t0 with
+            | Some(Fable.DeclaredType(e, gs)) -> e, gs
+            | _ -> failwith "unreachable"
+
+        let args =
+            match rest with
+            | [ Fable.Value(Fable.NewArray(Fable.ArrayValues xs, _, _), _) ] -> xs
+            | xs -> xs
+
+        let made = Fable.DeclaredType(entRef, gargs)
+
+        let subst =
+            match ctx.Com.TryGetEntity entRef with
+            | Some ent when ent.GenericParameters.Length = gargs.Length ->
+                List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) gargs
+                |> Map.ofList
+            | _ -> Map.empty
+
+        match
+            fileCtors().[entRef.FullName]
+            |> List.tryFind (fun (_, _, ps) -> ps.Length = args.Length)
+        with
+        | Some(ctorName, ctorRef, ps) ->
+            let ps = ps |> List.map (substFableType subst)
+
+            let args =
+                List.map2
+                    (fun (p: Fable.Type) (a: Fable.Expr) ->
+                        match a with
+                        | Fable.TypeCast(inner, Fable.Any) when inner.Type = p -> inner
+                        | _ when a.Type = p -> a
+                        | _ -> Fable.TypeCast(a, p)
+                    )
+                    ps
+                    args
+
+            let ctorType =
+                Fable.LambdaType(
+                    (match ps with
+                     | [ p ] -> p
+                     | _ -> Fable.Tuple(ps, false)),
+                    made
+                )
+
+            let call =
+                Fable.Call(
+                    Fable.IdentExpr(AST.makeTypedIdent ctorType ctorName),
+                    Fable.CallInfo.Create(args = args, sigArgTypes = ps, genArgs = gargs, memberRef = ctorRef),
+                    made,
+                    r
+                )
+
+            lw ctx (Fable.TypeCast(call, t))
+        | None -> fail r "the Zig target found no constructor of %s with %d parameters" entRef.FullName args.Length
     // `new 'T()` of a type parameter that is not known here: an inline function's own body,
     // which Zig looks at only if something calls it (its callers have it inlined)
     | ("Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions" | "System.Activator"), "CreateInstance", _ when

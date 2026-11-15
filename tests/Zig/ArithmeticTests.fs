@@ -1531,3 +1531,25 @@ let ``test int arithmetic inside an emit comprehension compiles`` () =
     roundTrip (id Int32.MaxValue) (id 1) |> equal Int32.MinValue
 
 #endif
+
+[<Fact>]
+let ``test A guard that does not rule out zero or -1 leaves the division checked`` () =
+    // (the false branch of `x < 0` allows 0; of `x <= -5` allows 0 and -1)
+    let f (x: int) = if x < 0 then -1 else 100 / x
+    let g (x: int) = if x <= -5 then -1 else System.Int32.MinValue / x
+    let h (x: int) = if x < 1 then -1 else 100 / x
+    f 4 |> equal 25
+    h 4 |> equal 25
+    g 2 |> equal (System.Int32.MinValue / 2)
+    let raised (h: unit -> int) =
+        try
+            h () |> ignore
+            "no exception"
+        with
+        | :? System.DivideByZeroException -> "DivideByZeroException"
+        | :? System.OverflowException -> "OverflowException"
+        | e -> e.Message
+
+    raised (fun () -> f 0) |> equal "DivideByZeroException"
+    raised (fun () -> g 0) |> equal "DivideByZeroException"
+    raised (fun () -> g -1) |> equal "OverflowException"

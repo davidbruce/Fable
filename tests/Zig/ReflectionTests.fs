@@ -548,7 +548,6 @@ let ``test Reflection works with enums`` () =
       t.GetEnumUnderlyingType() |> equal typeof<sbyte>
       System.Enum.GetUnderlyingType(t) |> equal typeof<sbyte>
 
-#if !FABLE_COMPILER_ZIG // (Activator.CreateInstance and MakeGenericType)
 [<Fact>]
 let ``test Can create generic classes at runtime`` () =
     let t = typedefof<MyClass<obj, obj>>
@@ -559,7 +558,6 @@ let ``test Can create generic classes at runtime`` () =
     let x = x :?> MyClass<int, string>
     x.Value1 |> equal 123
     x.Value2 |> equal "abc"
-#endif
 
 [<Fact>]
 let ``test IsSubclassOf works`` () =

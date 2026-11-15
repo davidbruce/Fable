@@ -1128,7 +1128,8 @@ let private hasManaged (fn: FnInfo) =
     isManaged fn.Ret || fn.Params |> List.exists (fun p -> isManaged p.Ty)
 
 /// The `[<StackArena>]` functions of the file being written.
-let mutable private currentArenas = Dictionary<string, int>()
+let private currentArenas =
+    new System.Threading.ThreadLocal<Dictionary<string, int> ref>(fun () -> ref (Dictionary<string, int>()))
 
 let emitFunction
     (out: StringBuilder)
@@ -1265,12 +1266,13 @@ let emitFunction
 
     // `[<StackArena(bytes)>]`: the function's cells come from a buffer on its stack
     let bodyText =
-        match currentArenas.TryGetValue fn.Name with
+        match currentArenas.Value.Value.TryGetValue fn.Name with
         | true, bytes ->
             $"    var fable_arena_buffer: [%d{bytes}]u8 align(16) = undefined;\n"
             + "    var fable_arena_fba = std.heap.FixedBufferAllocator.init(&fable_arena_buffer);\n"
-            + "    const fable_arena = fable_rt.arenaEnter(&fable_arena_fba);\n"
-            + "    defer fable_rt.arenaLeave(fable_arena);\n"
+            + "    var fable_arena: fable_rt.Arena = undefined;\n"
+            + "    fable_rt.arenaEnter(&fable_arena, &fable_arena_fba);\n"
+            + "    defer fable_rt.arenaLeave(&fable_arena);\n"
             + bodyText
         | _ -> bodyText
 
@@ -1619,7 +1621,7 @@ let hookDecls (e: Ent) (ind: string) : string =
 
 /// The text of one file, without its imports (their paths are only known to the writer).
 let emitFile (state: FileState) : string =
-    currentArenas <- state.Arenas
+    currentArenas.Value.Value <- state.Arenas
     let out = StringBuilder()
     let rootNames = HashSet<string>([ "result"; "hole"; "tail"; "env" ])
 

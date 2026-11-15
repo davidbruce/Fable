@@ -110,6 +110,17 @@ let kernelWork () : int =
 
     sum xs
 
+/// An arena inside an arena: the inner one's cells come from its own buffer, and the outer
+/// one's list stays alive in its buffer across the call.
+[<StackArena(2048)>]
+let innerArena (n: int) : int = sum (range 1 n)
+
+[<StackArena(4096)>]
+let outerArena () : int =
+    let xs = range 1 10
+    let inner = innerArena 20
+    inner + sum xs
+
 let run () : int =
     let before = liveCells ()
     let destroyed0 = Counters.resourceDestroys ()
@@ -159,10 +170,12 @@ let run () : int =
     let fan = fanOut { Page = 5 }
     let shared = fan.Tx.Page + fan.Log.Page
     let arena = kernelWork ()
+    let nested = outerArena ()
 
     let failed =
         check (a = 11 && b = 11 && t = 33 && shared = 10)
         + check (arena = 32034080)
+        + check (nested = 210 + 55)
         + (if counting () then
                // three buffers destroyed once each; the page was copied once, and each of its
                // two copies is destroyed once
