@@ -59,6 +59,14 @@ let call
 
         bindArgs ctx [ text ] (fun xs -> EEmit($"fable_rt.io.consoleWrite($0, %s{err}, %s{nl})", xs, tVoid))
 
+    // (a runtime function that fails only when the string `s` is null: no failure where `s` is
+    // known not to be null)
+    let ofString (s: Fable.Expr) (template: string) (xs: Fable.Expr list) (ty: Ty) =
+        if neverNullIn ctx s then
+            pure' $"(%s{template} catch unreachable)" xs ty
+        else
+            rt template xs ty
+
     match entity, name, args with
     // ---- the console ----
     | "System.Console", ("Write" | "WriteLine"), _ -> console false (name = "WriteLine") args
@@ -713,7 +721,7 @@ let call
             pure' "(fable_rt.compare($0, $1) == 0)" [ a; b ] tBool
         else
             pure' "fable_rt.compare($0, $1)" [ a; b ] tI32
-    | "System.String", "get_Length", [ s ] when neverNull s -> pure' "fable_rt.strLength($0)" [ s ] tI32
+    | "System.String", "get_Length", [ s ] when neverNullIn ctx s -> pure' "fable_rt.strLength($0)" [ s ] tI32
     | "System.String", "get_Length", [ s ] -> rt "fable_rt.strLen($0)" [ s ] tI32
     | "Microsoft.FSharp.Core.StringModule", "Length", [ s ] -> pure' "fable_rt.strLength($0)" [ s ] tI32
     | "System.String", "get_Chars", [ s; i ]
@@ -774,19 +782,19 @@ let call
     | "System.String", "EndsWith", [ s; x ] when unwrapNullness x.Type = Fable.String ->
         rt "fable_rt.strEndsWith($0, $1)" [ s; x ] tBool
     // (there is no current culture here: `ToUpper` is `ToUpperInvariant`)
-    | "System.String", ("ToUpper" | "ToUpperInvariant"), [ s ] -> rt "fable_rt.strCase($0, true)" [ s ] tStr
-    | "System.String", ("ToLower" | "ToLowerInvariant"), [ s ] -> rt "fable_rt.strCase($0, false)" [ s ] tStr
-    | "System.String", "Trim", [ s ] -> rt "fable_rt.strTrim($0, true, true, null)" [ s ] tStr
-    | "System.String", "TrimStart", [ s ] -> rt "fable_rt.strTrim($0, true, false, null)" [ s ] tStr
-    | "System.String", "TrimEnd", [ s ] -> rt "fable_rt.strTrim($0, false, true, null)" [ s ] tStr
+    | "System.String", ("ToUpper" | "ToUpperInvariant"), [ s ] -> ofString s "fable_rt.strCase($0, true)" [ s ] tStr
+    | "System.String", ("ToLower" | "ToLowerInvariant"), [ s ] -> ofString s "fable_rt.strCase($0, false)" [ s ] tStr
+    | "System.String", "Trim", [ s ] -> ofString s "fable_rt.strTrim($0, true, true, null)" [ s ] tStr
+    | "System.String", "TrimStart", [ s ] -> ofString s "fable_rt.strTrim($0, true, false, null)" [ s ] tStr
+    | "System.String", "TrimEnd", [ s ] -> ofString s "fable_rt.strTrim($0, false, true, null)" [ s ] tStr
     | "System.String", "Trim", [ s; c ] when c.Type = Fable.Char ->
-        rt "fable_rt.strTrim($0, true, true, $1)" [ s; c ] tStr
+        ofString s "fable_rt.strTrim($0, true, true, $1)" [ s; c ] tStr
     | "System.String", "TrimStart", [ s; c ] when c.Type = Fable.Char ->
-        rt "fable_rt.strTrim($0, true, false, $1)" [ s; c ] tStr
+        ofString s "fable_rt.strTrim($0, true, false, $1)" [ s; c ] tStr
     | "System.String", "TrimEnd", [ s; c ] when c.Type = Fable.Char ->
-        rt "fable_rt.strTrim($0, false, true, $1)" [ s; c ] tStr
+        ofString s "fable_rt.strTrim($0, false, true, $1)" [ s; c ] tStr
     | "System.String", "Replace", [ s; a; b ] when a.Type = Fable.Char && b.Type = Fable.Char ->
-        rt "fable_rt.strReplaceChar($0, $1, $2)" [ s; a; b ] tStr
+        ofString s "fable_rt.strReplaceChar($0, $1, $2)" [ s; a; b ] tStr
     | "System.String", "Replace", [ s; a; b ] when
         unwrapNullness a.Type = Fable.String && unwrapNullness b.Type = Fable.String
         ->
@@ -954,7 +962,7 @@ let call
 
         match x.Type with
         // (the text of a null string is the empty string)
-        | Fable.String when neverNull x -> lw ctx x
+        | Fable.String when neverNullIn ctx x -> lw ctx x
         | Fable.String -> pure' "fable_rt.strConcat($0, null)" [ x ] tStr
         // (a record or a union is written by its `ToString`, which is `%A`)
         | Fable.AnonymousRecordType _ -> shapeCall "fable_rt.anyText" "fable_rt.anyTextShape" true

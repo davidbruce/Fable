@@ -3881,7 +3881,37 @@ let rec neverNull (e: Fable.Expr) : bool =
         imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.StringModule"
         || (imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
             && (imp.Selector = "op_Addition" || imp.Selector = "ToString"))
+        // (.NET's string methods that give a string never give null)
+        || (imp.Path = Replacements.DotnetPrefix + "System.String"
+            && (
+                match imp.Selector with
+                | "Substring"
+                | "Trim"
+                | "TrimStart"
+                | "TrimEnd"
+                | "Replace"
+                | "ToUpper"
+                | "ToLower"
+                | "ToUpperInvariant"
+                | "ToLowerInvariant"
+                | "PadLeft"
+                | "PadRight"
+                | "Insert"
+                | "Remove"
+                | "Concat"
+                | "Format"
+                | "Join"
+                | "ToString" -> true
+                | _ -> false
+            ))
+    | Fable.Value(Fable.StringTemplate _, _) -> true
     | _ -> false
+
+/// `neverNull`, or a variable bound to such a string and never assigned (`Ctx.NonNull`)
+let neverNullIn (ctx: Ctx) (e: Fable.Expr) : bool =
+    match e with
+    | Fable.IdentExpr i -> ctx.NonNull.Contains i.Name
+    | _ -> neverNull e
 
 /// Has this type a default value here (what .NET's is: zero, false, null of a string, None)?
 let rec hasDefault (ctx: Ctx) (t: Fable.Type) : bool =
@@ -5695,7 +5725,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         lw ctx body
     | Fable.Let(id, value, body) ->
         // (a variable bound to an object made there, and never assigned: not null)
-        if not id.IsMutable && isMadeObject value then
+        if
+            not id.IsMutable
+            && (isMadeObject value || (id.Type = Fable.String && neverNullIn ctx value))
+        then
             ctx.NonNull.Add id.Name |> ignore
         else
             ctx.NonNull.Remove id.Name |> ignore
