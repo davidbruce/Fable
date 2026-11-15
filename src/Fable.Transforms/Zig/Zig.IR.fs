@@ -331,6 +331,9 @@ type Expr =
     /// a call of a function of the file (or `alias.name`), with its type arguments
     | ECall of string * Ty list * Expr list * Ty
     | ECallClo of Expr * Expr list * Ty
+    /// Virtual method call through a class vtable: `fn` (borrowed), `self` (borrowed `Obj`),
+    /// `args` (owned), result type.
+    | ECallVt of Expr * Expr * Expr list * Ty
     /// a function value: the function of the file (or `alias.name`) it calls with its type
     /// arguments, the values it captures (they are that function's first parameters), and its
     /// type
@@ -432,6 +435,7 @@ let rec typeOf (e: Expr) : Ty =
     | EPrim(_, _, t)
     | ECall(_, _, _, t)
     | ECallClo(_, _, t)
+    | ECallVt(_, _, _, t)
     | EClosure(_, _, _, t)
     | ECon(t, _, _, _)
     | EGet(_, _, t)
@@ -500,6 +504,7 @@ let flatKids (e: Expr) : Expr list =
     | EExnNew(_, xs)
     | ECon(_, _, xs, _) -> xs
     | ECallClo(f, xs, _) -> f :: xs
+    | ECallVt(f, s, xs, _) -> f :: s :: xs
     | EExnTest(x, _)
     | EExnGet(x, _, _, _)
     | EOnRaise(x, _)
@@ -526,6 +531,7 @@ let withFlatKids (e: Expr) (xs: Expr list) : Expr =
     | EOnRaise(_, ds), [ x ] -> EOnRaise(x, ds)
     | ERaise(_, t), [ x ] -> ERaise(x, t)
     | ECallClo(_, _, t), f :: rest -> ECallClo(f, rest, t)
+    | ECallVt(_, _, _, t), f :: s :: rest -> ECallVt(f, s, rest, t)
     | EGet(_, p, t), [ x ] -> EGet(x, p, t)
     | ETest(_, c, t), [ x ] -> ETest(x, c, t)
     | EAddr(_, c), [ x ] -> EAddr(x, c)

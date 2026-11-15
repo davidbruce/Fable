@@ -2989,7 +2989,6 @@ pub fn boxType(comptime T: type) *const ObjType {
             return reflect.typeOf(T);
         }
         pub fn boxText(_: ?*Env, o: Obj, _: void) Raised!String {
-            defer drop(o);
             const x = boxed(T, o).value;
             if (comptime hookOf(T, "fable_to_string")) return hookType(T).fable_to_string.call(.{x});
             // (a char: the character; UInt16 is c_ushort here)
@@ -3096,6 +3095,11 @@ pub fn anyIsClass(o: Any, ty: *const ObjType) bool {
 pub inline fn objNonNull(o: Any) Raised!Obj {
     const p = o orelse return nullRef();
     return dup(p);
+}
+
+/// Raise NullReferenceException when an optional object or interface is null, without retaining.
+pub inline fn checkNonNull(x: anytype) Raised!void {
+    if (x == null) return nullRef();
 }
 
 /// `o :?> C` of a class: null stays null
@@ -3445,7 +3449,7 @@ pub inline fn objPart(comptime P: type, comptime parts: []const type, o: Obj) P 
 
 /// `string o`: its class's `ToString`, or .NET's name of its class.
 pub fn objText(o: Obj) Raised!String {
-    if (o.type.to_string) |f| return f(null, dup(o), {});
+    if (o.type.to_string) |f| return f(null, o, {});
     var b: TextBuilder = .{};
     b.addAscii(o.type.name);
     return b.finish();
@@ -6418,7 +6422,7 @@ pub const Shower = struct {
 
 pub fn writeObj(out: *TextBuilder, o: Obj) void {
     if (o.type.to_string) |f| {
-        const t = f(null, dup(o), {}) catch return out.addAscii(o.type.name);
+        const t = f(null, o, {}) catch return out.addAscii(o.type.name);
         defer drop(t);
         return out.add(unitsOf(t));
     }

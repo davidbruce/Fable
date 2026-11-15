@@ -347,6 +347,7 @@ let private joinRaises (a: Raises) (b: Raises) : Raises =
 let private callRaises (p: P) (e: Expr) : Raises =
     match e with
     | ECallClo _
+    | ECallVt _
     | ERt _ -> RAlways
     | ECall(f, tyArgs, _, _) ->
         match p.Fns.TryGetValue f with
@@ -369,7 +370,8 @@ let rec private raisesOf (p: P) (e: Expr) : Raises =
     | ETry(_, _, h, _) -> raisesOf p h
     | ECall _
     | ERt _
-    | ECallClo _ -> joinRaises (callRaises p e) (many (flatKids e))
+    | ECallClo _
+    | ECallVt _ -> joinRaises (callRaises p e) (many (flatKids e))
     | ELet(_, r, b)
     | ESeq(r, b)
     | EWhile(r, b)
@@ -601,7 +603,8 @@ let rec private mayStore (p: P) (e: Expr) : bool =
          | true, g -> g.Stores
          | _ -> true)
         || any xs
-    | ECallClo _ -> true
+    | ECallClo _
+    | ECallVt _ -> true
     | ELet(_, r, b)
     | ESeq(r, b)
     | EWhile(r, b) -> any [ r; b ]
@@ -665,6 +668,10 @@ let rec private owningUses (p: P) (tail: bool) (e: Expr) : Set<int> =
             | ECall(f, _, xs, _) -> List.iter2 (fun m x -> go (m = MOwned) x) (modesOf p f xs) xs
             | ECallClo(f, xs, _) ->
                 go false f
+                List.iter (go true) xs
+            | ECallVt(f, s, xs, _) ->
+                go false f
+                go false s
                 List.iter (go true) xs
             | EClosure(_, _, xs, _)
             | EExnNew(_, xs)
@@ -1169,13 +1176,16 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
             | None -> e
         | _ -> e
 
-    let rec rw (owning: bool) (e: Expr) : Expr =
+    let rec rw (callBorrowed: Set<int>) (owning: bool) (e: Expr) : Expr =
         match e with
         | EVar v ->
             idx <- idx + 1
 
             if owning && isManaged v.Ty then
-                let usedLater = (laterAfter idx).Contains v.Id || lAfterX.Contains v.Id
+                let usedLater =
+                    (laterAfter idx).Contains v.Id
+                    || lAfterX.Contains v.Id
+                    || callBorrowed.Contains v.Id
 
                 if env.Owned.Contains v.Id && not usedLater && not (consumed.Contains v.Id) then
                     consumed.Add v.Id |> ignore
@@ -1191,13 +1201,33 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
                 match e with
                 | ECall(f, _, xs, _) -> modesOf p f xs |> List.map (fun m -> m = MOwned)
                 | ECallClo(_, xs, _) -> false :: (xs |> List.map (fun _ -> true))
+                | ECallVt(_, _, xs, _) -> false :: false :: (xs |> List.map (fun _ -> true))
                 | EEmit(m, _ :: rest, _) when ownsFirst m -> true :: (rest |> List.map (fun _ -> false))
                 | EClosure(_, _, xs, _)
                 | EExnNew(_, xs)
                 | ECon(_, _, xs, _) -> xs |> List.map (fun _ -> true)
                 | _ -> kids |> List.map (fun _ -> false)
 
-            let e' = withFlatKids e (List.map2 rw flags kids)
+            // Borrowed arguments of a call must stay alive for the duration of the call, so an
+            // owned argument of the same call must not move them away (e.g. `c.Method(c)`).
+            let borrowedKids =
+                match e with
+                | ECall _
+                | ECallClo _
+                | ECallVt _ ->
+                    List.zip flags kids
+                    |> List.fold
+                        (fun s (own, k) ->
+                            if own then
+                                s
+                            else
+                                Set.union s (expand env (fv k))
+                        )
+                        Set.empty
+                | _ -> Set.empty
+
+            let innerBorrowed = Set.union callBorrowed borrowedKids
+            let e' = withFlatKids e (List.map2 (rw innerBorrowed) flags kids)
 
             match e' with
             | EGet _
@@ -1208,7 +1238,7 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
             | ECon _ -> takeToken e'
             | _ -> e'
 
-    let e' = rw rootOwning e
+    let e' = rw Set.empty rootOwning e
     e', Set.ofSeq consumed, { env with Tokens = tokens }
 
 /// What a test tells about the value it tests. (Nothing is remembered about a variable that
@@ -1248,7 +1278,8 @@ let private wrapRaising (p: P) (env: PEnv) (e: Expr) (stillOwned: Set<int>) : Ex
     match e with
     | ECall _
     | ERt _
-    | ECallClo _ when callRaises p e <> RNever -> EOnRaise(e, raiseEdgeDrops p env stillOwned)
+    | ECallClo _
+    | ECallVt _ when callRaises p e <> RNever -> EOnRaise(e, raiseEdgeDrops p env stillOwned)
     | EDup((ECall _ as call), t) when callRaises p call <> RNever ->
         EDup(EOnRaise(call, raiseEdgeDrops p env stillOwned), t)
     | _ -> e

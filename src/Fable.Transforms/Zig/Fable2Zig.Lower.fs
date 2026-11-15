@@ -1103,6 +1103,33 @@ let asObjOf (ctx: Ctx) (x: Fable.Expr) (ir: Expr) : Expr =
     | TOpt t when t = tObj && known -> EGet(ir, PSome, tObj)
     | _ -> asObj ir
 
+/// Check `ir` (the lowered receiver of `x`) for null when needed and project its `Obj` as a
+/// borrow without `dup`/`drop`. Binds non-variable optionals first so literal `null` never
+/// produces comptime `(@as(?Obj, null)).?` in Zig.
+let withBorrowedObj (ctx: Ctx) (x: Fable.Expr) (ir: Expr) (k: Expr -> Expr) : Expr =
+    let known =
+        match x with
+        | Fable.IdentExpr i -> ctx.NonNull.Contains i.Name
+        | _ -> isMadeObject x
+
+    match typeOf ir with
+    | TOpt t when t = tObj ->
+        let step (vExpr: Expr) =
+            let proj = EGet(vExpr, PSome, tObj)
+
+            if known then
+                k proj
+            else
+                ctx.State.UsesRuntime <- true
+                ESeq(ERt("fable_rt.checkNonNull($0)", [ vExpr ], tVoid), k proj)
+
+        match ir with
+        | EVar _ -> step ir
+        | _ ->
+            let v = ctx.State.NewVar("obj", typeOf ir, VLocal, false)
+            ELet(v, ir, step (EVar v))
+    | _ -> k ir
+
 /// The names that `e` reads. (Not those read only by a binding of a read that is itself never
 /// read: such bindings are left out.) One walk of `e`.
 let rec namesRead (e: Fable.Expr) : Set<string> =
@@ -2445,6 +2472,7 @@ let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr
                 match ir with
                 | ECall _
                 | ECallClo _
+                | ECallVt _
                 | EClosure _
                 | ERt _
                 | EEmit _ -> true
@@ -4817,21 +4845,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             ctx
             (lw ctx x :: args)
             (fun given ->
-                // (the object: checked for null)
-                bindArgs
+                // (the object: checked for null and borrowed)
+                withBorrowedObj
                     ctx
-                    [ asObjOf ctx x given.Head ]
+                    x
+                    given.Head
                     (fun o ->
-                        let xs = o.Head :: given.Tail
-
                         let fn =
-                            EGet(
-                                EEmit($"fable_rt.objVt($R, $0, %d{level.Depth})", [ xs.Head ], table),
-                                PField slot,
-                                slotTy
-                            )
+                            EGet(EEmit($"fable_rt.objVt($R, $0, %d{level.Depth})", [ o ], table), PField slot, slotTy)
 
-                        ECallClo(fn, xs, mapType ctx r t)
+                        ECallVt(fn, o, given.Tail, mapType ctx r t)
                     )
             )
     // an abstract property read: its getter, through the table
@@ -4859,24 +4882,21 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             ctx
             [ lw ctx x ]
             (fun given ->
-                // (the object: checked for null)
-                bindArgs
+                // (the object: checked for null and borrowed)
+                withBorrowedObj
                     ctx
-                    [ asObjOf ctx x given.Head ]
-                    (fun xs ->
+                    x
+                    given.Head
+                    (fun o ->
                         let fn =
-                            EGet(
-                                EEmit($"fable_rt.objVt($R, $0, %d{level.Depth})", [ xs.Head ], table),
-                                PField slot,
-                                slotTy
-                            )
+                            EGet(EEmit($"fable_rt.objVt($R, $0, %d{level.Depth})", [ o ], table), PField slot, slotTy)
 
                         let retTy =
                             match slotTy with
                             | TFn(_, ret) -> ret
                             | _ -> mapType ctx r t
 
-                        ECallClo(fn, [ xs.Head; EUnit ], retTy)
+                        ECallVt(fn, o, [ EUnit ], retTy)
                     )
             )
     // a field of an object: in the part of the chain of the class that declares it
@@ -4896,13 +4916,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             ctx
             [ lw ctx x ]
             (fun given ->
-                // (the object: checked for null)
-                bindArgs
+                // (the object: checked for null and borrowed)
+                withBorrowedObj
                     ctx
-                    (List.map (asObjOf ctx x) given)
-                    (fun xs ->
+                    x
+                    given.Head
+                    (fun o ->
                         EGet(
-                            EEmit($"fable_rt.objPart($R, &[_]type{{ %s{parts} }}, $0)", xs, TPtr(part, false)),
+                            EEmit($"fable_rt.objPart($R, &[_]type{{ %s{parts} }}, $0)", [ o ], TPtr(part, false)),
                             PField field.Name,
                             fty
                         )
@@ -4926,17 +4947,26 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             ctx
             [ lw ctx x; lw ctx value ]
             (fun given ->
-                // (the object: checked for null)
-                bindArgs
+                // (the object: checked for null and borrowed)
+                withBorrowedObj
                     ctx
-                    [ asObjOf ctx x given[0] ]
+                    x
+                    given[0]
                     (fun o ->
                         let place =
                             if ctx.InCtor then
-                                EGet(EEmit($"objInit:%d{fieldIdx}:%s{parts}", o, TPtr(part, false)), PField name, fty)
+                                EGet(
+                                    EEmit($"objInit:%d{fieldIdx}:%s{parts}", [ o ], TPtr(part, false)),
+                                    PField name,
+                                    fty
+                                )
                             else
                                 EGet(
-                                    EEmit($"fable_rt.objPart($R, &[_]type{{ %s{parts} }}, $0)", o, TPtr(part, false)),
+                                    EEmit(
+                                        $"fable_rt.objPart($R, &[_]type{{ %s{parts} }}, $0)",
+                                        [ o ],
+                                        TPtr(part, false)
+                                    ),
                                     PField name,
                                     fty
                                 )
@@ -6431,13 +6461,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 ctx
                 (lw ctx inner :: args)
                 (fun xs ->
-                    // (the object: checked for null)
-                    bindArgs
+                    // (the object: checked for null and borrowed)
+                    withBorrowedObj
                         ctx
-                        [ asObjOf ctx inner xs.Head ]
-                        (fun this ->
-                            ECall(target, genArgs |> List.map (mapTypeArg ctx r), this @ xs.Tail, mapType ctx r t)
-                        )
+                        inner
+                        xs.Head
+                        (fun o -> ECall(target, genArgs |> List.map (mapTypeArg ctx r), o :: xs.Tail, mapType ctx r t))
                 )
         | _ -> fail r "internal: not a declared type"
 

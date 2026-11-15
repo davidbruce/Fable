@@ -34,6 +34,8 @@ type Adapter =
         /// the types of the captured values (needed for a function of another file)
         CaptureTys: Ty list
         FnTy: Ty
+        /// when true, `a0` is borrowed by the caller (used for class vtable and `ToString` adapters)
+        BorrowFirst: bool
         /// the type parameters of the surrounding function that the types above mention: the
         /// adapter is generic in them
         Gens: string list
@@ -322,6 +324,13 @@ let rec ex (em: Em) (e: Expr) : string =
         let fn = ex em f
         let args = $"%s{fn}.env" :: (xs |> List.map (ex em)) |> String.concat ", "
         $"%s{fn}.code(%s{args})"
+    | ECallVt(f, s, xs, _) ->
+        let fn = ex em f
+
+        let args =
+            $"%s{fn}.env" :: ex em s :: (xs |> List.map (ex em)) |> String.concat ", "
+
+        $"%s{fn}.code(%s{args})"
     | EClosure(target, typeArgs, caps, ty) ->
         let key = target + "<" + (typeArgs |> List.map tyKey |> String.concat ",") + ">"
 
@@ -337,6 +346,7 @@ let rec ex (em: Em) (e: Expr) : string =
                         NCaptures = caps.Length
                         CaptureTys = caps |> List.map typeOf
                         FnTy = ty
+                        BorrowFirst = false
                         Gens = freeGens (ty :: typeArgs @ (caps |> List.map typeOf))
                     }
 
@@ -383,6 +393,7 @@ let rec ex (em: Em) (e: Expr) : string =
         let definite =
             match call with
             | ECallClo _
+            | ECallVt _
             | ERt _ -> true
             | ECall(f, _, _, _) ->
                 match em.Fns.TryGetValue f with
@@ -1514,10 +1525,27 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
                     $"c.c%d{i}"
             )
 
-        let args = capturedArgs @ (ps |> List.map fst) |> String.concat ", "
+        let callPs =
+            match ps, rest with
+            | (n0, _) :: psTail, (_, m0) :: _ when a.BorrowFirst ->
+                let a0 =
+                    if m0 = MOwned then
+                        dupCode n0
+                    else
+                        n0
+
+                a0 :: (psTail |> List.map fst)
+            | _ -> ps |> List.map fst
+
+        let args = capturedArgs @ callPs |> String.concat ", "
+
+        let dropPairs =
+            match List.zip ps rest with
+            | _ :: tail when a.BorrowFirst -> tail
+            | all -> all
 
         let dropAfter =
-            List.zip ps rest
+            dropPairs
             |> List.choose (fun ((n, _), (_, m)) ->
                 if m = MBorrowed then
                     Some n
@@ -1555,7 +1583,7 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
             || argTys |> List.exists isManaged
             || a.CaptureTys |> List.exists isManaged
         then
-            // (the environment keeps what it captured; the arguments are given)
+            // (the environment keeps what it captured; the arguments are given unless BorrowFirst borrows a0)
             let uses =
                 (a.CaptureTys
                  |> List.map (fun t ->
@@ -1565,9 +1593,12 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
                          ".plain"
                  ))
                 @ (argTys
-                   |> List.map (fun t ->
+                   |> List.mapi (fun i t ->
                        if isManaged t then
-                           ".give"
+                           if a.BorrowFirst && i = 0 then
+                               ".keep"
+                           else
+                               ".give"
                        else
                            ".plain"
                    ))
@@ -1921,7 +1952,7 @@ let emitFile (state: FileState) : string =
                         $"%s{indent}    const f = fable_rt.dup(fable_rt.objPart(%s{zigType partPtr}, &[_]type{{ %s{parts} }}, this).%s{fieldIdent field});"
                     )
                     .AppendLine($"%s{indent}    defer fable_rt.drop(f);")
-                    .AppendLine($"%s{indent}    return f.code(f.env, this%s{xs});")
+                    .AppendLine($"%s{indent}    return f.code(f.env, fable_rt.dup(this)%s{xs});")
                     .AppendLine($"%s{indent}}}")
                 |> ignore
             | _ -> ()
@@ -1935,7 +1966,7 @@ let emitFile (state: FileState) : string =
         let decls = System.Collections.Generic.List<string>()
 
         // (a function as the code of a function value: an adapter, generic in the class's type
-        // parameters when the class is)
+        // parameters when the class is; class vtable / ToString adapters borrow `this`)
         let adapterFor (target: string) (typeArgs: Ty list) (fnTy: Ty) =
             let key =
                 target
@@ -1946,6 +1977,7 @@ let emitFile (state: FileState) : string =
                        "/" + String.concat "," d.TypeParams
                    else
                        "")
+                + "#vt"
 
             match adapters.TryGetValue key with
             | true, a -> a
@@ -1958,6 +1990,7 @@ let emitFile (state: FileState) : string =
                         NCaptures = 0
                         CaptureTys = []
                         FnTy = fnTy
+                        BorrowFirst = true
                         Gens = d.TypeParams
                     }
 
