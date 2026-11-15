@@ -260,3 +260,29 @@ let ``test Async.Parallel runs its computations at once`` () =
 
     results |> equal [| 1; 4; 9; 16 |]
     (sw.ElapsedMilliseconds < 600L) |> equal true
+
+[<Fact>]
+let ``test A shared array item read while another thread stores into it stays alive`` () =
+    // (no lock: a reader may see the old list or the new one, never one that was freed)
+    let slots: int list[] = [| [ 1; 2; 3 ] |]
+    let mutable seen = 0
+
+    let writer =
+        Thread(fun () ->
+            for i in 1..20_000 do
+                slots.[0] <- [ i; i; i ]
+        )
+
+    let reader =
+        Thread(fun () ->
+            for _ in 1..20_000 do
+                let xs = slots.[0]
+                seen <- seen + (if List.length xs = 3 then 1 else 0)
+        )
+
+    writer.Start()
+    reader.Start()
+    writer.Join()
+    reader.Join()
+    seen |> equal 20_000
+    slots.[0] |> equal [ 20_000; 20_000; 20_000 ]

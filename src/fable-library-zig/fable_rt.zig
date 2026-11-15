@@ -445,6 +445,10 @@ fn markCell(c: anytype) Raised!bool {
     if (isShared(c)) return false;
     // (a cell the collector follows leaves it when it is shared, unless it is part of a
     // structure of cells already, where its count is the collector's business)
+    // (a cell the collector follows leaves it when it is shared, unless it is part of a
+    // structure of cells already, where its count is the collector's business. The collector
+    // does not look at shared cells: a cycle made through them afterwards is not freed, as
+    // Koka frees no cycles at all; see Zig_Roadmap.md)
     if (gcOf(c)) |h| {
         if (sgc.inStructure(h)) return notShareable("a value that is part of a structure of cells the cycle collector follows");
     }
@@ -1009,15 +1013,15 @@ pub inline fn storeIn(owner: anytype, comptime field: []const u8, value: @FieldT
 
 var field_locks: [64]u32 = @splat(0);
 
-inline fn fieldLock(owner: anytype) *u32 {
+pub inline fn fieldLock(owner: anytype) *u32 {
     return &field_locks[(@intFromPtr(owner) >> 4) % field_locks.len];
 }
 
-inline fn lockField(l: *u32) void {
+pub inline fn lockField(l: *u32) void {
     while (@cmpxchgWeak(u32, l, 0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
 }
 
-inline fn unlockField(l: *u32) void {
+pub inline fn unlockField(l: *u32) void {
     @atomicStore(u32, l, 0, .release);
 }
 
@@ -1464,6 +1468,7 @@ pub const arrayFrom = arrays.arrayFrom;
 pub const arrayNull = arrays.arrayNull;
 pub const arrayIsNull = arrays.arrayIsNull;
 pub const arrayGet = arrays.arrayGet;
+pub const arrayItemAt = arrays.arrayItemAt;
 pub const arrayInit = arrays.arrayInit;
 pub const arrayItems = arrays.arrayItems;
 pub const arrayIter = arrays.arrayIter;

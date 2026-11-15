@@ -253,7 +253,7 @@ let call
         match a, i with
         // (`for i in 0 .. a.Length - 1`: in range)
         | Fable.IdentExpr ai, Fable.IdentExpr ii when ctx.InBounds.Contains(ai.Name + "|" + ii.Name) ->
-            pure' "fable_rt.dup($0.items[@as(usize, @intCast($1))])" [ a; i ] (mapType ctx r itemTy)
+            pure' "fable_rt.arrayItemAt($0, @as(usize, @intCast($1)))" [ a; i ] (mapType ctx r itemTy)
         | _ -> rt "fable_rt.arrayGet($0, $1)" [ a; i ] (mapType ctx r itemTy)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "SetArray", [ a; i; x ]
     | "Microsoft.FSharp.Collections.ArrayModule", "Set", [ a; i; x ] ->

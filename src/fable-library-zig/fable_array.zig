@@ -240,7 +240,19 @@ pub fn indexOutsideOf(a: anytype) Raised {
 /// `a.[i]`: a reference of its own to the item.
 pub inline fn arrayGet(a: anytype, i: i32) Raised!ItemOf(@TypeOf(a)) {
     if (i < 0 or i >= a.items.len) return indexOutsideOf(a);
-    return dup(a.items[@intCast(i)]);
+    return arrayItemAt(a, @intCast(i));
+}
+
+/// `a.[i]` where `i` is known to be inside, with its own reference: where the array is shared
+/// between threads, under its lock, as a store swaps an item in (Koka's protocol, see `loadIn`)
+pub inline fn arrayItemAt(a: anytype, i: usize) ItemOf(@TypeOf(a)) {
+    if (comptime !rt.isManaged(ItemOf(@TypeOf(a)))) return a.items[i];
+    if (!rt.isShared(a)) return dup(a.items[i]);
+    const l = rt.fieldLock(a);
+    rt.lockField(l);
+    const v = dup(a.items[i]);
+    rt.unlockField(l);
+    return v;
 }
 
 /// `a.[i] <- value`. The collector is told what the array no longer points at and what it
@@ -251,11 +263,21 @@ pub inline fn arraySet(a: anytype, i: i32, value: ItemOf(@TypeOf(a))) Raised!voi
 }
 
 pub fn arrayPut(a: anytype, i: usize, value: @typeInfo(@TypeOf(a.items)).pointer.child) void {
+    if (rt.isShared(a)) {
+        // (shared before another thread can read it, swapped in under the array's lock, the
+        // old item given up after)
+        rt.shareStored(value);
+        const l = rt.fieldLock(a);
+        rt.lockField(l);
+        const prev = a.items[i];
+        a.items[i] = value;
+        rt.unlockField(l);
+        drop(prev);
+        return;
+    }
     const old = a.items[i];
     a.items[i] = value;
-    if (rt.isShared(a)) {
-        rt.shareStored(value);
-    } else if (gcOf(a)) |h| {
+    if (gcOf(a)) |h| {
         eachHdr(old, h, unstored);
         storeValue(h, value);
     } else {
