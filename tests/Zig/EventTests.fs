@@ -226,7 +226,6 @@ let ``test Classes can trigger CLI events on interfaces`` () =
     equal 5 result
     equal (box classWithEvent) sender
 
-#if !FABLE_COMPILER_ZIG // (a [<CLIEvent>] member of an object expression is not supported by the Zig target yet)
 [<Fact>]
 let ``test Generic interface expression can have CLI events`` () = // See #3039
     let mutable actualSender = ""
@@ -244,7 +243,6 @@ let ``test Generic interface expression can have CLI events`` () = // See #3039
     event.Trigger(expectedSender, expectedResult)
     equal expectedSender actualSender
     equal expectedResult result
-#endif
 
 [<Fact>]
 let ``test Events are unsubscribed correctly`` () = // See #609

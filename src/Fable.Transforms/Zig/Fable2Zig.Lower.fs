@@ -6959,7 +6959,89 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
                         lw ctx (Fable.Delegate(args, m.Body, None, []))
                     | [] -> fail e.Range "internal: a member without its object"
-                | None -> fail e.Range "the Zig target cannot find the member %s in this object expression" f
+                // (a `[<CLIEvent>]` member: the object expression has its add_ and remove_; its
+                // getter is the event F# makes of them, `RuntimeHelpers.CreateEvent`)
+                | None when
+                    f.StartsWith("get_", System.StringComparison.Ordinal)
+                    && (pick ("add_" + f.Substring 4) fty).IsSome
+                    && (pick ("remove_" + f.Substring 4) fty).IsSome
+                    ->
+                    let name = f.Substring 4
+                    let addM = (pick ("add_" + name) fty).Value
+                    let removeM = (pick ("remove_" + name) fty).Value
+
+                    let handlerOf (m: Fable.ObjectExprMember) =
+                        match m.Args with
+                        | _ :: h :: _ -> Fable.Lambda(h, m.Body, None), h.Type
+                        | _ -> fail e.Range "internal: an event's add or remove without its handler"
+
+                    let addF, delTy = handlerOf addM
+                    let removeF, _ = handlerOf removeM
+
+                    let argTy =
+                        match delTy with
+                        | Fable.DelegateType([ _; a ], _) -> a
+                        | Fable.DeclaredType(_, [ _; a ]) -> a
+                        | _ -> Fable.Any
+
+                    let fId =
+                        AST.makeTypedIdent (Fable.LambdaType(Fable.Any, Fable.LambdaType(argTy, Fable.Unit))) "handler"
+
+                    let sId = AST.makeTypedIdent Fable.Any "sender"
+                    let aId = AST.makeTypedIdent argTy "args"
+
+                    let createF =
+                        Fable.Lambda(
+                            fId,
+                            Fable.Delegate(
+                                [ sId; aId ],
+                                Fable.CurriedApply(
+                                    Fable.IdentExpr fId,
+                                    [ Fable.IdentExpr sId; Fable.IdentExpr aId ],
+                                    Fable.Unit,
+                                    None
+                                ),
+                                None,
+                                []
+                            ),
+                            None
+                        )
+
+                    let eventTy =
+                        Fable.DeclaredType(
+                            {
+                                FullName = "Microsoft.FSharp.Control.IEvent`2"
+                                Path = Fable.CoreAssemblyName "FSharp.Core"
+                            },
+                            [ delTy; argTy ]
+                        )
+
+                    let create =
+                        Fable.Call(
+                            Fable.Import(
+                                {
+                                    Selector = "CreateEvent"
+                                    Path =
+                                        Replacements.DotnetPrefix
+                                        + "Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers"
+                                    Kind =
+                                        Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                                },
+                                Fable.Any,
+                                None
+                            ),
+                            Fable.CallInfo.Create(args = [ addF; removeF; createF ], genArgs = [ delTy; argTy ]),
+                            eventTy,
+                            e.Range
+                        )
+
+                    lw ctx (Fable.Delegate([ AST.makeTypedIdent Fable.Unit "unitVar" ], create, None, []))
+                | None ->
+                    fail
+                        e.Range
+                        "the Zig target cannot find the member %s in this object expression (it has %s)"
+                        f
+                        (candidates |> List.map fst |> String.concat ", ")
             )
 
         bindArgsIn
