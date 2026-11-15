@@ -59,6 +59,11 @@ pub const TypeInfo = struct {
 
 pub const Type = *const TypeInfo;
 
+var reflect_lock: u32 = 0;
+var class_types: std.AutoHashMapUnmanaged(*const rt.ObjType, Type) = .empty;
+var named_types: std.StringHashMapUnmanaged(Type) = .empty;
+var tuple_types: std.StringHashMapUnmanaged(Type) = .empty;
+
 /// `UnionCaseInfo`: the union and the case
 pub const UnionCase = struct {
     union_type: Type,
@@ -585,15 +590,21 @@ pub fn genericArguments(t: Type) rt.Array(Type) {
 /// A Type known only by its name (a quotation's types)
 pub fn typeNamed(name_: String) Type {
     var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(rt.allocator);
     var tmp: [4]u8 = undefined;
     for (rt.unitsOf(name_)) |u| {
         const n = std.unicode.utf8Encode(u, &tmp) catch 1;
         buf.appendSlice(rt.allocator, tmp[0..n]) catch @panic("fable: out of memory");
     }
-    const full = buf.toOwnedSlice(rt.allocator) catch @panic("fable: out of memory");
-    const info = rt.allocator.create(TypeInfo) catch @panic("fable: out of memory");
+    rt.lockField(&reflect_lock);
+    defer rt.unlockField(&reflect_lock);
+    if (named_types.get(buf.items)) |existing| return existing;
+    const bk = rt.bookkeeping();
+    const full = bk.dupe(u8, buf.items) catch @panic("fable: out of memory");
+    const info = bk.create(TypeInfo) catch @panic("fable: out of memory");
     const at = if (std.mem.lastIndexOfAny(u8, full, ".+")) |i| i + 1 else 0;
     info.* = .{ .full_name = full, .name = full[at..], .namespace = if (at > 0) full[0 .. at - 1] else "", .kind = .other };
+    named_types.put(bk, full, info) catch @panic("fable: out of memory");
     return info;
 }
 
@@ -801,9 +812,14 @@ pub fn isAssignableFrom(t: Type, s: Type) bool {
 pub fn typeOfObject(o: Any) Raised!Type {
     const p = o orelse return rt.raise(rt.NullReferenceException, rt.str("Object reference not set to an instance of an object."));
     if (p.type.reflect) |f| return f();
-    // (an object of a class: by its name)
-    const info = rt.allocator.create(TypeInfo) catch @panic("fable: out of memory");
+    // (an object of a class: by its name, interned per ObjType)
+    rt.lockField(&reflect_lock);
+    defer rt.unlockField(&reflect_lock);
+    if (class_types.get(p.type)) |existing| return existing;
+    const bk = rt.bookkeeping();
+    const info = bk.create(TypeInfo) catch @panic("fable: out of memory");
     info.* = .{ .full_name = p.type.name, .name = p.type.name[if (std.mem.lastIndexOfAny(u8, p.type.name, ".+")) |i| i + 1 else 0..], .namespace = "", .kind = .class };
+    class_types.put(bk, p.type, info) catch @panic("fable: out of memory");
     return info;
 }
 
@@ -895,20 +911,26 @@ pub fn functionElements(t: Type) Raised!struct { Type, Type } {
 
 /// `FSharpType.MakeTupleType(types)`: a tuple type of these (equal to `typeof` of it)
 pub fn makeTupleType(types: rt.Array(Type)) Type {
-    const elems = rt.allocator.dupe(Type, types.items) catch @panic("fable: out of memory");
     var names: std.ArrayList(u8) = .empty;
-    names.print(rt.allocator, "System.Tuple`{d}[", .{elems.len}) catch @panic("fable: out of memory");
-    for (elems, 0..) |e, i| {
+    defer names.deinit(rt.allocator);
+    names.print(rt.allocator, "System.Tuple`{d}[", .{types.items.len}) catch @panic("fable: out of memory");
+    for (types.items, 0..) |e, i| {
         if (i > 0) names.append(rt.allocator, ',') catch @panic("fable: out of memory");
         names.appendSlice(rt.allocator, e.full_name) catch @panic("fable: out of memory");
     }
     names.append(rt.allocator, ']') catch @panic("fable: out of memory");
+    rt.lockField(&reflect_lock);
+    defer rt.unlockField(&reflect_lock);
+    if (tuple_types.get(names.items)) |existing| return existing;
+    const bk = rt.bookkeeping();
+    const elems = bk.dupe(Type, types.items) catch @panic("fable: out of memory");
     const base_len = std.fmt.count("System.Tuple`{d}", .{elems.len});
-    const full = names.toOwnedSlice(rt.allocator) catch @panic("fable: out of memory");
-    const info = rt.allocator.create(TypeInfo) catch @panic("fable: out of memory");
+    const full = bk.dupe(u8, names.items) catch @panic("fable: out of memory");
+    const info = bk.create(TypeInfo) catch @panic("fable: out of memory");
     info.* = .{ .full_name = full, .name = full["System.".len..base_len], .namespace = "System", .kind = .tuple, .args = elems };
     // (what a tuple of these is made of: the one `typeof` gives, when the program has it)
     info.make = null;
+    tuple_types.put(bk, full, info) catch @panic("fable: out of memory");
     return info;
 }
 

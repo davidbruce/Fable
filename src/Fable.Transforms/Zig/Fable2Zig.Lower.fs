@@ -2149,6 +2149,9 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                     "queue", TEnt(netEnt ctx.State "ResizeArray", [ TGen "T" ])
                     "waiting", TOpt(TFn([ TGen "T" ], tVoid))
                     "started", tBool
+                    "begun", tBool
+                    "running", tBool
+                    "turnToken", tI32
                 ]
             | "TaskCode_1" -> [ "code", TFn([ tVoid ], TGen "T") ]
             | "StackOf_1" -> [ "items", TEnt(netEnt ctx.State "ResizeArray", [ TGen "T" ]) ]
@@ -2198,7 +2201,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "Timer" -> [ "live" ]
             | "StopwatchOf" -> [ "elapsed"; "startedAt"; "running" ]
             | "TaskOf_1" -> [ "fable_task"; "fable_thread" ]
-            | "MailboxOf_1" -> [ "waiting"; "started" ]
+            | "MailboxOf_1" -> [ "waiting"; "started"; "begun"; "running"; "turnToken" ]
             | _ -> []
 
         let e =

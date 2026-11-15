@@ -321,6 +321,175 @@ let ``test A lazy value forced on several threads is made once`` () =
     results |> equal [| 42; 42; 42; 42 |]
     runs.Value |> equal 1
 
+[<Fact>]
+let ``test Per-object lock does not collide across unrelated objects`` () =
+    let objs = [| for _ in 1..130 -> obj () |]
+    let t1Ready = ref 0
+    let t2Ready = ref 0
+
+    let rec holdRange (i: int) (last: int) (onAllHeld: unit -> unit) =
+        lock objs.[i] (fun () ->
+            if i < last then
+                holdRange (i + 1) last onAllHeld
+            else
+                onAllHeld ()
+        )
+
+    let t1 =
+        Thread(fun () ->
+            holdRange 0 64 (fun () ->
+                Interlocked.Exchange(&t1Ready.contents, 1) |> ignore
+
+                while Interlocked.CompareExchange(&t2Ready.contents, 0, 0) = 0 do
+                    Thread.Sleep 1
+            )
+        )
+
+    let t2 =
+        Thread(fun () ->
+            while Interlocked.CompareExchange(&t1Ready.contents, 0, 0) = 0 do
+                Thread.Sleep 1
+
+            holdRange 65 129 (fun () -> Interlocked.Exchange(&t2Ready.contents, 1) |> ignore)
+        )
+
+    t1.Start()
+    t2.Start()
+    t1.Join()
+    t2.Join()
+    t1Ready.Value |> equal 1
+    t2Ready.Value |> equal 1
+
+#if FABLE_COMPILER_ZIG // (.NET's ResizeArray, Dictionary, and HashSet are unsynchronized; Zig locks shared cells so buffer growth cannot free under a reader)
+[<Fact>]
+let ``test Shared ResizeArray, Dictionary, and HashSet serialize concurrent reads and writes`` () =
+    let ra = ResizeArray<string>()
+    let dict = System.Collections.Generic.Dictionary<int, string>()
+    let set = System.Collections.Generic.HashSet<int>()
+
+    let threads =
+        [
+            for k in 0..3 ->
+                Thread(fun () ->
+                    let baseIdx = k * 250
+
+                    for i in 0..249 do
+                        let key = baseIdx + i
+                        let label = string key
+                        ra.Add label
+                        dict.[key] <- label
+                        set.Add key |> ignore
+
+                    for i in 0..49 do
+                        let key = baseIdx + i
+                        dict.[key] <- "u" + string key
+                        set.Contains key |> ignore
+                )
+        ]
+
+    for t in threads do
+        t.Start()
+
+    for t in threads do
+        t.Join()
+
+    ra.Count |> equal 1000
+    dict.Count |> equal 1000
+    set.Count |> equal 1000
+    dict.[255] |> equal "u255"
+    dict.Remove 255 |> equal true
+    set.Remove 255 |> equal true
+    ra.Remove "255" |> equal true
+    ra.Clear()
+    dict.Clear()
+    set.Clear()
+#endif
+
+[<Fact>]
+let ``test Concurrent Path.GetRandomFileName and reflection lookups are thread-safe`` () =
+    let ok = ref 0
+    let expectedTuple = typeof<int * string>
+
+    let threads =
+        [
+            for _ in 0..3 ->
+                Thread(fun () ->
+                    let mutable allGood = true
+
+                    for _ in 1..50 do
+                        let name = System.IO.Path.GetRandomFileName()
+                        let o = obj ()
+                        let ot = o.GetType()
+                        let tt =
+                            Microsoft.FSharp.Reflection.FSharpType.MakeTupleType [| typeof<int>; typeof<string> |]
+
+                        if System.String.IsNullOrEmpty name || System.String.IsNullOrEmpty ot.FullName || tt.FullName <> expectedTuple.FullName then
+                            allGood <- false
+
+                    if allGood then
+                        Interlocked.Increment(&ok.contents) |> ignore
+                )
+        ]
+
+    for t in threads do
+        t.Start()
+
+    for t in threads do
+        t.Join()
+
+    ok.Value |> equal 4
+
+type private ThreadMailboxMsg =
+    | Add of int
+    | Get of AsyncReplyChannel<int>
+    | GetAndStop of AsyncReplyChannel<int>
+
+[<Fact>]
+let ``test MailboxProcessor Post and PostAndReply work across multiple OS threads`` () =
+    let mb =
+        MailboxProcessor.Start(fun inbox ->
+            let rec loop total =
+                async {
+                    let! msg = inbox.Receive()
+
+                    match msg with
+                    | Add n -> return! loop (total + n)
+                    | Get ch ->
+                        ch.Reply total
+                        return! loop total
+                    | GetAndStop ch ->
+                        ch.Reply total
+                        return ()
+                }
+
+            loop 0
+        )
+
+    let workerReads: int[] = Array.zeroCreate 4
+
+    let threads =
+        [
+            for k in 0..3 ->
+                Thread(fun () ->
+                    for _ in 1..75 do
+                        mb.Post(Add 1)
+
+                    workerReads.[k] <- mb.PostAndReply(fun ch -> Get ch)
+                )
+        ]
+
+    for t in threads do
+        t.Start()
+
+    for t in threads do
+        t.Join()
+
+    for r in workerReads do
+        r >= 75 |> equal true
+
+    let finalTotal = mb.PostAndReply(fun ch -> GetAndStop ch)
+    finalTotal |> equal 300
+
 #if FABLE_COMPILER_ZIG // (the Zig target refuses what .NET allows here: see fable_weak.zig)
 [<Fact>]
 let ``test A weak reference to a value shared between threads is refused, and the other way round`` () =

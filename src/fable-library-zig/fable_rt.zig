@@ -278,42 +278,133 @@ pub fn threadId() i32 {
     return @truncate(@as(i64, @intCast(std.Thread.getCurrentId())));
 }
 
-// ---- `lock`: .NET's Monitor, re-entrant, on the address of the object ----
+// ---- `lock`: .NET's Monitor, re-entrant, per object address with OS futex parking ----
 //
-// Locks are taken on one of a fixed set of slots chosen by the object's address (two objects
-// may share a slot, which only makes one wait for the other). Each is a flag and its owner, so
-// that the thread that holds it can take it again, as .NET's can.
+// Each locked object address gets its own MonitorNode stored in a small table guarded by a
+// spinlock only while acquiring/releasing a reference count on the node. Contended callers
+// sleep in the OS kernel via futex (__ulock_wait on Darwin, futex on Linux), so unrelated
+// objects never collide and waiting threads do not busy-spin.
 
-const LockSlot = struct {
-    held: u32 = 0,
+pub fn futexWait(ptr: *const u32, expect: u32) void {
+    if (comptime builtin.single_threaded) return;
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            const flags: std.c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true };
+            _ = std.c.__ulock_wait(flags, @constCast(ptr), expect, 0);
+        },
+        .linux => {
+            _ = std.os.linux.futex_4arg(@ptrCast(ptr), .{ .cmd = .WAIT, .private = true }, expect, null);
+        },
+        else => std.Thread.yield() catch {},
+    }
+}
+
+pub fn futexWake(ptr: *const u32, wake_all: bool) void {
+    if (comptime builtin.single_threaded) return;
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            const flags: std.c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true, .WAKE_ALL = wake_all };
+            _ = std.c.__ulock_wake(flags, @constCast(ptr), 0);
+        },
+        .linux => {
+            _ = std.os.linux.futex_3arg(@ptrCast(ptr), .{ .cmd = .WAKE, .private = true }, if (wake_all) std.math.maxInt(i32) else 1);
+        },
+        else => {},
+    }
+}
+
+pub fn waitUntilSet(flag: *const u32) void {
+    while (@atomicLoad(u32, flag, .acquire) == 0) {
+        futexWait(flag, 0);
+    }
+}
+
+pub fn setAndWakeAll(flag: *u32) void {
+    @atomicStore(u32, flag, 1, .release);
+    futexWake(flag, true);
+}
+
+const MonitorNode = struct {
+    // state: 0 = unlocked, 1 = locked (uncontended), 2 = locked (maybe waiters)
+    state: u32 = 0,
+    owner_valid: u32 = 0,
     owner: usize = 0,
     depth: u32 = 0,
+    refs: usize = 0,
+    next_free: ?*MonitorNode = null,
 };
 
-var lock_slots: [64]LockSlot = @splat(.{});
+var monitor_table_lock: u32 = 0;
+var monitors: std.AutoHashMapUnmanaged(usize, *MonitorNode) = .empty;
+var free_monitors: ?*MonitorNode = null;
 
-fn lockSlot(key: usize) *LockSlot {
-    return &lock_slots[(key >> 4) % lock_slots.len];
+fn acquireMonitor(key: usize) *MonitorNode {
+    lockField(&monitor_table_lock);
+    defer unlockField(&monitor_table_lock);
+    if (monitors.get(key)) |node| {
+        node.refs += 1;
+        return node;
+    }
+    const node = if (free_monitors) |head| blk: {
+        free_monitors = head.next_free;
+        head.* = .{ .refs = 1 };
+        break :blk head;
+    } else blk: {
+        const fresh = bookkeeping().create(MonitorNode) catch @panic("fable: out of memory");
+        fresh.* = .{ .refs = 1 };
+        break :blk fresh;
+    };
+    monitors.put(bookkeeping(), key, node) catch @panic("fable: out of memory");
+    return node;
 }
 
-fn lockEnter(key: usize) void {
-    const slot = lockSlot(key);
-    const me: usize = @intCast(std.Thread.getCurrentId());
-    if (@atomicLoad(u32, &slot.held, .acquire) == 1 and @atomicLoad(usize, &slot.owner, .monotonic) == me) {
-        slot.depth += 1;
+fn releaseMonitor(key: usize, node: *MonitorNode) void {
+    lockField(&monitor_table_lock);
+    defer unlockField(&monitor_table_lock);
+    node.refs -= 1;
+    if (node.refs == 0) {
+        _ = monitors.remove(key);
+        node.next_free = free_monitors;
+        free_monitors = node;
+    }
+}
+
+pub fn lockEnter(key: usize) void {
+    const node = acquireMonitor(key);
+    const me: usize = if (comptime builtin.single_threaded) 1 else @intCast(std.Thread.getCurrentId());
+    if (@atomicLoad(u32, &node.state, .acquire) != 0 and
+        @atomicLoad(u32, &node.owner_valid, .acquire) != 0 and
+        @atomicLoad(usize, &node.owner, .monotonic) == me)
+    {
+        node.depth += 1;
         return;
     }
-    while (@cmpxchgWeak(u32, &slot.held, 0, 1, .acquire, .monotonic) != null) std.Thread.yield() catch {};
-    @atomicStore(usize, &slot.owner, me, .monotonic);
-    slot.depth = 1;
+    var c = @cmpxchgStrong(u32, &node.state, 0, 1, .acquire, .monotonic);
+    if (c != null) {
+        if (c.? == 1) c = @atomicRmw(u32, &node.state, .Xchg, 2, .acquire);
+        while (c.? != 0) : (c = @atomicRmw(u32, &node.state, .Xchg, 2, .acquire)) {
+            futexWait(&node.state, 2);
+        }
+    }
+    @atomicStore(usize, &node.owner, me, .monotonic);
+    @atomicStore(u32, &node.owner_valid, 1, .release);
+    node.depth = 1;
 }
 
-fn lockExit(key: usize) void {
-    const slot = lockSlot(key);
-    slot.depth -= 1;
-    if (slot.depth != 0) return;
-    @atomicStore(usize, &slot.owner, 0, .monotonic);
-    @atomicStore(u32, &slot.held, 0, .release);
+pub fn lockExit(key: usize) void {
+    const node = blk: {
+        lockField(&monitor_table_lock);
+        defer unlockField(&monitor_table_lock);
+        break :blk monitors.get(key) orelse unreachable;
+    };
+    node.depth -= 1;
+    if (node.depth == 0) {
+        @atomicStore(u32, &node.owner_valid, 0, .monotonic);
+        if (@atomicRmw(u32, &node.state, .Xchg, 0, .release) == 2) {
+            futexWake(&node.state, false);
+        }
+    }
+    releaseMonitor(key, node);
 }
 
 /// (the address a lock is taken on: of the cell; null cannot be locked)
@@ -1556,6 +1647,9 @@ pub fn ResizeArray(comptime T: type) type {
         }
 
         pub fn fable_show_shape(b: *Shower, x: *Self, comptime shape: TypeShape, node: ShowNode, depth: i32) *Layout {
+            const shared = isShared(x);
+            if (shared) lockEnter(@intFromPtr(x));
+            defer if (shared) lockExit(@intFromPtr(x));
             const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
             var items: [4]*Layout = undefined;
             const n = @min(x.items.len, 4);
@@ -1590,8 +1684,7 @@ pub fn raGrow(r: anytype, need: usize) void {
     r.capacity = cap;
 }
 
-/// `r.Add x`
-pub fn raAdd(r: anytype, x: rItem(@TypeOf(r))) void {
+fn raAddUnlocked(r: anytype, x: rItem(@TypeOf(r))) void {
     raGrow(r, r.items.len + 1);
     r.items.len += 1;
     r.items[r.items.len - 1] = undefined;
@@ -1601,38 +1694,82 @@ pub fn raAdd(r: anytype, x: rItem(@TypeOf(r))) void {
     if (gcOf(r)) |h| storeValue(h, r.items[n]) else touch(r.items[n]);
 }
 
+/// `r.Add x`
+pub fn raAdd(r: anytype, x: rItem(@TypeOf(r))) void {
+    const shared = isShared(r);
+    if (shared) {
+        shareStored(x);
+        lockEnter(@intFromPtr(r));
+    }
+    defer if (shared) lockExit(@intFromPtr(r));
+    raAddUnlocked(r, x);
+}
+
 /// `ResizeArray xs` of a list
 pub fn raOfList(comptime R: type, xs: List(rItem(R))) R {
     const r = raNew(R);
     var rest = xs;
-    while (rest == .Cons) : (rest = rest.Cons.Tail) raAdd(r, rest.Cons.Head);
+    while (rest == .Cons) : (rest = rest.Cons.Tail) raAddUnlocked(r, rest.Cons.Head);
     return r;
 }
 
 /// `r.AddRange xs` of a list
 pub fn raAddList(r: anytype, xs: List(rItem(@TypeOf(r)))) void {
+    const shared = isShared(r);
+    if (shared) {
+        var cur = xs;
+        while (cur == .Cons) : (cur = cur.Cons.Tail) shareStored(cur.Cons.Head);
+        lockEnter(@intFromPtr(r));
+    }
+    defer if (shared) lockExit(@intFromPtr(r));
     var rest = xs;
-    while (rest == .Cons) : (rest = rest.Cons.Tail) raAdd(r, rest.Cons.Head);
+    while (rest == .Cons) : (rest = rest.Cons.Tail) raAddUnlocked(r, rest.Cons.Head);
 }
 
-pub inline fn raCount(r: anytype) i32 {
+pub fn raCount(r: anytype) i32 {
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    defer if (shared) lockExit(@intFromPtr(r));
     return @intCast(r.items.len);
 }
 
 /// `r.[i]`
 pub fn raGet(r: anytype, i: i32) Raised!rItem(@TypeOf(r)) {
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    defer if (shared) lockExit(@intFromPtr(r));
     if (i < 0 or i >= r.items.len) return outOfRange();
     return dup(r.items[@intCast(i)]);
 }
 
 /// `r.[i] <- x`
 pub fn raSet(r: anytype, i: i32, x: rItem(@TypeOf(r))) Raised!void {
+    if (isShared(r)) {
+        shareStored(x);
+        lockEnter(@intFromPtr(r));
+        if (i < 0 or i >= r.items.len) {
+            lockExit(@intFromPtr(r));
+            return outOfRange();
+        }
+        const at: usize = @intCast(i);
+        const old = r.items[at];
+        r.items[at] = dup(x);
+        lockExit(@intFromPtr(r));
+        drop(old);
+        return;
+    }
     if (i < 0 or i >= r.items.len) return outOfRange();
     arrayPut(r, @intCast(i), dup(x));
 }
 
 /// `r.Insert(i, x)`
 pub fn raInsert(r: anytype, i: i32, x: rItem(@TypeOf(r))) Raised!void {
+    const shared = isShared(r);
+    if (shared) {
+        shareStored(x);
+        lockEnter(@intFromPtr(r));
+    }
+    defer if (shared) lockExit(@intFromPtr(r));
     if (i < 0 or i > r.items.len) return raise(ArgumentOutOfRangeException, str("Index must be within the bounds of the List. (Parameter 'index')"));
     raGrow(r, r.items.len + 1);
     const at: usize = @intCast(i);
@@ -1642,53 +1779,98 @@ pub fn raInsert(r: anytype, i: i32, x: rItem(@TypeOf(r))) Raised!void {
     if (gcOf(r)) |h| storeValue(h, r.items[at]) else touch(r.items[at]);
 }
 
-pub fn raTake(r: anytype, at: usize) void {
+fn raTakeDetached(r: anytype, at: usize) rItem(@TypeOf(r)) {
     const old = r.items[at];
     std.mem.copyForwards(rItem(@TypeOf(r)), r.items[at .. r.items.len - 1], r.items[at + 1 ..]);
     r.items.len -= 1;
     if (gcOf(r)) |h| eachHdr(old, h, unstored);
-    drop(old);
+    return old;
+}
+
+pub fn raTake(r: anytype, at: usize) void {
+    drop(raTakeDetached(r, at));
 }
 
 /// `r.RemoveAt i`
 pub fn raRemoveAt(r: anytype, i: i32) Raised!void {
-    if (i < 0 or i >= r.items.len) return outOfRange();
-    raTake(r, @intCast(i));
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    if (i < 0 or i >= r.items.len) {
+        if (shared) lockExit(@intFromPtr(r));
+        return outOfRange();
+    }
+    const old = raTakeDetached(r, @intCast(i));
+    if (shared) lockExit(@intFromPtr(r));
+    drop(old);
 }
 
-/// `r.IndexOf x`
-pub fn raIndexOf(r: anytype, x: rItem(@TypeOf(r))) i32 {
+fn raIndexOfUnlocked(r: anytype, x: rItem(@TypeOf(r))) i32 {
     for (r.items, 0..) |item, i| {
         if (eql(item, x)) return @intCast(i);
     }
     return -1;
 }
 
+/// `r.IndexOf x`
+pub fn raIndexOf(r: anytype, x: rItem(@TypeOf(r))) i32 {
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    defer if (shared) lockExit(@intFromPtr(r));
+    return raIndexOfUnlocked(r, x);
+}
+
 pub fn raContains(r: anytype, x: rItem(@TypeOf(r))) bool {
-    return raIndexOf(r, x) >= 0;
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    defer if (shared) lockExit(@intFromPtr(r));
+    return raIndexOfUnlocked(r, x) >= 0;
 }
 
 /// `r.Remove x`: the first item equal to x, if there is one.
 pub fn raRemove(r: anytype, x: rItem(@TypeOf(r))) bool {
-    const i = raIndexOf(r, x);
-    if (i < 0) return false;
-    raTake(r, @intCast(i));
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    const i = raIndexOfUnlocked(r, x);
+    if (i < 0) {
+        if (shared) lockExit(@intFromPtr(r));
+        return false;
+    }
+    const old = raTakeDetached(r, @intCast(i));
+    if (shared) lockExit(@intFromPtr(r));
+    drop(old);
     return true;
 }
 
 /// `r.Clear()`
 pub fn raClear(r: anytype) void {
+    if (isShared(r)) {
+        lockEnter(@intFromPtr(r));
+        const old_items = r.items;
+        const old_cap = r.capacity;
+        r.items = &.{};
+        r.capacity = 0;
+        lockExit(@intFromPtr(r));
+        for (old_items) |item| drop(item);
+        if (old_cap != 0) allocator.free(old_items.ptr[0..old_cap]);
+        return;
+    }
     while (r.items.len != 0) raTake(r, r.items.len - 1);
 }
 
 /// `r.Reverse()`
 pub fn raReverse(r: anytype) void {
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    defer if (shared) lockExit(@intFromPtr(r));
     std.mem.reverse(rItem(@TypeOf(r)), r.items);
 }
 
 /// `r.Sort()`: by `compare`. (Equal items stay in their order; on .NET their order is not
 /// promised, and for F# values two equal items cannot be told apart.)
 pub fn raSort(r: anytype) void {
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    defer if (shared) lockExit(@intFromPtr(r));
     const T = rItem(@TypeOf(r));
     std.sort.insertion(T, r.items, {}, struct {
         pub fn lt(_: void, a: T, b: T) bool {
@@ -1699,6 +1881,9 @@ pub fn raSort(r: anytype) void {
 
 /// `r.ToArray()`
 pub fn raToArray(r: anytype) Array(rItem(@TypeOf(r))) {
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    defer if (shared) lockExit(@intFromPtr(r));
     const A = Array(rItem(@TypeOf(r)));
     const items = arrayItems(A, r.items.len);
     for (items, r.items) |*to, item| to.* = dup(item);
@@ -1707,6 +1892,9 @@ pub fn raToArray(r: anytype) Array(rItem(@TypeOf(r))) {
 
 /// What a loop over it walks: its items now, as a list.
 pub fn raToList(r: anytype) List(rItem(@TypeOf(r))) {
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    defer if (shared) lockExit(@intFromPtr(r));
     return listOf(rItem(@TypeOf(r)), r.items);
 }
 
@@ -1764,6 +1952,9 @@ pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type
         }
 
         pub fn fable_show_shape(b: *Shower, x: *Self, comptime shape: TypeShape, node: ShowNode, depth: i32) *Layout {
+            const shared = isShared(x);
+            if (shared) lockEnter(@intFromPtr(x));
+            defer if (shared) lockExit(@intFromPtr(x));
             const k_idx: u16 = if (node.kind == .map or node.kind == .seq) node.a else ShowNode.auto;
             const v_idx: u16 = if (node.kind == .map) node.b else ShowNode.auto;
             var items: [4]*Layout = undefined;
@@ -1840,6 +2031,9 @@ pub fn htNewWith(comptime D: type, comparer: anytype) D {
 
 /// An empty dictionary or set that compares keys as `d` does
 pub fn htEmptyLike(d: anytype) @TypeOf(d) {
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    defer if (shared) lockExit(@intFromPtr(d));
     const e = htNew(@TypeOf(d));
     if (d.cmp_eq) |f| e.cmp_eq = dup(f);
     if (d.cmp_hash) |f| e.cmp_hash = dup(f);
@@ -1898,7 +2092,8 @@ pub fn htFind(d: anytype, key: KeyOf(@TypeOf(d))) ?usize {
 }
 
 /// Put an entry in: false (and nothing changed) if the key is there and `replace` is false.
-fn htPut(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d)), replace: bool) bool {
+/// When replacing an existing value, returns it in `displaced` so callers can drop after unlocking.
+fn htPutUnlocked(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d)), replace: bool, displaced: *?ValueOf(@TypeOf(d))) bool {
     if (htFind(d, key)) |i| {
         if (!replace) return false;
         const e = &d.entries[i];
@@ -1908,7 +2103,7 @@ fn htPut(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d)), replace
             eachHdr(old, h, unstored);
             storeValue(h, e.kv.?.value);
         } else touch(e.kv.?.value);
-        drop(old);
+        displaced.* = old;
         return true;
     }
     if (d.buckets.len == 0) htResize(d, htNextSize(0));
@@ -1937,7 +2132,17 @@ fn notMutable() Raised {
 
 pub fn dictAdd(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) Raised!void {
     if (d.read_only) return notMutable();
-    if (!htPut(d, key, value, false)) {
+    const shared = isShared(d);
+    if (shared) {
+        shareStored(key);
+        shareStored(value);
+        lockEnter(@intFromPtr(d));
+    }
+    var displaced: ?ValueOf(@TypeOf(d)) = null;
+    const inserted = htPutUnlocked(d, key, value, false, &displaced);
+    if (shared) lockExit(@intFromPtr(d));
+    if (displaced) |old| drop(old);
+    if (!inserted) {
         return raise(ArgumentException, format(.{ "An item with the same key has already been added. Key: ", arg(.{ .kind = 'T' }, key) }));
     }
 }
@@ -1945,7 +2150,16 @@ pub fn dictAdd(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) R
 /// `d.[k] <- v`
 pub fn dictSet(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) Raised!void {
     if (d.read_only) return notMutable();
-    _ = htPut(d, key, value, true);
+    const shared = isShared(d);
+    if (shared) {
+        shareStored(key);
+        shareStored(value);
+        lockEnter(@intFromPtr(d));
+    }
+    var displaced: ?ValueOf(@TypeOf(d)) = null;
+    _ = htPutUnlocked(d, key, value, true, &displaced);
+    if (shared) lockExit(@intFromPtr(d));
+    if (displaced) |old| drop(old);
 }
 
 /// `dict pairs` (`read_only`) and `Dictionary(pairs)`: a later pair of the same key replaces an
@@ -1953,7 +2167,11 @@ pub fn dictSet(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) R
 pub fn dictOfList(comptime D: type, pairs: anytype, comptime read_only: bool) D {
     const d = htNew(D);
     var rest = pairs;
-    while (rest == .Cons) : (rest = rest.Cons.Tail) _ = htPut(d, rest.Cons.Head[0], rest.Cons.Head[1], true);
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        var displaced: ?ValueOf(D) = null;
+        _ = htPutUnlocked(d, rest.Cons.Head[0], rest.Cons.Head[1], true, &displaced);
+        if (displaced) |old| drop(old);
+    }
     d.read_only = read_only;
     return d;
 }
@@ -1968,25 +2186,39 @@ pub fn listCount(xs: anytype) i32 {
 
 /// `d.[k]`
 pub fn dictGet(d: anytype, key: KeyOf(@TypeOf(d))) Raised!ValueOf(@TypeOf(d)) {
-    const i = htFind(d, key) orelse {
-        // (F#'s `dict` keeps its keys in a box of its own, which is what .NET names)
-        if (d.read_only) return raise(KeyNotFoundException, str("The given key 'Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers+StructBox`1[" ++ comptime netTypeName(KeyOf(@TypeOf(d))) ++ "]' was not present in the dictionary."));
-        return raise(KeyNotFoundException, format(.{ "The given key '", arg(.{ .kind = 'T' }, key), "' was not present in the dictionary." }));
-    };
-    return dup(d.entries[i].kv.?.value);
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    if (htFind(d, key)) |i| {
+        const res = dup(d.entries[i].kv.?.value);
+        if (shared) lockExit(@intFromPtr(d));
+        return res;
+    }
+    if (shared) lockExit(@intFromPtr(d));
+    // (F#'s `dict` keeps its keys in a box of its own, which is what .NET names)
+    if (d.read_only) return raise(KeyNotFoundException, str("The given key 'Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers+StructBox`1[" ++ comptime netTypeName(KeyOf(@TypeOf(d))) ++ "]' was not present in the dictionary."));
+    return raise(KeyNotFoundException, format(.{ "The given key '", arg(.{ .kind = 'T' }, key), "' was not present in the dictionary." }));
 }
 
 /// `d.TryGetValue(k, &v)`: the value, or null.
 pub fn dictTryGet(d: anytype, key: KeyOf(@TypeOf(d))) ?ValueOf(@TypeOf(d)) {
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    defer if (shared) lockExit(@intFromPtr(d));
     const i = htFind(d, key) orelse return null;
     return dup(d.entries[i].kv.?.value);
 }
 
 pub fn dictContainsKey(d: anytype, key: KeyOf(@TypeOf(d))) bool {
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    defer if (shared) lockExit(@intFromPtr(d));
     return htFind(d, key) != null;
 }
 
 pub fn dictContainsValue(d: anytype, value: ValueOf(@TypeOf(d))) bool {
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    defer if (shared) lockExit(@intFromPtr(d));
     for (d.entries) |e| {
         if (e.kv) |kv| {
             if (eql(kv.value, value)) return true;
@@ -1998,7 +2230,12 @@ pub fn dictContainsValue(d: anytype, value: ValueOf(@TypeOf(d))) bool {
 /// `d.Remove k`
 pub fn htRemove(d: anytype, key: KeyOf(@TypeOf(d))) Raised!bool {
     if (d.read_only) return notMutable();
-    if (d.buckets.len == 0) return false;
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    if (d.buckets.len == 0) {
+        if (shared) lockExit(@intFromPtr(d));
+        return false;
+    }
     const h = htHash(d, key);
     const bucket = htBucket(d, h);
     var last: i32 = -1;
@@ -2013,22 +2250,47 @@ pub fn htRemove(d: anytype, key: KeyOf(@TypeOf(d))) Raised!bool {
             d.free_list = i;
             d.free_count += 1;
             if (gcOf(d)) |hdr| eachHdr(old, hdr, unstored);
+            if (shared) lockExit(@intFromPtr(d));
             drop(old);
             return true;
         }
         last = i;
         i = e.next;
     }
+    if (shared) lockExit(@intFromPtr(d));
     return false;
 }
 
 pub fn htCount(d: anytype) i32 {
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    defer if (shared) lockExit(@intFromPtr(d));
     return @as(i32, @intCast(d.entries.len)) - d.free_count;
 }
 
 /// `d.Clear()`
 pub fn htClear(d: anytype) Raised!void {
     if (d.read_only) return notMutable();
+    if (isShared(d)) {
+        lockEnter(@intFromPtr(d));
+        const old_entries = d.entries;
+        const old_cap = d.capacity;
+        const old_buckets = d.buckets;
+        d.entries = &.{};
+        d.capacity = 0;
+        d.buckets = &.{};
+        d.free_list = -1;
+        d.free_count = 0;
+        lockExit(@intFromPtr(d));
+        for (old_entries) |e| {
+            if (e.kv) |kv| drop(kv);
+        }
+        if (old_cap != 0) {
+            allocator.free(old_entries.ptr[0..old_cap]);
+            allocator.free(old_buckets);
+        }
+        return;
+    }
     for (d.entries) |*e| {
         if (e.kv) |kv| {
             e.kv = null;
@@ -2044,6 +2306,9 @@ pub fn htClear(d: anytype) Raised!void {
 
 /// What a loop over a dictionary walks: its entries, as pairs, in .NET's order.
 pub fn dictToList(d: anytype) List(struct { KeyOf(@TypeOf(d)), ValueOf(@TypeOf(d)) }) {
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    defer if (shared) lockExit(@intFromPtr(d));
     const P = struct { KeyOf(@TypeOf(d)), ValueOf(@TypeOf(d)) };
     var items: std.ArrayList(P) = .empty;
     defer items.deinit(allocator);
@@ -2054,6 +2319,9 @@ pub fn dictToList(d: anytype) List(struct { KeyOf(@TypeOf(d)), ValueOf(@TypeOf(d
 }
 
 pub fn dictKeys(d: anytype) List(KeyOf(@TypeOf(d))) {
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    defer if (shared) lockExit(@intFromPtr(d));
     var items: std.ArrayList(KeyOf(@TypeOf(d))) = .empty;
     defer items.deinit(allocator);
     for (d.entries) |e| {
@@ -2063,6 +2331,9 @@ pub fn dictKeys(d: anytype) List(KeyOf(@TypeOf(d))) {
 }
 
 pub fn dictValues(d: anytype) List(ValueOf(@TypeOf(d))) {
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    defer if (shared) lockExit(@intFromPtr(d));
     var items: std.ArrayList(ValueOf(@TypeOf(d))) = .empty;
     defer items.deinit(allocator);
     for (d.entries) |e| {
@@ -2073,21 +2344,41 @@ pub fn dictValues(d: anytype) List(ValueOf(@TypeOf(d))) {
 
 /// `h.Add x`: false if it was there.
 pub fn setAdd(h: anytype, x: KeyOf(@TypeOf(h))) bool {
-    return htPut(h, x, {}, false);
+    const shared = isShared(h);
+    if (shared) {
+        shareStored(x);
+        lockEnter(@intFromPtr(h));
+    }
+    defer if (shared) lockExit(@intFromPtr(h));
+    var displaced: ?ValueOf(@TypeOf(h)) = null;
+    return htPutUnlocked(h, x, {}, false, &displaced);
 }
 
 /// `HashSet xs` of a list
 pub fn setOfList(comptime H: type, xs: List(KeyOf(H))) H {
     const h = htNew(H);
     var rest = xs;
-    while (rest == .Cons) : (rest = rest.Cons.Tail) _ = setAdd(h, rest.Cons.Head);
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        var displaced: ?ValueOf(H) = null;
+        _ = htPutUnlocked(h, rest.Cons.Head, {}, false, &displaced);
+    }
     return h;
 }
 
 /// `h.UnionWith xs` of a list
 pub fn setUnionList(h: anytype, xs: List(KeyOf(@TypeOf(h)))) void {
+    const shared = isShared(h);
+    if (shared) {
+        var cur = xs;
+        while (cur == .Cons) : (cur = cur.Cons.Tail) shareStored(cur.Cons.Head);
+        lockEnter(@intFromPtr(h));
+    }
+    defer if (shared) lockExit(@intFromPtr(h));
     var rest = xs;
-    while (rest == .Cons) : (rest = rest.Cons.Tail) _ = setAdd(h, rest.Cons.Head);
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        var displaced: ?ValueOf(@TypeOf(h)) = null;
+        _ = htPutUnlocked(h, rest.Cons.Head, {}, false, &displaced);
+    }
 }
 
 pub fn setToList(h: anytype) List(KeyOf(@TypeOf(h))) {

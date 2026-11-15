@@ -128,7 +128,11 @@ pub fn arrayIsNull(a: anytype) bool {
 pub fn arrayBoxAll(a: anytype) Array(rt.Any) {
     const A = Array(rt.Any);
     const items = arrayItems(A, a.items.len);
-    for (items, a.items) |*to, x| to.* = rt.box(x);
+    for (items, 0..) |*to, i| {
+        const v = arrayItemAt(a, i);
+        defer rt.drop(v);
+        to.* = rt.box(v);
+    }
     return arrayFrom(A, items);
 }
 
@@ -188,7 +192,7 @@ pub fn arrayResize(place: anytype, n: i32) Raised!void {
     const old = place.*;
     const kept = @min(old.items.len, @as(usize, @intCast(n)));
     const items = arrayItems(A, @intCast(n));
-    for (items[0..kept], old.items[0..kept]) |*x, y| x.* = rt.dup(y);
+    for (items[0..kept], 0..) |*x, i| x.* = arrayItemAt(old, i);
     fillDefault(A, items[kept..]) catch |e| {
         for (items[0..kept]) |x| rt.drop(x);
         rt.allocator.free(items);
@@ -292,7 +296,7 @@ pub fn arrayPut(a: anytype, i: usize, value: @typeInfo(@TypeOf(a.items)).pointer
 pub fn arrayPart(a: anytype, from: usize, n: usize) @TypeOf(a) {
     const A = @TypeOf(a);
     const items = arrayItems(A, n);
-    for (items, a.items[from..][0..n]) |*to, item| to.* = dup(item);
+    for (items, 0..) |*to, k| to.* = arrayItemAt(a, from + k);
     return arrayFrom(A, items);
 }
 
@@ -323,8 +327,8 @@ pub fn arraySub(a: anytype, start: i32, count: i32) Raised!@TypeOf(a) {
 pub fn arrayAppend(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
     const A = @TypeOf(a);
     const items = arrayItems(A, a.items.len + b.items.len);
-    for (items[0..a.items.len], a.items) |*to, item| to.* = dup(item);
-    for (items[a.items.len..], b.items) |*to, item| to.* = dup(item);
+    for (0..a.items.len) |i| items[i] = arrayItemAt(a, i);
+    for (0..b.items.len) |i| items[a.items.len + i] = arrayItemAt(b, i);
     return arrayFrom(A, items);
 }
 
@@ -333,7 +337,7 @@ pub fn arrayRev(a: anytype) @TypeOf(a) {
     const A = @TypeOf(a);
     const n = a.items.len;
     const items = arrayItems(A, n);
-    for (items, 0..) |*to, i| to.* = dup(a.items[n - 1 - i]);
+    for (items, 0..) |*to, i| to.* = arrayItemAt(a, n - 1 - i);
     return arrayFrom(A, items);
 }
 
@@ -376,11 +380,31 @@ pub fn listOf(comptime T: type, items: []const T) List(T) {
 
 /// `Array.toList a`
 pub fn arrayToList(a: anytype) List(ItemOf(@TypeOf(a))) {
-    return listOf(ItemOf(@TypeOf(a)), a.items);
+    const T = ItemOf(@TypeOf(a));
+    if (comptime !rt.isManaged(T)) return listOf(T, a.items);
+    if (!rt.isShared(a)) return listOf(T, a.items);
+    var all: List(T) = .Empty;
+    var i = a.items.len;
+    while (i > 0) {
+        i -= 1;
+        const tail = all;
+        all = .{ .Cons = cell(List(T), .Cons, .{ .Head = arrayItemAt(a, i), .Tail = tail }) };
+    }
+    return all;
 }
 
 /// `Array.contains x a`
 pub fn arrayContains(x: anytype, a: Array(@TypeOf(x))) bool {
+    if (comptime rt.isManaged(@TypeOf(x))) {
+        if (rt.isShared(a)) {
+            for (0..a.items.len) |i| {
+                const item = arrayItemAt(a, i);
+                defer rt.drop(item);
+                if (eql(item, x)) return true;
+            }
+            return false;
+        }
+    }
     for (a.items) |item| {
         if (eql(item, x)) return true;
     }
@@ -391,7 +415,7 @@ pub fn arrayContains(x: anytype, a: Array(@TypeOf(x))) bool {
 pub fn arrayMap(comptime A: type, f: anytype, a: anytype) Raised!A {
     const items = arrayItems(A, a.items.len);
     for (items, 0..) |*to, i| {
-        to.* = f.code(f.env, dup(a.items[i])) catch |e| {
+        to.* = f.code(f.env, arrayItemAt(a, i)) catch |e| {
             arrayAbandon(items, i);
             return e;
         };
@@ -432,7 +456,7 @@ fn parallelItems(comptime A: type, n: usize, f: anytype, a: anytype, comptime ma
 pub fn arrayParallelMap(comptime A: type, f: anytype, a: anytype) Raised!A {
     const S = struct {
         fn make(g: @TypeOf(f), xs: @TypeOf(a), i: usize) Raised!ItemOf(A) {
-            return g.code(g.env, dup(xs.items[i]));
+            return g.code(g.env, arrayItemAt(xs, i));
         }
     };
     return parallelItems(A, a.items.len, f, a, S.make);
@@ -442,7 +466,7 @@ pub fn arrayParallelMap(comptime A: type, f: anytype, a: anytype) Raised!A {
 pub fn arrayParallelMapi(comptime A: type, f: anytype, a: anytype) Raised!A {
     const S = struct {
         fn make(g: @TypeOf(f), xs: @TypeOf(a), i: usize) Raised!ItemOf(A) {
-            return apply2(ItemOf(A), g, @as(i32, @intCast(i)), dup(xs.items[i]));
+            return apply2(ItemOf(A), g, @as(i32, @intCast(i)), arrayItemAt(xs, i));
         }
     };
     return parallelItems(A, a.items.len, f, a, S.make);
@@ -466,7 +490,7 @@ pub fn arrayParallelIter(f: anytype, a: anytype) Raised!void {
     const Ctx = struct { f: @TypeOf(f), a: @TypeOf(a) };
     const S = struct {
         fn step(c: Ctx, i: usize) Raised!void {
-            return c.f.code(c.f.env, dup(c.a.items[i]));
+            return c.f.code(c.f.env, arrayItemAt(c.a, i));
         }
     };
     return rt.parallelFor(c_len(a), Ctx{ .f = f, .a = a }, S.step);
@@ -480,7 +504,7 @@ inline fn c_len(a: anytype) usize {
 pub fn arrayMapi(comptime A: type, f: anytype, a: anytype) Raised!A {
     const items = arrayItems(A, a.items.len);
     for (items, 0..) |*to, i| {
-        to.* = apply2(ItemOf(A), f, @as(i32, @intCast(i)), dup(a.items[i])) catch |e| {
+        to.* = apply2(ItemOf(A), f, @as(i32, @intCast(i)), arrayItemAt(a, i)) catch |e| {
             arrayAbandon(items, i);
             return e;
         };
@@ -490,18 +514,18 @@ pub fn arrayMapi(comptime A: type, f: anytype, a: anytype) Raised!A {
 
 /// `Array.iter f a`
 pub fn arrayIter(f: anytype, a: anytype) Raised!void {
-    for (0..a.items.len) |i| try f.code(f.env, dup(a.items[i]));
+    for (0..a.items.len) |i| try f.code(f.env, arrayItemAt(a, i));
 }
 
 /// `Array.iteri f a`
 pub fn arrayIteri(f: anytype, a: anytype) Raised!void {
-    for (0..a.items.len) |i| try apply2(void, f, @as(i32, @intCast(i)), dup(a.items[i]));
+    for (0..a.items.len) |i| try apply2(void, f, @as(i32, @intCast(i)), arrayItemAt(a, i));
 }
 
 /// `Array.fold f state a`: `state` is the caller's, the result is a reference of its own.
 pub fn arrayFold(f: anytype, state: anytype, a: anytype) Raised!@TypeOf(state) {
     var acc = dup(state);
-    for (0..a.items.len) |i| acc = try apply2(@TypeOf(state), f, acc, dup(a.items[i]));
+    for (0..a.items.len) |i| acc = try apply2(@TypeOf(state), f, acc, arrayItemAt(a, i));
     return acc;
 }
 
@@ -512,14 +536,14 @@ pub fn arrayFilter(f: anytype, a: anytype) Raised!@TypeOf(a) {
     defer rt.allocator.free(keep);
     var n: usize = 0;
     for (keep, 0..) |*k, i| {
-        k.* = try f.code(f.env, dup(a.items[i]));
+        k.* = try f.code(f.env, arrayItemAt(a, i));
         n += @intFromBool(k.*);
     }
     const items = arrayItems(A, n);
     var at: usize = 0;
     for (keep, 0..) |k, i| {
         if (k and i < a.items.len and at < n) {
-            items[at] = dup(a.items[i]);
+            items[at] = arrayItemAt(a, i);
             at += 1;
         }
     }
@@ -529,7 +553,7 @@ pub fn arrayFilter(f: anytype, a: anytype) Raised!@TypeOf(a) {
 /// `Array.exists f a`
 pub fn arrayExists(f: anytype, a: anytype) Raised!bool {
     for (0..a.items.len) |i| {
-        if (try f.code(f.env, dup(a.items[i]))) return true;
+        if (try f.code(f.env, arrayItemAt(a, i))) return true;
     }
     return false;
 }
@@ -537,7 +561,7 @@ pub fn arrayExists(f: anytype, a: anytype) Raised!bool {
 /// `Array.forall f a`
 pub fn arrayForall(f: anytype, a: anytype) Raised!bool {
     for (0..a.items.len) |i| {
-        if (!try f.code(f.env, dup(a.items[i]))) return false;
+        if (!try f.code(f.env, arrayItemAt(a, i))) return false;
     }
     return true;
 }

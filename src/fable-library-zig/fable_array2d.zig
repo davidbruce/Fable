@@ -80,7 +80,7 @@ pub fn at2D(a: anytype, i: i32, j: i32) Raised!usize {
 
 /// `a.[i, j]`: a reference of its own to the item.
 pub fn array2DGet(a: anytype, i: i32, j: i32) Raised!ItemOf(@TypeOf(a)) {
-    return dup(a.items[try at2D(a, i, j)]);
+    return rt.arrayItemAt(a, try at2D(a, i, j));
 }
 
 /// `a.[i, j] <- value`
@@ -120,7 +120,7 @@ pub fn array2DMapi(comptime A: type, f: anytype, a: anytype) Raised!A {
     const shape = shapeOf(a);
     const items = arrayItems(A, a.items.len);
     for (items, 0..) |*to, k| {
-        to.* = apply3(ItemOf(A), f, @as(i32, @intCast(k / shape[1])), @as(i32, @intCast(k % shape[1])), dup(a.items[k])) catch |e| {
+        to.* = apply3(ItemOf(A), f, @as(i32, @intCast(k / shape[1])), @as(i32, @intCast(k % shape[1])), rt.arrayItemAt(a, k)) catch |e| {
             arrayAbandon(items, k);
             return e;
         };
@@ -207,7 +207,7 @@ pub fn array2DBlit(source: anytype, si: i32, sj: i32, target: @TypeOf(source), t
         while (j < n2) : (j += 1) {
             const from: usize = @intCast((si + i) * sy + sj + j);
             const to: usize = @intCast((ti + i) * ty + tj + j);
-            arrayPut(target, to, dup(source.items[from]));
+            arrayPut(target, to, rt.arrayItemAt(source, from));
         }
     }
 }
@@ -224,7 +224,7 @@ pub fn array2DSlice(a: anytype, lo1: ?i32, hi1: ?i32, lo2: ?i32, hi2: ?i32) @Typ
     const A = @TypeOf(a);
     const items = arrayItems(A, rows * cols);
     for (0..rows) |i| {
-        for (0..cols) |j| items[i * cols + j] = dup(a.items[(@as(usize, @intCast(r0)) + i) * shape[1] + @as(usize, @intCast(c0)) + j]);
+        for (0..cols) |j| items[i * cols + j] = rt.arrayItemAt(a, (@as(usize, @intCast(r0)) + i) * shape[1] + @as(usize, @intCast(c0)) + j);
     }
     return shaped(arrayFrom(A, items), rows, cols);
 }
@@ -237,5 +237,5 @@ pub fn array2DIter(f: anytype, a: anytype) Raised!void {
 /// `Array2D.iteri f a`
 pub fn array2DIteri(f: anytype, a: anytype) Raised!void {
     const shape = shapeOf(a);
-    for (0..a.items.len) |k| try apply3(void, f, @as(i32, @intCast(k / shape[1])), @as(i32, @intCast(k % shape[1])), dup(a.items[k]));
+    for (0..a.items.len) |k| try apply3(void, f, @as(i32, @intCast(k / shape[1])), @as(i32, @intCast(k % shape[1])), rt.arrayItemAt(a, k));
 }

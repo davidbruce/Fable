@@ -958,6 +958,25 @@ type ReplyChannelOf<'R> = { reply: 'R -> unit }
 
 let replyChannelReply<'R> (c: ReplyChannelOf<'R>) (value: 'R) : unit = c.reply value
 
+#if FABLE_COMPILER
+[<Fable.Core.Emit("fable_rt.isShared($0)")>]
+let private isCellShared (_x: 'a) : bool = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.shareStored($0)")>]
+let private shareValue (_x: 'a) : unit = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.waitUntilSet(&($0).ready)")>]
+let private waitReplyReady (_x: 'a) : unit = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.setAndWakeAll(&($0).ready)")>]
+let private wakeReplyReady (_x: 'a) : unit = Fable.Core.Util.nativeOnly
+#else
+let private isCellShared (_x: 'a) : bool = false
+let private shareValue (_x: 'a) : unit = ()
+let private waitReplyReady (_x: 'a) : unit = ()
+let private wakeReplyReady (_x: 'a) : unit = ()
+#endif
+
 /// A `MailboxProcessor<'Msg>`: its messages, the `Receive` that waits for one (if any), and its
 /// body, which starts with `Start`
 type MailboxOf<'Msg> =
@@ -966,6 +985,9 @@ type MailboxOf<'Msg> =
         queue: ResizeArray<'Msg>
         mutable waiting: ('Msg -> unit) option
         mutable started: bool
+        mutable begun: bool
+        mutable running: bool
+        mutable turnToken: int
         token: CancellationTokenOf
         errorHandlers: ResizeArray<exn -> unit>
     }
@@ -976,33 +998,97 @@ let mailboxCreate<'Msg> (body: MailboxOf<'Msg> -> AsyncOf<unit>) (token: Cancell
         queue = ResizeArray()
         waiting = None
         started = false
+        begun = false
+        running = false
+        turnToken = 0
         token = defaultArg token (tokenNone ())
         errorHandlers = ResizeArray()
     }
 
+let private beginMailboxBody<'Msg> (mb: MailboxOf<'Msg>) : unit =
+    let finish () =
+        if isCellShared mb then
+            lock
+                mb
+                (fun () ->
+                    mb.running <- false
+                    mb.waiting <- None
+                )
+
+    start
+        (mb.body mb)
+        {
+            ok = fun () -> finish ()
+            fail =
+                fun e ->
+                    finish ()
+
+                    let handlers =
+                        if isCellShared mb then
+                            lock mb (fun () -> mb.errorHandlers.ToArray())
+                        else
+                            mb.errorHandlers.ToArray()
+
+                    for h in handlers do
+                        h e
+            cancel = fun _ -> finish ()
+            token = mb.token
+            handOver = None
+        }
+
+type private PostAction<'Msg> =
+    | BeginBody of int
+    | Resume of ('Msg -> unit) * int
+    | Queued
+
+let private runMailboxTurn<'Msg> (mb: MailboxOf<'Msg>) (turn: int) (action: unit -> unit) : unit =
+    drive (fun () -> lock mb (fun () -> not mb.running || mb.turnToken <> turn)) action
+
 /// `mb.Start()`: the body runs as the mailbox's own (from a timer, as .NET runs it on the thread
 /// pool); what it raises goes to the Error event
 let mailboxStart<'Msg> (mb: MailboxOf<'Msg>) : unit =
-    if mb.started then
-        raise (System.InvalidOperationException "The MailboxProcessor has already been started.")
+    let alreadyStarted =
+        if isCellShared mb then
+            lock
+                mb
+                (fun () ->
+                    if mb.started then
+                        true
+                    else
+                        mb.started <- true
+                        false
+                )
+        else if mb.started then
+            true
+        else
+            mb.started <- true
+            false
 
-    mb.started <- true
+    if alreadyStarted then
+        raise (System.InvalidOperationException "The MailboxProcessor has already been started.")
 
     schedule
         0
         (fun () ->
-            start
-                (mb.body mb)
-                {
-                    ok = ignore
-                    fail =
-                        fun e ->
-                            for h in mb.errorHandlers.ToArray() do
-                                h e
-                    cancel = ignore
-                    token = mb.token
-                    handOver = None
-                }
+            if isCellShared mb then
+                let shouldBegin, turn =
+                    lock
+                        mb
+                        (fun () ->
+                            if mb.begun then
+                                false, 0
+                            else
+                                mb.begun <- true
+                                mb.running <- true
+                                mb.turnToken <- mb.turnToken + 1
+                                true, mb.turnToken
+                        )
+
+                if shouldBegin then
+                    runMailboxTurn mb turn (fun () -> beginMailboxBody mb)
+            else if not mb.begun then
+                mb.begun <- true
+                beginMailboxBody mb
         )
     |> ignore
 
@@ -1015,25 +1101,165 @@ let mailboxStartNew<'Msg>
     mailboxStart mb
     mb
 
-/// `mb.Post(msg)`: to the Receive that waits (it goes on from a timer: posting returns at once),
-/// or to the queue
+/// `mb.Post(msg)`: to the Receive that waits (it goes on from a timer when local, or directly
+/// in the poster's turn when shared across threads), or to the queue
 let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
-    match mb.waiting with
-    | Some resume ->
-        mb.waiting <- None
-        schedule 0 (fun () -> resume msg) |> ignore
-    | None -> mb.queue.Add msg
+    if isCellShared mb then
+        shareValue msg
 
-let mailboxQueueLength<'Msg> (mb: MailboxOf<'Msg>) : int = mb.queue.Count
+        let action =
+            lock
+                mb
+                (fun () ->
+                    if mb.started && not mb.begun then
+                        mb.begun <- true
+                        mb.running <- true
+                        mb.turnToken <- mb.turnToken + 1
+                        mb.queue.Add msg
+                        BeginBody mb.turnToken
+                    else
+                        match mb.waiting with
+                        | Some resume ->
+                            mb.waiting <- None
+                            mb.running <- true
+                            mb.turnToken <- mb.turnToken + 1
+                            Resume(resume, mb.turnToken)
+                        | None ->
+                            mb.queue.Add msg
+                            Queued
+                )
 
-let mailboxAddError<'Msg> (mb: MailboxOf<'Msg>) (handler: exn -> unit) : unit = mb.errorHandlers.Add handler
+        match action with
+        | BeginBody turn -> runMailboxTurn mb turn (fun () -> beginMailboxBody mb)
+        | Resume(resume, turn) -> runMailboxTurn mb turn (fun () -> resume msg)
+        | Queued -> ()
+    else
+        match mb.waiting with
+        | Some resume ->
+            mb.waiting <- None
+            schedule 0 (fun () -> resume msg) |> ignore
+        | None -> mb.queue.Add msg
+
+let mailboxQueueLength<'Msg> (mb: MailboxOf<'Msg>) : int =
+    if isCellShared mb then
+        lock mb (fun () -> mb.queue.Count)
+    else
+        mb.queue.Count
+
+let mailboxAddError<'Msg> (mb: MailboxOf<'Msg>) (handler: exn -> unit) : unit =
+    if isCellShared mb then
+        shareValue handler
+        lock mb (fun () -> mb.errorHandlers.Add handler)
+    else
+        mb.errorHandlers.Add handler
 
 /// `inbox.TryReceive(timeout)`: the next message, or None when the time is up first (-1: no limit)
 let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncOf<'Msg option> =
     let timeout = defaultArg timeout -1
 
     make (fun k ->
-        if mb.queue.Count > 0 then
+        if isCellShared mb then
+            let mutable done' = false
+            let mutable timer: Timer option = None
+            let mutable registration: System.IDisposable option = None
+
+            let immediate =
+                lock
+                    mb
+                    (fun () ->
+                        if mb.queue.Count > 0 then
+                            let msg = mb.queue.[0]
+                            mb.queue.RemoveAt 0
+                            Some msg
+                        else
+                            mb.running <- false
+
+                            if timeout >= 0 then
+                                timer <-
+                                    Some(
+                                        schedule
+                                            timeout
+                                            (fun () ->
+                                                let won, regOpt =
+                                                    lock
+                                                        mb
+                                                        (fun () ->
+                                                            if not done' then
+                                                                done' <- true
+                                                                mb.waiting <- None
+                                                                true, registration
+                                                            else
+                                                                false, None
+                                                        )
+
+                                                if won then
+                                                    match regOpt with
+                                                    | Some d -> d.Dispose()
+                                                    | None -> ()
+
+                                                    k.ok None
+                                            )
+                                    )
+
+                            mb.waiting <-
+                                Some(fun msg ->
+                                    let won, timerOpt, regOpt =
+                                        lock
+                                            mb
+                                            (fun () ->
+                                                if not done' then
+                                                    done' <- true
+                                                    true, timer, registration
+                                                else
+                                                    mb.queue.Add msg
+                                                    false, None, None
+                                            )
+
+                                    if won then
+                                        match timerOpt with
+                                        | Some t -> t.live <- false
+                                        | None -> ()
+
+                                        match regOpt with
+                                        | Some d -> d.Dispose()
+                                        | None -> ()
+
+                                        k.ok (Some msg)
+                                )
+
+                            registration <-
+                                Some(
+                                    tokenRegister
+                                        k.token
+                                        (fun () ->
+                                            let won, timerOpt =
+                                                lock
+                                                    mb
+                                                    (fun () ->
+                                                        if not done' then
+                                                            done' <- true
+                                                            mb.waiting <- None
+                                                            true, timer
+                                                        else
+                                                            false, None
+                                                    )
+
+                                            if won then
+                                                match timerOpt with
+                                                | Some t -> t.live <- false
+                                                | None -> ()
+
+                                                k.cancel (canceled ())
+                                        )
+                                )
+
+                            None
+                    )
+
+            match immediate with
+            | Some msg -> k.ok (Some msg)
+            | None -> ()
+        else if mb.queue.Count > 0 then
             let msg = mb.queue.[0]
             mb.queue.RemoveAt 0
             k.ok (Some msg)
@@ -1110,59 +1336,138 @@ let mailboxReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncOf<'
 let mailboxScan<'Msg, 'T> (mb: MailboxOf<'Msg>) (f: 'Msg -> AsyncOf<'T> option) : AsyncOf<'T> =
     let rec look () : AsyncOf<'T> =
         make (fun k ->
-            let mutable found = None
-            let mutable i = 0
+            if isCellShared mb then
+                let found =
+                    lock
+                        mb
+                        (fun () ->
+                            let mutable res = None
+                            let mutable i = 0
 
-            while found.IsNone && i < mb.queue.Count do
-                match f mb.queue.[i] with
-                | Some c ->
-                    mb.queue.RemoveAt i
-                    found <- Some c
-                | None -> i <- i + 1
+                            while res.IsNone && i < mb.queue.Count do
+                                match f mb.queue.[i] with
+                                | Some c ->
+                                    mb.queue.RemoveAt i
+                                    res <- Some c
+                                | None -> i <- i + 1
 
-            match found with
-            | Some c -> start c k
-            | None ->
-                mb.waiting <-
-                    Some(fun msg ->
-                        mb.queue.Add msg
-                        start (look ()) k
-                    )
+                            if res.IsNone then
+                                mb.running <- false
+
+                                mb.waiting <-
+                                    Some(fun msg ->
+                                        lock mb (fun () -> mb.queue.Add msg)
+                                        start (look ()) k
+                                    )
+
+                            res
+                        )
+
+                match found with
+                | Some c -> start c k
+                | None -> ()
+            else
+                let mutable found = None
+                let mutable i = 0
+
+                while found.IsNone && i < mb.queue.Count do
+                    match f mb.queue.[i] with
+                    | Some c ->
+                        mb.queue.RemoveAt i
+                        found <- Some c
+                    | None -> i <- i + 1
+
+                match found with
+                | Some c -> start c k
+                | None ->
+                    mb.waiting <-
+                        Some(fun msg ->
+                            mb.queue.Add msg
+                            start (look ()) k
+                        )
         )
 
     look ()
 
-/// `mb.PostAndAsyncReply(build)`: the message, made with a reply channel, is posted now (as
-/// FSharp.Core posts it); the computation waits for the reply (each time it runs: the same one)
-let mailboxPostAndAsyncReply<'Msg, 'R> (mb: MailboxOf<'Msg>) (build: ReplyChannelOf<'R> -> 'Msg) : AsyncOf<'R> =
-    let mutable result: 'R option = None
-    let waiters = ResizeArray<'R -> unit>()
+type private ReplyBox<'R> =
+    {
+        mutable value: 'R option
+        mutable ready: uint32
+        waiters: ResizeArray<'R -> unit>
+    }
+
+let private makeReplyChannel<'Msg, 'R> (mb: MailboxOf<'Msg>) : ReplyBox<'R> * ReplyChannelOf<'R> =
+    let replyBox =
+        {
+            value = None
+            ready = 0u
+            waiters = ResizeArray()
+        }
+
+    if isCellShared mb then
+        shareValue replyBox
 
     let channel =
         {
             reply =
                 fun r ->
-                    if result.IsNone then
-                        result <- Some r
-                        let ws = waiters.ToArray()
-                        waiters.Clear()
+                    if isCellShared mb || isCellShared replyBox then
+                        shareValue r
+
+                        let ws =
+                            lock
+                                replyBox
+                                (fun () ->
+                                    if replyBox.value.IsNone then
+                                        replyBox.value <- Some r
+                                        let arr = replyBox.waiters.ToArray()
+                                        replyBox.waiters.Clear()
+                                        wakeReplyReady replyBox
+                                        arr
+                                    else
+                                        [||]
+                                )
+
+                        for w in ws do
+                            schedule 0 (fun () -> w r) |> ignore
+                    else if replyBox.value.IsNone then
+                        replyBox.value <- Some r
+                        let ws = replyBox.waiters.ToArray()
+                        replyBox.waiters.Clear()
 
                         // (those waiting go on from a timer, as on another thread)
                         for w in ws do
                             schedule 0 (fun () -> w r) |> ignore
         }
 
+    replyBox, channel
+
+/// `mb.PostAndAsyncReply(build)`: the message, made with a reply channel, is posted now (as
+/// FSharp.Core posts it); the computation waits for the reply (each time it runs: the same one)
+let mailboxPostAndAsyncReply<'Msg, 'R> (mb: MailboxOf<'Msg>) (build: ReplyChannelOf<'R> -> 'Msg) : AsyncOf<'R> =
+    let replyBox, channel = makeReplyChannel mb
     mailboxPost mb (build channel)
 
     make (fun k ->
-        match result with
-        | Some r -> k.ok r
-        | None -> waiters.Add k.ok
+        if isCellShared mb || isCellShared replyBox then
+            waitReplyReady replyBox
+            let r = lock replyBox (fun () -> replyBox.value.Value)
+            k.ok r
+        else
+            match replyBox.value with
+            | Some r -> k.ok r
+            | None -> replyBox.waiters.Add k.ok
     )
 
 /// `mb.PostAndReply(build)`: the same, waited for here
 let mailboxPostAndReply<'Msg, 'R> (mb: MailboxOf<'Msg>) (build: ReplyChannelOf<'R> -> 'Msg) : 'R =
-    runSynchronously (mailboxPostAndAsyncReply mb build)
+    if isCellShared mb then
+        let replyBox, channel = makeReplyChannel mb
+        mailboxPost mb (build channel)
+        waitReplyReady replyBox
+        lock replyBox (fun () -> replyBox.value.Value)
+    else
+        runSynchronously (mailboxPostAndAsyncReply mb build)
 
 let mailboxPostAndTryAsyncReply<'Msg, 'R>
     (mb: MailboxOf<'Msg>)

@@ -258,10 +258,16 @@ fn readAll(path: [*:0]const u8) ![]u8 {
 }
 
 /// (an errno carried as a Zig error, to be turned into .NET's exception)
-var last_errno: Errno = .SUCCESS;
+const io_thread = if (rt.sgc.per_thread) struct {
+    threadlocal var last_errno: Errno = .SUCCESS;
+    threadlocal var rng: ?std.Random.DefaultPrng = null;
+} else struct {
+    var last_errno: Errno = .SUCCESS;
+    var rng: ?std.Random.DefaultPrng = null;
+};
 
 fn errnoError(e: Errno) error{Sys} {
-    last_errno = e;
+    io_thread.last_errno = e;
     return error.Sys;
 }
 
@@ -294,7 +300,7 @@ pub fn readAllText(path: String) Raised!String {
     try checkPath(path);
     const z = utf8z(path);
     defer freeZ(z);
-    const bytes = readAll(z) catch return fail(last_errno, z, false);
+    const bytes = readAll(z) catch return fail(io_thread.last_errno, z, false);
     defer rt.allocator.free(bytes);
     if (bytes.len >= 3 and bytes[0] == 0xEF and bytes[1] == 0xBB and bytes[2] == 0xBF) return fromUtf8(bytes[3..]);
     if (bytes.len >= 2 and bytes[0] == 0xFF and bytes[1] == 0xFE) return fromUtf16(bytes[2..], false);
@@ -307,7 +313,7 @@ pub fn readAllBytes(path: String) Raised!rt.Array(u8) {
     try checkPath(path);
     const z = utf8z(path);
     defer freeZ(z);
-    const bytes = readAll(z) catch return fail(last_errno, z, false);
+    const bytes = readAll(z) catch return fail(io_thread.last_errno, z, false);
     return rt.arrays.arrayFrom(rt.Array(u8), bytes);
 }
 
@@ -318,7 +324,7 @@ pub fn writeAllText(path: String, text: String, append: bool) Raised!void {
     defer freeZ(z);
     const t = utf8z(text);
     defer freeZ(t);
-    writeAll(z, t, append) catch return fail(last_errno, z, false);
+    writeAll(z, t, append) catch return fail(io_thread.last_errno, z, false);
 }
 
 /// `File.WriteAllBytes(path, bytes)`
@@ -326,7 +332,7 @@ pub fn writeAllBytes(path: String, bytes: rt.Array(u8)) Raised!void {
     try checkPath(path);
     const z = utf8z(path);
     defer freeZ(z);
-    writeAll(z, bytes.items, false) catch return fail(last_errno, z, false);
+    writeAll(z, bytes.items, false) catch return fail(io_thread.last_errno, z, false);
 }
 
 fn isDir(z: [*:0]const u8) bool {
@@ -436,15 +442,13 @@ pub fn tempPath() String {
     return fromUtf8(b.items);
 }
 
-var rng: ?std.Random.DefaultPrng = null;
-
 fn randomChar() u8 {
-    if (rng == null) {
-        const seed: u64 = @bitCast(@import("fable_time.zig").monotonicNs() ^ @import("fable_time.zig").nowUtcTicks());
-        rng = std.Random.DefaultPrng.init(seed);
+    if (io_thread.rng == null) {
+        const seed: u64 = @bitCast(@import("fable_time.zig").monotonicNs() ^ @import("fable_time.zig").nowUtcTicks() ^ @as(i64, rt.threadId()));
+        io_thread.rng = std.Random.DefaultPrng.init(seed);
     }
     const chars = "abcdefghijklmnopqrstuvwxyz012345";
-    return chars[rng.?.random().uintLessThan(usize, chars.len)];
+    return chars[io_thread.rng.?.random().uintLessThan(usize, chars.len)];
 }
 
 /// `Path.GetRandomFileName()`: eight characters, a dot and three more
