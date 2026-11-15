@@ -1408,6 +1408,9 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         || ent.FullName = "System.Text.UnicodeEncoding"
         ->
         TPrim "fable_rt.TextEncoding"
+    // (`IComparable`, as F# types a key whose type it leaves open (`Map []`): an object, as on
+    // .NET, which compares by what it holds)
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.IComparable" -> tAny
     // (.NET's threads: the runtime's ThreadOf)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Thread" -> TPrim "fable_rt.ThreadOf"
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Diagnostics.Stopwatch" ->
@@ -6508,6 +6511,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | _ -> buildFrom xs.Head
             )
 
+    // (a value seen as `IComparable`: the object of it)
+    | Fable.TypeCast(x, Fable.DeclaredType(i, [])) when i.FullName = "System.IComparable" && x.Type <> Fable.Any ->
+        boxed ctx x
     // (`Comparer<'T>` where its IComparer is expected: the same value here)
     | Fable.TypeCast(x, ifaceTarget) when
         (match x.Type, unwrapNullness ifaceTarget with

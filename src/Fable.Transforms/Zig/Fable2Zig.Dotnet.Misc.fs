@@ -1277,6 +1277,9 @@ let call
             [],
             mapType ctx r t
         )
+    // (`x.CompareTo(y)` of an IComparable, an object here)
+    | "System.IComparable", "CompareTo", [ x; y ] ->
+        bindArgs ctx [ lw ctx x; lw ctx y ] (fun xs -> EEmit("fable_rt.compare($0, $1)", xs, tI32))
     // `lock o f`: .NET's Monitor (the runtime's lockRun, re-entrant); `obj ()`: an object to lock on
     | "Microsoft.FSharp.Core.Operators", "Lock", [ o; f ] -> rt "fable_rt.lockRun($0, $1)" [ o; f ] (mapType ctx r t)
     | "System.Object", ".ctor", [] -> pure' "fable_rt.objectNew()" [] tAny

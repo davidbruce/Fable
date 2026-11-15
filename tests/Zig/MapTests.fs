@@ -33,14 +33,12 @@ let ``test Map construction from lists works`` () =
     xs |> Seq.isEmpty
     |> equal false
 
-#if !FABLE_COMPILER_ZIG // (custom equality and IComparable are not supported by the Zig target yet)
 [<Fact>]
 let ``test Map.isEmpty works`` () =
     let xs = Map []
     Map.isEmpty xs |> equal true
     let ys = Map [1,1]
     Map.isEmpty ys |> equal false
-#endif
 
 [<Fact>]
 let ``test Map.IsEmpty works II`` () =
