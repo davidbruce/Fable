@@ -9,11 +9,9 @@ type List(x: int) =
 
 type ExceptFoo = { Bar:string }
 
-#if !FABLE_COMPILER_ZIG // (a loop over a value of a type parameter that is a sequence is not supported yet)
 let tryListChoose xss =
     let f xss = xss |> List.choose (function Some a -> Some a | _ -> None)
     xss |> f |> List.collect (fun xs -> [ for s in xs do yield s ])
-#endif
 let rec sumFirstList (zs: float list) (n: int): float =
     match n with
     | 0 -> 0.
@@ -653,12 +651,10 @@ let ``test List.truncate works`` () =
     [] = (List.truncate 0 []) |> equal true
     [] = (List.truncate 1 []) |> equal true
 
-#if !FABLE_COMPILER_ZIG // (needs obj values, which the Zig target does not have)
 [<Fact>]
 let ``test List.choose works with generic arguments`` () =
     let res = tryListChoose [ Some [ "a" ] ]
     equal ["a"] res
-#endif
 
 [<Fact>]
 let ``test List.collect works`` () =

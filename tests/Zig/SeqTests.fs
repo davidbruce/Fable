@@ -9,11 +9,9 @@ let sumFirstTwo (zs: seq<float>) =
     let first = Seq.head zs
     first + second
 
-#if !FABLE_COMPILER_ZIG // (a loop over a value of a type parameter that is a sequence is not supported yet)
 let seqChoose xss =
     let f xss = xss |> List.choose (function Some a -> Some a | _ -> None)
     xss |> f |> List.collect (fun xs -> [ for s in xs do yield s ])
-#endif
 
 let rec sumFirstSeq (zs: seq<float>) (n: int): float =
    match n with
@@ -170,12 +168,10 @@ let ``test Seq.choose works`` () =
     sumFirstTwo zs
     |> equal 7.
 
-#if !FABLE_COMPILER_ZIG // (a loop over a value of a type parameter that is a sequence is not supported yet)
 [<Fact>]
 let ``test Seq.choose works with generic arguments`` () =
     let res = seqChoose [ Some [ 5 ] ]
     equal [ 5 ] res
-#endif
 
 [<Fact>]
 let ``test Seq.concat works`` () =
