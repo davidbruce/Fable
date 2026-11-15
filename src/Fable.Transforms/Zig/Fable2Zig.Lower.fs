@@ -1408,6 +1408,11 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         || ent.FullName = "System.Text.UnicodeEncoding"
         ->
         TPrim "fable_rt.TextEncoding"
+    // (`IList<'T>`, as an array is seen through it: the array; `System.Array`: an array of objects)
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.IList`1" ->
+        mapType ctx r (Fable.Array(item, Fable.MutableArray))
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Array" ->
+        mapType ctx r (Fable.Array(Fable.Any, Fable.MutableArray))
     // (`IComparable`, as F# types a key whose type it leaves open (`Map []`): an object, as on
     // .NET, which compares by what it holds)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.IComparable" -> tAny
@@ -6413,6 +6418,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             let v = ctx.State.NewVar("enumerable", mapType ctx e.Range x.Type, VLocal, false)
             ctx.Vars[obj.Name] <- v
             ELet(v, lw ctx x, lowerSeqOfGetEnumerator ctx e.Range item getEnumerator)
+        // (an `IList<'T>`: the array it is here)
+        | Fable.DeclaredType(il, [ item ]) when il.FullName = "System.Collections.Generic.IList`1" ->
+            lw ctx (Fable.TypeCast(Fable.TypeCast(x, Fable.Array(item, Fable.MutableArray)), e.Type))
         // (the matches and the groups of a regular expression)
         | Fable.DeclaredType(coll, []) when
             coll.FullName = "System.Text.RegularExpressions.MatchCollection"
@@ -6511,6 +6519,33 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | _ -> buildFrom xs.Head
             )
 
+    // (an array seen as `IList<'T>`: the same array)
+    | Fable.TypeCast(x, Fable.DeclaredType(i, [ _ ])) when
+        i.FullName = "System.Collections.Generic.IList`1"
+        && (
+            match x.Type with
+            | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> true
+            | _ -> false
+        )
+        ->
+        lw ctx x
+    // (an array seen as `System.Array`: its items as objects)
+    | Fable.TypeCast(x, Fable.DeclaredType(i, [])) when
+        i.FullName = "System.Array"
+        && (
+            match x.Type with
+            | Fable.Array(item, (Fable.MutableArray | Fable.ImmutableArray)) -> item <> Fable.Any
+            | _ -> false
+        )
+        ->
+        ctx.State.UsesRuntime <- true
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                EEmit("fable_rt.arrayBoxAll($0)", xs, mapType ctx e.Range (Fable.Array(Fable.Any, Fable.MutableArray)))
+            )
     // (a value seen as `IComparable`: the object of it)
     | Fable.TypeCast(x, Fable.DeclaredType(i, [])) when i.FullName = "System.IComparable" && x.Type <> Fable.Any ->
         boxed ctx x

@@ -121,6 +121,15 @@ pub fn arrayIsNull(a: anytype) bool {
     return a == NullOf(@TypeOf(a)).get();
 }
 
+/// `xs :> System.Array`: the items as objects (a new array: what is set through it is not seen
+/// in the one it was made of)
+pub fn arrayBoxAll(a: anytype) Array(rt.Any) {
+    const A = Array(rt.Any);
+    const items = arrayItems(A, a.items.len);
+    for (items, a.items) |*to, x| to.* = rt.box(x);
+    return arrayFrom(A, items);
+}
+
 /// `[| a; b; c |]`
 pub fn arrayOf(comptime A: type, values: anytype) A {
     const items = arrayItems(A, values.len);

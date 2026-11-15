@@ -1414,6 +1414,7 @@ pub const arraySub = arrays.arraySub;
 pub const arrayToList = arrays.arrayToList;
 pub const arrayZero = arrays.arrayZero;
 pub const arrayResize = arrays.arrayResize;
+pub const arrayBoxAll = arrays.arrayBoxAll;
 pub const arrayParallelMap = arrays.arrayParallelMap;
 pub const arrayParallelMapi = arrays.arrayParallelMapi;
 pub const arrayParallelInit = arrays.arrayParallelInit;

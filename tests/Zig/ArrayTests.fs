@@ -1194,7 +1194,6 @@ let ``test Array.zip3 works`` () =
     let x, y, z = ks.[0]
     x + y + z |> equal 3.
 
-#if !FABLE_COMPILER_ZIG // (IList and System.Array are not supported by the Zig target yet)
 [<Fact>]
 let ``test Array as IList indexer has same behaviour`` () =
     let xs = [|1.; 2.; 3.|]
@@ -1208,15 +1207,12 @@ let ``test Array as IList count has same behaviour`` () =
     let xs = [|1.; 2.; 3.|]
     let ys = xs :> _ System.Collections.Generic.IList
     ys.Count |> equal 3
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target cannot use a value of this type as a sequence yet (DeclaredType)
 [<Fact>]
 let ``test Array as IList Seq.length has same behaviour`` () =
     let xs = [|1.; 2.; 3.|]
     let ys = xs :> _ System.Collections.Generic.IList
     ys |> Seq.length |> equal 3
-#endif
 
 [<Fact>]
 let ``test Mapping with typed arrays doesnt coerce`` () =
@@ -1302,7 +1298,7 @@ let ``test Array.allPairs works`` () =
           (3, 'c'); (3, 'd'); (3, 'e'); (3, 'f'); (4, 'a'); (4, 'b'); (4, 'c');
           (4, 'd'); (4, 'e'); (4, 'f')|]
 
-#if !FABLE_COMPILER_ZIG // (System.Array as a value (a sequence of obj))
+#if !FABLE_COMPILER_ZIG // (a loop over a non-generic IEnumerable (RuntimeHelpers.EnumerateFromFunctions) is not supported by the Zig target yet)
 [<Fact>]
 let ``test Casting to System.Array works`` () =
     let xs = [|1;2;3;4|] :> System.Array // Numeric array
