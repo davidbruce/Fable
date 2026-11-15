@@ -185,6 +185,8 @@ let call
     | _, "Invoke", f :: rest when
         (match f.Type with
          | Fable.DelegateType _ -> true
+         // (a `Func<'T>` made of a function value, as Fable types it)
+         | Fable.LambdaType _ -> true
          | Fable.DeclaredType(e, _) ->
              e.FullName.StartsWith("System.Func`", System.StringComparison.Ordinal)
              || e.FullName.StartsWith("System.Action", System.StringComparison.Ordinal)

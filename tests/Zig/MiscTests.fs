@@ -778,7 +778,6 @@ let ``test Calls to core lib from a subfolder work`` () =
     Util2.Helper.Format("{0} + {0} = {1}", 2, 4)
     |> equal "2 + 2 = 4"
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Func`1.Invoke yet)
 [<Fact>]
 let ``test Conversion to delegate works`` () =
     (System.Func<_,_,_,_> f1).Invoke(1,2,3) |> equal 6
@@ -813,7 +812,6 @@ let ``test Conversion to delegate works`` () =
     let fn4 x y = x * y - 3
     let func4 = Func<int, int, int>(fn4)
     func4.Invoke(4, 6) |> equal 21
-#endif
 
 [<Fact>]
 let ``test Conversion to Func<_> works`` () =
@@ -1535,7 +1533,6 @@ let ``test Public mutable variables can be passed by reference`` () =
     setOutRef a &mutX
     mutX |> equal 1
 
-#if !FABLE_COMPILER_ZIG // (the Zig target can only take the address of a variable (`&x`))
 [<Fact>]
 let ``test Mutable fields can be passed by reference`` () =
     let a = 1
@@ -1546,7 +1543,6 @@ let ``test Mutable fields can be passed by reference`` () =
     foo.x |> equal 3
     setOutRef a &foo.x
     foo.x |> equal 1
-#endif
 
 [<Fact>]
 let ``test Assigning to unit works`` () =
@@ -1775,14 +1771,11 @@ let ``test exception variable captured in deferred single-arg closure`` () =
             (fun (_: int) -> ex.Message)  // lambda-with-arg captures ex
     sub 42 |> equal "boom"
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Object..ctor yet)
 [<Fact>]
 let ``test lock is reentrant and returns the body value`` () =
     let key = obj()
     lock key (fun () -> lock key (fun () -> 42)) |> equal 42
-#endif
 
-#if !FABLE_COMPILER_ZIG // (the Zig target does not support System.Object..ctor yet)
 [<Fact>]
 let ``test lock releases after a body exception`` () =
     let key = obj()
@@ -1793,7 +1786,6 @@ let ``test lock releases after a body exception`` () =
         error <- ex.Message
     equal "body" error
     lock key (fun () -> 42) |> equal 42
-#endif
 
 #if FABLE_COMPILER && !FABLE_COMPILER_ZIG // (the Python runtime)
 module private LockRuntime =
