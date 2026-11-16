@@ -34,6 +34,7 @@ let private transformFileHere (com: Compiler) (file: Fable.File) : ZigFile =
     let body =
         try
             sw.Restart()
+            NonNull.run state
             Perceus.run state
 
             if timing then

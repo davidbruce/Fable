@@ -12,6 +12,7 @@
     <Compile Include="Fable2Zig.Dotnet.Text.fs" />
     <Compile Include="Fable2Zig.Dotnet.Numbers.fs" />
     <Compile Include="Fable2Zig.Dotnet.Misc.fs" />
+    <Compile Include="Fable2Zig.NonNull.fs" />
     <Compile Include="Fable2Zig.Perceus.fs" />
     <Compile Include="Fable2Zig.Emit.fs" />
     <Compile Include="Fable2Zig.fs" />
