@@ -864,7 +864,12 @@ let private tryShare (_x: 'a) : bool = Fable.Core.Util.nativeOnly
 
 [<Fable.Core.Emit("(comptime !fable_rt.holdsCyclic(@TypeOf($0)))")>]
 let private holdsNoCycles (_x: 'a) : bool = Fable.Core.Util.nativeOnly
+
+/// (a message the receiver alone holds now: its own again, see fable_rt.adoptShared)
+[<Fable.Core.Emit("fable_rt.adoptShared($0)")>]
+let private adoptShared (_x: 'a) : unit = Fable.Core.Util.nativeOnly
 #else
+let private adoptShared (_x: 'a) : unit = ()
 let private tryShare (_x: 'a) : bool = false
 let private holdsNoCycles (_x: 'a) : bool = false
 #endif
@@ -1179,12 +1184,50 @@ let private waitReplyReady (_x: 'a) : unit = ()
 let private wakeReplyReady (_x: 'a) : unit = ()
 #endif
 
+/// A mailbox's messages, in order: those of `items` from `head` on. Taking the first leaves None
+/// in its place (the queue lets go of it at once: the receiver may then be its only holder) and
+/// moves `head`; the part before `head` goes once it is half of `items`. Taking is O(1) amortised,
+/// where removing the first of a ResizeArray moves all the others.
+type MessageQueue<'Msg> =
+    {
+        items: ResizeArray<'Msg option>
+        mutable head: int
+    }
+
+let private queueCount (q: MessageQueue<'Msg>) = q.items.Count - q.head
+
+let private queueAdd (q: MessageQueue<'Msg>) (msg: 'Msg) = q.items.Add(Some msg)
+
+/// The `i`th message (of those waiting)
+let private queueItem (q: MessageQueue<'Msg>) (i: int) : 'Msg =
+    match q.items.[q.head + i] with
+    | Some msg -> msg
+    | None -> failwith "a message queue's slot is empty"
+
+let private queueCompact (q: MessageQueue<'Msg>) =
+    if q.head > 0 && q.head * 2 >= q.items.Count then
+        q.items.RemoveRange(0, q.head)
+        q.head <- 0
+
+/// The `i`th message, taken out
+let private queueRemoveAt (q: MessageQueue<'Msg>) (i: int) : 'Msg =
+    if i = 0 then
+        let msg = queueItem q 0
+        q.items.[q.head] <- None
+        q.head <- q.head + 1
+        queueCompact q
+        msg
+    else
+        let msg = queueItem q i
+        q.items.RemoveAt(q.head + i)
+        msg
+
 /// A `MailboxProcessor<'Msg>`: its messages, the `Receive` that waits for one (if any), and its
 /// body, which starts with `Start`
 type MailboxOf<'Msg> =
     {
         body: MailboxOf<'Msg> -> AsyncOf<unit>
-        queue: ResizeArray<'Msg>
+        queue: MessageQueue<'Msg>
         mutable waiting: ('Msg -> unit) option
         mutable started: bool
         mutable begun: bool
@@ -1197,7 +1240,11 @@ type MailboxOf<'Msg> =
 let mailboxCreate<'Msg> (body: MailboxOf<'Msg> -> AsyncOf<unit>) (token: CancellationTokenOf option) : MailboxOf<'Msg> =
     {
         body = body
-        queue = ResizeArray()
+        queue =
+            {
+                items = ResizeArray()
+                head = 0
+            }
         waiting = None
         started = false
         begun = false
@@ -1317,7 +1364,7 @@ let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
                         mb.begun <- true
                         mb.running <- true
                         mb.turnToken <- mb.turnToken + 1
-                        mb.queue.Add msg
+                        queueAdd mb.queue msg
                         BeginBody mb.turnToken
                     else
                         match mb.waiting with
@@ -1327,7 +1374,7 @@ let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
                             mb.turnToken <- mb.turnToken + 1
                             Resume(resume, mb.turnToken)
                         | None ->
-                            mb.queue.Add msg
+                            queueAdd mb.queue msg
                             Queued
                 )
 
@@ -1340,13 +1387,13 @@ let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
         | Some resume ->
             mb.waiting <- None
             schedule 0 (fun () -> resume msg) |> ignore
-        | None -> mb.queue.Add msg
+        | None -> queueAdd mb.queue msg
 
 let mailboxQueueLength<'Msg> (mb: MailboxOf<'Msg>) : int =
     if isCellShared mb then
-        lock mb (fun () -> mb.queue.Count)
+        lock mb (fun () -> queueCount mb.queue)
     else
-        mb.queue.Count
+        queueCount mb.queue
 
 let mailboxAddError<'Msg> (mb: MailboxOf<'Msg>) (handler: exn -> unit) : unit =
     if isCellShared mb then
@@ -1369,9 +1416,8 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
                 lock
                     mb
                     (fun () ->
-                        if mb.queue.Count > 0 then
-                            let msg = mb.queue.[0]
-                            mb.queue.RemoveAt 0
+                        if queueCount mb.queue > 0 then
+                            let msg = queueRemoveAt mb.queue 0
                             Some msg
                         else
                             mb.running <- false
@@ -1413,7 +1459,7 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
                                                     done' <- true
                                                     true, timer, registration
                                                 else
-                                                    mb.queue.Add msg
+                                                    queueAdd mb.queue msg
                                                     false, None, None
                                             )
 
@@ -1459,11 +1505,12 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
                     )
 
             match immediate with
-            | Some msg -> k.ok (Some msg)
+            | Some msg ->
+                adoptShared msg
+                k.ok (Some msg)
             | None -> ()
-        else if mb.queue.Count > 0 then
-            let msg = mb.queue.[0]
-            mb.queue.RemoveAt 0
+        else if queueCount mb.queue > 0 then
+            let msg = queueRemoveAt mb.queue 0
             k.ok (Some msg)
         else
             let mutable done' = false
@@ -1502,7 +1549,7 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
 
                         k.ok (Some msg)
                     else
-                        mb.queue.Add msg
+                        queueAdd mb.queue msg
                 )
 
             if not done' then
@@ -1546,10 +1593,10 @@ let mailboxScan<'Msg, 'T> (mb: MailboxOf<'Msg>) (f: 'Msg -> AsyncOf<'T> option) 
                             let mutable res = None
                             let mutable i = 0
 
-                            while res.IsNone && i < mb.queue.Count do
-                                match f mb.queue.[i] with
+                            while res.IsNone && i < queueCount mb.queue do
+                                match f (queueItem mb.queue i) with
                                 | Some c ->
-                                    mb.queue.RemoveAt i
+                                    queueRemoveAt mb.queue i |> ignore
                                     res <- Some c
                                 | None -> i <- i + 1
 
@@ -1558,7 +1605,7 @@ let mailboxScan<'Msg, 'T> (mb: MailboxOf<'Msg>) (f: 'Msg -> AsyncOf<'T> option) 
 
                                 mb.waiting <-
                                     Some(fun msg ->
-                                        lock mb (fun () -> mb.queue.Add msg)
+                                        lock mb (fun () -> queueAdd mb.queue msg)
                                         start (look ()) k
                                     )
 
@@ -1572,10 +1619,10 @@ let mailboxScan<'Msg, 'T> (mb: MailboxOf<'Msg>) (f: 'Msg -> AsyncOf<'T> option) 
                 let mutable found = None
                 let mutable i = 0
 
-                while found.IsNone && i < mb.queue.Count do
-                    match f mb.queue.[i] with
+                while found.IsNone && i < queueCount mb.queue do
+                    match f (queueItem mb.queue i) with
                     | Some c ->
-                        mb.queue.RemoveAt i
+                        queueRemoveAt mb.queue i |> ignore
                         found <- Some c
                     | None -> i <- i + 1
 
@@ -1584,7 +1631,7 @@ let mailboxScan<'Msg, 'T> (mb: MailboxOf<'Msg>) (f: 'Msg -> AsyncOf<'T> option) 
                 | None ->
                     mb.waiting <-
                         Some(fun msg ->
-                            mb.queue.Add msg
+                            queueAdd mb.queue msg
                             start (look ()) k
                         )
         )

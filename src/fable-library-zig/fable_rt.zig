@@ -220,8 +220,10 @@ pub inline fn cellReuse(comptime T: type, comptime tag: std.meta.Tag(T), tok: an
     return cell(T, tag, init);
 }
 
+/// (an atomic load: another thread may be changing a shared cell's count, which is then never
+/// one; on the targets this is the plain load it was)
 pub inline fn isUnique(c: anytype) bool {
-    return c.@"$rc" == 1;
+    return @atomicLoad(u32, &c.@"$rc", .monotonic) == 1;
 }
 
 // ---- values shared between threads (Koka's Perceus) ----
@@ -274,6 +276,88 @@ pub fn markShared(x: anytype) Raised!void {
             inline else => |p| try markShared(p),
         },
         else => comptime unreachable,
+    }
+}
+
+// ---- Ownership regained on receipt (Verona's regions, Pony's `iso`): a value that was marked
+// shared to cross to another thread (a message of a MailboxProcessor) is the receiver's own
+// again where only the receiver holds it: the region reached from it through cells and strings
+// counted once has its shared bits cleared, so its counts are plain from then on and Perceus may
+// change it in place. A cell counted once and reached only through such cells has no other
+// holder, so no thread can take a reference to it meanwhile (those that hold one are counted).
+// The walk stops, leaving it shared, at anything counted more than once, at what is reached
+// through hooks of its own (a function, an object, an exception, an interface), at a weak
+// reference and at a cell the collector follows (it left the collector when shared); unshared
+// cells then point to shared ones, never the other way. Nothing is taken back while weak
+// references to shared values exist (one could take a reference meanwhile). ----
+
+/// The region of `x` that only the receiver holds made its own again
+pub fn adoptShared(x: anytype) void {
+    if (weak_refs.shared_count.load(.acquire) != 0) return;
+    adoptRegion(x);
+}
+
+/// (one reference, shared or not; read after the other threads' last releases)
+inline fn countedOnce(c: anytype) bool {
+    return @atomicLoad(u32, &c.@"$rc", .acquire) & ~shared_bit == 1;
+}
+
+fn adoptRegion(x: anytype) void {
+    const T = @TypeOf(x);
+    if (comptime !isManaged(T)) return;
+    if (comptime isFunc(T) or isIface(T) or T == Obj or T == Exn or T == Any) return;
+    if (T == String) {
+        const p = x orelse return;
+        const rc = @atomicLoad(u32, &p.rc, .acquire);
+        if (rc != Str.literal and rc & ~shared_bit == 1) p.rc = 1;
+        return;
+    }
+    if (comptime isSlice(T)) {
+        for (x) |item| adoptRegion(item);
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            const C = ptr.child;
+            if (comptime hasGc(C) or @hasDecl(C, "fable_weak") or @hasDecl(C, "fable_object")) return;
+            var cur = x;
+            while (true) {
+                if (!countedOnce(cur)) return;
+                cur.@"$rc" = 1;
+                var next: ?T = null;
+                inline for (@typeInfo(C).@"struct".field_names) |name| {
+                    if (comptime isCount(name)) continue;
+                    const F = @TypeOf(@field(cur, name));
+                    if (F == T) next = @field(cur, name) else if (F == ?T) next = @field(cur, name) else adoptRegion(@field(cur, name));
+                }
+                cur = next orelse return;
+            }
+        },
+        .optional => if (x) |v| adoptRegion(v),
+        .@"struct" => |st| inline for (st.field_names) |name| adoptRegion(@field(x, name)),
+        .@"union" => {
+            var cur = x;
+            while (true) {
+                var next: ?T = null;
+                switch (cur) {
+                    inline else => |p| {
+                        const P = @TypeOf(p);
+                        if (comptime isCellPtr(P)) {
+                            const C = @typeInfo(P).pointer.child;
+                            if (comptime hasGc(C)) return;
+                            if (!countedOnce(p)) return;
+                            p.@"$rc" = 1;
+                            inline for (@typeInfo(C).@"struct".field_names) |name| {
+                                if (comptime isCount(name)) continue;
+                                if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else adoptRegion(@field(p, name));
+                            }
+                        } else adoptRegion(p);
+                    },
+                }
+                cur = next orelse return;
+            }
+        },
+        else => {},
     }
 }
 
@@ -625,6 +709,12 @@ fn notShareable(what: []const u8) Raised {
 fn markCell(c: anytype) Raised!bool {
     // (shared already: other threads may be changing the count; until then, no other has it)
     if (isShared(c)) return false;
+    // (made in a `[<StackArena>]` function of this thread: its memory is that function's stack,
+    // which another thread would free on the heap)
+    if (thread.arena != null) {
+        const bytes: [*]u8 = @ptrCast(c);
+        if (arenaOwning(bytes[0..@sizeOf(@TypeOf(c.*))]) != null) return notShareable("a value made in a [<StackArena>] function");
+    }
     // (weak references point at it: their handle moves to the table of shared cells, which a
     // thread that frees it empties)
     if (thread.weak.count() != 0) weak_refs.shareWeakHandle(@intFromPtr(c));
@@ -2131,6 +2221,36 @@ fn raTakeDetached(r: anytype, at: usize) rItem(@TypeOf(r)) {
 
 pub fn raTake(r: anytype, at: usize) void {
     drop(raTakeDetached(r, at));
+}
+
+/// `r.RemoveRange(index, count)`: what follows moved once (not once per item); what was
+/// removed given up after the lock
+pub fn raRemoveRange(r: anytype, index: i32, count: i32) Raised!void {
+    const T = rItem(@TypeOf(r));
+    if (index < 0 or count < 0) return outOfRange();
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    const at: usize = @intCast(index);
+    const n: usize = @intCast(count);
+    if (at + n > r.items.len) {
+        if (shared) lockExit(@intFromPtr(r));
+        return raise(ArgumentException, str("Offset and length were out of bounds for the array or count is greater than the number of elements from index to the end of the source collection."));
+    }
+    var removed: []T = &.{};
+    if (comptime isManaged(T)) {
+        if (n > 0) {
+            removed = allocator.alloc(T, n) catch oom();
+            @memcpy(removed, r.items[at .. at + n]);
+            if (gcOf(r)) |h| for (removed) |old| eachHdr(old, h, unstored);
+        }
+    }
+    std.mem.copyForwards(T, r.items[at .. r.items.len - n], r.items[at + n ..]);
+    r.items.len -= n;
+    if (shared) lockExit(@intFromPtr(r));
+    if (comptime isManaged(T)) {
+        for (removed) |old| drop(old);
+        if (n > 0) allocator.free(removed);
+    }
 }
 
 /// `r.RemoveAt i`
@@ -4652,6 +4772,12 @@ fn CellNull(comptime P: type) type {
 
         fn freeNull(p: *anyopaque) void {
             const c: P = @ptrCast(@alignCast(p));
+            // (shared with another thread, which may outlive this one: left as it is, one empty
+            // cell per type and thread, never counted)
+            if (isShared(c)) {
+                made = null;
+                return;
+            }
             c.@"$rc" = 1;
             recount();
             drop(c);

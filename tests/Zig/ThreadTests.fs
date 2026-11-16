@@ -522,3 +522,52 @@ let ``test Weak references work with values shared between threads`` () =
     t3.Start()
     t3.Join()
     seen |> equal n.Name
+
+[<Fact>]
+let ``test A null shared with a thread outlives the thread that made it`` () =
+    let gate = obj ()
+    let go = ref false
+    let result = ref false
+    let second = ref (None: Thread option)
+
+    let first =
+        Thread(fun () ->
+            let d: System.Collections.Generic.Dictionary<string, obj> = Unchecked.defaultof<_>
+
+            let t =
+                Thread(fun () ->
+                    while not (lock gate (fun () -> go.Value)) do
+                        Thread.Sleep 1
+
+                    result.Value <- isNull d
+                )
+
+            t.Start()
+            lock gate (fun () -> second.Value <- Some t)
+        )
+
+    first.Start()
+    first.Join()
+    lock gate (fun () -> go.Value <- true)
+    second.Value.Value.Join()
+    result.Value |> equal true
+
+[<Fable.Core.Zig.StackArena(65536)>]
+let private shareFromArena () : bool =
+    let r = ref 1
+
+    try
+        let t = Thread(fun () -> r.Value <- 2)
+        t.Start()
+        t.Join()
+        false
+    with :? System.NotSupportedException ->
+        true
+
+[<Fact>]
+let ``test A value made in a stack arena is not shared with a thread`` () =
+#if FABLE_COMPILER_ZIG
+    shareFromArena () |> equal true
+#else
+    shareFromArena () |> equal false
+#endif

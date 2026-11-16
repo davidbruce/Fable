@@ -19,8 +19,8 @@ best() {
     echo $b
 }
 printf "%-10s %10s %10s  %s\n" benchmark "zig ms" ".NET ms" output
-names=(${@:-nbody lists maps strings virtual})
-[ $# -eq 0 ] && names=(nbody lists maps strings virtual)
+names=(${@:-nbody lists maps strings virtual messages})
+[ $# -eq 0 ] && names=(nbody lists maps strings virtual messages)
 for d in $names; do
     (cd $d
      rm -rf fable_modules; rm -f *.zig

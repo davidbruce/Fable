@@ -112,6 +112,14 @@ let removeAll<'T> (r: ResizeArray<'T>) (predicate: 'T -> bool) : int =
 
     removed
 
+/// (the items from `index` on moved once, see fable_rt.raRemoveRange)
+#if FABLE_COMPILER
+[<Fable.Core.Emit("try fable_rt.raRemoveRange($0, $1, $2)")>]
+let private removeRangeChecked (_r: ResizeArray<'T>) (_index: int) (_count: int) : unit = Fable.Core.Util.nativeOnly
+#else
+let private removeRangeChecked (r: ResizeArray<'T>) (index: int) (count: int) : unit = r.RemoveRange(index, count)
+#endif
+
 let removeRange<'T> (r: ResizeArray<'T>) (index: int) (count: int) : unit =
     if index < 0 then
         outOfRange "index"
@@ -122,8 +130,7 @@ let removeRange<'T> (r: ResizeArray<'T>) (index: int) (count: int) : unit =
     if index + count > r.Count then
         badRange ()
 
-    for _ in 1..count do
-        r.RemoveAt index
+    removeRangeChecked r index count
 
 let getRange<'T> (r: ResizeArray<'T>) (index: int) (count: int) : ResizeArray<'T> =
     if index < 0 then

@@ -102,6 +102,12 @@ fn NullOf(comptime A: type) type {
 
         fn free(p: *anyopaque) void {
             const c: A = @ptrCast(@alignCast(p));
+            // (shared with another thread, which may outlive this one: left as it is, one empty
+            // array per type and thread, never counted)
+            if (rt.isShared(c)) {
+                made = null;
+                return;
+            }
             c.@"$rc" = 1;
             rt.recount();
             rt.drop(c);

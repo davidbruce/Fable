@@ -12,6 +12,8 @@ three runs of each in milliseconds (.NET's time includes the start of the runtim
 - `maps`: F#'s `Map` and `Set`
 - `strings`: `StringBuilder`, `Split`, `String.Join`, `Contains`, and `+` in a loop
 - `virtual`: virtual calls through an abstract class, and objects made and given up
+- `messages`: four threads post batches (a ResizeArray, a list) to a MailboxProcessor, which
+  changes and sums them; the total comes back with PostAndReply
 
 On an Apple M-series machine (Zig 0.18, .NET 10), 2026-11-13:
 
