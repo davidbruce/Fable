@@ -2914,6 +2914,8 @@ pub const bigint = @import("fable_bigint.zig");
 pub const BigInt = bigint.BigInt;
 pub const bigAbs = bigint.bigAbs;
 pub const bigGcd = bigint.bigGcd;
+pub const bigToByteArray = bigint.bigToByteArray;
+pub const bigOfBytes = bigint.bigOfBytes;
 pub const bigLog2 = bigint.bigLog2;
 pub const bigBitLength = bigint.bigBitLength;
 pub const bigAdd = bigint.bigAdd;
@@ -4814,6 +4816,8 @@ pub const strSlice = fable_string.strSlice;
 pub const strSubstring = fable_string.strSubstring;
 pub const strIndexOfChar = fable_string.strIndexOfChar;
 pub const strIndexOf = fable_string.strIndexOf;
+pub const strIndexOfCmp = fable_string.strIndexOfCmp;
+pub const strLastIndexOfCmp = fable_string.strLastIndexOfCmp;
 pub const strLastIndexOfChar = fable_string.strLastIndexOfChar;
 pub const strLastIndexOf = fable_string.strLastIndexOf;
 pub const strContains = fable_string.strContains;
@@ -5761,6 +5765,12 @@ pub fn flexSeq(comptime S: type, x: anytype, comptime m: type) Raised!S {
         const I = @FieldType(@typeInfo(@FieldType(T, "Cons")).pointer.child, "Head");
         return across(m.ofList(I).call, m.@"ofList$sig", .{.keep}, .{x});
     }
+    // (a ResizeArray: what it holds now, as an array; .NET raises if it changes while walked)
+    if (comptime isCellPtr(T) and @hasField(@typeInfo(T).pointer.child, "capacity") and @hasField(@typeInfo(T).pointer.child, "items")) {
+        const I = rItem(T);
+        const arr = raToArray(x);
+        return across(m.ofArray(I).call, m.@"ofArray$sig", .{.give}, .{arr});
+    }
     @compileError("fable: " ++ @typeName(T) ++ " is not a sequence the Zig target can walk yet");
 }
 
@@ -6023,6 +6033,11 @@ const parseWhole = fable_math.parseWhole;
 pub const trimmed = fable_math.trimmed;
 pub const numberText = fable_math.numberText;
 pub const parseFloatFs = fable_math.parseFloatFs;
+pub const parseFloatStyle = convert.parseFloatStyle;
+pub const tryParseFloatStyle = convert.tryParseFloatStyle;
+pub const numberStyled = convert.numberStyled;
+pub const decParseStyle = decimal.decParseStyle;
+pub const decTryParseStyle = decimal.decTryParseStyle;
 pub const tryParseAny = fable_math.tryParseAny;
 pub const tryParseFloat = fable_math.tryParseFloat;
 pub const tryParseInt = fable_math.tryParseInt;

@@ -457,6 +457,31 @@ pub fn decParse(s: String, comptime fsharp: bool) Raised!NetDecimal {
     };
 }
 
+/// `Decimal.Parse(s, style)` and `Decimal.TryParse(s, style, provider, &v)`
+pub fn decParseStyle(s: String, style: i32) Raised!NetDecimal {
+    if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
+    return decReadStyle(s, style) catch |e| switch (e) {
+        error.Format => badFormat(s),
+        error.Raised => error.Raised,
+    };
+}
+
+pub fn decTryParseStyle(s: String, style: i32) ?NetDecimal {
+    if (s == null) return null;
+    return decReadStyle(s, style) catch |e| {
+        if (e == error.Raised) rt.drop(rt.take());
+        return null;
+    };
+}
+
+fn decReadStyle(s: String, style: i32) (error{Format} || Raised)!NetDecimal {
+    var buf: [400]u8 = undefined;
+    const text = rt.numberStyled(rt.unitsOf(s), style, &buf) orelse return error.Format;
+    var units: [400]u16 = undefined;
+    for (text, 0..) |c, i| units[i] = c;
+    return decRead(units[0..text.len], true);
+}
+
 pub fn decRead(u: []const u16, comptime fsharp: bool) (error{Format} || Raised)!NetDecimal {
     var i: usize = 0;
     var negative = false;

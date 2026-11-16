@@ -461,14 +461,134 @@ fn floatSymbol(comptime T: type, units: []const u16) ?T {
     return null;
 }
 
-/// (a float's symbol, or its digits with .NET's white space and trailing NULs around them)
-fn readFloat(comptime T: type, units: []const u16) ?T {
-    if (floatSymbol(T, units)) |x| return x;
+/// .NET's NumberStyles flags
+pub const ns = struct {
+    pub const leading_white: i32 = 1;
+    pub const trailing_white: i32 = 2;
+    pub const leading_sign: i32 = 4;
+    pub const trailing_sign: i32 = 8;
+    pub const parentheses: i32 = 16;
+    pub const decimal_point: i32 = 32;
+    pub const thousands: i32 = 64;
+    pub const exponent: i32 = 128;
+    /// `NumberStyles.Float ||| NumberStyles.AllowThousands`: what Double.Parse takes by default
+    pub const float_default: i32 = 167 | 64;
+    pub const float: i32 = 167;
+};
+
+/// A number as .NET's parser reads it under a NumberStyles: white space, a sign before or after
+/// (or parentheses), digits with group separators in the whole part, a point, an exponent, each
+/// where the style allows it; trailing NULs are left out. What it gives is the number in plain
+/// form (`-123.45e6`) in `buf`, or null when the text is not one.
+pub fn numberStyled(units: []const u16, style: i32, buf: []u8) ?[]const u8 {
     var u = units;
     while (u.len != 0 and u[u.len - 1] == 0) u = u[0 .. u.len - 1];
-    while (u.len != 0 and isNumberWhite(u[0])) u = u[1..];
-    while (u.len != 0 and isNumberWhite(u[u.len - 1])) u = u[0 .. u.len - 1];
-    return parseReal(T, u);
+    if (style & ns.leading_white != 0) {
+        while (u.len != 0 and isNumberWhite(u[0])) u = u[1..];
+    }
+    if (style & ns.trailing_white != 0) {
+        while (u.len != 0 and isNumberWhite(u[u.len - 1])) u = u[0 .. u.len - 1];
+    }
+    var n: usize = 1;
+    var i: usize = 0;
+    var negative = false;
+    var signed = false;
+    var paren = false;
+    if (i < u.len and (u[i] == '-' or u[i] == '+') and style & ns.leading_sign != 0) {
+        negative = u[i] == '-';
+        signed = true;
+        i += 1;
+    } else if (i < u.len and u[i] == '(' and style & ns.parentheses != 0) {
+        paren = true;
+        negative = true;
+        i += 1;
+    }
+    var digits: usize = 0;
+    while (i < u.len) : (i += 1) {
+        const c = u[i];
+        if (c >= '0' and c <= '9') {
+            if (n >= buf.len - 16) return null;
+            buf[n] = @intCast(c);
+            n += 1;
+            digits += 1;
+        } else if (c == ',' and style & ns.thousands != 0 and digits > 0) {
+            // (a group separator, in the whole part only)
+        } else break;
+    }
+    if (i < u.len and u[i] == '.' and style & ns.decimal_point != 0) {
+        buf[n] = '.';
+        n += 1;
+        i += 1;
+        while (i < u.len and u[i] >= '0' and u[i] <= '9') : (i += 1) {
+            if (n >= buf.len - 16) return null;
+            buf[n] = @intCast(u[i]);
+            n += 1;
+            digits += 1;
+        }
+    }
+    if (digits == 0) return null;
+    if (i < u.len and (u[i] == 'e' or u[i] == 'E') and style & ns.exponent != 0) {
+        var j = i + 1;
+        var e_buf: [12]u8 = undefined;
+        var en: usize = 0;
+        if (j < u.len and (u[j] == '-' or u[j] == '+')) {
+            e_buf[en] = @intCast(u[j]);
+            en += 1;
+            j += 1;
+        }
+        var e_digits: usize = 0;
+        while (j < u.len and u[j] >= '0' and u[j] <= '9') : (j += 1) {
+            // (a huge exponent: kept short, it overflows all the same)
+            if (en < e_buf.len - 1) {
+                e_buf[en] = @intCast(u[j]);
+                en += 1;
+            }
+            e_digits += 1;
+        }
+        if (e_digits == 0) return null;
+        buf[n] = 'e';
+        n += 1;
+        @memcpy(buf[n .. n + en], e_buf[0..en]);
+        n += en;
+        i = j;
+    }
+    if (paren) {
+        if (i >= u.len or u[i] != ')') return null;
+        i += 1;
+    } else if (!signed and i < u.len and (u[i] == '-' or u[i] == '+') and style & ns.trailing_sign != 0) {
+        negative = u[i] == '-';
+        i += 1;
+    }
+    if (i != u.len) return null;
+    if (negative) {
+        buf[0] = '-';
+        return buf[0..n];
+    }
+    return buf[1..n];
+}
+
+fn readFloatStyle(comptime T: type, units: []const u16, style: i32) ?T {
+    if (floatSymbol(T, units)) |x| return x;
+    var buf: [400]u8 = undefined;
+    const text = numberStyled(units, style, &buf) orelse return null;
+    return std.fmt.parseFloat(T, text) catch null;
+}
+
+/// (a float's symbol, or its digits with .NET's white space and trailing NULs around them)
+fn readFloat(comptime T: type, units: []const u16) ?T {
+    return readFloatStyle(T, units, ns.float_default);
+}
+
+/// `Double.Parse(s, style)`
+pub fn parseFloatStyle(comptime T: type, s: String, style: i32) Raised!T {
+    if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
+    return readFloatStyle(T, unitsOf(s), style) orelse badFormat(s);
+}
+
+/// `Double.TryParse(s, style, provider, &v)`: the value, or null
+pub fn tryParseFloatStyle(comptime T: type, s: String, style: i32) ?T {
+    if (s == null) return null;
+    return readFloatStyle(T, unitsOf(s), style);
 }
 
 /// `Double.Parse s`
@@ -488,7 +608,7 @@ pub fn parseFloatFs(comptime T: type, s: String) Raised!T {
         buf[n] = c;
         n += 1;
     }
-    return readFloat(T, buf[0..n]) orelse badFormat(s);
+    return readFloatStyle(T, buf[0..n], ns.float) orelse badFormat(s);
 }
 
 pub fn tryParseFloat(comptime T: type, s: String) ?T {

@@ -1199,3 +1199,9 @@ let ``test Comparer.Create works`` () =
     cmp.Compare(1, 2) |> equal 1
     cmp.Compare(2, 1) |> equal -1
 
+[<Fact>]
+let ``test EqualityComparer.Create works`` () =
+    let cmp = EqualityComparer<'T>.Create((<>), hash)
+    cmp.Equals(1, 1) |> equal false
+    cmp.Equals(1, 2) |> equal true
+

@@ -2173,6 +2173,16 @@ let ``test Generic values holding generic functions are used at several types`` 
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+type FlexibleOverloads() =
+    member _.For(xs: 'a list, f: 'a -> 'b list) : 'b list = xs |> List.collect f
+    member _.For(xs: #seq<'a>, f: 'a -> unit) : int =
+        let mutable count = 0
+        for x in xs do
+            f x
+            count <- count + 1
+        count
+
+
 type IGenericMethodHelpers<'JsonValue> =
     abstract encodeString: string -> 'JsonValue
 
@@ -2605,4 +2615,12 @@ let ``test Explicit constructor self identifier is the created object`` () =
     valClassSelfSaved.Count |> equal 3
     obj.ReferenceEquals(valClassSelfSaved.[1], b) |> equal true
     obj.ReferenceEquals(valClassSelfSaved.[2], b) |> equal true
+
+[<Fact>]
+let ``test Overloads distinguished by a flexible type work`` () =
+    let t = FlexibleOverloads()
+    t.For([1; 2], fun i -> [i; i * 10]) |> equal [1; 10; 2; 20]
+    let mutable sum = 0
+    t.For([|1; 2; 3|], fun i -> sum <- sum + i) |> equal 3
+    sum |> equal 6
 

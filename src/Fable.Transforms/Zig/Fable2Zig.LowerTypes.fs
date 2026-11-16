@@ -175,6 +175,18 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         ->
         tVoid
     // (`Comparer<'T>`, as `Comparer<'T>.Default` gives it: the IComparer it is used as)
+    // (`EqualityComparer<'T>`: the IEqualityComparer it is used as, `Default` or one of `Create`)
+    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.EqualityComparer`1" ->
+        mapType
+            ctx
+            r
+            (Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEqualityComparer`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ item ]
+            ))
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Comparer`1" ->
         mapType
             ctx

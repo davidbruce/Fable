@@ -2588,3 +2588,19 @@ let resolveIfaceSlot
         )
 
     directSlot, getterSlot
+
+/// `EqualityComparer<'T>.Default`, as it is read where a member of it is called
+let (|IsDefaultEqualityComparer|_|) (e: Fable.Expr) =
+    match e with
+    | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
+        imp.Selector = "get_Default"
+        && info.ThisArg.IsNone
+        && imp.Path.EndsWith("System.Collections.Generic.EqualityComparer`1", System.StringComparison.Ordinal)
+        ->
+        Some()
+    | Fable.Get(_, Fable.FieldGet fi, Fable.DeclaredType(ent, _), _) when
+        fi.Name = "Default"
+        && ent.FullName = "System.Collections.Generic.EqualityComparer`1"
+        ->
+        Some()
+    | _ -> None

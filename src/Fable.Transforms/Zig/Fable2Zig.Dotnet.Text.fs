@@ -13,6 +13,12 @@ open Fable.Transforms.Zig.LowerHelpers
 open Fable.Transforms.Zig.Lower
 open Fable.Transforms.Zig.DotnetHelpers
 
+/// (a StringComparison: an enum of that type)
+let private isComparison (x: Fable.Expr) =
+    match x.Type with
+    | Fable.Number(Int32, Fable.NumberInfo.IsEnum e) -> e.FullName = "System.StringComparison"
+    | _ -> false
+
 /// The lowered call, or null when the member is not one of this file's.
 let call
     (ctx: Ctx)
@@ -257,6 +263,13 @@ let call
         x.Type = Fable.String
         ->
         rt "fable_rt.strIndexOf($0, $1, $2)" [ s; x; start ] tI32
+    // (with a StringComparison other than Ordinal: see fable_rt.strIndexOfCmp)
+    | "System.String", "IndexOf", [ s; x; start; cmp ] when unwrapNullness x.Type = Fable.String && isComparison cmp ->
+        rt "fable_rt.strIndexOfCmp($0, $1, $2, @as(i32, @intCast($3)))" [ s; x; start; cmp ] tI32
+    | "System.String", "LastIndexOf", [ s; x; cmp ] when unwrapNullness x.Type = Fable.String && isComparison cmp ->
+        rt "fable_rt.strLastIndexOfCmp($0, $1, null, @as(i32, @intCast($2)))" [ s; x; cmp ] tI32
+    | "System.String", "LastIndexOf", [ s; x; start; cmp ] when unwrapNullness x.Type = Fable.String && isComparison cmp ->
+        rt "fable_rt.strLastIndexOfCmp($0, $1, $2, @as(i32, @intCast($3)))" [ s; x; start; cmp ] tI32
     | "System.String", "IndexOfAny", [ s; Uncast chars ] ->
         rt "fable_rt.strIndexOfAny($0, $1, 0, null)" [ s; chars ] tI32
     | "System.String", "IndexOfAny", [ s; Uncast chars; start ] ->

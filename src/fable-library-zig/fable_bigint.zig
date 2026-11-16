@@ -215,6 +215,70 @@ pub fn bigBitLength(a: BigInt) i64 {
     return @intCast(m.bitCountAbs());
 }
 
+/// `x.ToByteArray()`: two's complement, least significant byte first, as short as the sign
+/// allows (.NET's)
+pub fn bigToByteArray(a: BigInt) rt.Array(u8) {
+    var mag = a.value.clone() catch |e| bigOom(e);
+    defer mag.deinit();
+    const negative = !a.value.isPositive() and !a.value.eqlZero();
+    mag.abs();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(rt.allocator);
+    // (the magnitude's bytes, low first)
+    const limbs = mag.toConst().limbs;
+    for (limbs) |limb| {
+        var l = limb;
+        var k: usize = 0;
+        while (k < @sizeOf(@TypeOf(limb))) : (k += 1) {
+            bytes.append(rt.allocator, @truncate(l)) catch rt.oom();
+            l >>= 8;
+        }
+    }
+    while (bytes.items.len > 1 and bytes.items[bytes.items.len - 1] == 0) _ = bytes.pop();
+    if (negative) {
+        var carry: u16 = 1;
+        for (bytes.items) |*b| {
+            const v: u16 = @as(u16, ~b.*) + carry;
+            b.* = @truncate(v);
+            carry = v >> 8;
+        }
+        if (bytes.items[bytes.items.len - 1] & 0x80 == 0) bytes.append(rt.allocator, 0xFF) catch rt.oom();
+        // (-1 - ...: no byte of 0xFF more than the sign needs)
+        while (bytes.items.len > 1 and bytes.items[bytes.items.len - 1] == 0xFF and bytes.items[bytes.items.len - 2] & 0x80 != 0) _ = bytes.pop();
+    } else if (bytes.items[bytes.items.len - 1] & 0x80 != 0) {
+        bytes.append(rt.allocator, 0) catch rt.oom();
+    }
+    const A = rt.Array(u8);
+    const items = rt.arrays.arrayItems(A, bytes.items.len);
+    @memcpy(items, bytes.items);
+    return rt.arrays.arrayFrom(A, items);
+}
+
+/// `BigInteger(bytes)`: of two's complement bytes, least significant first
+pub fn bigOfBytes(arr: rt.Array(u8)) BigInt {
+    const items = arr.items;
+    var m = bigEmpty();
+    if (items.len == 0) return bigFrom(m);
+    const negative = items[items.len - 1] & 0x80 != 0;
+    var k = items.len;
+    while (k > 0) {
+        k -= 1;
+        const b: u8 = if (negative) ~items[k] else items[k];
+        m.shiftLeft(&m, 8) catch |e| bigOom(e);
+        var add = Big.initSet(rt.allocator, b) catch |e| bigOom(e);
+        defer add.deinit();
+        m.add(&m, &add) catch |e| bigOom(e);
+    }
+    if (negative) {
+        // (-(~x) - 1)
+        var one = Big.initSet(rt.allocator, 1) catch |e| bigOom(e);
+        defer one.deinit();
+        m.add(&m, &one) catch |e| bigOom(e);
+        m.negate();
+    }
+    return bigFrom(m);
+}
+
 /// `BigInteger.Pow(a, n)` and `pown a n`
 pub fn bigPow(a: BigInt, n: i32) Raised!BigInt {
     if (n < 0) return raise(ArgumentOutOfRangeException, str("The number must be greater than or equal to zero. (Parameter 'exponent')"));

@@ -2488,8 +2488,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.TypeCast(x, ifaceTarget) when
         (match x.Type, unwrapNullness ifaceTarget with
          | Fable.DeclaredType(c, [ _ ]), Fable.DeclaredType(i, [ _ ]) ->
-             c.FullName = "System.Collections.Generic.Comparer`1"
-             && i.FullName = "System.Collections.Generic.IComparer`1"
+             (c.FullName = "System.Collections.Generic.Comparer`1"
+              && i.FullName = "System.Collections.Generic.IComparer`1")
+             || (c.FullName = "System.Collections.Generic.EqualityComparer`1"
+                 && i.FullName = "System.Collections.Generic.IEqualityComparer`1")
          | _ -> false)
         ->
         lw ctx x
@@ -4745,7 +4747,50 @@ and compositeFormat
                 bad <- true
             else
                 let _, _, ident = temps[index]
-                holes.Add(Fable.IdentExpr ident)
+
+                // (a date, a time or a span with a format: its own ToString(format), .NET's)
+                let dateEntity =
+                    match ident.Type with
+                    | Fable.DeclaredType(e, []) when
+                        format <> ""
+                        && (e.FullName = "System.DateTime"
+                            || e.FullName = "System.DateTimeOffset"
+                            || e.FullName = "System.DateOnly"
+                            || e.FullName = "System.TimeOnly"
+                            || e.FullName = "System.TimeSpan")
+                        ->
+                        Some e.FullName
+                    | _ -> None
+
+                match dateEntity with
+                | Some entity ->
+                    holes.Add(
+                        Fable.Call(
+                            Fable.Import(
+                                {
+                                    Selector = "ToString"
+                                    Path = Replacements.DotnetPrefix + entity
+                                    Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                                },
+                                Fable.Any,
+                                None
+                            ),
+                            Fable.CallInfo.Create(
+                                thisArg = Fable.IdentExpr ident,
+                                args = [ Fable.Value(Fable.StringConstant format, None) ],
+                                sigArgTypes = [ Fable.String ]
+                            ),
+                            Fable.String,
+                            r
+                        )
+                    )
+                | None -> holes.Add(Fable.IdentExpr ident)
+
+                let format =
+                    if dateEntity.IsSome then
+                        ""
+                    else
+                        format
 
                 let flags =
                     if width < 0 then
@@ -5135,6 +5180,11 @@ and dotnetCall
       ("get_InvariantCulture" | "get_CurrentCulture" | "get_CurrentUICulture" | "get_InvariantUICulture") -> EUnit
     | ("System.Double" | "System.Single"), ("Max" | "Min") when info.Args.Length = 2 ->
         dotnetCall ctx r "System.Math" name info t
+    // (`byte x` and `sbyte x`, as F# names them in ExtraTopLevelOperators: Operators' conversions)
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators", ("ToByte" | "ToSByte" | "ToDouble" | "ToSingle" | "ToInt32") when
+        info.Args.Length = 1 && unwrapNullness info.Args.Head.Type <> Fable.String
+        ->
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators" name info t
     | "Microsoft.FSharp.Control.FSharpAsync", "Parallel" when info.Args.Length = 2 ->
         libraryCall ctx r "Async" "parallelAllMax" info info.Args t
     | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Reduce" ->
@@ -5639,11 +5689,20 @@ and dotnetCall
         | ("System.Object" | "System.String" | "System.Boolean" | "System.Char" | "System.SByte" | "System.Byte" | "System.Int16" | "System.UInt16" | "System.Int32" | "System.UInt32" | "System.Int64" | "System.UInt64" | "System.Single" | "System.Double" | "System.Decimal" | "System.Numerics.BigInteger"),
           "GetHashCode",
           [ x ] -> pure' "fable_rt.hash($0)" [ x ] tI32
-        | "System.Collections.Generic.EqualityComparer`1", "Equals", [ _; a; b ] ->
+        // (`EqualityComparer<'T>.Default`: F#'s equality and hash, called directly; another
+        // comparer, one of `Create`, is called through its IEqualityComparer)
+        | "System.Collections.Generic.EqualityComparer`1", "Equals", [ IsDefaultEqualityComparer; a; b ] ->
             pure' "fable_rt.eql($0, $1)" [ a; b ] tBool
-        | "System.Collections.Generic.EqualityComparer`1", "GetHashCode", [ _; x ] ->
+        | "System.Collections.Generic.EqualityComparer`1", "GetHashCode", [ IsDefaultEqualityComparer; x ] ->
             pure' "fable_rt.hash($0)" [ x ] tI32
-        | "System.Collections.Generic.EqualityComparer`1", "get_Default", [] -> EUnit
+        | "System.Collections.Generic.EqualityComparer`1", "Equals", [ c; a; b ] ->
+            libraryCall ctx r "Array" "equalityComparerEquals" info [ c; a; b ] t
+        | "System.Collections.Generic.EqualityComparer`1", "GetHashCode", [ c; x ] ->
+            libraryCall ctx r "Array" "equalityComparerHash" info [ c; x ] t
+        | "System.Collections.Generic.EqualityComparer`1", "get_Default", [] ->
+            libraryCall ctx r "Array" "structuralEqualityComparer" info [ Fable.Value(Fable.UnitConstant, None) ] t
+        | "System.Collections.Generic.EqualityComparer`1", "Create", [ eq; h ] ->
+            libraryCall ctx r "Array" "equalityComparerOfDelegates" info [ eq; h ] t
         // ---- numbers ----
         | "System.MathF", _, _ -> dotnetCall ctx r "System.Math" name info t
         | ("System.Double" | "System.Single"),
@@ -5827,6 +5886,8 @@ and dotnetCall
           [ x ] -> rt "fable_rt.parseInt($R, $0)" [ x ] (mapType ctx r t)
         | ("System.Double" | "System.Single"), "Parse", [ x ] ->
             rt "fable_rt.parseFloat($R, $0)" [ x ] (mapType ctx r t)
+        | ("System.Double" | "System.Single"), "Parse", [ x; style ] ->
+            rt "fable_rt.parseFloatStyle($R, $0, @as(i32, @intCast($1)))" [ x; style ] (mapType ctx r t)
         | "System.Boolean", "Parse", [ x ] -> rt "fable_rt.parseBool($0)" [ x ] tBool
         // (`Int32.Parse(s, provider)`: the invariant culture's, as without one)
         | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single"),
@@ -5844,22 +5905,37 @@ and dotnetCall
         // type's default, as on .NET.
         | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single" | "System.Decimal" | "System.Boolean" | "System.Numerics.BigInteger"),
           "TryParse",
-          [ x; out ] when
-            (match out with
-             | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr o), _, _, _) -> ctx.Vars.ContainsKey o.Name
-             // (`&r.contents` of a ref cell)
-             | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.Get(cell, Fable.FieldGet info, _, _)), _, _, _) ->
-                 info.Name = "contents"
-                 && (
-                     match cell.Type with
-                     | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
-                     | _ -> false
-                 )
-             | _ ->
-                 match out.Type with
-                 | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
-                 | _ -> false)
+          x :: (([ _ ] | [ _; _ ]) as rest) when
+            (let out = List.last rest
+             // (with a NumberStyles before the place: of a float only, see parseFloatStyle)
+             (rest.Length = 1
+              || entity = "System.Double"
+              || entity = "System.Single"
+              || entity = "System.Decimal")
+             && match out with
+                | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr o), _, _, _) ->
+                    ctx.Vars.ContainsKey o.Name
+                // (`&r.contents` of a ref cell)
+                | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.Get(cell, Fable.FieldGet info, _, _)), _, _, _) ->
+                    info.Name = "contents"
+                    && (
+                        match cell.Type with
+                        | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
+                        | _ -> false
+                    )
+                | _ ->
+                    match out.Type with
+                    | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
+                    | _ -> false)
             ->
+            let out = List.last rest
+
+            let style =
+                if rest.Length = 2 then
+                    Some rest.Head
+                else
+                    None
+
             let valueType =
                 match out with
                 | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr o), _, _, _) -> unByref o.Type
@@ -5875,9 +5951,14 @@ and dotnetCall
             let parsed =
                 Fable.Emit(
                     {
-                        Macro = $"fable_rt.tryParseAny(%s{zigTypeName ty}, $0)"
+                        Macro =
+                            match style with
+                            | Some _ when entity = "System.Decimal" ->
+                                "fable_rt.decTryParseStyle($0, @as(i32, @intCast($1)))"
+                            | Some _ -> $"fable_rt.tryParseFloatStyle(%s{zigTypeName ty}, $0, @as(i32, @intCast($1)))"
+                            | None -> $"fable_rt.tryParseAny(%s{zigTypeName ty}, $0)"
                         IsStatement = false
-                        CallInfo = Fable.CallInfo.Create(args = [ x ])
+                        CallInfo = Fable.CallInfo.Create(args = x :: Option.toList style)
                     },
                     Fable.Option(valueType, false),
                     r

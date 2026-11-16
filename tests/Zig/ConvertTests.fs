@@ -2221,3 +2221,55 @@ let ``test Encoding.UTF8.GetString for range works with non-typed array`` () =
     System.Text.Encoding.UTF8.GetString(bytes, 6, 6)
     |> equal "\u03B2\uD8FF\uDCFF"
 
+
+let tryParseFloat (s: string) =
+    Double.TryParse(s, NumberStyles.Float ||| NumberStyles.AllowThousands, CultureInfo.InvariantCulture)
+
+[<Fact>]
+let ``test System.Double.TryParse follows .NET's Float grammar`` () =
+    tryParseFloat "1." |> equal (true, 1.0)
+    tryParseFloat "  .5\r\n" |> equal (true, 0.5)
+    tryParseFloat "1\u0000" |> equal (true, 1.0)
+    tryParseFloat "-infinity" |> equal (true, Double.NegativeInfinity)
+    tryParseFloat "nan" |> fst |> equal true
+    tryParseFloat "0x10" |> equal (false, 0.0)
+    tryParseFloat "\u00a01" |> equal (false, 0.0)
+    tryParseFloat "1_0" |> equal (false, 0.0)
+    tryParseFloat "_" |> equal (false, 0.0)
+    tryParseFloat null |> equal (false, 0.0)
+
+[<Fact>]
+let ``test System.Double.Parse accepts group separators like invariant .NET`` () =
+    let parse (s: string) = Double.Parse(s, CultureInfo.InvariantCulture)
+    parse "1,5" |> equal 15.0
+    parse "1,000.5" |> equal 1000.5
+    parse "1,,0" |> equal 10.0
+    parse "1," |> equal 1.0
+    parse "1,.5" |> equal 1.5
+    parse "1,e2" |> equal 100.0
+    parse "-1,000" |> equal -1000.0
+    Single.Parse("1,5", CultureInfo.InvariantCulture) |> equal 15.0f
+    Convert.ToDouble("1,000", CultureInfo.InvariantCulture) |> equal 1000.0
+    tryParseFloat "1,000" |> equal (true, 1000.0)
+    for s in [ ","; ",1"; "1.5,0"; "1e1,0"; "-,1" ] do
+        (fun () -> parse s) |> throwsAnyError
+    (fun () -> float "1,5") |> throwsAnyError
+    (fun () -> float32 "1,5") |> throwsAnyError
+
+[<Fact>]
+let ``test System.Double.Parse honors NumberStyles`` () =
+    let parse (s: string) (style: NumberStyles) = Double.Parse(s, style, CultureInfo.InvariantCulture)
+    parse "1e3" NumberStyles.Float |> equal 1000.0
+    parse "1,000" NumberStyles.Number |> equal 1000.0
+    parse "1.5-" NumberStyles.Number |> equal -1.5
+    parse "(1.5)" (NumberStyles.Float ||| NumberStyles.AllowParentheses) |> equal -1.5
+    parse "1" NumberStyles.None |> equal 1.0
+    for s, style in [ "1,5", NumberStyles.Float; "1e3", NumberStyles.Number; "1.5", NumberStyles.Integer; " 1 ", NumberStyles.None; "-1", NumberStyles.None; "+1", NumberStyles.AllowTrailingSign ] do
+        (fun () -> parse s style) |> throwsAnyError
+    let result = ref 0.0
+    Double.TryParse("1,5", NumberStyles.Float, CultureInfo.InvariantCulture, result) |> equal false
+    Double.TryParse("1,5", NumberStyles.Number, CultureInfo.InvariantCulture, result) |> equal true
+    result.Value |> equal 15.0
+    Single.Parse("1,5", NumberStyles.Float ||| NumberStyles.AllowThousands, CultureInfo.InvariantCulture) |> equal 15.0f
+    (fun () -> Single.Parse("1,5", NumberStyles.Float, CultureInfo.InvariantCulture)) |> throwsAnyError
+

@@ -1110,6 +1110,29 @@ let comparerOfDelegate (f: System.Comparison<'T>) : System.Collections.Generic.I
 /// `c.Compare(a, b)` of a `Comparer<'T>` (an IComparer here: `Default` or one made by `Create`)
 let comparerCompare (c: System.Collections.Generic.IComparer<'T>) (a: 'T) (b: 'T) : int = c.Compare(a, b)
 
+/// `EqualityComparer<'T>.Default` as a value: F#'s equality and hash
+let structuralEqualityComparer<'T when 'T: equality> () : System.Collections.Generic.IEqualityComparer<'T> =
+    { new System.Collections.Generic.IEqualityComparer<'T> with
+        member _.Equals(a, b) = a = b
+        member _.GetHashCode x = hash x
+    }
+
+/// `EqualityComparer<'T>.Create(equals, getHashCode)`
+let equalityComparerOfDelegates
+    (eq: System.Func<'T, 'T, bool>)
+    (h: System.Func<'T, int>)
+    : System.Collections.Generic.IEqualityComparer<'T>
+    =
+    { new System.Collections.Generic.IEqualityComparer<'T> with
+        member _.Equals(a, b) = eq.Invoke(a, b)
+        member _.GetHashCode x = h.Invoke x
+    }
+
+/// `c.Equals(a, b)` and `c.GetHashCode x` of an `EqualityComparer<'T>` that is not `Default`
+let equalityComparerEquals (c: System.Collections.Generic.IEqualityComparer<'T>) (a: 'T) (b: 'T) : bool = c.Equals(a, b)
+
+let equalityComparerHash (c: System.Collections.Generic.IEqualityComparer<'T>) (x: 'T) : int = c.GetHashCode x
+
 /// `ComparisonIdentity.Structural`: F#'s comparison
 let structuralComparer<'T when 'T: comparison> () : System.Collections.Generic.IComparer<'T> =
     { new System.Collections.Generic.IComparer<'T> with

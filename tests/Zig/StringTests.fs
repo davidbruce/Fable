@@ -1870,3 +1870,59 @@ let ``test interpolated string with consecutive holes work`` () =
     $"""{"foo"}{5}""" |> equal "foo5"
     $"""%s{"foo"}%i{5}""" |> equal "foo5"
     $"""{"foo"}/{5}.fsi""" |> equal "foo/5.fsi"
+[<Fact>]
+let ``test sprintf "%o" padding and flags work`` () =
+    sprintf "%5o|%-5o|%05o" 8 8 8 |> equal "   10|10   |00010"
+    sprintf "%+o|% o|%+05o" 8 8 8 |> equal "+10| 10|+0010"
+    sprintf "%+o" -1 |> equal "+37777777777"
+
+[<Fact>]
+let ``test sprintf "%x" sign flags work`` () =
+    sprintf "%+x|% x|%+X" 8 8 255 |> equal "+8| 8|+FF"
+    sprintf "%+x" -1 |> equal "+ffffffff"
+
+[<Fact>]
+let ``test String.Format with extra formatting works`` () =
+    let i = 0.5466788
+    let dt = DateTime(2014, 9, 26).AddMinutes(19.)
+    String.Format(CultureInfo.InvariantCulture, "{0:F2} {0:P2} {1:yyyy-MM-dd HH:mm}", i, dt)
+            .Replace(",", ".").Replace(" %", "%")
+    |> equal "0.55 54.67% 2014-09-26 00:19"
+
+[<Fact>]
+let ``test String.Format uses .NET formatting for DateOnly, TimeOnly and TimeSpan`` () =
+    let d = DateOnly(2024, 1, 2)
+    let t = TimeOnly(1, 2, 3)
+    let ts = TimeSpan.FromHours(1.)
+    String.Format(CultureInfo.InvariantCulture, "{0}", d) |> equal "01/02/2024"
+    String.Format(CultureInfo.InvariantCulture, "{0:O}", d) |> equal "2024-01-02"
+    String.Format(CultureInfo.InvariantCulture, "{0}", t) |> equal "01:02"
+    String.Format(CultureInfo.InvariantCulture, "{0:T}", t) |> equal "01:02:03"
+    String.Format(CultureInfo.InvariantCulture, "{0}", ts) |> equal "01:00:00"
+    String.Format(CultureInfo.InvariantCulture, "{0:g}", ts) |> equal "1:00:00"
+    String.Format(CultureInfo.InvariantCulture, "{0} {1} {2}", d, t, ts)
+    |> equal "01/02/2024 01:02 01:00:00"
+
+[<Fact>]
+let ``test String.Split with trim and remove entries works`` () =
+    " a-- b- c ".Split([| "-" |], 2, StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
+    |> equal [|"a"; "b- c"|]
+    " a-- b- c ".Split([| '-' |], 3, StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
+    |> equal  [|"a"; "b"; "c"|]
+
+[<Fact>]
+let ``test String.IndexOf with index and OrdinalIgnoreCase StringComparison`` () =
+    "ABCDBC".IndexOf("b", 2, StringComparison.OrdinalIgnoreCase) |> equal 4
+    "ABCDBC".IndexOf("b", 2, StringComparison.Ordinal) |> equal -1
+
+[<Fact>]
+let ``test String.LastIndexOf with OrdinalIgnoreCase StringComparison`` () =
+    "ABCDBC".LastIndexOf("b", StringComparison.OrdinalIgnoreCase) |> equal 4
+    "ABCDBC".LastIndexOf("b", StringComparison.Ordinal) |> equal -1
+    "ABCDBC".LastIndexOf("b", StringComparison.InvariantCultureIgnoreCase) |> equal 4
+
+[<Fact>]
+let ``test String.LastIndexOf with index and OrdinalIgnoreCase StringComparison`` () =
+    "ABCDBC".LastIndexOf("b", 3, StringComparison.OrdinalIgnoreCase) |> equal 1
+    "ABCDBC".LastIndexOf("b", 3, StringComparison.Ordinal) |> equal -1
+

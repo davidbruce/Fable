@@ -83,6 +83,8 @@ let call
     | "System.Decimal", (".ctor" | "op_Implicit" | "op_Explicit"), [ x ] when not (isDec x) ->
         rt $"fable_rt.decOf(%s{typedArg ctx r x 0})" [ x ] tDec
     | "System.Decimal", "Parse", [ x ] -> rt "fable_rt.decParse($0, false)" [ x ] tDec
+    | "System.Decimal", "Parse", [ x; style ] ->
+        rt "fable_rt.decParseStyle($0, @as(i32, @intCast($1)))" [ x; style ] tDec
     | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked" | "System.Decimal"),
       ("op_Addition" | "op_Subtraction" | "op_Multiply" | "op_Division" | "op_Modulus" | "Add" | "Subtract" | "Multiply" | "Divide" | "Remainder"),
       [ a; b ] when isDec a ->
@@ -157,6 +159,13 @@ let call
         pure' $"fable_rt.bigOf(%s{typedArg ctx r x 0})" [ x ] tBig
     | "Microsoft.FSharp.Core.NumericLiterals.NumericLiteralI", "FromString", [ x ] ->
         rt "fable_rt.bigParse($0)" [ x ] tBig
+    | "System.Numerics.BigInteger", ".ctor", [ x ] when
+        (match x.Type with
+         | Fable.Array(Fable.Number(UInt8, _), _) -> true
+         | _ -> false)
+        ->
+        pure' "fable_rt.bigOfBytes($0)" [ x ] tBig
+    | "System.Numerics.BigInteger", "ToByteArray", [ x ] -> pure' "fable_rt.bigToByteArray($0)" [ x ] (mapType ctx r t)
     | "System.Numerics.BigInteger", ".ctor", [ x ] when not (isBig x) ->
         pure' $"fable_rt.bigOf(%s{typedArg ctx r x 0})" [ x ] tBig
     | "System.Numerics.BigInteger", "get_Zero", [] -> pure' "fable_rt.bigOf(@as(i32, 0))" [] tBig

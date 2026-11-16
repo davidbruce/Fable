@@ -807,6 +807,58 @@ pub fn strLastIndexOf(s: String, value: String) Raised!i32 {
     return @intCast(at);
 }
 
+/// (do the units match at `at`, case folded if `fold`?)
+fn unitsMatchAt(u: []const u16, at: usize, v: []const u16, fold: bool) bool {
+    if (at + v.len > u.len) return false;
+    for (v, 0..) |c, k| {
+        const d = u[at + k];
+        if (c == d) continue;
+        if (!fold or unicode.toUpper(c) != unicode.toUpper(d)) return false;
+    }
+    return true;
+}
+
+/// `s.IndexOf(value, start, comparison)`: the comparisons that ignore case (odd values) compare
+/// case-folded units; the others, by units (the culture is the invariant one here)
+pub fn strIndexOfCmp(s: String, value: String, start: i32, comparison: i32) Raised!i32 {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    const u = p.units();
+    if (start < 0 or start > u.len) return argRange("startIndex", index_range);
+    const fold = @mod(comparison, 2) == 1;
+    const vu = v.units();
+    if (vu.len == 0) return start;
+    var at: usize = @intCast(start);
+    while (at + vu.len <= u.len) : (at += 1) {
+        if (unitsMatchAt(u, at, vu, fold)) return @intCast(at);
+    }
+    return -1;
+}
+
+/// `s.LastIndexOf(value, comparison)` and `s.LastIndexOf(value, start, comparison)`: the last
+/// match that starts at or before `start` and ends at or before `start + 1`
+pub fn strLastIndexOfCmp(s: String, value: String, start: ?i32, comparison: i32) Raised!i32 {
+    const p = s orelse return nullRef();
+    const v = value orelse return argNull("value");
+    const u = p.units();
+    const fold = @mod(comparison, 2) == 1;
+    const vu = v.units();
+    const from: i32 = start orelse @as(i32, @intCast(u.len)) - 1;
+    if (u.len == 0) return if (vu.len == 0) 0 else -1;
+    if (from < 0 or from >= u.len) return argRange("startIndex", index_range);
+    if (vu.len == 0) return from;
+    // (the match ends at `from` at the latest)
+    const last_end: usize = @as(usize, @intCast(from)) + 1;
+    if (last_end < vu.len) return -1;
+    var at: usize = last_end - vu.len;
+    while (true) {
+        if (unitsMatchAt(u, at, vu, fold)) return @intCast(at);
+        if (at == 0) break;
+        at -= 1;
+    }
+    return -1;
+}
+
 pub fn strContains(s: String, value: String) Raised!bool {
     const p = s orelse return nullRef();
     const v = value orelse return argNull("value");
@@ -1482,10 +1534,13 @@ pub fn pieceOf(comptime spec: Spec, value: anytype, scratch: *[scratch_len]u8) P
             }
             const Bits = @Int(.unsigned, info.bits);
             const sign: []const u8 = if (value >= 0 and spec.plus) "+" else if (value >= 0 and spec.space) " " else "";
+            // (the digits of `x`, `X` and `o` are of the unsigned bits: F# writes the sign flag
+            // before them whatever the value)
+            const flag: []const u8 = if (spec.plus) "+" else if (spec.space) " " else "";
             const text = switch (spec.kind) {
-                'x' => std.fmt.bufPrint(scratch, "{x}", .{@as(Bits, @bitCast(value))}),
-                'X' => std.fmt.bufPrint(scratch, "{X}", .{@as(Bits, @bitCast(value))}),
-                'o' => std.fmt.bufPrint(scratch, "{o}", .{@as(Bits, @bitCast(value))}),
+                'x' => std.fmt.bufPrint(scratch, "{s}{x}", .{ flag, @as(Bits, @bitCast(value)) }),
+                'X' => std.fmt.bufPrint(scratch, "{s}{X}", .{ flag, @as(Bits, @bitCast(value)) }),
+                'o' => std.fmt.bufPrint(scratch, "{s}{o}", .{ flag, @as(Bits, @bitCast(value)) }),
                 'u' => std.fmt.bufPrint(scratch, "{d}", .{@as(Bits, @bitCast(value))}),
                 else => std.fmt.bufPrint(scratch, "{s}{d}", .{ sign, value }),
             };

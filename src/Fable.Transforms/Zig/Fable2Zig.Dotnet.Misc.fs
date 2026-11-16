@@ -81,7 +81,15 @@ let call
     match entity, name, args with
     // `(s :> IEnumerable<'T>).GetEnumerator()` of a sequence: an enumerator over a walk of it
     | "System.Collections.Generic.IEnumerable`1", "GetEnumerator", [ Uncast source ] when
-        isSeqType source.Type || (forInSource ctx source).IsSome
+        isSeqType source.Type
+        || (forInSource ctx source).IsSome
+        // (a value of a type parameter constrained to a sequence, `#seq<'T>`: the sequence of the
+        // type Zig instantiates it with, see fable_rt.flexSeq)
+        || (
+            match unwrapNullness source.Type with
+            | Fable.GenericParam _ -> true
+            | _ -> false
+        )
         ->
         // (a list or an array: the sequence of it)
         let source =

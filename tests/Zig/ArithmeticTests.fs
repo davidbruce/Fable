@@ -2112,3 +2112,51 @@ let ``test Sign operator works`` () =
     sign -1. |> equal -1
     sign -89. |> equal -1
 
+[<Fact>]
+let ``test Decimal.Parse follows NumberStyles`` () =
+    let inv = CultureInfo.InvariantCulture
+    Decimal.Parse("+5", inv) |> equal 5M
+    Decimal.Parse(" 5 ", inv) |> equal 5M
+    Decimal.Parse("5-", inv) |> equal -5M
+    Decimal.Parse("1,234.5", inv) |> equal 1234.5M
+    Decimal.Parse("1,23,4", inv) |> equal 1234M
+    Decimal.Parse(".5", inv) |> equal 0.5M
+    Decimal.Parse("5.", inv) |> equal 5M
+    string (Decimal.Parse("-0.00", inv)) |> equal "0.00"
+    (fun () -> Decimal.Parse("1e3", inv)) |> throwsError ""
+    (fun () -> Decimal.Parse(",5", inv)) |> throwsError ""
+    (fun () -> Decimal.Parse("1,234.5,6", inv)) |> throwsError ""
+    (fun () -> Decimal.Parse("(5)", inv)) |> throwsError ""
+    (fun () -> Decimal.Parse("", inv)) |> throwsError ""
+    Decimal.Parse("1.5E+2", NumberStyles.Float, inv) |> equal 150M
+    string (Decimal.Parse("1.50e1", NumberStyles.Float, inv)) |> equal "15.0"
+    Decimal.Parse("1e3", NumberStyles.Any, inv) |> equal 1000M
+    Decimal.Parse("(5)", NumberStyles.Any, inv) |> equal -5M
+    (fun () -> Decimal.Parse("1,234", NumberStyles.Float, inv)) |> throwsError ""
+    (fun () -> Decimal.Parse("1e30", NumberStyles.Float, inv)) |> throwsError ""
+    let ok1, v1 = Decimal.TryParse("1,5", NumberStyles.Number, inv)
+    ok1 |> equal true
+    v1 |> equal 15M
+    let ok2, _ = Decimal.TryParse("1e3", NumberStyles.Number, inv)
+    ok2 |> equal false
+
+[<Fact>]
+let ``test Big integer to byte array round-trips negatives`` () =
+    // See regression where -62837 corrupted the sign extension
+    (bigint -62837).ToByteArray() |> equal [|0x8Buy; 0x0Auy; 0xFFuy|]
+    Numerics.BigInteger((bigint -62837).ToByteArray()) |> equal -62837I
+    (bigint -129).ToByteArray() |> equal [|0x7Fuy; 0xFFuy|]
+    Numerics.BigInteger((bigint -129).ToByteArray()) |> equal -129I
+    (bigint -256).ToByteArray() |> equal [|0x00uy; 0xFFuy|]
+    Numerics.BigInteger((bigint -256).ToByteArray()) |> equal -256I
+    (bigint 255).ToByteArray() |> equal [|0xFFuy; 0x00uy|]
+    Numerics.BigInteger((bigint 255).ToByteArray()) |> equal 255I
+
+[<Fact>]
+let ``test BigInteger checked conversions throw on overflow`` () =
+    (fun () -> int8 200I) |> throwsError ""
+    (fun () -> uint8 -1I) |> throwsError ""
+    (fun () -> int32 3000000000I) |> throwsError ""
+    (fun () -> byte 256I) |> throwsError ""
+    (fun () -> sbyte 200I) |> throwsError ""
+

@@ -48,6 +48,27 @@ pub fn splitDone(parts: *std.ArrayList(String)) Array(String) {
     return arrayFrom(A, items);
 }
 
+/// (is a part empty, once trimmed if the options trim parts?)
+fn pieceEmpty(piece: []const u16, trim: bool) bool {
+    if (!trim) return piece.len == 0;
+    for (piece) |c| {
+        if (!unicode.isWhiteSpace(c)) return false;
+    }
+    return true;
+}
+
+/// (where the next separator is from `from`, and its length)
+fn nextSeparator(u: []const u16, from: usize, separators: []const String) ?struct { pos: usize, len: usize } {
+    var i = from;
+    while (i < u.len) : (i += 1) {
+        for (separators) |sepStr| {
+            const sep = unitsOf(sepStr);
+            if (sep.len != 0 and std.mem.startsWith(u16, u[i..], sep)) return .{ .pos = i, .len = sep.len };
+        }
+    }
+    return null;
+}
+
 /// `s.Split(chars, options)`: by any of the chars (white space if there are none). `options`
 /// is .NET's StringSplitOptions: 1 removes empty parts, 2 trims each part.
 pub fn strSplitChars(s: String, chars: []const u16, count: i32, options: i32) Raised!Array(String) {
@@ -61,9 +82,25 @@ pub fn strSplitChars(s: String, chars: []const u16, count: i32, options: i32) Ra
         // (`count` parts at most: the last is the rest of the string)
         if (parts.items.len + 1 == count) break;
         const sep = if (chars.len == 0) unicode.isWhiteSpace(c) else std.mem.indexOfScalar(u16, chars, c) != null;
+        if (i < start) continue;
         if (sep) {
             splitPush(&parts, u[start..i], options & 1 != 0, options & 2 != 0);
             start = i + 1;
+            // (.NET's: with the parts but the last made, empty ones after are skipped before the
+            // last one is taken, when empty parts are removed)
+            if (options & 1 != 0 and parts.items.len + 1 == count) {
+                while (true) {
+                    var j = start;
+                    while (j < u.len) : (j += 1) {
+                        const d = u[j];
+                        const is_sep = if (chars.len == 0) unicode.isWhiteSpace(d) else std.mem.indexOfScalar(u16, chars, d) != null;
+                        if (is_sep) break;
+                    }
+                    if (j >= u.len or !pieceEmpty(u[start..j], options & 2 != 0)) break;
+                    start = j + 1;
+                }
+                break;
+            }
         }
     }
     splitPush(&parts, u[start..], options & 1 != 0, options & 2 != 0);
@@ -87,6 +124,14 @@ pub fn strSplitStrings(s: String, separators: []const String, count: i32, option
                 splitPush(&parts, u[start..i], options & 1 != 0, options & 2 != 0);
                 i += sep.len;
                 start = i;
+                // (.NET's: with the parts but the last made, empty ones after are skipped)
+                if (options & 1 != 0 and parts.items.len + 1 == count) {
+                    while (nextSeparator(u, start, separators)) |at| {
+                        if (!pieceEmpty(u[start..at.pos], options & 2 != 0)) break;
+                        start = at.pos + at.len;
+                    }
+                    break :outer;
+                }
                 continue :outer;
             }
         }
