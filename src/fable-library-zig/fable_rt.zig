@@ -6780,6 +6780,24 @@ pub inline fn callM(
     return acrossCompact(@field(M, name), @field(M, name ++ "$sig"), uses, args, err_drops);
 }
 
+/// For Zig code of the program's: `name args` of a function of the F# file `M` (the Zig that
+/// Fable wrote, `@import`ed). The arguments stay the caller's (dup'ed where the function keeps
+/// them) and what it gives is the caller's; `error.Raised` where the F# raises (an error union
+/// whether or not the function can raise).
+pub inline fn callFSharp(
+    comptime M: type,
+    comptime name: []const u8,
+    args: anytype,
+) Raised!UnwrapRaised(@typeInfo(@TypeOf(@field(M, name))).@"fn".return_type.?) {
+    const n = @typeInfo(@TypeOf(args)).@"struct".field_names.len;
+    const uses = comptime blk: {
+        var u: [n]u8 = undefined;
+        @memset(&u, 'k');
+        break :blk u;
+    };
+    return callM(M, name, &uses, args, .{});
+}
+
 pub inline fn xcallG(
     comptime G: type,
     comptime uses: []const u8,

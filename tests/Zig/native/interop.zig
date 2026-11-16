@@ -44,3 +44,37 @@ pub fn call_len(s: [*:0]const u8) i32 {
     const f = @extern(*const fn (?[*:0]const u8) callconv(.c) i32, .{ .name = "fable_test_len" });
     return f(s);
 }
+
+/// A Zig struct that InteropTests.fs uses through an `[<Erase; Import>]` interface
+pub const Counter = struct {
+    n: i32,
+
+    pub fn add(self: *Counter, x: i32) i32 {
+        self.n += x;
+        return self.n;
+    }
+};
+
+var live_counters: i32 = 0;
+
+pub fn counter_new(start: i32) *Counter {
+    const c = fable_rt.allocator.create(Counter) catch fable_rt.oom();
+    c.* = .{ .n = start };
+    live_counters += 1;
+    return c;
+}
+
+pub fn counter_free(c: *Counter) void {
+    fable_rt.allocator.destroy(c);
+    live_counters -= 1;
+}
+
+pub fn counters_live() i32 {
+    return live_counters;
+}
+
+/// A call of an F# function of InteropTests.fs from Zig
+pub fn call_twice_text(s: fable_rt.String) fable_rt.String {
+    const app = @import("../InteropTests.zig");
+    return fable_rt.callFSharp(app, "twiceText", .{s}) catch fable_rt.str("raised");
+}

@@ -109,4 +109,60 @@ let ``test F# functions can be given to C`` () =
     callTwice 21 |> equal 42
     // (to C as UTF-8, back to F# as a string: 5 chars)
     callLength "héllo" |> equal 5
+
+[<Erase; Import("*Counter", "./native/interop.zig")>]
+type ICounter =
+    abstract add: x: int -> int
+    abstract n: int with get, set
+
+[<Import("counter_new", "./native/interop.zig")>]
+let counterNew (start: int) : ICounter = nativeOnly
+
+[<Import("counter_free", "./native/interop.zig")>]
+let counterFree (c: ICounter) : unit = nativeOnly
+
+[<Import("counters_live", "./native/interop.zig")>]
+let countersLive () : int = nativeOnly
+
+[<Fact>]
+let ``test Erased interfaces are Zig types`` () =
+    let c = counterNew 1
+    c.add 2 |> equal 3
+    c.n |> equal 3
+    c.n <- 10
+    c.add 1 |> equal 11
+    counterFree c
+
+type IResource<'T> =
+    static abstract Destroy: 'T -> unit
+
+/// (a handle of Zig's, freed after the last use of the record that owns it)
+type OwnedCounter =
+    { C: ICounter }
+
+    interface IResource<OwnedCounter> with
+        static member Destroy(o: OwnedCounter) = counterFree o.C
+
+let useCounter (o: OwnedCounter) = o.C.add 5
+
+[<Fact>]
+let ``test A resource gives up a Zig handle after its last use`` () =
+    let before = countersLive ()
+    let total =
+        let o = { C = counterNew 1 }
+        countersLive () |> equal (before + 1)
+        useCounter o
+    total |> equal 6
+    countersLive () |> equal before
+
+let twiceText (s: string) = s + s
+
+[<Import("call_twice_text", "./native/interop.zig")>]
+let callTwiceText (s: string) : string = nativeOnly
+
+[<Fact>]
+let ``test Zig code can call F# functions`` () =
+    let s = "ab"
+    callTwiceText s |> equal "abab"
+    s |> equal "ab"
 #endif

@@ -70,6 +70,23 @@ the like are Zig's `i32`, `f64`, `bool`; a `string` is `fable_rt.String` (UTF-16
 `fable_rt.unitsOf`, `fable_rt.str`). A `.zig` file next to your `.fs` files is copied to the
 output with them, as Zig imports only files under the root of the program.
 
+A Zig struct is used through an interface that stands for it, with no wrapper:
+
+```fsharp
+[<Erase; Import("*Counter", "./counter.zig")>]   // `*`: a pointer to one
+type ICounter =
+    abstract add: x: int -> int                   // `c.add(x)`
+    abstract n: int with get, set                 // `c.n`, `c.n = v`
+```
+
+The program does not count such values: what Zig allocates, Zig frees. A record that implements
+an `IResource<'T>` of the program's (`static abstract Destroy: 'T -> unit`) and holds one frees
+it right after its own last use.
+
+From Zig, an F# function is called with `fable_rt.callFSharp(@import("App.zig"), "name",
+.{ args })`: the arguments stay the caller's, what it gives is the caller's, and it is an error
+union (`error.Raised`) whether or not the function can raise.
+
 C functions are called the .NET way, and work on both:
 
 ```fsharp

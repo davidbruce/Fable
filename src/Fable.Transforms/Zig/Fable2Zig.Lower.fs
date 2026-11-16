@@ -20,6 +20,28 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         lw ctx (userImportCall ctx imp info t r)
     | Fable.CurriedApply(Fable.Import({ Kind = Fable.UserImport _ } as imp, _, _), args, t, r) ->
         lw ctx (userImportCall ctx imp (Fable.CallInfo.Create(args = args)) t r)
+    // (a member of an interface of a Zig type, `[<Erase; Import(...)>]`: the Zig type's own:
+    // `x.add(1)`, `x.n`, `x.n = 2`)
+    | Fable.Call(Fable.Get(x, Fable.FieldGet fi, _, _), info, t, r) when isErasedZig ctx x.Type ->
+        let n = info.Args |> List.filter (fun a -> not (isUnit a.Type)) |> List.length
+
+        let holes = List.init n (fun i -> $"$%d{i + 1}") |> String.concat ", "
+
+        lw
+            ctx
+            (Fable.Emit(
+                {
+                    Macro = $"$0.%s{fi.Name}(%s{holes})"
+                    IsStatement = false
+                    CallInfo = { info with ThisArg = Some x }
+                },
+                t,
+                r
+            ))
+    | Fable.Get(x, Fable.FieldGet fi, t, r) when isErasedZig ctx x.Type ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"$0.%s{fi.Name}", xs, mapType ctx r t))
+    | Fable.Set(x, Fable.FieldSet name, _, v, _) when isErasedZig ctx x.Type ->
+        bindArgs ctx [ lw ctx x; lw ctx v ] (fun xs -> EEmit($"$0.%s{name} = $1", xs, tVoid))
     // (a value whose type F# gives where it is used: `let answer: int = nativeOnly`)
     | Fable.TypeCast(Fable.Import({ Kind = Fable.UserImport _ } as imp, Fable.Any, _), t) when t <> Fable.Any ->
         lw ctx (Fable.Import(imp, t, None))

@@ -17,6 +17,9 @@ let rec unwrapNullness (t: Fable.Type) : Fable.Type =
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
     | Fable.Unit -> tVoid
+    // (an interface of a Zig type, `[<Erase; Import("Counter", "./counter.zig")>]`: that type,
+    // which the program does not count; `*Counter` is a pointer to one)
+    | Fable.DeclaredType(ent, _) when (erasedZigType ctx ent).IsSome -> TPrim (erasedZigType ctx ent).Value
     // (a class deriving from `Dictionary` or `HashSet` with members only: the collection)
     | Fable.DeclaredType _ when (collectionBase ctx.Com t).IsSome -> mapType ctx r (collectionBase ctx.Com t).Value
     | Fable.Boolean -> tBool
@@ -902,6 +905,37 @@ and userImportAlias (ctx: Ctx) (path: string) =
         ctx.State.UserImports[path] <- alias
         alias
 
+/// The Zig type an `[<Erase>]` interface stands for (its `[<Import>]`), if it is one
+and erasedZigType (ctx: Ctx) (entRef: Fable.EntityRef) : string option =
+    match ctx.Com.TryGetEntity entRef with
+    | Some ent when ent.IsInterface ->
+        let has (name: string) =
+            ent.Attributes |> Seq.tryFind (fun a -> a.Entity.FullName = name)
+
+        match has "Fable.Core.EraseAttribute", has "Fable.Core.ImportAttribute" with
+        | Some _, Some imp ->
+            match imp.ConstructorArgs with
+            | [ :? string as selector; :? string as path ] ->
+                let pointer = selector.StartsWith("*", System.StringComparison.Ordinal)
+
+                let info: Fable.ImportInfo =
+                    {
+                        Selector = selector.TrimStart('*')
+                        Path = path
+                        Kind = Fable.UserImport false
+                    }
+
+                Some(
+                    (if pointer then
+                         "*"
+                     else
+                         "")
+                    + userImportTarget ctx info
+                )
+            | _ -> None
+        | _ -> None
+    | _ -> None
+
 /// What an imported name is in Zig: the alias of its file (`[<ImportAll>]`), or a declaration of
 /// it (quoted where it is not a plain identifier)
 and userImportTarget (ctx: Ctx) (imp: Fable.ImportInfo) =
@@ -1248,6 +1282,12 @@ and treeEnt (ctx: Ctx) (isMap: bool) : Ent =
 
         ctx.State.Ents[key] <- e
         e
+
+/// Is this an interface of a Zig type (`[<Erase; Import(...)>]`, see erasedZigType)?
+let isErasedZig (ctx: Ctx) (t: Fable.Type) =
+    match t with
+    | Fable.DeclaredType(ent, _) -> (erasedZigType ctx ent).IsSome
+    | _ -> false
 
 let isUnit (t: Fable.Type) =
     match t with
