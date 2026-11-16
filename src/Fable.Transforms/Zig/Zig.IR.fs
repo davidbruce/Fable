@@ -748,6 +748,9 @@ type FileState() =
     /// files and packages written by hand, path -> local alias (none of the module values,
     /// `$init` and `$cycles` an F# file's Zig has)
     member val UserImports = Dictionary<string, string>()
+    /// functions given to C (`[<UnmanagedCallersOnly(EntryPoint = "name")>]`): the function,
+    /// and its name in C
+    member val Exports = List<string * string>()
     /// the generated code calls the hand-written runtime (`fable_rt.zig`)
     member val UsesRuntime = false with get, set
     /// what the file's code does that lets a function value be part of a cycle (see

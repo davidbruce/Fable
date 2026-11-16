@@ -3870,6 +3870,151 @@ pub fn physicalHash(x: anytype) i32 {
     return hash(x);
 }
 
+// ---- C functions of the program's (`[<DllImport("lib")>] extern int f(string s)`): called
+// directly, as Zig calls C. F#'s values are given as C's: a string as its UTF-8 ended by a zero
+// (in a buffer of the call's stack when it fits, made for the call only), an array as a pointer
+// to its items, anything else (numbers, bool, nativeint) as it is; a string C gives back is
+// copied (C still owns it). The library is linked by the build (`-lc`, `-lsqlite3`). ----
+
+/// A string given to C for one call
+const CString = struct {
+    small: [256]u8 = undefined,
+    big: ?[]u8 = null,
+
+    fn init(c: *CString, s: String) [*:0]const u8 {
+        const units = unitsOf(s);
+        const need = units.len * 3 + 1;
+        const buf: []u8 = if (need <= c.small.len) &c.small else blk: {
+            const b = allocator.alloc(u8, need) catch oom();
+            c.big = b;
+            break :blk b;
+        };
+        const n = std.unicode.wtf16LeToWtf8(buf, units);
+        buf[n] = 0;
+        return @ptrCast(buf.ptr);
+    }
+
+    fn deinit(c: *CString) void {
+        if (c.big) |b| allocator.free(b);
+    }
+};
+
+/// What C is given for a value of type T
+fn CArg(comptime T: type) type {
+    if (T == String) return ?[*:0]const u8;
+    if (comptime isArrayPtr(T)) return [*]@typeInfo(@FieldType(@typeInfo(T).pointer.child, "items")).pointer.child;
+    return T;
+}
+
+fn CFn(comptime P: []const type, comptime R: type) type {
+    return switch (P.len) {
+        0 => *const fn () callconv(.c) R,
+        1 => *const fn (P[0]) callconv(.c) R,
+        2 => *const fn (P[0], P[1]) callconv(.c) R,
+        3 => *const fn (P[0], P[1], P[2]) callconv(.c) R,
+        4 => *const fn (P[0], P[1], P[2], P[3]) callconv(.c) R,
+        5 => *const fn (P[0], P[1], P[2], P[3], P[4]) callconv(.c) R,
+        6 => *const fn (P[0], P[1], P[2], P[3], P[4], P[5]) callconv(.c) R,
+        else => @compileError("fable: a C function of more than six arguments"),
+    };
+}
+
+/// `f args` of `[<DllImport>] extern R f(...)`: the C function `name`
+pub fn callC(comptime R: type, comptime name: []const u8, args: anytype) R {
+    const fields = @typeInfo(@TypeOf(args)).@"struct".field_types;
+    const n = fields.len;
+    const params = comptime blk: {
+        var ps: [n]type = undefined;
+        for (fields, 0..) |F, i| ps[i] = CArg(F);
+        break :blk ps;
+    };
+    var c_args: @Tuple(&params) = undefined;
+    var strings: [n]CString = undefined;
+    inline for (0..n) |i| {
+        const F = fields[i];
+        if (F == String) {
+            strings[i] = .{};
+            c_args[i] = if (args[i] == null) null else strings[i].init(args[i]);
+        } else if (comptime isArrayPtr(F)) {
+            c_args[i] = args[i].items.ptr;
+        } else {
+            c_args[i] = args[i];
+        }
+    }
+    defer inline for (0..n) |i| {
+        if (fields[i] == String) strings[i].deinit();
+    };
+    const CR = if (R == String) ?[*:0]const u8 else R;
+    const f = @extern(CFn(&params, CR), .{ .name = name });
+    const r = @call(.auto, f, c_args);
+    if (R == String) return if (r) |p| io.fromUtf8(std.mem.span(p)) else null;
+    return r;
+}
+
+/// `f args` of a C function imported with `[<Import("f", "c:module")>]` (a module of C's
+/// declarations: translated from a header by the build, or `extern` functions written in Zig):
+/// F#'s values given as the function's parameter types ask, as `callC` gives them; a string or
+/// a number of another size given back as F#'s type `R`
+pub fn cCall(comptime R: type, f: anytype, args: anytype) R {
+    const P = @typeInfo(@TypeOf(f)).@"fn".param_types;
+    const fields = @typeInfo(@TypeOf(args)).@"struct".field_types;
+    if (P.len != fields.len) @compileError("fable: the C function takes " ++ std.fmt.comptimePrint("{d}", .{P.len}) ++ " arguments");
+    const params = comptime blk: {
+        var ps: [P.len]type = undefined;
+        for (P, 0..) |p, i| ps[i] = p.?;
+        break :blk ps;
+    };
+    var c_args: @Tuple(&params) = undefined;
+    var strings: [fields.len]CString = undefined;
+    inline for (0..fields.len) |i| {
+        const F = fields[i];
+        if (F == String) {
+            strings[i] = .{};
+            c_args[i] = if (args[i] == null) @ptrFromInt(0) else @ptrCast(strings[i].init(args[i]));
+        } else if (comptime isArrayPtr(F)) {
+            c_args[i] = @ptrCast(args[i].items.ptr);
+        } else if (comptime @typeInfo(F) == .int and @typeInfo(params[i]) == .int) {
+            c_args[i] = @intCast(args[i]);
+        } else if (comptime @typeInfo(F) == .float and @typeInfo(params[i]) == .float) {
+            c_args[i] = @floatCast(args[i]);
+        } else {
+            c_args[i] = args[i];
+        }
+    }
+    defer inline for (0..fields.len) |i| {
+        if (fields[i] == String) strings[i].deinit();
+    };
+    const r = @call(.auto, f, c_args);
+    const T = @TypeOf(r);
+    if (R == String) {
+        const p: ?[*:0]const u8 = @ptrCast(r);
+        return if (p) |q| io.fromUtf8(std.mem.span(q)) else null;
+    }
+    if (comptime T == R) return r;
+    if (comptime @typeInfo(T) == .int and @typeInfo(R) == .int) return @intCast(r);
+    if (comptime @typeInfo(T) == .float and @typeInfo(R) == .float) return @floatCast(r);
+    if (comptime @typeInfo(T) == .bool and @typeInfo(R) == .bool) return r;
+    return r;
+}
+
+/// For Zig code of the program's: the UTF-8 of a string, ended by a zero, which the caller frees
+/// (`fable_rt.allocator`); and a string of UTF-8 bytes or of a C string (copied)
+pub fn strToUtf8Z(s: String) [:0]u8 {
+    const units = unitsOf(s);
+    const buf = allocator.allocSentinel(u8, std.unicode.calcWtf8Len(units), 0) catch oom();
+    _ = std.unicode.wtf16LeToWtf8(buf, units);
+    return buf;
+}
+
+pub fn strFromUtf8(bytes: []const u8) String {
+    return io.fromUtf8(bytes);
+}
+
+pub fn strFromCStr(p: ?[*:0]const u8) String {
+    const q = p orelse return null;
+    return io.fromUtf8(std.mem.span(q));
+}
+
 /// `Fable.Core.Zig.sameCell a b`: are both the same cell (one reference type's object, a
 /// list's first cell, a function's environment)? A value (a number, a struct, a record or a union
 /// kept as a value) is never the same cell as anything: false, as .NET's ReferenceEquals of two

@@ -8741,6 +8741,57 @@ and asStmt (ctx: Ctx) (ir: Expr) : Expr =
 
 and lwStmt (ctx: Ctx) (e: Fable.Expr) : Expr = asStmt ctx (lw ctx e)
 
+/// The body F# gives an `extern` function (`[<DllImport>] extern int f(int x)`)
+let isExternBody (body: Fable.Expr) =
+    match body with
+    | Fable.Call(Fable.Import({ Selector = "FailWith" }, _, _),
+                 { Args = [ Fable.Value(Fable.StringConstant "extern was not given a DllImport attribute", _) ] },
+                 _,
+                 _) -> true
+    | _ -> false
+
+/// The `EntryPoint` given to an attribute of a member (DllImport's, UnmanagedCallersOnly's)
+let attEntryPoint (attFullName: string) (info: Fable.MemberFunctionOrValue) : string option =
+    info.Attributes
+    |> Seq.tryPick (fun att ->
+        match att with
+        | :? Fable.Transforms.FSharp2Fable.FsAtt as a when att.Entity.FullName = attFullName ->
+            a.NamedArguments
+            |> List.tryPick (fun (name, value) ->
+                match value with
+                | :? string as s when name = "EntryPoint" -> Some s
+                | _ -> None
+            )
+        | _ -> None
+    )
+
+/// An `extern` function's body here: a call of the C function it names (DllImport's
+/// `EntryPoint`, or its own name), see fable_rt.callC
+let externBody (com: Compiler) (m: Fable.MemberDecl) : Fable.Expr =
+    let info = com.TryGetMember m.MemberRef
+
+    let entryPoint =
+        info
+        |> Option.bind (attEntryPoint "System.Runtime.InteropServices.DllImportAttribute")
+
+    let name =
+        entryPoint
+        |> Option.orElse (info |> Option.map (fun i -> i.CompiledName))
+        |> Option.defaultValue m.Name
+
+    let args = m.Args |> List.filter (fun a -> a.Type <> Fable.Unit)
+    let holes = args |> List.mapi (fun i _ -> $"$%d{i}") |> String.concat ", "
+
+    Fable.Emit(
+        {
+            Macro = $"fable_rt.callC($R, \"%s{name}\", .{{ %s{holes} }})"
+            IsStatement = false
+            CallInfo = Fable.CallInfo.Create(args = (args |> List.map Fable.IdentExpr))
+        },
+        m.Body.Type,
+        None
+    )
+
 let isEntryPoint (info: Fable.MemberFunctionOrValue) =
     info.Attributes
     |> Seq.exists (fun att -> att.Entity.FullName = "Microsoft.FSharp.Core.EntryPointAttribute")
@@ -9041,6 +9092,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         Body = initTail m.Body
                     }
                 ]
+            | Fable.MemberDeclaration m when isExternBody m.Body -> [ { m with Body = externBody com m } ]
             | Fable.MemberDeclaration m -> [ m ]
             | Fable.ModuleDeclaration m -> membersOf m.Members
             // A top-level statement runs when the program starts, in its place among the
@@ -9586,6 +9638,29 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                     )
                 then
                     state.Tests.Add((info.DisplayName, d.Name))
+
+                // a function given to C (`[<UnmanagedCallersOnly(EntryPoint = "name")>]`): a
+                // wrapper of C's calling convention is exported under the name (see Emit)
+                if
+                    info.Attributes
+                    |> Seq.exists (fun a ->
+                        a.Entity.FullName = "System.Runtime.InteropServices.UnmanagedCallersOnlyAttribute"
+                    )
+                then
+                    if not typeParams.IsEmpty then
+                        fail d.Body.Range "%s: a function given to C cannot be generic" d.Name
+
+                    if isManaged ret || ps |> List.exists (fun p -> isManaged p.Ty && p.Ty <> tStr) then
+                        fail
+                            d.Body.Range
+                            "%s: a function given to C takes numbers, bools and strings and gives numbers, bools or nothing"
+                            d.Name
+
+                    let symbol =
+                        attEntryPoint "System.Runtime.InteropServices.UnmanagedCallersOnlyAttribute" info
+                        |> Option.defaultValue info.CompiledName
+
+                    state.Exports.Add((d.Name, symbol))
 
                 state.Fns.Add
                     {

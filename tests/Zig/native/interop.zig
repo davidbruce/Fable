@@ -33,3 +33,14 @@ pub fn release_kept() void {
     fable_rt.drop(kept);
     kept = null;
 }
+
+/// Calls of F# functions that InteropTests.fs gives to C, by their C names
+pub fn call_twice(x: i32) i32 {
+    const f = @extern(*const fn (i32) callconv(.c) i32, .{ .name = "fable_test_twice" });
+    return f(x);
+}
+
+pub fn call_len(s: [*:0]const u8) i32 {
+    const f = @extern(*const fn (?[*:0]const u8) callconv(.c) i32, .{ .name = "fable_test_len" });
+    return f(s);
+}

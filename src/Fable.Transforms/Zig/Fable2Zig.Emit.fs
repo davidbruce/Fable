@@ -3369,6 +3369,65 @@ let emitFile (state: FileState) : string =
                 .AppendLine("}")
             |> ignore
 
+    // The functions given to C (`[<UnmanagedCallersOnly(EntryPoint = "name")>]`): a wrapper of
+    // C's calling convention, exported under the name. It makes the module values first (as
+    // `main` does: once), takes a C string as a string, and ends the program on an exception
+    // that nothing handled, as C cannot receive one (as .NET does).
+    for (fnName, symbol) in state.Exports do
+        let fn = state.Fns |> Seq.find (fun f -> f.Name = fnName)
+        let ps = fn.Params |> List.indexed
+
+        let cParams =
+            ps
+            |> List.filter (fun (_, p) -> not (isVoid p.Ty))
+            |> List.map (fun (i, p) ->
+                let ty =
+                    if p.Ty = tStr then
+                        "?[*:0]const u8"
+                    else
+                        zigType p.Ty
+
+                $"p%d{i}: %s{ty}"
+            )
+            |> String.concat ", "
+
+        let wrapper = "@\"$export_" + symbol + "\""
+
+        out
+            .AppendLine($"fn %s{wrapper}(%s{cParams}) callconv(.c) %s{zigType fn.Ret} {{")
+            .AppendLine(
+                "    if (comptime fable_rt.isRaised(@TypeOf(@\"$init\"()))) (@\"$init\"() catch { fable_rt.uncaught(); std.process.exit(134); }) else @\"$init\"();"
+            )
+        |> ignore
+
+        let args =
+            ps
+            |> List.map (fun (i, p) ->
+                if isVoid p.Ty then
+                    "{}"
+                elif p.Ty = tStr then
+                    out.AppendLine($"    const a%d{i} = fable_rt.strFromCStr(p%d{i});") |> ignore
+
+                    if fn.Modes |> List.tryItem i <> Some MOwned then
+                        out.AppendLine($"    defer fable_rt.drop(a%d{i});") |> ignore
+
+                    $"a%d{i}"
+                else
+                    $"p%d{i}"
+            )
+            |> String.concat ", "
+
+        let call = $"%s{topIdent fn.Name}(%s{args})"
+
+        out
+            .AppendLine(
+                $"    return if (comptime fable_rt.isRaised(@TypeOf(%s{call}))) (%s{call} catch {{ fable_rt.uncaught(); std.process.exit(134); }}) else %s{call};"
+            )
+            .AppendLine("}")
+            .AppendLine($"comptime {{ @export(&%s{wrapper}, .{{ .name = \"%s{symbol}\" }}); }}")
+            .AppendLine()
+        |> ignore
+
     let bodyText = out.ToString()
 
     let usesExnShow =

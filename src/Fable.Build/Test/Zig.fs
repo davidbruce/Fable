@@ -59,7 +59,16 @@ let handle (args: string list) =
     )
 
     for file in System.IO.Directory.GetFiles(testsDir, "*Tests.zig") |> Array.sort do
-        Command.Run("zig", $"test %s{System.IO.Path.GetFileName file}", workingDirectory = testsDir)
+        let name = System.IO.Path.GetFileName file
+        // (the tests of C functions, `[<DllImport>]`, link C's library; the others do not, as the
+        // runtime takes C's allocator when it is linked)
+        let libc =
+            if name = "InteropTests.zig" then
+                " -lc"
+            else
+                ""
+
+        Command.Run("zig", $"test %s{name}%s{libc}", workingDirectory = testsDir)
 
     // (in Release: F# makes tail calls only there, and the tail-call tests recurse deeply)
     if not noDotnet then

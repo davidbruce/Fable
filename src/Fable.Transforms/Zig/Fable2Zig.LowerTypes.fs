@@ -905,7 +905,7 @@ and userImportAlias (ctx: Ctx) (path: string) =
 /// What an imported name is in Zig: the alias of its file (`[<ImportAll>]`), or a declaration of
 /// it (quoted where it is not a plain identifier)
 and userImportTarget (ctx: Ctx) (imp: Fable.ImportInfo) =
-    let alias = userImportAlias ctx imp.Path
+    let alias = userImportAlias ctx (userImportPath imp)
 
     match imp.Selector with
     | "*"
@@ -915,7 +915,15 @@ and userImportTarget (ctx: Ctx) (imp: Fable.ImportInfo) =
     | sel when System.Text.RegularExpressions.Regex.IsMatch(sel, "^[A-Za-z_]") -> alias + "." + sel
     | sel -> alias + ".@\"" + sel + "\""
 
-/// A call of an imported Zig function: an Emit of it with its arguments (not those of unit)
+/// What is imported: the path, without the `c:` that marks a module of C's declarations
+and userImportPath (imp: Fable.ImportInfo) =
+    if imp.Path.StartsWith("c:", System.StringComparison.Ordinal) then
+        imp.Path.Substring 2
+    else
+        imp.Path
+
+/// A call of an imported Zig function: an Emit of it with its arguments (not those of unit). A C
+/// function (`c:`) is given C's values for F#'s, see fable_rt.cCall.
 and userImportCall (ctx: Ctx) (imp: Fable.ImportInfo) (info: Fable.CallInfo) (t: Fable.Type) r : Fable.Expr =
     let n =
         (Option.toList info.ThisArg @ info.Args)
@@ -924,9 +932,15 @@ and userImportCall (ctx: Ctx) (imp: Fable.ImportInfo) (info: Fable.CallInfo) (t:
 
     let holes = List.init n (fun i -> $"$%d{i}") |> String.concat ", "
 
+    let macro =
+        if imp.Path.StartsWith("c:", System.StringComparison.Ordinal) then
+            $"fable_rt.cCall($R, %s{userImportTarget ctx imp}, .{{ %s{holes} }})"
+        else
+            $"%s{userImportTarget ctx imp}(%s{holes})"
+
     Fable.Emit(
         {
-            Macro = $"%s{userImportTarget ctx imp}(%s{holes})"
+            Macro = macro
             IsStatement = false
             CallInfo = info
         },

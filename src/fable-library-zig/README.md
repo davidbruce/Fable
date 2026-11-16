@@ -70,6 +70,35 @@ the like are Zig's `i32`, `f64`, `bool`; a `string` is `fable_rt.String` (UTF-16
 `fable_rt.unitsOf`, `fable_rt.str`). A `.zig` file next to your `.fs` files is copied to the
 output with them, as Zig imports only files under the root of the program.
 
+C functions are called the .NET way, and work on both:
+
+```fsharp
+[<DllImport("libc", EntryPoint = "strlen")>]
+extern unativeint cStrlen(string s)          // a string is given as UTF-8 ended by a zero
+
+[<UnmanagedCallersOnly(EntryPoint = "app_twice")>]
+let twice (x: int) : int = x * 2             // exported to C under that name
+```
+
+A C header becomes a module the build translates (Zig has no `@cImport`), imported with
+`c:`, whose calls are given C's values as `extern` ones are:
+`[<Import("sqlite3_open", "c:sqlite")>]`. `fable_build.zig` wires that up for `zig build`:
+
+```zig
+const fable = @import("fable_modules/fable-library-zig/fable_build.zig");
+
+pub fn build(b: *std.Build) void {
+    const exe = fable.addExecutable(b, .{
+        .name = "app",
+        .target = b.standardTargetOptions(.{}),
+        .optimize = b.standardOptimizeOption(.{}),
+        .system_libraries = &.{"sqlite3"},
+        .c_headers = &.{.{ .name = "sqlite", .header = "sqlite.h" }}, // `#include <sqlite3.h>`
+    });
+    b.installArtifact(exe);
+}
+```
+
 ## What differs from .NET
 
 Programs print and compute what they do on .NET; where the target cannot do that yet it refuses

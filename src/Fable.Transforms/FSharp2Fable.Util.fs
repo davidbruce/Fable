@@ -152,6 +152,11 @@ type FsUnionCase(uci: FSharpUnionCase) =
         member _.UnionCaseFields = uci.Fields |> Seq.mapToList (fun x -> upcast FsField(x))
 
 type FsAtt(att: FSharpAttribute) =
+    /// The attribute's named arguments (`EntryPoint = "strlen"` of a DllImport), which
+    /// Fable.Attribute does not carry
+    member _.NamedArguments =
+        att.NamedArguments |> Seq.mapToList (fun (_, name, _, value) -> name, value)
+
     interface Fable.Attribute with
         member _.Entity = FsEnt.Ref att.AttributeType
         member _.ConstructorArgs = att.ConstructorArguments |> Seq.mapToList snd
