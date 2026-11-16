@@ -1812,6 +1812,7 @@ pub const arrayOfList = arrays.arrayOfList;
 pub const arrayPut = arrays.arrayPut;
 pub const arrayRev = arrays.arrayRev;
 pub const arraySet = arrays.arraySet;
+pub const arraySetAt = arrays.arraySetAt;
 pub const arraySlice = arrays.arraySlice;
 pub const arraySort = arrays.arraySort;
 pub const arraySortDesc = arrays.arraySortDesc;
@@ -2925,7 +2926,50 @@ pub const ObjType = struct {
     unwrap_obj: ?*const fn (Obj) ?Obj = null,
     /// identity pointer of a boxed interface wrapper (when `Box(Iface)`)
     iface_id: ?*const fn (Obj) ?*anyopaque = null,
+    /// the interfaces the class implements (its parents' are in theirs), with its table of
+    /// each: what `o :?> I` of an object of the class finds
+    ifaces: []const IfaceImpl = &.{},
 };
+
+/// An interface a class implements: the interface (`ifaceId`) and the class's table for it
+pub const IfaceImpl = struct { id: *const anyopaque, vt: *const anyopaque };
+
+/// What tells an interface type from the others at run time (a variable of its own: constants
+/// of equal values could share an address)
+pub fn ifaceId(comptime I: type) *const anyopaque {
+    return @ptrCast(&IfaceIdOf(I).tag);
+}
+
+fn IfaceIdOf(comptime I: type) type {
+    return struct {
+        var tag: u8 = @truncate(@sizeOf(I));
+    };
+}
+
+/// A class's object type with the interfaces it implements
+pub fn withIfaces(comptime t: ObjType, comptime ifaces: []const IfaceImpl) ObjType {
+    var r = t;
+    r.ifaces = ifaces;
+    return r;
+}
+
+/// The table of interface `C` of the class of `p` (or of a parent class), if it implements it
+fn objIfaceVt(comptime C: type, p: Obj) ?*const anyopaque {
+    var t: ?*const ObjType = p.type;
+    while (t) |ty| : (t = ty.parent) {
+        for (ty.ifaces) |e| {
+            if (e.id == ifaceId(C)) return e.vt;
+        }
+    }
+    return null;
+}
+
+/// `o :?> C` of an object of a class that implements interface `C` (a reference of its own)
+fn objAsIface(comptime C: type, p: Obj) ?C {
+    const vt = objIfaceVt(C, p) orelse return null;
+    retain(p);
+    return C{ .data = @ptrCast(p), .vt = @ptrCast(@alignCast(vt)) };
+}
 
 pub const ObjHeader = struct {
     @"$rc": u32 = 1,
@@ -3331,10 +3375,8 @@ pub fn box(x: anytype) Any {
             return objNew(boxType(C), BoxChain(C){ .own = .{ .value = v } });
         }
     }
-    // (an array's null is null as an object too)
-    if (comptime isArrayPtr(T)) {
-        if (arrayIsNull(x)) return null;
-    }
+    // (an array's, a record's or a function's null is null as an object too)
+    if (isNullOf(x)) return null;
     return objNew(boxType(T), BoxChain(T){ .own = .{ .value = x } });
 }
 
@@ -3343,12 +3385,16 @@ pub fn isType(comptime T: type, o: Any) bool {
     if (T == void) return o == null;
     const p = o orelse return false;
     if (p.type == boxType(T)) return true;
+    if (comptime isIface(T)) {
+        if (objIfaceVt(T, p) != null) return true;
+    }
     if (comptime @typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child)) {
         const C = @typeInfo(T).optional.child;
         if (p.type == boxType(C)) return true;
         if (p.type.unwrap_box) |f| {
             if (f(p, boxType(C)) != null) return true;
         }
+        if (objIfaceVt(C, p) != null) return true;
     }
     if (p.type.unwrap_box) |f| {
         if (f(p, boxType(T)) != null) return true;
@@ -3368,12 +3414,16 @@ pub fn tryUnbox(comptime OT: type, o: Any) OT {
         return dup(p);
     }
     if (p.type == boxType(T)) return dup(boxed(T, p).value);
+    if (comptime isIface(T)) {
+        if (objAsIface(T, p)) |v| return v;
+    }
     if (comptime @typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child)) {
         const C = @typeInfo(T).optional.child;
         if (p.type == boxType(C)) return @as(T, dup(boxed(C, p).value));
         if (p.type.unwrap_box) |f| {
             if (f(p, boxType(C))) |bp| return @as(T, dup(boxed(C, bp).value));
         }
+        if (objAsIface(C, p)) |v| return @as(T, v);
     }
     if (p.type.unwrap_box) |f| {
         if (f(p, boxType(T))) |bp| return dup(boxed(T, bp).value);
@@ -3425,12 +3475,16 @@ pub fn unbox(comptime T: type, x: anytype) Raised!T {
     };
     if (T == Obj) return dup(p);
     if (p.type == boxType(T)) return dup(boxed(T, p).value);
+    if (comptime isIface(T)) {
+        if (objAsIface(T, p)) |v| return v;
+    }
     if (comptime @typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child)) {
         const C = @typeInfo(T).optional.child;
         if (p.type == boxType(C)) return dup(boxed(C, p).value);
         if (p.type.unwrap_box) |f| {
             if (f(p, boxType(C))) |bp| return dup(boxed(C, bp).value);
         }
+        if (objAsIface(C, p)) |v| return v;
     }
     if (p.type.unwrap_box) |f| {
         if (f(p, boxType(T))) |bp| return dup(boxed(T, bp).value);
@@ -3446,6 +3500,12 @@ pub fn unbox(comptime T: type, x: anytype) Raised!T {
     b.addAscii(netTypeName(T));
     b.addAscii("'.");
     return raise(InvalidCastException, b.finish());
+}
+
+/// `o :?> I` of an interface that has no null: null raises NullReferenceException
+pub fn unboxNonNull(comptime T: type, x: Any) Raised!T {
+    if (x == null) return nullRef();
+    return unbox(T, x);
 }
 
 /// `o.ToString()` (null raises) and `string o` (null is "")
@@ -3574,6 +3634,182 @@ pub fn defaultOf(comptime T: type) T {
         },
         else => std.mem.zeroes(T),
     };
+}
+
+// ---- .NET's null of types that have none here (`Array.zeroCreate`, `Unchecked.defaultof`) ----
+//
+// A reference record (or another counted cell) gets a null cell of its type: one cell whose count
+// starts at `null_count`, so it is never unique (never changed in place by reuse) and never freed,
+// and which `isCellNull` tells from any real cell by its count alone (on any thread). Its fields
+// hold their own types' nulls. A union, which is a value here, gets its first case with null
+// fields (a list: the empty list); a function, one that raises NullReferenceException when
+// applied. Known differences from .NET: reading a field of a null record gives the field's null
+// instead of raising, and a union's or a list's null is not null to `isNull (box x)`.
+
+/// Does the type have a null (or the nearest value of it) here?
+pub fn hasNull(comptime T: type) bool {
+    return comptime hasNullDepth(T, 8);
+}
+
+fn hasNullDepth(comptime T: type, comptime depth: u8) bool {
+    if (depth == 0) return true;
+    if (T == String or T == Any or T == BigInt or T == NetDecimal) return true;
+    if (isArrayPtr(T)) return true;
+    if (isFunc(T)) return @typeInfo(@typeInfo(@FieldType(T, "code")).pointer.child).@"fn".param_types.len <= 4;
+    if (isIface(T)) return false;
+    if (isCellPtr(T)) {
+        const C = @typeInfo(T).pointer.child;
+        if (@hasDecl(C, "fable_identity") or @hasDecl(C, "fable_object")) return false;
+        const st = @typeInfo(C).@"struct";
+        for (st.field_names, st.field_types) |name, F| {
+            if (std.mem.eql(u8, name, "$rc") or std.mem.eql(u8, name, "$gc")) continue;
+            if (!hasNullDepth(F, depth - 1)) return false;
+        }
+        return true;
+    }
+    return switch (@typeInfo(T)) {
+        .int, .float, .bool, .void, .optional, .@"enum" => true,
+        .@"struct" => |st| blk: {
+            for (st.field_types) |F| {
+                if (!hasNullDepth(F, depth - 1)) break :blk false;
+            }
+            break :blk true;
+        },
+        .@"union" => |u| u.tag_type != null and hasNullDepth(u.field_types[0], depth - 1),
+        else => false,
+    };
+}
+
+/// .NET's null of a type (a reference of its own); see `hasNull`
+pub fn nullOf(comptime T: type) T {
+    if (T == String or T == Any) return null;
+    if (comptime isArrayPtr(T)) return arrayNull(T);
+    if (comptime isFunc(T)) return .{ .env = null, .code = nullCode(@FieldType(T, "code")) };
+    if (comptime isCellPtr(T)) return dup(CellNull(T).get());
+    if (T == BigInt or T == NetDecimal) return defaultOf(T);
+    return switch (@typeInfo(T)) {
+        .optional => null,
+        .@"struct" => |st| blk: {
+            var x: T = undefined;
+            inline for (st.field_names) |name| @field(x, name) = nullOf(@FieldType(T, name));
+            break :blk x;
+        },
+        .@"union" => |u| blk: {
+            const F = u.field_types[0];
+            break :blk @unionInit(T, u.field_names[0], if (F == void) {} else nullOf(F));
+        },
+        else => std.mem.zeroes(T),
+    };
+}
+
+/// Is a counted cell the null cell of its type?
+pub inline fn isCellNull(c: anytype) bool {
+    return (@atomicLoad(u32, &c.@"$rc", .monotonic) & ~shared_bit) >= arrays.null_count / 2;
+}
+
+/// Is a value of a type with no null of its own .NET's null (`nullOf` made it)?
+pub fn isNullOf(x: anytype) bool {
+    const T = @TypeOf(x);
+    if (comptime isArrayPtr(T)) return arrayIsNull(x);
+    if (comptime isCellPtr(T)) return isCellNull(x);
+    if (comptime isFunc(T)) return x.env == null and x.code == nullCode(@FieldType(T, "code"));
+    return false;
+}
+
+fn CellNull(comptime P: type) type {
+    const C = @typeInfo(P).pointer.child;
+    return if (hasGc(C)) struct {
+        // (the collector follows these: one of the thread's own, made as any other cell and
+        // given up with the thread's null arrays)
+        threadlocal var made: ?P = null;
+
+        fn get() P {
+            if (made) |c| return c;
+            if (comptime hasGc(C)) gcTick();
+            const c = allocator.create(C) catch @panic("fable: out of memory");
+            if (track) thread.stats.allocs += 1;
+            made = c;
+            fillNullCell(P, c);
+            c.@"$gc" = gcHeader(C, c);
+            thread.null_arrays.append(bookkeeping(), .{ .cell = c, .free = freeNull }) catch @panic("fable: out of memory");
+            uncount();
+            return c;
+        }
+
+        fn freeNull(p: *anyopaque) void {
+            const c: P = @ptrCast(@alignCast(p));
+            c.@"$rc" = 1;
+            recount();
+            drop(c);
+            made = null;
+        }
+    } else struct {
+        var null_cell: C = undefined;
+        var ready = std.atomic.Value(u8).init(0);
+        threadlocal var filling = false;
+
+        fn get() P {
+            if (ready.load(.acquire) == 2 or filling) return &null_cell;
+            if (ready.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+                filling = true;
+                fillNullCell(P, &null_cell);
+                filling = false;
+                ready.store(2, .release);
+            } else {
+                while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+            }
+            return &null_cell;
+        }
+    };
+}
+
+/// (the null cell's fields: their own types' nulls; the count first, so that a field of the
+/// cell's own type, which reads the cell back, sees it as a null cell)
+fn fillNullCell(comptime P: type, c: P) void {
+    const C = @typeInfo(P).pointer.child;
+    c.@"$rc" = arrays.null_count;
+    const st = @typeInfo(C).@"struct";
+    inline for (st.field_names, st.field_types) |name, F| {
+        if (comptime !std.mem.eql(u8, name, "$rc") and !std.mem.eql(u8, name, "$gc")) {
+            @field(c, name) = nullOf(F);
+        }
+    }
+}
+
+/// The code of a null function: raises NullReferenceException (or stops the program, where
+/// the function's type cannot raise)
+fn nullCode(comptime Code: type) Code {
+    const F = @typeInfo(@typeInfo(Code).pointer.child).@"fn";
+    const R = F.return_type.?;
+    const p = F.param_types;
+    return switch (p.len) {
+        1 => &struct {
+            fn f(_: p[0].?) R {
+                return nullCall(R);
+            }
+        }.f,
+        2 => &struct {
+            fn f(_: p[0].?, _: p[1].?) R {
+                return nullCall(R);
+            }
+        }.f,
+        3 => &struct {
+            fn f(_: p[0].?, _: p[1].?, _: p[2].?) R {
+                return nullCall(R);
+            }
+        }.f,
+        4 => &struct {
+            fn f(_: p[0].?, _: p[1].?, _: p[2].?, _: p[3].?) R {
+                return nullCall(R);
+            }
+        }.f,
+        else => @compileError("nullCode: a function of more than three arguments"),
+    };
+}
+
+fn nullCall(comptime R: type) R {
+    if (comptime isRaised(R)) return nullRef();
+    @panic("Object reference not set to an instance of an object.");
 }
 
 /// What a `Find` gives: the item found, or `default(T)`
@@ -3936,6 +4172,7 @@ pub const Cycles = struct {
     cap_instantiated: bool = false,
     stack_traces: bool = false,
     reflection: bool = false,
+    exn_show: bool = true,
 };
 
 /// A file's own answer joined with those of the files it uses.
@@ -3950,6 +4187,7 @@ pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
         if (@hasField(@TypeOf(u), "cap_instantiated")) r.cap_instantiated = r.cap_instantiated or u.cap_instantiated;
         if (@hasField(@TypeOf(u), "stack_traces")) r.stack_traces = r.stack_traces or u.stack_traces;
         if (@hasField(@TypeOf(u), "reflection")) r.reflection = r.reflection or u.reflection;
+        if (@hasField(@TypeOf(u), "exn_show")) r.exn_show = r.exn_show or u.exn_show;
     }
     return r;
 }
@@ -3985,6 +4223,18 @@ pub const stack_traces: bool = blk: {
     if (!@hasDecl(root, "$cycles")) break :blk true;
     const c: Cycles = root.@"$cycles";
     break :blk c.stack_traces;
+};
+
+/// Does the program ever format an F# exception (`%A` via `exnMessage`, or an unhandled exception
+/// escaping `main`/`$init`)? When false, `ExnUnder` leaves `.show = null` so `%A` code is stripped.
+pub const exn_show: bool = blk: {
+    if (@import("builtin").is_test) break :blk true;
+    if (!@hasDecl(root, "$cycles")) break :blk true;
+    const c: Cycles = root.@"$cycles";
+    if (c.exn_show) break :blk true;
+    if (@hasDecl(root, "$init") and isRaised(@TypeOf(root.@"$init"()))) break :blk true;
+    if (@hasDecl(root, "$main_raises") and root.@"$main_raises") break :blk true;
+    break :blk false;
 };
 
 /// `LanguagePrimitives.GenericZero` and `GenericOne` of a type parameter: of the number type
@@ -4900,8 +5150,7 @@ pub fn argNull(comptime param: []const u8) Raised {
 pub fn isNullValue(x: anytype) bool {
     const T = @TypeOf(x);
     if (comptime @typeInfo(T) == .optional) return x == null;
-    if (comptime isArrayPtr(T)) return arrayIsNull(x);
-    return false;
+    return isNullOf(x);
 }
 
 /// Is the type an array's (a cell of `fable_array`)?
@@ -6576,7 +6825,13 @@ pub const Shower = struct {
             const copy = b.arena.dupe(u8, buf[0 .. t.len + 1]) catch @panic("fable: out of memory");
             return b.word(copy);
         }
-        if (T == Exn) return x.type.show(b, x, prec, depth);
+        if (comptime isCellPtr(T)) {
+            if (isCellNull(x)) return b.word("null");
+        }
+        if (T == Exn) {
+            if (x.type.show) |exn_show_fn| return exn_show_fn(b, x, prec, depth);
+            return b.word(x.type.name);
+        }
         if (T == Obj) return b.word(x.type.name);
         if (comptime isIface(T)) {
             if (ifaceToObjBorrow(x)) |o| return b.word(o.type.name);
@@ -7655,8 +7910,8 @@ pub const ExnType = struct {
     message: ?*const fn (Exn) String = null,
     /// the .NET class this one derives from, if a program can name it
     parent: ?*const ExnType = null,
-    /// the exception as `%A` writes it
-    show: *const fn (*Shower, Exn, Prec, i32) *Layout,
+    /// the exception as `%A` writes it (null when the program never formats one: see `exn_show`)
+    show: ?*const fn (*Shower, Exn, Prec, i32) *Layout,
     /// F#'s `exception` declarations are equal when their fields are (null: only to itself)
     eql: ?*const fn (Exn, Exn) bool = null,
     hash: ?*const fn (Exn) i32 = null,
@@ -7714,7 +7969,7 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
             .share = share,
             .message = if (Payload == Described) message else if (is_match_failure) matchMessage else if (@hasField(Payload, "fable_message")) classMessage else null,
             .parent = parent,
-            .show = show,
+            .show = if (exn_show) show else null,
             // (an object of a class compares by reference, as on .NET)
             .eql = if (Payload == Described or @hasField(Payload, "fable_message")) null else payloadEql,
             .hash = if (Payload == Described or @hasField(Payload, "fable_message")) null else payloadHash,
@@ -7980,7 +8235,8 @@ fn exnText(t: *TextBuilder, e: Exn) void {
 
 pub fn exnMessage(e: Exn) String {
     if (e.type.message) |message| return message(e);
-    return anyText(e);
+    if (comptime exn_show) return anyText(e);
+    return str(e.type.name);
 }
 
 /// `e.StackTrace`: null until the exception is thrown, then the captured frames.
@@ -8165,6 +8421,150 @@ pub inline fn across(
         if (u == .give and sig.borrows[i]) drop(args[i]);
     }
     return result;
+}
+
+pub inline fn dropAll(xs: anytype) void {
+    inline for (xs) |x| drop(x);
+}
+
+pub fn UnwrapRaised(comptime T: type) type {
+    return if (@typeInfo(T) == .error_union) @typeInfo(T).error_union.payload else T;
+}
+
+/// Concise cross-file call with ASCII use string (`p` = plain, `k` = keep, `g` = give)
+/// and an error-edge tuple `err_drops` of caller values dropped if the callee raises.
+pub inline fn acrossCompact(
+    comptime f: anytype,
+    comptime sig: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+    @setEvalBranchQuota(1_000_000);
+    var a: std.meta.ArgsTuple(@TypeOf(f)) = undefined;
+    inline for (uses, 0..) |u, i| {
+        a[i] = if (u == 'k' and !sig.borrows[i]) dup(args[i]) else args[i];
+    }
+    const raw = @call(.auto, f, a);
+    const r = if (comptime isRaised(@TypeOf(raw))) raw catch |err| {
+        inline for (uses, 0..) |u, i| {
+            if (u == 'g' and sig.borrows[i]) drop(args[i]);
+        }
+        inline for (err_drops) |d| drop(d);
+        return err;
+    } else raw;
+    const result = if (sig.result_borrowed) dup(r) else r;
+    inline for (uses, 0..) |u, i| {
+        if (u == 'g' and sig.borrows[i]) drop(args[i]);
+    }
+    return result;
+}
+
+pub inline fn callG(
+    comptime G: type,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(G.call)).@"fn".return_type.? {
+    return acrossCompact(G.call, G.sig, uses, args, err_drops);
+}
+
+pub inline fn callM(
+    comptime M: type,
+    comptime name: []const u8,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(@field(M, name))).@"fn".return_type.? {
+    return acrossCompact(@field(M, name), @field(M, name ++ "$sig"), uses, args, err_drops);
+}
+
+pub inline fn xcallG(
+    comptime G: type,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) Raised!UnwrapRaised(@typeInfo(@TypeOf(G.call)).@"fn".return_type.?) {
+    return callG(G, uses, args, err_drops);
+}
+
+pub inline fn xcallM(
+    comptime M: type,
+    comptime name: []const u8,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) Raised!UnwrapRaised(@typeInfo(@TypeOf(@field(M, name))).@"fn".return_type.?) {
+    return callM(M, name, uses, args, err_drops);
+}
+
+pub inline fn xcallPlain(
+    raw: anytype,
+    err_drops: anytype,
+) Raised!UnwrapRaised(@TypeOf(raw)) {
+    if (comptime isRaised(@TypeOf(raw))) {
+        return raw catch |err| {
+            inline for (err_drops) |d| drop(d);
+            return err;
+        };
+    } else {
+        return raw;
+    }
+}
+
+// ---- `NativePtr.stackalloc`: memory of the function that asks for it ----
+//
+// .NET's `stackalloc` (F#'s `NativePtr.stackalloc`, then `Span(ptr, n)` over it) gives memory
+// that lives until the function returns, zeroed (F# compiles with `localsinit`). A function that
+// asks for it has a `StackAlloc` on its own stack: small requests come from its buffer, larger
+// ones from the heap, and all of it is given up when the function returns. (Its items are
+// unmanaged, as `stackalloc` requires: nothing to count.)
+
+pub const StackAlloc = struct {
+    buf: [1024]u8 align(16) = undefined,
+    used: usize = 0,
+    blocks: ?*Block = null,
+
+    const Block = struct { next: ?*Block, bytes: []align(16) u8 };
+
+    pub fn alloc(self: *StackAlloc, comptime T: type, n: i32) Raised![*]T {
+        if (n < 0) return raise(OverflowException, str("Arithmetic operation resulted in an overflow."));
+        const size = @as(usize, @intCast(n)) * @sizeOf(T);
+        const start = std.mem.alignForward(usize, self.used, @max(@alignOf(T), 1));
+        if (start + size <= self.buf.len) {
+            self.used = start + size;
+            const bytes = self.buf[start .. start + size];
+            @memset(bytes, 0);
+            return @ptrCast(@alignCast(bytes.ptr));
+        }
+        const bytes = allocator.alignedAlloc(u8, .@"16", @max(size, 1)) catch return raise(OutOfMemoryException, str("Insufficient memory to continue the execution of the program."));
+        @memset(bytes, 0);
+        const b = allocator.create(Block) catch {
+            allocator.free(bytes);
+            return raise(OutOfMemoryException, str("Insufficient memory to continue the execution of the program."));
+        };
+        b.* = .{ .next = self.blocks, .bytes = bytes };
+        self.blocks = b;
+        return @ptrCast(@alignCast(bytes.ptr));
+    }
+
+    pub fn deinit(self: *StackAlloc) void {
+        var b = self.blocks;
+        while (b) |x| {
+            b = x.next;
+            allocator.free(x.bytes);
+            allocator.destroy(x);
+        }
+        self.blocks = null;
+    }
+};
+
+/// `Span<T>(ptr, n)` of what `stackalloc` (or another pointer) gives
+pub fn spanOfPtr(comptime S: type, p: anytype, n: i32) Raised!S {
+    if (n < 0) return raise(ArgumentOutOfRangeException, str("Specified argument was out of the range of valid values. (Parameter 'length')"));
+    const T = @typeInfo(S).pointer.child;
+    const items: [*]T = @ptrCast(@alignCast(@constCast(p)));
+    return items[0..@intCast(n)];
 }
 
 /// Cells that were allocated and not freed (0 when counters are not kept).
@@ -9925,6 +10325,54 @@ test "closure2 and apply2: zero intermediate closure alloc and exception-edge dr
         const res = apply2(i32, failing, 1, s3);
         try std.testing.expectError(error.Raised, res);
         drop(take());
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "arraySetAt, dropAll, callM/xcallM, and exn_show" {
+    const before = thread.stats;
+    {
+        const A = Array(String);
+        const arr = arrayOf(A, .{ str("a"), str("b") });
+        const s = strConcat(str("c"), str("d"));
+        arraySetAt(arr, 1, s);
+        drop(s);
+        try expectText("cd", try arrayGet(arr, 1));
+
+        const p1 = strConcat(str("p"), str("1"));
+        const p2 = strConcat(str("p"), str("2"));
+        dropAll(.{ arr, p1, p2 });
+
+        const Nums = Array(i32);
+        const nums = arrayOf(Nums, .{ 1, 2, 3 });
+        arraySetAt(nums, 0, 42);
+        try std.testing.expectEqual(@as(i32, 42), arrayItemAt(nums, 0));
+        drop(nums);
+
+        const Mod = struct {
+            pub fn echo(x: String) Raised!String {
+                if (unitsOf(x).len == 0) return raise(ArgumentException, str("empty"));
+                return dup(x);
+            }
+            pub const @"echo$sig" = .{ .borrows = .{ true }, .result_borrowed = false };
+
+            pub fn plainOk(n: i32) i32 {
+                return n + 1;
+            }
+        };
+
+        const src = strConcat(str("hi"), str("!"));
+        const echoed = try xcallM(Mod, "echo", "k", .{ src }, .{});
+        try expectText("hi!", echoed);
+        try expectText("hi!", dup(src));
+
+        const held = strConcat(str("he"), str("ld"));
+        const fail_arg = str("");
+        try std.testing.expectError(error.Raised, xcallM(Mod, "echo", "g", .{ fail_arg }, .{ src, held }));
+        drop(take());
+
+        try std.testing.expectEqual(@as(i32, 8), try xcallPlain(Mod.plainOk(7), .{}));
+        try std.testing.expect(exn_show);
     }
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }

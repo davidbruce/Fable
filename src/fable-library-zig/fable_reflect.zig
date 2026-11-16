@@ -61,6 +61,7 @@ pub const Type = *const TypeInfo;
 
 var reflect_lock: u32 = 0;
 var class_types: std.AutoHashMapUnmanaged(*const rt.ObjType, Type) = .empty;
+var exn_types: std.AutoHashMapUnmanaged(*const rt.ExnType, Type) = .empty;
 var named_types: std.StringHashMapUnmanaged(Type) = .empty;
 var tuple_types: std.StringHashMapUnmanaged(Type) = .empty;
 
@@ -827,6 +828,25 @@ pub fn typeOfObject(o: Any) Raised!Type {
     const info = bk.create(TypeInfo) catch @panic("fable: out of memory");
     info.* = .{ .full_name = p.type.name, .name = p.type.name[if (std.mem.lastIndexOfAny(u8, p.type.name, ".+")) |i| i + 1 else 0..], .namespace = "", .kind = .class };
     class_types.put(bk, p.type, info) catch @panic("fable: out of memory");
+    return info;
+}
+
+/// `e.GetType()` of an exception: by its class's name, interned per exception type
+pub fn typeOfExn(e: rt.Exn) Type {
+    rt.lockField(&reflect_lock);
+    defer rt.unlockField(&reflect_lock);
+    if (exn_types.get(e.type)) |existing| return existing;
+    const bk = rt.bookkeeping();
+    const full = e.type.name;
+    const info = bk.create(TypeInfo) catch @panic("fable: out of memory");
+    const dot = std.mem.lastIndexOfScalar(u8, full, '.');
+    info.* = .{
+        .full_name = full,
+        .name = full[if (std.mem.lastIndexOfAny(u8, full, ".+")) |i| i + 1 else 0..],
+        .namespace = if (dot) |i| full[0..i] else "",
+        .kind = .class,
+    };
+    exn_types.put(bk, e.type, info) catch @panic("fable: out of memory");
     return info;
 }
 

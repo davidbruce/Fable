@@ -67,6 +67,7 @@ let raisedExceptionType (f: unit -> 'a) : string =
     | :? ArgumentException -> "ArgumentException"
     | :? InvalidOperationException -> "InvalidOperationException"
     | :? FormatException -> "FormatException"
+    | :? IndexOutOfRangeException -> "IndexOutOfRangeException"
     | e -> "Unexpected exception: " + e.Message
 
 // ---- what MiscTests uses (as the other targets have it) ----

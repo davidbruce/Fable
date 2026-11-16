@@ -10,6 +10,10 @@ type private P =
         State: FileState
         /// the functions of the file being compiled, by name
         Fns: Dictionary<string, FnInfo>
+        StoredFields: Dictionary<string, Set<string>>
+        CallsCallback: HashSet<string>
+        CallsExtStore: HashSet<string>
+        PureStdlibAliases: HashSet<string>
     }
 
 // =============================================================================================
@@ -612,54 +616,294 @@ let rec private hoistMutableReads (p: P) (e: Expr) : Expr =
         wrap binds e'
 
 // =============================================================================================
-// Reference records: which code can assign a field. A value read from such a field is only a
-// borrow while nothing can assign.
+// Reference records: field-sensitive store tracking so a read of field A stays borrowed while
+// only field B or a pure stdlib function runs, and local unescaped ref cells borrow freely.
 // =============================================================================================
 
-/// Can evaluating `e` assign a field of a reference record? A function of another file and a
-/// function value are taken to: this file cannot see what they do.
-let rec private mayStore (p: P) (e: Expr) : bool =
-    let any (es: Expr list) = es |> List.exists (mayStore p)
+let private fieldKey (ent: Ent) (f: string) = $"%s{ent.Ref.FullName}|%s{f}"
+
+let rec private mayCarryCallable (t: Ty) : bool =
+    match t with
+    | TFn _
+    | TGen _
+    | TPrim "fable_rt.Obj" -> true
+    | TEnt(e, args) -> e.Kind = KIface || e.ReachesOpaque || List.exists mayCarryCallable args
+    | TOpt x -> mayCarryCallable x
+    | TTuple ts -> List.exists mayCarryCallable ts
+    | _ -> false
+
+let rec private mentionsRefCell (t: Ty) : bool =
+    match t with
+    | TGen _
+    | TPrim "fable_rt.Obj" -> true
+    | TEnt(e, args) ->
+        e.Ref.FullName = "Microsoft.FSharp.Core.FSharpRef`1"
+        || List.exists mentionsRefCell args
+    | TOpt x -> mentionsRefCell x
+    | TTuple ts -> List.exists mentionsRefCell ts
+    | _ -> false
+
+let private isPureStdlibCall (p: P) (fname: string) (xs: Expr list) =
+    match fname.IndexOf '.' with
+    | -1 -> false
+    | dot ->
+        let alias = fname.Substring(0, dot)
+
+        p.PureStdlibAliases.Contains alias
+        && not (xs |> List.exists (typeOf >> mentionsRefCell))
+
+let rec private scanFnStores
+    (p: P)
+    (stored: HashSet<string>)
+    (callsCallback: bool ref)
+    (callsExtStore: bool ref)
+    (e: Expr)
+    : unit
+    =
+    let go x =
+        scanFnStores p stored callsCallback callsExtStore x
 
     match e with
     | EStore(lv, r) ->
         (match lv with
-         | EGet(x, _, _) ->
+         | EGet(EEmit(m, _, _), _, _) when m.StartsWith("objInit:", System.StringComparison.Ordinal) -> ()
+         | EGet(x, PField f, _) ->
              match typeOf x with
-             | TEnt({ Kind = KRefRecord }, _) -> true
-             | _ -> false
-         | _ -> false)
-        || mayStore p r
+             | TEnt({ Kind = KRefRecord } as ent, _)
+             | TPtr(TEnt(ent, _), _) -> stored.Add(fieldKey ent f) |> ignore
+             | _ -> callsExtStore.Value <- true
+         | _ -> callsExtStore.Value <- true)
+
+        go lv
+        go r
     | ECall(f, _, xs, _) ->
-        (match p.Fns.TryGetValue f with
-         | true, g -> g.Stores
-         | _ -> true)
-        || any xs
+        match p.Fns.TryGetValue f with
+        | true, _ ->
+            for k in p.StoredFields[f] do
+                stored.Add k |> ignore
+
+            if p.CallsCallback.Contains f then
+                callsCallback.Value <- true
+
+            if p.CallsExtStore.Contains f then
+                callsExtStore.Value <- true
+        | _ ->
+            if xs |> List.exists (typeOf >> mayCarryCallable) then
+                callsCallback.Value <- true
+            elif not (isPureStdlibCall p f xs) then
+                callsExtStore.Value <- true
+
+        List.iter go xs
     | ECallClo _
     | ECallVt _
-    | ECallIface _ -> true
+    | ECallIface _ ->
+        callsCallback.Value <- true
+        List.iter go (flatKids e)
     | ELet(_, r, b)
     | ESeq(r, b)
-    | EWhile(r, b) -> any [ r; b ]
-    | EIf(c, t, f, _) -> any [ c; t; f ]
-    | EFor(_, a, b, _, body) -> any [ a; b; body ]
-    | EAssign(_, r) -> mayStore p r
-    | ETry(b, _, h, _) -> any [ b; h ]
+    | EWhile(r, b) ->
+        go r
+        go b
+    | EIf(c, t, f, _) ->
+        go c
+        go t
+        go f
+    | EFor(_, a, b, _, body) ->
+        go a
+        go b
+        go body
+    | EAssign(_, r) -> go r
+    | ETry(b, _, h, _) ->
+        go b
+        go h
     | EDrop(_, k)
     | EUnpack(_, k)
-    | EPromote(_, k) -> mayStore p k
-    | _ -> any (flatKids e)
+    | EPromote(_, k) -> go k
+    | _ -> List.iter go (flatKids e)
 
 let private inferStores (p: P) : unit =
+    for fn in p.State.Fns do
+        p.StoredFields[fn.Name] <- Set.empty
+
     let mutable changed = true
 
     while changed do
         changed <- false
 
         for fn in p.State.Fns do
-            if not fn.Stores && mayStore p fn.Body then
-                fn.Stores <- true
+            let stored = HashSet<string>(p.StoredFields[fn.Name])
+            let callsCb = ref (p.CallsCallback.Contains fn.Name)
+            let callsExt = ref (p.CallsExtStore.Contains fn.Name)
+            scanFnStores p stored callsCb callsExt fn.Body
+            let storedSet = Set.ofSeq stored
+
+            if storedSet <> p.StoredFields[fn.Name] then
+                p.StoredFields[fn.Name] <- storedSet
                 changed <- true
+
+            if callsCb.Value && p.CallsCallback.Add fn.Name then
+                changed <- true
+
+            if callsExt.Value && p.CallsExtStore.Add fn.Name then
+                changed <- true
+
+            fn.Stores <- not storedSet.IsEmpty || callsCb.Value || callsExt.Value
+
+let private localUnescapedRefVars (body: Expr) : Set<int> =
+    let candidates = HashSet<int>()
+    let escaped = HashSet<int>()
+
+    let rec collect (e: Expr) =
+        match e with
+        | ELet(v, ECon(TEnt({ Kind = KRefRecord }, _), "", args, _), b) when not v.FMutable && v.Kind = VLocal ->
+            candidates.Add v.Id |> ignore
+            List.iter collect args
+            collect b
+        | ELet(_, r, b)
+        | ESeq(r, b)
+        | EWhile(r, b)
+        | EStore(r, b) ->
+            collect r
+            collect b
+        | EIf(c, t, f, _) ->
+            collect c
+            collect t
+            collect f
+        | EFor(_, a, b, _, bd) ->
+            collect a
+            collect b
+            collect bd
+        | EAssign(_, r) -> collect r
+        | ETry(b, _, h, _) ->
+            collect b
+            collect h
+        | EDrop(_, k)
+        | EUnpack(_, k)
+        | EPromote(_, k) -> collect k
+        | _ -> List.iter collect (flatKids e)
+
+    collect body
+
+    let rec markAll (e: Expr) =
+        match e with
+        | EVar v -> escaped.Add v.Id |> ignore
+        | _ -> List.iter markAll (flatKids e)
+
+    let rec scan (e: Expr) =
+        match e with
+        | EVar v -> escaped.Add v.Id |> ignore
+        | EAddr(x, _) -> markAll x
+        | EGet(EVar v, PField _, _) when candidates.Contains v.Id -> ()
+        | EStore(EGet(EVar v, PField _, _), rhs) when candidates.Contains v.Id -> scan rhs
+        | ELet(_, r, b) ->
+            scan r
+            scan b
+        | ESeq(r, b)
+        | EWhile(r, b) ->
+            scan r
+            scan b
+        | EIf(c, t, f, _) ->
+            scan c
+            scan t
+            scan f
+        | EFor(_, a, b, _, bd) ->
+            scan a
+            scan b
+            scan bd
+        | EAssign(_, r) -> scan r
+        | EStore(lv, r) ->
+            scan lv
+            scan r
+        | ETry(b, _, h, _) ->
+            scan b
+            scan h
+        | EDrop(_, k)
+        | EUnpack(_, k)
+        | EPromote(_, k) -> scan k
+        | _ -> List.iter scan (flatKids e)
+
+    if candidates.Count > 0 then
+        scan body
+
+    candidates |> Seq.filter (fun id -> not (escaped.Contains id)) |> Set.ofSeq
+
+let rec private mayOverwriteRead (p: P) (unescaped: Set<int>) (rhs: Expr) (body: Expr) : bool =
+    let rec mutableFieldsRead e =
+        match e with
+        | EGet(x, proj, _) ->
+            let here =
+                match proj, typeOf x with
+                | PField f, TEnt({ Kind = KRefRecord } as ent, _) when List.contains f ent.MutableFields -> [ ent, f ]
+                | PField f, TPtr(TEnt(ent, _), _) when List.contains f ent.MutableFields -> [ ent, f ]
+                | _ -> []
+
+            here @ mutableFieldsRead x
+        | _ -> []
+
+    let fields = mutableFieldsRead rhs
+
+    if fields.IsEmpty then
+        false
+    else
+        match rhs with
+        | EGet(EVar owner, PField fieldName, _) when unescaped.Contains owner.Id ->
+            exists
+                (function
+                | EStore(EGet(EVar v2, PField f2, _), _) -> v2.Id = owner.Id && f2 = fieldName
+                | _ -> false)
+                body
+        | _ ->
+            let fieldKeys = fields |> List.map (fun (ent, f) -> fieldKey ent f) |> Set.ofList
+
+            let hasNonLocalOrRef =
+                fields
+                |> List.exists (fun (ent, _) ->
+                    not ent.IsLocal || ent.Ref.FullName = "Microsoft.FSharp.Core.FSharpRef`1"
+                )
+
+            let rec hits (e: Expr) : bool =
+                match e with
+                | EStore(lv, r) ->
+                    let hitLv =
+                        match lv with
+                        | EGet(EEmit(m, _, _), _, _) when m.StartsWith("objInit:", System.StringComparison.Ordinal) ->
+                            false
+                        | EGet(y, PField f2, _) ->
+                            match typeOf y with
+                            | TEnt({ Kind = KRefRecord } as e2, _)
+                            | TPtr(TEnt(e2, _), _) -> fieldKeys.Contains(fieldKey e2 f2)
+                            | _ -> true
+                        | _ -> true
+
+                    hitLv || hits r
+                | ECallClo _
+                | ECallVt _
+                | ECallIface _ -> true
+                | ECall(g, _, xs, _) ->
+                    let calleeHit =
+                        match p.Fns.TryGetValue g with
+                        | true, _ ->
+                            not (Set.isEmpty (Set.intersect fieldKeys p.StoredFields[g]))
+                            || p.CallsCallback.Contains g
+                            || (hasNonLocalOrRef && p.CallsExtStore.Contains g)
+                        | _ ->
+                            (xs |> List.exists (typeOf >> mayCarryCallable))
+                            || (hasNonLocalOrRef && not (isPureStdlibCall p g xs))
+
+                    calleeHit || List.exists hits xs
+                | ELet(_, r, b)
+                | ESeq(r, b)
+                | EWhile(r, b) -> hits r || hits b
+                | EIf(c, t, f, _) -> hits c || hits t || hits f
+                | EFor(_, a, b, _, bd) -> hits a || hits b || hits bd
+                | EAssign(_, r) -> hits r
+                | ETry(b, _, h, _) -> hits b || hits h
+                | EDrop(_, k)
+                | EUnpack(_, k)
+                | EPromote(_, k) -> hits k
+                | _ -> List.exists hits (flatKids e)
+
+            hits body
 
 // =============================================================================================
 // Borrow inference: a managed parameter is borrowed unless the body consumes it (returns it,
@@ -820,8 +1064,83 @@ let rec private tailSources (p: P) (fn: FnInfo) (aliases: Map<int, Set<int>>) (e
     | _ when isFlat e -> borrowSources p fn aliases e
     | _ -> None
 
+/// The functions of the file that call each other last (strongly connected components of two
+/// or more over calls in tail position). As Koka's borrow inference does, their parameters are
+/// owned: a borrowed argument would leave the caller a drop after the call, and the call would
+/// no longer be the last thing it does (see the state machines of `Emit`).
+let private mutualTailFns (fns: FnInfo seq) : HashSet<string> =
+    let byName = Dictionary<string, FnInfo>()
+
+    for fn in fns do
+        byName[fn.Name] <- fn
+
+    let edges = Dictionary<string, string list>()
+
+    for fn in fns do
+        let rec collect (e: Expr) : string list =
+            match e with
+            | ELet(_, _, b)
+            | EDrop(_, b)
+            | EUnpack(_, b)
+            | EPromote(_, b) -> collect b
+            | ESeq(_, b) -> collect b
+            | EIf(_, t, f, _) -> collect t @ collect f
+            | ECall(g, tArgs, args, _)
+            | EOnRaise(ECall(g, tArgs, args, _), _) when
+                g <> fn.Name
+                && byName.ContainsKey g
+                && tArgs = (fn.TypeParams |> List.map TGen)
+                && args.Length = byName[g].Params.Length
+                ->
+                [ g ]
+            | _ -> []
+
+        edges[fn.Name] <- collect fn.Body |> List.distinct
+
+    let result = HashSet<string>()
+    let index = Dictionary<string, int>()
+    let low = Dictionary<string, int>()
+    let onStack = HashSet<string>()
+    let stack = Stack<string>()
+    let mutable next = 0
+
+    let rec connect (v: string) =
+        index[v] <- next
+        low[v] <- next
+        next <- next + 1
+        stack.Push v
+        onStack.Add v |> ignore
+
+        for w in edges[v] do
+            if not (index.ContainsKey w) then
+                connect w
+                low[v] <- min low[v] low[w]
+            elif onStack.Contains w then
+                low[v] <- min low[v] index[w]
+
+        if low[v] = index[v] then
+            let comp = List<string>()
+            let mutable stop = false
+
+            while not stop do
+                let w = stack.Pop()
+                onStack.Remove w |> ignore
+                comp.Add w
+                stop <- (w = v)
+
+            if comp.Count >= 2 then
+                for w in comp do
+                    result.Add w |> ignore
+
+    for fn in fns do
+        if not (index.ContainsKey fn.Name) then
+            connect fn.Name
+
+    result
+
 let private inferBorrows (p: P) : unit =
     let fns = p.State.Fns
+    let mutualTail = mutualTailFns fns
 
     for fn in fns do
         fn.Modes <-
@@ -857,7 +1176,7 @@ let private inferBorrows (p: P) : unit =
                 |> List.map (fun q ->
                     if not (isManaged q.Ty) then
                         MPlain
-                    elif owning.Contains q.Id || isReuseSite fn.Body q then
+                    elif owning.Contains q.Id || isReuseSite fn.Body q || mutualTail.Contains fn.Name then
                         MOwned
                     else
                         MBorrowed
@@ -909,6 +1228,8 @@ type private PEnv =
         /// inside a `try` body: what the handler (or the code after the `try`) still needs, and
         /// an error edge must therefore leave alone
         RaiseKeep: Set<int>
+        /// local KRefRecord (`ref` / mutable record) variables whose handle never escapes this function
+        UnescapedRefs: Set<int>
     }
 
 type private POp =
@@ -1143,7 +1464,7 @@ let private settle (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : PEnv * POp list 
                             && Set.isEmpty (Set.intersect directB L)
                             && directB
                                |> Set.forall (fun b -> isManaged allVars[b].Ty && isCopyable allVars[b].Ty)
-                            && directB |> Set.exists consumedLater.Contains
+                            && (allVars[x].FMutable || directB |> Set.exists consumedLater.Contains)
                         then
                             for b in directB do
                                 ops.Add(OPromote allVars[b])
@@ -1319,11 +1640,36 @@ let private rewriteFlat (p: P) (env: PEnv) (e: Expr) (rootOwning: bool) (lAfter:
     let e' = rw Set.empty rootOwning e
     e', Set.ofSeq consumed, { env with Tokens = tokens }
 
+let rec private isLocalPath (e: Expr) =
+    match e with
+    | EVar v -> v.Kind <> VGlobal
+    | EGet(x, _, _) -> isLocalPath x
+    | _ -> false
+
+let private clearAssignedKnown (ids: Set<int>) (env: PEnv) : PEnv =
+    if ids.IsEmpty || (env.Known.IsEmpty && env.Excluded.IsEmpty) then
+        env
+    else
+        let prefixes = ids |> Set.map vk
+
+        let invalidates (k: string) =
+            prefixes
+            |> Set.exists (fun p -> k = p || k.StartsWith(p + ".", System.StringComparison.Ordinal))
+
+        { env with
+            Known = env.Known |> Map.filter (fun k _ -> not (invalidates k))
+            Excluded = env.Excluded |> Map.filter (fun k _ -> not (invalidates k))
+        }
+
 /// What a test tells about the value it tests. (Nothing is remembered about a variable that
-/// can be assigned: it may hold another value by the time the knowledge is used.)
-let private refine (env: PEnv) (c: Expr) : PEnv * PEnv =
+/// can be assigned across an assignment: `clearAssignedKnown` drops stale facts before loops,
+/// sequences, handlers and bindings.)
+let rec private refine (env: PEnv) (c: Expr) : PEnv * PEnv =
     match c with
-    | ETest(x, case, ty) when (pathKey x).IsSome && isStablePath x && not (touchesMutable x) ->
+    | EPrim("not", [ inner ], _) ->
+        let envT, envF = refine env inner
+        envF, envT
+    | ETest(x, case, ty) when (pathKey x).IsSome && isLocalPath x && not (touchesMutable x) ->
         let key = (pathKey x).Value
         let envT = { env with Known = env.Known.Add(key, case) }
         let excl = Set.add case (defaultArg (env.Excluded.TryFind key) Set.empty)
@@ -1382,14 +1728,16 @@ and private pcNode (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
             |> Set.filter (fun id -> isManaged allVars[id].Ty && La.Contains id)
 
         let env' =
-            { env with
-                Owned = Set.union (Set.intersect env.Owned (expand env La)) reowned
-                Tokens =
-                    if isFlat a then
-                        env.Tokens
-                    else
-                        []
-            }
+            clearAssignedKnown
+                (assignedIn a)
+                { env with
+                    Owned = Set.union (Set.intersect env.Owned (expand env La)) reowned
+                    Tokens =
+                        if isFlat a then
+                            env.Tokens
+                        else
+                            []
+                }
 
         ESeq(a', pc p env' b L)
     | EIf(c, t, f, ty) ->
@@ -1398,15 +1746,17 @@ and private pcNode (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
         let envT, envF = refine env1 c
         EIf(c', pc p envT t L, pc p envF f L, ty)
     | EWhile(c, b) ->
+        let envLoop = clearAssignedKnown (assignedIn b) env
         let head = live e L
-        let c', _, _ = rewriteFlat p env c false head
+        let c', _, _ = rewriteFlat p envLoop c false head
+        let envBody, _ = refine envLoop c
 
         let loop =
             EWhile(
                 c',
                 pc
                     p
-                    { env with
+                    { envBody with
                         Tokens = []
                         TailBorrowed = false
                     }
@@ -1414,8 +1764,9 @@ and private pcNode (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
                     head
             )
 
-        dropAfterLoop p env loop L
+        dropAfterLoop p envLoop loop L
     | EFor(i, a, b, up, body) ->
+        let envLoop = clearAssignedKnown (assignedIn body) env
         let head = Set.union (live e L) L
 
         let loop =
@@ -1426,7 +1777,7 @@ and private pcNode (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
                 up,
                 pc
                     p
-                    { env with
+                    { envLoop with
                         Tokens = []
                         TailBorrowed = false
                     }
@@ -1434,7 +1785,7 @@ and private pcNode (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
                     head
             )
 
-        dropAfterLoop p env loop L
+        dropAfterLoop p envLoop loop L
     | EAssign(v, rhs) ->
         let L' = Set.remove v.Id L
 
@@ -1518,11 +1869,13 @@ and private pcNode (p: P) (env: PEnv) (e: Expr) (L: Set<int>) : Expr =
         let handler' =
             pc
                 p
-                { env with
-                    Owned = ownedH
-                    Tokens = []
-                    TailBorrowed = false
-                }
+                (clearAssignedKnown
+                    (assignedIn body)
+                    { env with
+                        Owned = ownedH
+                        Tokens = []
+                        TailBorrowed = false
+                    })
                 handler
                 L
 
@@ -1580,19 +1933,70 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
             | EGet(x, _, _) -> rootOf x
             | _ -> None
 
-        // (A projection of a variable that can be assigned is not an alias: the variable may be
-        // given another value while the name is still in use, so the name gets its own
-        // reference.)
+        // A pattern over a `let mutable` (`match cur with h :: t -> cur <- t; ...`) may borrow
+        // its fields when `r` is never mutated inside `body`, or when every existing borrower of `r`
+        // is a direct copyable child and `body` ends the linear projection spine with `r <- next`
+        // (so `settle` unpacks `r` in place or promotes its borrows before the assignment).
+        let isSafeMutableAlias (r: Var) (v: Var) (env: PEnv) (body: Expr) =
+            r.FMutable
+            && r.Kind <> VGlobal
+            && env.Owned.Contains r.Id
+            && isCopyable v.Ty
+            && (not ((assignedIn body).Contains r.Id)
+                || (let existingOk =
+                        env.Owners
+                        |> Map.forall (fun bId owners ->
+                            not (List.contains r.Id owners)
+                            || (
+                                match env.Children.TryFind bId with
+                                | Some(pId, _, _) -> pId = r.Id && isCopyable p.State.Vars[bId].Ty
+                                | None -> false
+                            )
+                        )
+
+                    let rec checkSpine b =
+                        match b with
+                        | ELet(w, EGet(EVar r2, _, _), rest) when r2.Id = r.Id && not w.FMutable && isCopyable w.Ty ->
+                            checkSpine rest
+                        | ELet(_, uRhs, rest) when
+                            not ((fv uRhs).Contains r.Id) && not ((assignedIn uRhs).Contains r.Id)
+                            ->
+                            checkSpine rest
+                        | EAssign(r2, assignRhs) when
+                            r2.Id = r.Id && isFlat assignRhs && not ((fv assignRhs).Contains r.Id)
+                            ->
+                            true
+                        | ESeq(EAssign(r2, assignRhs), afterAssign) when
+                            r2.Id = r.Id
+                            && isFlat assignRhs
+                            && not ((fv assignRhs).Contains r.Id)
+                            && not ((assignedIn afterAssign).Contains r.Id)
+                            ->
+                            true
+                        | ESeq(head, tail) when not ((fv head).Contains r.Id) && not ((assignedIn head).Contains r.Id) ->
+                            checkSpine tail
+                        | _ -> false
+
+                    existingOk && checkSpine body))
+
+        // (A projection of a variable that can be assigned is not an alias unless proven safe by
+        // `isSafeMutableAlias`: otherwise the variable may be given another value while the name is
+        // still in use, so the name gets its own reference.)
         let env1, isAlias =
             match rhs with
             // (Nor is a read of a field that can be assigned, if anything while the name is in
-            // use may assign a field: the field could get another value and give this one up.
-            // A walk that only reads a mutable structure stays free of reference counting.)
+            // use may assign that field: field-sensitive `mayOverwriteRead` lets reads across stores
+            // to other fields or pure stdlib calls remain borrowed.)
             | EGet(x, proj, _) when
                 isManaged v.Ty
                 && not v.FMutable
-                && isStablePath x
-                && (not (touchesMutable rhs) || not (mayStore p body))
+                && (isStablePath x
+                    || (
+                        match x with
+                        | EVar r -> isSafeMutableAlias r v env body
+                        | _ -> false
+                    ))
+                && (not (touchesMutable rhs) || not (mayOverwriteRead p env.UnescapedRefs rhs body))
                 && not (isSharedFieldRead rhs)
                 ->
                 let env1 =
@@ -1703,10 +2107,12 @@ and private pcLet (p: P) (env: PEnv) (v: Var) (rhs: Expr) (body: Expr) (L: Set<i
             rhs',
             pc
                 p
-                { env with
-                    Owned = owned
-                    Tokens = []
-                }
+                (clearAssignedKnown
+                    (assignedIn rhs)
+                    { env with
+                        Owned = owned
+                        Tokens = []
+                    })
                 body
                 L
         )
@@ -1721,6 +2127,7 @@ let private emptyEnv =
         Tokens = []
         TailBorrowed = false
         RaiseKeep = Set.empty
+        UnescapedRefs = Set.empty
     }
 
 let private capsAreImmutableVars (caps: Expr list) =
@@ -2319,10 +2726,62 @@ let run (state: FileState) : unit =
 
     specializeHofs state hooks
 
+    let pureStdlibModules =
+        HashSet
+            [
+                "List"
+                "Array"
+                "Seq"
+                "Map"
+                "Set"
+                "Option"
+                "Result"
+                "Guid"
+                "TimeSpan"
+                "DateTime"
+                "DateOnly"
+                "DateTimeOffset"
+                "Uri"
+                "Path"
+                "ResizeArray"
+                "HashSet"
+                "Queue"
+                "Stack"
+                "ListCollector"
+            ]
+
+    let hasFableLibPrefix =
+        state.Imports.Keys
+        |> Seq.exists (fun path -> path.Replace('\\', '/').Contains "fable-library-zig")
+
+    let pureStdlibAliases =
+        state.Imports
+        |> Seq.choose (fun kv ->
+            let norm = kv.Key.Replace('\\', '/')
+            let baseName = System.IO.Path.GetFileNameWithoutExtension norm
+
+            let isLibPath =
+                if hasFableLibPrefix then
+                    norm.Contains "fable-library-zig/"
+                else
+                    norm.StartsWith("./", System.StringComparison.Ordinal)
+                    && norm.IndexOf('/', 2) = -1
+
+            if isLibPath && pureStdlibModules.Contains baseName then
+                Some kv.Value
+            else
+                None
+        )
+        |> HashSet
+
     let p =
         {
             State = state
             Fns = Dictionary()
+            StoredFields = Dictionary()
+            CallsCallback = HashSet()
+            CallsExtStore = HashSet()
+            PureStdlibAliases = pureStdlibAliases
         }
 
     for fn in state.Fns do
@@ -2402,6 +2861,7 @@ let run (state: FileState) : unit =
                         { emptyEnv with
                             Owned = owned
                             TailBorrowed = fn.RetFrom.IsSome
+                            UnescapedRefs = localUnescapedRefVars fn.Body
                         }
                         fn.Body
                         Set.empty

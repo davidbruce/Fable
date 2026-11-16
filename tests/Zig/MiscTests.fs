@@ -1,5 +1,6 @@
 module Fable.Tests.Zig.MiscTests
 
+#nowarn "9" // NativePtr.stackalloc
 #nowarn "40" //  warning FSHARP: This and other recursive references to the object(s) being defined will be checked for initialization-soundness at runtime through the use of a delayed reference.
 
 open System
@@ -1880,3 +1881,46 @@ let ``test A read of another file's mutable value is not moved past side effects
     let before = MiscTestsHelper.trackedCalls
     MiscTestsHelper.track 1 |> ignore
     MiscTestsHelper.trackedCalls - before |> equal 1
+
+open Microsoft.FSharp.NativeInterop
+
+let private stackSpanSum (n: int) =
+    let p = NativePtr.stackalloc<int> n
+    let span = Span<int>(NativePtr.toVoidPtr p, n)
+    for i in 0 .. n - 1 do
+        span.[i] <- i * 10
+    let mutable t = 0
+    for x in span do
+        t <- t + x
+    t
+
+[<Fact>]
+let ``test NativePtr.stackalloc gives zeroed memory of the function`` () =
+    stackSpanSum 4 |> equal 60
+    stackSpanSum 100 |> equal 49500
+    let big = Span<float>(NativePtr.toVoidPtr (NativePtr.stackalloc<float> 1000), 1000)
+    big.Length |> equal 1000
+    big.[999] |> equal 0.0
+    big.Fill 0.5
+    let mutable t = 0.0
+    for x in big do
+        t <- t + x
+    t |> equal 500.0
+    let longs = Span<int64>(NativePtr.toVoidPtr (NativePtr.stackalloc<int64> 8), 8)
+    let mutable zeros = 0
+    for x in longs do
+        if x = 0L then zeros <- zeros + 1
+    zeros |> equal 8
+
+[<Fact>]
+let ``test GetType of exceptions`` () =
+    try
+        failwith "x"
+    with e ->
+        e.GetType().Name |> equal "Exception"
+        e.GetType().FullName |> equal "System.Exception"
+    try
+        raise (ArgumentException "y")
+    with e ->
+        e.GetType().Name |> equal "ArgumentException"
+        e.GetType().Namespace |> equal "System"

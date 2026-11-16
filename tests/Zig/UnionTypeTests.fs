@@ -534,3 +534,44 @@ let ``test Match with condition works`` () =
     let b2 = DeepWrappedB "not"
     b1 |> matchStringWhenStringNotHello |> equal "hello"
     b2 |> matchStringWhenStringNotHello |> equal "not hello"
+
+[<Fact>]
+let ``test mutable list pattern traversal handles unique, shared, and throwing loops`` () =
+    let mutable cur = List.init 10 (fun i -> "u-" + string i)
+    let mutable out = ""
+
+    while not cur.IsEmpty do
+        match cur with
+        | h :: rest ->
+            out <- out + h + ","
+            cur <- rest
+        | [] -> ()
+
+    out |> equal "u-0,u-1,u-2,u-3,u-4,u-5,u-6,u-7,u-8,u-9,"
+
+    let shared = List.init 5 (fun i -> "s-" + string i)
+    let mutable sc = shared
+    let mutable revAcc = []
+
+    while not sc.IsEmpty do
+        match sc with
+        | h :: rest ->
+            sc <- rest
+            revAcc <- h :: revAcc
+        | [] -> ()
+
+    revAcc |> equal [ "s-4"; "s-3"; "s-2"; "s-1"; "s-0" ]
+    shared |> List.length |> equal 5
+
+    throwsError "mut-list-boom" (fun () ->
+        let mutable tc = List.init 8 (fun i -> "t-" + string i)
+
+        while not tc.IsEmpty do
+            match tc with
+            | h :: rest ->
+                tc <- rest
+
+                if h = "t-4" then
+                    failwith "mut-list-boom"
+            | [] -> ()
+    )

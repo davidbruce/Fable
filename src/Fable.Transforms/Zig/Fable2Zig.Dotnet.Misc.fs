@@ -718,13 +718,14 @@ let call
             | _ -> "objectRecordFields", mapType ctx r t
 
         rt $"fable_rt.reflect.%s{fn}($0)" [ Fable.TypeCast(o, Fable.Any) ] ty
-    | ("Microsoft.FSharp.Core.Operators" | "System.Type" | "System.Object" | "Microsoft.FSharp.Reflection.FSharpType" | "Microsoft.FSharp.Reflection.FSharpValue" | "System.Reflection.PropertyInfo" | "System.Reflection.MemberInfo" | "Microsoft.FSharp.Reflection.UnionCaseInfo"),
+    | ("Microsoft.FSharp.Core.Operators" | "System.Type" | "System.Object" | "System.Exception" | "Microsoft.FSharp.Reflection.FSharpType" | "Microsoft.FSharp.Reflection.FSharpValue" | "System.Reflection.PropertyInfo" | "System.Reflection.MemberInfo" | "Microsoft.FSharp.Reflection.UnionCaseInfo"),
       name,
       args when
-        (entity <> "Microsoft.FSharp.Core.Operators"
-         || name = "TypeOf"
-         || name = "TypeDefOf"
-         || (name = "IsNull" && args |> List.exists (fun a -> a.Type = Fable.MetaType)))
+        (entity <> "System.Exception" || name = "GetType")
+        && (entity <> "Microsoft.FSharp.Core.Operators"
+            || name = "TypeOf"
+            || name = "TypeDefOf"
+            || (name = "IsNull" && args |> List.exists (fun a -> a.Type = Fable.MetaType)))
         && (entity <> "System.Object"
             || name = "GetType"
             || (name = "ReferenceEquals"
@@ -914,6 +915,10 @@ let call
         | "System.Object", "GetType", [ Unboxed inner as x ] when unwrapNullness inner.Type = Fable.Any ->
             ctx.State.UsesReflection <- true
             rfl "typeOfObject" [ x ] tType
+        // (an exception: its class, known when the program runs)
+        | _, "GetType", [ x ] when mapType ctx r x.Type = TPrim "fable_rt.Exn" ->
+            ctx.State.UsesReflection <- true
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.reflect.typeOfExn($0)", xs, tType))
         | "System.Object", "GetType", [ x ] -> bindArgs ctx [ lw ctx x ] (fun _ -> typeOfIr x.Type)
         // (two Type objects: the same type information)
         | "System.Object", "ReferenceEquals", [ Unboxed a; Unboxed b ] -> pure' "($0 == $1)" [ a; b ] tBool

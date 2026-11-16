@@ -57,10 +57,18 @@ type Ctx =
         /// whole-number variables known to be greater than zero where they are used (a guard
         /// tested it): a divisor that needs no test
         Positive: HashSet<string>
+        /// whole-number variables known to be non-negative (>= 0) where they are used
+        NonNeg: HashSet<string>
+        /// i32 variables known to be strictly less than Int32.MaxValue (so `v + 1` cannot wrap negative)
+        BoundedBelowMax: HashSet<string>
+        /// immutable int var `n -> (collection/string var, collection/string type)` from `let n = c.Length`
+        Lengths: Dictionary<string, string * Fable.Type>
+        /// immutable array var `a -> known constant length`
+        ConstLen: Dictionary<string, int>
         /// variables bound to a `Type` that is known here (`typeof<T>`, a `MakeGenericType` of known
         /// types): what it stands for
         KnownTypes: Dictionary<string, Fable.Type>
-        /// `coll|i`: inside `for i in 0 .. coll.Length - 1` (coll an immutable string or array),
+        /// `coll|i`: inside `for i in 0 .. coll.Length - 1` or guarded `while i < coll.Length`,
         /// `coll.[i]` is in range (and the string not null: its length was read)
         InBounds: HashSet<string>
         /// inside a `for ... in` loop: the enumerator's name, and the variable that holds the
@@ -1559,6 +1567,13 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
             | _ -> false
 
         TPtr(mapType ctx r t, isIn)
+    // a native pointer (`NativePtr.stackalloc`): a many-item pointer; `voidptr`: an opaque one
+    | Fable.DeclaredType(ent, [ t ]) when
+        ent.FullName = "nativeptr`1"
+        || ent.FullName = "Microsoft.FSharp.Core.nativeptr`1"
+        ->
+        TPrim("[*]" + zigType (mapType ctx r t))
+    | Fable.DeclaredType(ent, []) when ent.FullName = "voidptr" || ent.FullName = "System.Void*" -> TPrim "*anyopaque"
     // a span: a slice of what it views
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Span`1" || ent.FullName = "System.ReadOnlySpan`1" ->
         TSlice(mapType ctx r t, ent.FullName = "System.ReadOnlySpan`1")
@@ -2698,6 +2713,8 @@ let tryCallable (ctx: Ctx) (e: Fable.Expr) : Callable option =
     match e with
     | Fable.IdentExpr id when not (ctx.Vars.ContainsKey id.Name) ->
         match ctx.LocalFns.TryGetValue id.Name with
+        // (a generic value is not called by name: its value is, see `lw`)
+        | true, fn when ctx.State.GenericValues.Contains fn.FnName -> None
         | true, fn ->
             Some
                 {
@@ -3825,7 +3842,50 @@ let objDecl (ctx: Ctx) (r: SourceLocation option) (o: ObjInfo) (dotnetName: stri
             | _ -> None
         )
 
+    // (the interfaces of the class, with the tables a value of each made of its object has)
+    let ifaces =
+        if o.IsAbstract then
+            []
+        else
+            match com.TryGetEntity o.Ref with
+            | Some ent ->
+                let srcType =
+                    Fable.DeclaredType(o.Ref, o.Gens |> List.map (fun g -> Fable.GenericParam(g, false, [])))
+
+                ent.AllInterfaces
+                |> Seq.toList
+                // (the interfaces of the program: .NET's have tables of their own here)
+                |> List.filter (fun i ->
+                    match i.Entity.Path with
+                    | Fable.SourcePath _
+                    | Fable.PrecompiledLib _ -> true
+                    | _ -> false
+                )
+                |> List.choose (fun i ->
+                    let ifaceType = Fable.DeclaredType(i.Entity, i.GenericArgs)
+
+                    try
+                        if not (isInterfaceType com ifaceType) then
+                            None
+                        else
+                            match mapType ctx r ifaceType with
+                            | TOpt(TEnt(e, _) as s)
+                            | (TEnt(e, _) as s) when e.Kind = KIface ->
+                                let slots =
+                                    caseFields s ""
+                                    |> List.map (fun (f, _) ->
+                                        f, interfaceImplSlot ctx r srcType o.Ref i.Entity.FullName f
+                                    )
+
+                                Some(s, slots)
+                            | _ -> None
+                    with _ ->
+                        None
+                )
+            | None -> []
+
     {
+        Ifaces = ifaces
         TypeName = o.Prefix + "__type"
         TypeParams = o.Gens
         Chain = TEnt(o.Chain, o.Gens |> List.map TGen)
@@ -4208,6 +4268,27 @@ let usedInFunction (name: string) (e: Fable.Expr) : bool =
 
     go false e
 
+let hasAddressOfIdent (name: string) (e: Fable.Expr) : bool =
+    let rec go e =
+        match e with
+        | Fable.Operation(Fable.Unary(UnaryAddressOf, Uncast(Fable.IdentExpr id)), _, _, _) when id.Name = name -> true
+        | _ -> getSubExpressions e |> List.exists go
+
+    go e
+
+let mutatedIdentsIn (e: Fable.Expr) : HashSet<string> =
+    let acc = HashSet<string>()
+
+    let rec go e =
+        match e with
+        | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, _) ->
+            acc.Add id.Name |> ignore
+            go value
+        | _ -> getSubExpressions e |> List.iter go
+
+    go e
+    acc
+
 /// A string that is certainly not null: its length needs no test.
 let rec neverNull (e: Fable.Expr) : bool =
     match e with
@@ -4287,6 +4368,9 @@ let nullFacts (cond: Fable.Expr) : string list * string list =
             | Fable.Call(Fable.Import(imp, _, _), info, _, _) ->
                 match imp.Selector, info.Args with
                 | ("IsNull" | "IsNullOrEmpty" | "IsNullOrWhiteSpace"), [ x ] -> [], Option.toList (named x)
+                | "ReferenceEquals", [ x; n ] when isNullValue n -> [], Option.toList (named x)
+                | "ReferenceEquals", [ n; x ] when isNullValue n -> [], Option.toList (named x)
+                | ("NonNull" | "NonNullQuickPattern"), [ x ] -> Option.toList (named x), []
                 | "op_Equality", [ x; n ] when isNullValue n -> [], Option.toList (named x)
                 | "op_Equality", [ n; x ] when isNullValue n -> [], Option.toList (named x)
                 | "op_Inequality", [ x; n ] when isNullValue n -> Option.toList (named x), []
@@ -4365,6 +4449,63 @@ let positiveFacts (cond: Fable.Expr) : string list * string list =
         )
         cond
 
+/// What a condition tells of whole numbers: the variables known to be non-negative (`>= 0`)
+/// where it is true, and where it is false.
+let nonNegFacts (cond: Fable.Expr) : string list * string list =
+    let constOf (e: Fable.Expr) : int64 option =
+        match e with
+        | Fable.Value(Fable.NumberConstant(v, _), _) ->
+            match v with
+            | Fable.NumberValue.Int8 n -> Some(int64 n)
+            | Fable.NumberValue.Int16 n -> Some(int64 n)
+            | Fable.NumberValue.Int32 n -> Some(int64 n)
+            | Fable.NumberValue.Int64 n -> Some n
+            | Fable.NumberValue.UInt8 n -> Some(int64 n)
+            | Fable.NumberValue.UInt16 n -> Some(int64 n)
+            | Fable.NumberValue.UInt32 n -> Some(int64 n)
+            | Fable.NumberValue.UInt64 n when n <= uint64 System.Int64.MaxValue -> Some(int64 n)
+            | _ -> None
+        | _ -> None
+
+    let named (e: Fable.Expr) =
+        match e with
+        | Fable.IdentExpr i when not i.IsMutable ->
+            match i.Type with
+            | Fable.Number((Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64), _) -> Some i.Name
+            | _ -> None
+        | _ -> None
+
+    let leaf (op: BinaryOperator) (x: Fable.Expr) (c: int64) : string list * string list =
+        match named x with
+        | None -> [], []
+        | Some n ->
+            match op with
+            | BinaryGreaterOrEqual when c >= 0L -> [ n ], []
+            | BinaryGreater when c >= -1L -> [ n ], []
+            | BinaryLess when c >= 0L && c <= 0L -> [], [ n ]
+            | BinaryLessOrEqual when c >= -1L && c <= -1L -> [], [ n ]
+            | _ -> [], []
+
+    let flip (op: BinaryOperator) =
+        match op with
+        | BinaryGreater -> BinaryLess
+        | BinaryGreaterOrEqual -> BinaryLessOrEqual
+        | BinaryLess -> BinaryGreater
+        | BinaryLessOrEqual -> BinaryGreaterOrEqual
+        | o -> o
+
+    factsOf
+        (fun cond ->
+            match cond with
+            | Fable.Operation(Fable.Binary(op, x, k), _, _, _) ->
+                match constOf k, constOf x with
+                | Some c, _ -> leaf op x c
+                | None, Some c -> leaf (flip op) k c
+                | _ -> [], []
+            | _ -> [], []
+        )
+        cond
+
 /// Does this always raise (`raise`, `failwith`, `nullArg`, `invalidArg`, `invalidOp`)?
 let rec alwaysRaises (e: Fable.Expr) : bool =
     match e with
@@ -4416,6 +4557,212 @@ let withFacts (set: HashSet<string>) (names: string list) (f: unit -> 'a) : 'a =
 /// `f ()` with these variables known not to be null, and these known positive
 let withKnown (ctx: Ctx) (nonNull: string list) (positive: string list) (f: unit -> 'a) : 'a =
     withFacts ctx.NonNull nonNull (fun () -> withFacts ctx.Positive positive f)
+
+/// `f ()` with these variables known non-null, positive, and non-negative
+let withKnownFacts
+    (ctx: Ctx)
+    (nonNull: string list)
+    (positive: string list)
+    (nonNeg: string list)
+    (f: unit -> 'a)
+    : 'a
+    =
+    withFacts ctx.NonNull nonNull (fun () -> withFacts ctx.Positive positive (fun () -> withFacts ctx.NonNeg nonNeg f))
+
+let clearIdentFacts (ctx: Ctx) (name: string) : unit =
+    ctx.NonNull.Remove name |> ignore
+    ctx.Positive.Remove name |> ignore
+    ctx.NonNeg.Remove name |> ignore
+    ctx.BoundedBelowMax.Remove name |> ignore
+    ctx.Lengths.Remove name |> ignore
+
+    let depKeys =
+        ctx.Lengths
+        |> Seq.choose (fun kv ->
+            if fst kv.Value = name then
+                Some kv.Key
+            else
+                None
+        )
+        |> List.ofSeq
+
+    for k in depKeys do
+        ctx.Lengths.Remove k |> ignore
+
+    ctx.ConstLen.Remove name |> ignore
+    ctx.KnownTypes.Remove name |> ignore
+
+    ctx.InBounds.RemoveWhere(fun k ->
+        k.StartsWith(name + "|", System.StringComparison.Ordinal)
+        || k.EndsWith("|" + name, System.StringComparison.Ordinal)
+    )
+    |> ignore
+
+let withScopedIdent (ctx: Ctx) (id: Fable.Ident) (f: unit -> 'a) : 'a =
+    let name = id.Name
+
+    let savedVar =
+        match ctx.Vars.TryGetValue name with
+        | true, v -> Some v
+        | _ -> None
+
+    let savedBoxed = ctx.Boxed.Contains name
+    let savedNonNull = ctx.NonNull.Contains name
+    let savedPositive = ctx.Positive.Contains name
+    let savedNonNeg = ctx.NonNeg.Contains name
+    let savedBounded = ctx.BoundedBelowMax.Contains name
+
+    let savedLenKey =
+        match ctx.Lengths.TryGetValue name with
+        | true, v -> Some v
+        | _ -> None
+
+    let savedLenVals =
+        ctx.Lengths
+        |> Seq.choose (fun kv ->
+            if fst kv.Value = name then
+                Some(kv.Key, kv.Value)
+            else
+                None
+        )
+        |> List.ofSeq
+
+    let savedConstLen =
+        match ctx.ConstLen.TryGetValue name with
+        | true, n -> Some n
+        | _ -> None
+
+    let savedKnownType =
+        match ctx.KnownTypes.TryGetValue name with
+        | true, t -> Some t
+        | _ -> None
+
+    let savedBounds =
+        ctx.InBounds
+        |> Seq.filter (fun k ->
+            k.StartsWith(name + "|", System.StringComparison.Ordinal)
+            || k.EndsWith("|" + name, System.StringComparison.Ordinal)
+        )
+        |> List.ofSeq
+
+    ctx.Vars.Remove name |> ignore
+    ctx.Boxed.Remove name |> ignore
+    clearIdentFacts ctx name
+
+    try
+        f ()
+    finally
+        ctx.Vars.Remove name |> ignore
+        ctx.Boxed.Remove name |> ignore
+        clearIdentFacts ctx name
+
+        match savedVar with
+        | Some v -> ctx.Vars[name] <- v
+        | None -> ()
+
+        if savedBoxed then
+            ctx.Boxed.Add name |> ignore
+
+        if savedNonNull then
+            ctx.NonNull.Add name |> ignore
+
+        if savedPositive then
+            ctx.Positive.Add name |> ignore
+
+        if savedNonNeg then
+            ctx.NonNeg.Add name |> ignore
+
+        if savedBounded then
+            ctx.BoundedBelowMax.Add name |> ignore
+
+        match savedLenKey with
+        | Some v -> ctx.Lengths[name] <- v
+        | None -> ()
+
+        for (k, v) in savedLenVals do
+            ctx.Lengths[k] <- v
+
+        match savedConstLen with
+        | Some n -> ctx.ConstLen[name] <- n
+        | None -> ()
+
+        match savedKnownType with
+        | Some t -> ctx.KnownTypes[name] <- t
+        | None -> ()
+
+        for k in savedBounds do
+            ctx.InBounds.Add k |> ignore
+
+let tryLengthTarget (ctx: Ctx) (e: Fable.Expr) : (string * Fable.Type) option =
+    let ofArgs (info: Fable.CallInfo) =
+        match info.ThisArg, info.Args with
+        | Some(Fable.IdentExpr c), []
+        | None, [ Fable.IdentExpr c ] when not c.IsMutable -> Some(c.Name, c.Type)
+        | _ -> None
+
+    match e with
+    | Fable.Call(Fable.Import(imp, _, _), info, _, _) when imp.Selector = "get_Length" || imp.Selector = "Length" ->
+        ofArgs info
+    | Fable.IdentExpr n when not n.IsMutable ->
+        match ctx.Lengths.TryGetValue n.Name with
+        | true, (cName, cTy) when ctx.Vars.ContainsKey cName -> Some(cName, cTy)
+        | _ -> None
+    | _ -> None
+
+let tryConstArrayLen (e: Fable.Expr) : int option =
+    match e with
+    | Fable.Value(Fable.NewArray(Fable.ArrayValues vs, _, _), _) -> Some vs.Length
+    | Fable.Value(Fable.NewArray(Fable.ArrayAlloc(Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 k, _), _)),
+                                 _,
+                                 _),
+                  _) when k >= 0 -> Some k
+    | Fable.Call(Fable.Import(imp, _, _),
+                 {
+                     ThisArg = None
+                     Args = [ Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 k, _), _) ]
+                 },
+                 _,
+                 _) when
+        (imp.Selector = "ZeroCreate" || imp.Selector = "Create")
+        && imp.Path.EndsWith("ArrayModule", System.StringComparison.Ordinal)
+        && k >= 0
+        ->
+        Some k
+    | _ -> None
+
+let isKnownPosExpr (ctx: Ctx) (e: Fable.Expr) : bool =
+    match e with
+    | Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 k, _), _) -> k > 0
+    | Fable.IdentExpr id -> ctx.Positive.Contains id.Name
+    | _ -> false
+
+let isKnownNonNegExpr (ctx: Ctx) (e: Fable.Expr) : bool =
+    match e with
+    | Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 k, _), _) -> k >= 0
+    | Fable.IdentExpr id -> ctx.NonNeg.Contains id.Name || ctx.Positive.Contains id.Name
+    | _ when (tryLengthTarget ctx e).IsSome -> true
+    | Fable.Operation(Fable.Binary(BinaryPlus,
+                                   Fable.IdentExpr v,
+                                   Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 1, _), _)),
+                      _,
+                      _,
+                      _)
+    | Fable.Operation(Fable.Binary(BinaryPlus,
+                                   Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 1, _), _),
+                                   Fable.IdentExpr v),
+                      _,
+                      _,
+                      _) when ctx.BoundedBelowMax.Contains v.Name -> true
+    | _ -> false
+
+let isArrayIndexInBounds (ctx: Ctx) (a: Fable.Expr) (i: Fable.Expr) : bool =
+    match a, i with
+    | Fable.IdentExpr ai, Fable.IdentExpr ii -> ctx.InBounds.Contains(ai.Name + "|" + ii.Name)
+    | Fable.IdentExpr ai, Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 k, _), _) when k >= 0 ->
+        match ctx.ConstLen.TryGetValue ai.Name with
+        | true, len -> k < len
+        | _ -> false
+    | _ -> false
 
 /// The type a `Type` value stands for, where it is known here: `typeof<T>`, `typedefof<T>`, a
 /// `MakeGenericType` of known types, a variable bound to one (what an ahead-of-time compiler can
@@ -4704,6 +5051,12 @@ let rec hasTypeParams (t: Fable.Type) : bool =
     match t with
     | Fable.GenericParam _ -> true
     | _ -> t.Generics |> List.exists hasTypeParams
+
+/// The names of the type parameters a type mentions
+let rec typeParamNames (t: Fable.Type) : string list =
+    match t with
+    | Fable.GenericParam(name, _, _) -> [ name ]
+    | _ -> t.Generics |> List.collect typeParamNames
 
 /// Whether a type is another with obj in some of its places
 let rec moreGeneral (t: Fable.Type) (wanted: Fable.Type) : bool =
@@ -5651,9 +6004,25 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 ctx.State.UsesRuntime <- true
                 EEmit("fable_rt.dup($0)", [ globalVar id.Name ty true ], ty)
             | _ ->
-                match tryCallable ctx e with
-                | Some c -> fnValue ctx id.Range e c id.Type
-                | None -> fail id.Range "the Zig target cannot resolve `%s` yet" id.Name
+                match ctx.LocalFns.TryGetValue id.Name with
+                | true, fn when ctx.State.GenericValues.Contains fn.FnName ->
+                    let c =
+                        {
+                            Target = fn.FnName
+                            Captures = captureExprs ctx id.Range fn.CaptureNames
+                            OuterTypeArgs = fn.OuterTypeParams |> List.map TGen
+                            TypeParams = fn.TypeParams
+                            ArgTypes = []
+                            Ret = fn.Ret
+                        }
+
+                    let typeArgs, _ = typeArgsOf ctx id.Range c None [] (Some id.Type)
+                    ECall(c.Target, typeArgs, c.Captures, mapType ctx id.Range id.Type)
+                | _ ->
+
+                    match tryCallable ctx e with
+                    | Some c -> fnValue ctx id.Range e c id.Type
+                    | None -> fail id.Range "the Zig target cannot resolve `%s` yet" id.Name
 
     // a function of another file, as a value
     | Fable.Import(_, t, r) when (tryCallable ctx e).IsSome -> fnValue ctx r e (tryCallable ctx e).Value t
@@ -5683,6 +6052,31 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         liftGroup ctx id.Range [ Some id.Name, id.Name, wrapFnNullCast id.Type fnExpr ]
         |> ignore
 
+        lw ctx body
+
+    // A generic value (F# generalizes `let fOpt = Some f` when its expression can be): a
+    // function of the file without parameters, which each use calls at its own types, as .NET
+    // compiles it to a generic method (its expression is made again at each use)
+    | Fable.Let(id, value, body) when
+        not id.IsMutable
+        && (
+            match value with
+            | Fable.Lambda _
+            | Fable.Delegate _
+            // (an alias of a function: see the case of aliases)
+            | Fable.IdentExpr _ -> false
+            | _ -> true
+        )
+        && typeParamNames id.Type
+           |> List.exists (fun g -> not (List.contains g ctx.TypeParams))
+        && freeGens [ mapType ctx id.Range id.Type ]
+           |> List.exists (fun g -> not (List.contains g ctx.TypeParams))
+        ->
+        let fn =
+            liftGroup ctx id.Range [ Some id.Name, id.Name, Fable.Delegate([], value, None, []) ]
+            |> List.head
+
+        ctx.State.GenericValues.Add fn.FnName |> ignore
         lw ctx body
 
     | Fable.LetRec(bindings, body) ->
@@ -6273,6 +6667,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | "list" ->
                 let listTy = typeOf source
                 let restV = ctx.State.NewVar("rest", listTy, VLocal, true)
+                let nextRest = ctx.State.NewVar("next_rest", listTy, VLocal, false)
 
                 ELet(
                     restV,
@@ -6282,7 +6677,45 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         ELet(
                             cur,
                             EGet(EVar restV, PCase("Cons", "Head"), itemTy),
-                            ESeq(EAssign(restV, EGet(EVar restV, PCase("Cons", "Tail"), listTy)), lwStmt ctx loopBody)
+                            ELet(
+                                nextRest,
+                                EGet(EVar restV, PCase("Cons", "Tail"), listTy),
+                                ESeq(EAssign(restV, EVar nextRest), lwStmt ctx loopBody)
+                            )
+                        )
+                    )
+                )
+            | "array" ->
+                let arrTy = typeOf source
+                let arrV = ctx.State.NewVar("arr", arrTy, VLocal, false)
+                let lenV = ctx.State.NewVar("len", tI32, VLocal, false)
+                let iV = ctx.State.NewVar("i", tI32, VLocal, true)
+                ctx.State.UsesRuntime <- true
+
+                ELet(
+                    arrV,
+                    source,
+                    ELet(
+                        lenV,
+                        EEmit("fable_rt.arrayLen($0)", [ EVar arrV ], tI32),
+                        ELet(
+                            iV,
+                            ELit("0", tI32),
+                            EWhile(
+                                EPrim("lt", [ EVar iV; EVar lenV ], tBool),
+                                ELet(
+                                    cur,
+                                    EEmit(
+                                        "fable_rt.arrayItemAt($0, @as(usize, @intCast($1)))",
+                                        [ EVar arrV; EVar iV ],
+                                        itemTy
+                                    ),
+                                    ESeq(
+                                        EAssign(iV, EPrim("add", [ EVar iV; ELit("1", tI32) ], tI32)),
+                                        lwStmt ctx loopBody
+                                    )
+                                )
+                            )
                         )
                     )
                 )
@@ -6331,6 +6764,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 let i = ctx.State.NewVar("i", tI32, VLocal, true)
                 ctx.State.UsesRuntime <- true
 
+                let bodyIr =
+                    match getInfo.ThisArg.Value with
+                    | Uncast(Fable.IdentExpr si) when not si.IsMutable ->
+                        withKnown ctx [ si.Name ] [] (fun () -> lwStmt ctx loopBody)
+                    | _ -> lwStmt ctx loopBody
+
                 ELet(
                     s,
                     source,
@@ -6342,7 +6781,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                             ELet(
                                 cur,
                                 EEmit("fable_rt.unitsOf($0)[@intCast($1)]", [ EVar s; EVar i ], itemTy),
-                                ESeq(EAssign(i, EPrim("add", [ EVar i; ELit("1", tI32) ], tI32)), lwStmt ctx loopBody)
+                                ESeq(EAssign(i, EPrim("add", [ EVar i; ELit("1", tI32) ], tI32)), bodyIr)
                             )
                         )
                     )
@@ -6365,9 +6804,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let rhs =
             bindArgsIn true ctx [ lw ctx value ] (fun xs -> ECon(cellTy, "", xs, None))
 
-        ctx.Vars[id.Name] <- v
-        ctx.Boxed.Add id.Name |> ignore
-        ELet(v, rhs, lw ctx body)
+        withScopedIdent
+            ctx
+            id
+            (fun () ->
+                ctx.Vars[id.Name] <- v
+                ctx.Boxed.Add id.Name |> ignore
+                ELet(v, rhs, lw ctx body)
+            )
 
     // a byref variable bound to a place: the pointer to it
     | Fable.Let(id, value, body) when
@@ -6388,8 +6832,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | ty, _ -> ty
 
         let v = ctx.State.NewVar(id.Name, ty, VLocal, false)
-        ctx.Vars[id.Name] <- v
-        ELet(v, place, lw ctx body)
+
+        withScopedIdent
+            ctx
+            id
+            (fun () ->
+                ctx.Vars[id.Name] <- v
+                ELet(v, place, lw ctx body)
+            )
 
     // another name of a function of this function (`let alias = f`): the same function, so a
     // generic one stays generic, each use giving its type arguments
@@ -6408,30 +6858,53 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         ->
         lw ctx body
     | Fable.Let(id, value, body) ->
-        // (a variable bound to an object made there, and never assigned: not null)
-        if
+        let isValNonNull =
             not id.IsMutable
-            && (isMadeObject value || (id.Type = Fable.String && neverNullIn ctx value))
-        then
-            ctx.NonNull.Add id.Name |> ignore
-        else
-            ctx.NonNull.Remove id.Name |> ignore
+            && (isMadeObject value
+                || (id.Type = Fable.String && neverNullIn ctx value)
+                || (unwrapNullness id.Type = Fable.String && neverNullIn ctx value)
+                || (
+                    match value with
+                    | Uncast(Fable.IdentExpr s) -> ctx.NonNull.Contains s.Name
+                    | _ -> false
+                ))
 
-        // (a name bound again is not the one a guard tested)
-        ctx.Positive.Remove id.Name |> ignore
+        let isValPos = not id.IsMutable && isKnownPosExpr ctx value
 
-        // (a `Type` known here: what it stands for, for `Activator.CreateInstance`)
-        match
-            (if id.IsMutable then
-                 None
-             else
-                 staticTypeOf ctx value)
-        with
-        | Some st when unwrapNullness id.Type = Fable.MetaType -> ctx.KnownTypes[id.Name] <- st
-        | _ -> ctx.KnownTypes.Remove id.Name |> ignore
+        let canTrackMutNonNeg =
+            id.IsMutable
+            && not (usedInFunction id.Name body)
+            && not (hasAddressOfIdent id.Name body)
 
-        ctx.InBounds.RemoveWhere(fun k -> k.StartsWith(id.Name + "|") || k.EndsWith("|" + id.Name))
-        |> ignore
+        let isValNonNeg =
+            (not id.IsMutable || canTrackMutNonNeg)
+            && (isValPos || isKnownNonNegExpr ctx value)
+
+        let lenTarget =
+            if not id.IsMutable then
+                tryLengthTarget ctx value
+            else
+                None
+
+        let strOwnerNonNull =
+            match value, lenTarget with
+            | Fable.Call(Fable.Import(imp, _, _), _, _, _), Some(cName, cTy) when
+                imp.Selector = "get_Length" && unwrapNullness cTy = Fable.String
+                ->
+                [ cName ]
+            | _ -> []
+
+        let constLen =
+            if not id.IsMutable then
+                tryConstArrayLen value
+            else
+                None
+
+        let stOpt =
+            if id.IsMutable then
+                None
+            else
+                staticTypeOf ctx value
 
         let rhs = lw ctx (adaptTo ctx.Com id.Type value)
         let ty = mapType ctx id.Range id.Type
@@ -6450,20 +6923,52 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | TPtr(t, false), (TPtr(t2, true) as actual) when t = t2 -> actual
             | _ -> ty
 
-        if isVoid ty then
-            ESeq(asStmt ctx rhs, lw ctx body)
-        else
-            let rhs = coerceTy ctx ty rhs
+        withScopedIdent
+            ctx
+            id
+            (fun () ->
+                if isValNonNull then
+                    ctx.NonNull.Add id.Name |> ignore
 
-            match rhs with
-            // an immutable name for an immutable variable is that variable
-            | EVar x when not id.IsMutable && not x.FMutable && x.Kind <> VGlobal ->
-                ctx.Vars[id.Name] <- x
-                lw ctx body
-            | _ ->
-                let v = ctx.State.NewVar(id.Name, ty, VLocal, id.IsMutable)
-                ctx.Vars[id.Name] <- v
-                ELet(v, rhs, lw ctx body)
+                if isValPos then
+                    ctx.Positive.Add id.Name |> ignore
+
+                if isValNonNeg then
+                    ctx.NonNeg.Add id.Name |> ignore
+
+                match lenTarget with
+                | Some lt -> ctx.Lengths[id.Name] <- lt
+                | None -> ()
+
+                match constLen with
+                | Some n -> ctx.ConstLen[id.Name] <- n
+                | None -> ()
+
+                match stOpt with
+                | Some st when unwrapNullness id.Type = Fable.MetaType -> ctx.KnownTypes[id.Name] <- st
+                | _ -> ()
+
+                let lowerBody () =
+                    if strOwnerNonNull.IsEmpty then
+                        lw ctx body
+                    else
+                        withFacts ctx.NonNull strOwnerNonNull (fun () -> lw ctx body)
+
+                if isVoid ty then
+                    ESeq(asStmt ctx rhs, lowerBody ())
+                else
+                    let rhs = coerceTy ctx ty rhs
+
+                    match rhs with
+                    // an immutable name for an immutable variable is that variable
+                    | EVar x when not id.IsMutable && not x.FMutable && x.Kind <> VGlobal ->
+                        ctx.Vars[id.Name] <- x
+                        lowerBody ()
+                    | _ ->
+                        let v = ctx.State.NewVar(id.Name, ty, VLocal, id.IsMutable)
+                        ctx.Vars[id.Name] <- v
+                        ELet(v, rhs, lowerBody ())
+            )
 
     // (`ExceptionDispatchInfo.Capture(e).Throw()`, as F# rethrows in an `async` handler, then a
     // placeholder value never reached: the rethrow, of the sequence's type)
@@ -6505,7 +7010,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     // (a guard that raises when something is null: it is not null in what follows)
     | Fable.Sequential es when
         es
-        |> List.exists (fun x -> not (factsAfter nullFacts x).IsEmpty || not (factsAfter positiveFacts x).IsEmpty)
+        |> List.exists (fun x ->
+            not (factsAfter nullFacts x).IsEmpty
+            || not (factsAfter positiveFacts x).IsEmpty
+            || not (factsAfter nonNegFacts x).IsEmpty
+        )
         ->
         let rec go (stmts: Fable.Expr list) : Expr =
             match stmts with
@@ -6514,7 +7023,15 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | x :: rest ->
                 let ir = lwStmt ctx x
 
-                ESeq(ir, withKnown ctx (factsAfter nullFacts x) (factsAfter positiveFacts x) (fun () -> go rest))
+                ESeq(
+                    ir,
+                    withKnownFacts
+                        ctx
+                        (factsAfter nullFacts x)
+                        (factsAfter positiveFacts x)
+                        (factsAfter nonNegFacts x)
+                        (fun () -> go rest)
+                )
 
         go es
     | Fable.Sequential es ->
@@ -6535,9 +7052,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let thenExpr = wrapNullCast merged thenExpr
         let elseExpr = wrapNullCast merged elseExpr
 
-        // (what the guard tells of nulls holds in its branches)
+        // (what the guard tells of nulls and ints holds in its branches)
         let whenTrue, whenFalse = nullFacts guard
         let posTrue, posFalse = positiveFacts guard
+        let nonNegTrue, nonNegFalse = nonNegFacts guard
 
         bindArgs
             ctx
@@ -6545,8 +7063,8 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             (fun xs ->
                 EIf(
                     xs.Head,
-                    coerceTy ctx ty (withKnown ctx whenTrue posTrue (fun () -> lw ctx thenExpr)),
-                    coerceTy ctx ty (withKnown ctx whenFalse posFalse (fun () -> lw ctx elseExpr)),
+                    coerceTy ctx ty (withKnownFacts ctx whenTrue posTrue nonNegTrue (fun () -> lw ctx thenExpr)),
+                    coerceTy ctx ty (withKnownFacts ctx whenFalse posFalse nonNegFalse (fun () -> lw ctx elseExpr)),
                     ty
                 )
             )
@@ -7597,6 +8115,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         |> List.tryFind (fun k -> classImplements ctx.Com k slot)
                         |> Option.map (fun k -> hook, implName k.Prefix slot)
                     )
+                Ifaces = []
                 Thunks =
                     slots
                     |> List.map (fun (slot, ty, _) ->
@@ -8468,18 +8987,24 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
     | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, value, r) ->
         let value = wrapNullCast id.Type value
+        let nonNegAfter = isKnownNonNegExpr ctx value
+        let valueIr = lw ctx value
+        clearIdentFacts ctx id.Name
+
+        if nonNegAfter && id.IsMutable then
+            ctx.NonNeg.Add id.Name |> ignore
 
         match ctx.Vars.TryGetValue id.Name, ctx.Members.TryGetValue id.Name with
         | (true, ({ Ty = TPtr(t, _) } as v)), _ ->
-            bindArgs ctx [ coerceTy ctx t (lw ctx value) ] (fun xs -> EStore(EDeref(EVar v, t), xs.Head))
-        | (true, v), _ -> EAssign(v, coerceTy ctx v.Ty (lw ctx value))
+            bindArgs ctx [ coerceTy ctx t valueIr ] (fun xs -> EStore(EDeref(EVar v, t), xs.Head))
+        | (true, v), _ -> EAssign(v, coerceTy ctx v.Ty valueIr)
         // (a module-level value: what it held is given up once the new value is in place)
         | _, (true, MValue ty) ->
             ctx.State.UsesRuntime <- true
 
             bindArgs
                 ctx
-                [ coerceTy ctx ty (lw ctx value) ]
+                [ coerceTy ctx ty valueIr ]
                 (fun xs ->
                     EEmit("fable_rt.store(&$0, fable_rt.dup($1))", [ globalVar id.Name ty true; xs.Head ], tVoid)
                 )
@@ -8497,62 +9022,179 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             (fun xs -> EEmit("fable_rt.store(&$0, fable_rt.dup($1))", [ globalVar name ty true; xs.Head ], tVoid))
 
     | Fable.WhileLoop(guard, body, r) ->
+        let rec checkMonotonicStep (idxName: string) (inNestedLoop: bool) (e: Fable.Expr) : bool =
+            match e with
+            | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, rhs, _) when id.Name = idxName ->
+                if inNestedLoop then
+                    false
+                else
+                    match rhs with
+                    | Fable.Operation(Fable.Binary(BinaryPlus,
+                                                   Fable.IdentExpr v,
+                                                   Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 1, _), _)),
+                                      _,
+                                      _,
+                                      _)
+                    | Fable.Operation(Fable.Binary(BinaryPlus,
+                                                   Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 1, _), _),
+                                                   Fable.IdentExpr v),
+                                      _,
+                                      _,
+                                      _) when v.Name = idxName -> true
+                    | Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 k, _), _) when k >= 0 -> true
+                    | _ -> false
+            | Fable.WhileLoop(g, b, _) -> checkMonotonicStep idxName true g && checkMonotonicStep idxName true b
+            | Fable.ForLoop(_, s, l, b, _, _) ->
+                checkMonotonicStep idxName true s
+                && checkMonotonicStep idxName true l
+                && checkMonotonicStep idxName true b
+            | Fable.Set(Fable.IdentExpr id, Fable.ValueSet, _, rhs, _) ->
+                id.Name <> idxName && checkMonotonicStep idxName inNestedLoop rhs
+            | _ -> getSubExpressions e |> List.forall (checkMonotonicStep idxName inNestedLoop)
+
+        let mono =
+            match guard with
+            | Fable.Operation(Fable.Binary(BinaryLess, Fable.IdentExpr idx, len), _, _, _) when
+                (match idx.Type with
+                 | Fable.Number(Int32, _) -> true
+                 | _ -> false)
+                && (ctx.NonNeg.Contains idx.Name || ctx.Positive.Contains idx.Name)
+                && not (usedInFunction idx.Name body)
+                && not (hasAddressOfIdent idx.Name body)
+                && checkMonotonicStep idx.Name false body
+                ->
+                match tryLengthTarget ctx len with
+                | Some(cName, cTy) -> Some(idx, cName, cTy)
+                | None -> None
+            | _ -> None
+
+        let mutated = mutatedIdentsIn body
+
+        for m in mutated do
+            let keepNonNeg =
+                match mono with
+                | Some(idx, _, _) -> m = idx.Name
+                | None -> false
+
+            if keepNonNeg then
+                ctx.Positive.Remove m |> ignore
+                ctx.BoundedBelowMax.Remove m |> ignore
+                ctx.ConstLen.Remove m |> ignore
+                ctx.Lengths.Remove m |> ignore
+                ctx.KnownTypes.Remove m |> ignore
+
+                ctx.InBounds.RemoveWhere(fun k ->
+                    k.StartsWith(m + "|", System.StringComparison.Ordinal)
+                    || k.EndsWith("|" + m, System.StringComparison.Ordinal)
+                )
+                |> ignore
+            else
+                clearIdentFacts ctx m
+
         let c = lw ctx guard
 
+        let bIr =
+            match mono with
+            | Some(idx, cName, cTy) ->
+                let nonNull =
+                    if unwrapNullness cTy = Fable.String then
+                        [ cName ]
+                    else
+                        []
+
+                let ir =
+                    withFacts
+                        ctx.NonNull
+                        nonNull
+                        (fun () ->
+                            withFacts
+                                ctx.BoundedBelowMax
+                                [ idx.Name ]
+                                (fun () ->
+                                    withFacts ctx.InBounds [ cName + "|" + idx.Name ] (fun () -> lwStmt ctx body)
+                                )
+                        )
+
+                ctx.Positive.Remove idx.Name |> ignore
+                ctx.BoundedBelowMax.Remove idx.Name |> ignore
+
+                ctx.InBounds.RemoveWhere(fun k ->
+                    k.StartsWith(idx.Name + "|", System.StringComparison.Ordinal)
+                    || k.EndsWith("|" + idx.Name, System.StringComparison.Ordinal)
+                )
+                |> ignore
+
+                ir
+            | None -> lwStmt ctx body
+
         if isFlat c then
-            EWhile(c, lwStmt ctx body)
+            EWhile(c, bIr)
         else
             // (a condition with control flow in it, like `a && b`, is tested inside the loop)
             let go = ctx.State.NewVar("go", tBool, VLocal, true)
             let stop = EAssign(go, ELit("false", tBool))
-            let step = bindArgs ctx [ c ] (fun xs -> EIf(xs.Head, lwStmt ctx body, stop, tVoid))
+            let step = bindArgs ctx [ c ] (fun xs -> EIf(xs.Head, bIr, stop, tVoid))
             ELet(go, ELit("true", tBool), EWhile(EVar go, step))
 
     | Fable.ForLoop(id, start, limit, body, isUp, _) ->
+        let startNonNeg = isKnownNonNegExpr ctx start
+        let startIr = lw ctx start
+        let limitIr = lw ctx limit
         let iv = ctx.State.NewVar(id.Name, mapType ctx id.Range id.Type, VLocal, false)
-        ctx.Vars[id.Name] <- iv
 
-        // (`for i in 0 .. c.Length - 1`: `c.[i]` is in range in the body)
-        let lengthOf (e: Fable.Expr) : Fable.Ident option =
-            let ofArgs (info: Fable.CallInfo) =
-                match info.ThisArg, info.Args with
-                | Some(Fable.IdentExpr c), []
-                | None, [ Fable.IdentExpr c ] when not c.IsMutable -> Some c
-                | _ -> None
-
-            match e with
-            | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
-                imp.Selector = "get_Length" || imp.Selector = "Length"
-                ->
-                ofArgs info
-            | _ -> None
-
-        let covered =
-            match start, limit with
-            | Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 n, _), _),
-              Fable.Operation(Fable.Binary(BinaryMinus,
+        // (`for i in 0 .. c.Length - 1`, `let n = c.Length` aliases, and constant-length bounds)
+        let coveredLen =
+            match limit with
+            | Fable.Operation(Fable.Binary(BinaryMinus,
                                            len,
                                            Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 1, _), _)),
                               _,
                               _,
-                              _) when isUp && n >= 0 && not id.IsMutable -> lengthOf len
+                              _) when isUp && not id.IsMutable && startNonNeg -> tryLengthTarget ctx len
             | _ -> None
 
-        let lowerBody () = lwStmt ctx body
+        let coveredConstHi =
+            match limit with
+            | Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 hi, _), _) when
+                isUp && not id.IsMutable && startNonNeg
+                ->
+                Some hi
+            | _ -> None
 
         let bodyIr =
-            match covered with
-            | Some c ->
-                let nonNull =
-                    if unwrapNullness c.Type = Fable.String then
-                        [ c.Name ]
-                    else
-                        []
+            withScopedIdent
+                ctx
+                id
+                (fun () ->
+                    ctx.Vars[id.Name] <- iv
 
-                withFacts ctx.InBounds [ c.Name + "|" + id.Name ] (fun () -> withKnown ctx nonNull [] lowerBody)
-            | None -> lowerBody ()
+                    if isUp && not id.IsMutable && startNonNeg then
+                        ctx.NonNeg.Add id.Name |> ignore
 
-        bindArgs ctx [ lw ctx start; lw ctx limit ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, bodyIr))
+                    match coveredLen with
+                    | Some(cName, cTy) ->
+                        ctx.InBounds.Add(cName + "|" + id.Name) |> ignore
+                        ctx.BoundedBelowMax.Add id.Name |> ignore
+
+                        if unwrapNullness cTy = Fable.String then
+                            withKnown ctx [ cName ] [] (fun () -> lwStmt ctx body)
+                        else
+                            lwStmt ctx body
+                    | None ->
+                        match coveredConstHi with
+                        | Some hi ->
+                            if hi < System.Int32.MaxValue then
+                                ctx.BoundedBelowMax.Add id.Name |> ignore
+
+                            for kv in ctx.ConstLen do
+                                if hi < kv.Value then
+                                    ctx.InBounds.Add(kv.Key + "|" + id.Name) |> ignore
+                        | None -> ()
+
+                        lwStmt ctx body
+                )
+
+        bindArgs ctx [ startIr; limitIr ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, bodyIr))
 
     // (`box e.InnerException`: null when there is none)
     | Fable.TypeCast(Fable.Call(Fable.Import(imp, _, _), info, _, _), Fable.Any) when
@@ -8807,6 +9449,30 @@ and unboxed (ctx: Ctx) (r: SourceLocation option) (x: Fable.Expr) (t: Fable.Type
         let o = (objInfo ctx r cls).Value
         let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
         bindArgs ctx [ lw ctx x ] (fun xs -> ERt($"fable_rt.anyToClass($0, %s{typeRef})", xs, tAny))
+    // (an interface F# declares has no null, unless `[<AllowNullLiteral>]` or `I | null` says so:
+    // null raises NullReferenceException, as F#'s UnboxGeneric does)
+    | Fable.DeclaredType(i, _) when
+        (match t with
+         | Fable.Nullable _ -> false
+         | _ -> true)
+        && (
+            match (i: Fable.EntityRef).Path with
+            | Fable.SourcePath _
+            | Fable.PrecompiledLib _ -> true
+            | _ -> false
+        )
+        && (
+            match ctx.Com.TryGetEntity i with
+            | Some ent ->
+                ent.IsInterface
+                && not (
+                    ent.Attributes
+                    |> Seq.exists (fun a -> a.Entity.FullName = "Microsoft.FSharp.Core.AllowNullLiteralAttribute")
+                )
+            | None -> false
+        )
+        ->
+        bindArgs ctx [ lw ctx x ] (fun xs -> ERt("fable_rt.unboxNonNull($R, $0)", xs, mapType ctx r t))
     | _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ERt("fable_rt.unbox($R, $0)", xs, mapType ctx r t))
 
 /// `x :? T` where `x` is a fat-pointer interface.
@@ -9592,10 +10258,21 @@ and liftGroup
     (bindings: (string option * string * Fable.Expr) list)
     : LocalFn list
     =
+    // (a named function declared as `let f a b c = ...`, which F# gives as nested lambdas,
+    // takes all its arguments at once, as a function of the module does: a call with all of
+    // them is direct, and mutual tail calls between such functions can be fused)
+    let rec curriedArgs (acc: Fable.Ident list) (e: Fable.Expr) =
+        match e with
+        | Fable.Lambda(arg, body, _) -> curriedArgs (arg :: acc) body
+        | _ -> List.rev acc, e
+
     let parts =
         bindings
         |> List.map (fun (ident, hint, fnExpr) ->
             match fnExpr with
+            | Fable.Lambda _ when ident.IsSome ->
+                let args, body = curriedArgs [] fnExpr
+                ident, hint, args, body
             | Fable.Lambda(arg, body, _) -> ident, hint, [ arg ], body
             | Fable.Delegate(args, body, _, _) -> ident, hint, args, body
             | _ -> fail r "internal: not a lambda"
@@ -9672,6 +10349,14 @@ and liftGroup
                 LocalFns = Dictionary<string, LocalFn>(localFns)
                 TypeParams = ctx.TypeParams @ ownGens
                 DecisionTargets = []
+                NonNull = HashSet<string>(ctx.NonNull)
+                Positive = HashSet<string>(ctx.Positive)
+                NonNeg = HashSet<string>(ctx.NonNeg)
+                BoundedBelowMax = HashSet<string>(ctx.BoundedBelowMax)
+                Lengths = Dictionary<string, string * Fable.Type>(ctx.Lengths)
+                ConstLen = Dictionary<string, int>(ctx.ConstLen)
+                KnownTypes = Dictionary<string, Fable.Type>(ctx.KnownTypes)
+                InBounds = HashSet<string>(ctx.InBounds)
                 CaughtExn = None
             }
 
@@ -9686,6 +10371,11 @@ and liftGroup
         let ps =
             List.zip args argTys
             |> List.map (fun (a, ty) ->
+                clearIdentFacts inner a.Name
+
+                if a.IsThisArgument then
+                    inner.NonNull.Add a.Name |> ignore
+
                 let v = ctx.State.NewVar(a.Name, ty, VParam, false)
                 vars[a.Name] <- v
                 v
@@ -10559,6 +11249,7 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
 
     match inner.Type with
     | Fable.List _ -> Some(lw ctx inner, "list")
+    | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> Some(lw ctx inner, "array")
     | Fable.DeclaredType(ent, _) when
         ent.FullName = "System.Collections.Generic.ICollection`1"
         || ent.FullName = "System.Collections.Generic.Dictionary`2.KeyCollection"
@@ -11115,11 +11806,7 @@ and private isOpenEmptyArg (a: Fable.Expr) =
         && hasAnyType typ
     | _ -> false
 
-and private isKnownNonNeg (ctx: Ctx) (e: Fable.Expr) =
-    match e with
-    | Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 k, _), _) -> k >= 0
-    | Fable.IdentExpr id -> ctx.Positive.Contains id.Name
-    | _ -> false
+and private isKnownNonNeg (ctx: Ctx) (e: Fable.Expr) = isKnownNonNegExpr ctx e
 
 and private canSpecFnExpr (ctx: Ctx) (e: Fable.Expr) =
     match e with
@@ -12801,6 +13488,10 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             Boxed = HashSet()
             NonNull = HashSet()
             Positive = HashSet()
+            NonNeg = HashSet()
+            BoundedBelowMax = HashSet()
+            Lengths = Dictionary()
+            ConstLen = Dictionary()
             KnownTypes = Dictionary()
             InBounds = HashSet()
             Enumerators = Dictionary()

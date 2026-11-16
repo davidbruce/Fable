@@ -2120,3 +2120,53 @@ let ``test explicit constructor self identifier is the created object`` () =
     valClassSelfSaved.Count |> equal 3
     obj.ReferenceEquals(valClassSelfSaved.[1], b) |> equal true
     obj.ReferenceEquals(valClassSelfSaved.[2], b) |> equal true
+
+type IDynGreeter =
+    abstract Greet: string -> string
+
+type IDynNamed =
+    abstract Name: string
+
+type DynGreeter(name: string) =
+    member _.Hi = "hi"
+    interface IDynGreeter with
+        member _.Greet n = "hello " + n + " from " + name
+    interface IDynNamed with
+        member _.Name = name
+
+type DynGreeterChild(name: string) =
+    inherit DynGreeter(name + "!")
+
+[<AbstractClass>]
+type DynShape<'T>(name: string) =
+    member _.Name = name
+    abstract Area: 'T -> float
+
+[<Fact>]
+let ``test Objects cast to the interfaces their classes implement`` () =
+    let o = box (DynGreeter "g")
+    (o :?> IDynGreeter).Greet "x" |> equal "hello x from g"
+    (o :?> IDynNamed).Name |> equal "g"
+    (o :? IDynGreeter) |> equal true
+    match o with
+    | :? IDynNamed as n -> n.Name |> equal "g"
+    | _ -> failwith "not named"
+    let c = box (DynGreeterChild "c")
+    (c :?> IDynGreeter).Greet "y" |> equal "hello y from c!"
+    (box "text" :? IDynGreeter) |> equal false
+    let mutable raised = ""
+    try (null: obj) :?> IDynGreeter |> ignore with :? NullReferenceException -> raised <- "nre"
+    raised |> equal "nre"
+
+[<Fact>]
+let ``test Object expressions deriving from a generic class`` () =
+    let s = { new DynShape<int>("sq") with member _.Area x = float (x * x) }
+    s.Name |> equal "sq"
+    s.Area 3 |> equal 9.0
+
+[<Fact>]
+let ``test Generic values holding generic functions are used at several types`` () =
+    let twice x = [ x; x ]
+    let twiceOpt = Some twice
+    twiceOpt |> Option.map (fun g -> g 1) |> equal (Some [ 1; 1 ])
+    twiceOpt |> Option.map (fun g -> g "a") |> equal (Some [ "a"; "a" ])

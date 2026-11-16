@@ -259,3 +259,31 @@ let ``test Copy-and-update of a struct record argument works`` () =
     equal 1 held.Data.Size
     equal 2 held.Data.Seed
     equal [ 8; 7 ] held.Data.Path
+
+type private DualMutableRec =
+    {
+        mutable Title: string
+        mutable Note: string
+    }
+
+[<Fact>]
+let ``test mutable record field borrow safety across pure stdlib, other fields, and same-field writes`` () =
+    let r = { Title = "v" + string 1; Note = "n" + string 1 }
+    let t0 = r.Title
+    let extra = List.length [ 1; 2; 3 ]
+    r.Note <- "n" + string 2
+    let m = Map.ofList [ ("k", r.Title) ]
+    let found = Map.tryFind "k" m
+    (t0 + ":" + string extra + ":" + r.Note + ":" + Option.defaultValue "" found)
+    |> equal "v1:3:n2:v1"
+
+    // When the same mutable field IS overwritten while `snap` is still live, `snap` must keep the old string.
+    let snap = r.Title
+    r.Title <- "v" + string 9
+    (snap + "->" + r.Title) |> equal "v1->v9"
+
+    // Unescaped local ref cell.
+    let cell = ref ("cell-" + string 1)
+    let c0 = cell.Value
+    cell.Value <- "cell-" + string 2
+    (c0 + "/" + cell.Value) |> equal "cell-1/cell-2"

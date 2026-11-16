@@ -111,7 +111,7 @@ fn NullOf(comptime A: type) type {
 }
 
 /// (far from one and from overflowing either way)
-const null_count: u32 = 1 << 30;
+pub const null_count: u32 = 1 << 30;
 
 /// The null of an array type (a reference of its own)
 pub fn arrayNull(comptime A: type) A {
@@ -160,8 +160,8 @@ pub fn hasZero(comptime T: type) bool {
 }
 
 /// `Array.zeroCreate n`. .NET fills the array with null where the items are records, unions
-/// or functions; here those have no null, so only an empty array of them can be made this
-/// way (anything longer raises `NotSupportedException`).
+/// or functions: here with `rt.nullOf` of the item type (a reference record's null cell, a
+/// union's first case, a function that raises NullReferenceException).
 pub fn arrayZero(comptime A: type, n: i32) Raised!A {
     if (n < 0) return countNegative(n);
     const items = arrayItems(A, @intCast(n));
@@ -172,13 +172,14 @@ pub fn arrayZero(comptime A: type, n: i32) Raised!A {
     return arrayFrom(A, items);
 }
 
-/// Items set to .NET's default of their type: zero, null (an array's null for arrays)
+/// Items set to .NET's default of their type: zero, null (an array's null for arrays, a
+/// record's null cell for reference records, see `rt.nullOf`)
 fn fillDefault(comptime A: type, items: []ItemOf(A)) Raised!void {
     const T = ItemOf(A);
     if (comptime hasZero(T)) {
         @memset(items, comptime std.mem.zeroes(T));
-    } else if (comptime rt.isArrayPtr(T)) {
-        for (items) |*x| x.* = arrayNull(T);
+    } else if (comptime rt.hasNull(T)) {
+        for (items) |*x| x.* = rt.nullOf(T);
     } else if (items.len != 0) {
         return raise(NotSupportedException, str("Array.zeroCreate of a type without a null value: use Array.create or Array.init"));
     }
@@ -268,7 +269,16 @@ pub inline fn arraySet(a: anytype, i: i32, value: ItemOf(@TypeOf(a))) Raised!voi
     arrayPut(a, @intCast(i), dup(value));
 }
 
-pub fn arrayPut(a: anytype, i: usize, value: @typeInfo(@TypeOf(a.items)).pointer.child) void {
+/// `a.[i] <- value` where `i` is known to be inside bounds.
+pub inline fn arraySetAt(a: anytype, i: usize, value: ItemOf(@TypeOf(a))) void {
+    arrayPut(a, i, dup(value));
+}
+
+pub inline fn arrayPut(a: anytype, i: usize, value: @typeInfo(@TypeOf(a.items)).pointer.child) void {
+    if (comptime !rt.isManaged(@TypeOf(value))) {
+        a.items[i] = value;
+        return;
+    }
     if (rt.isShared(a)) {
         // (shared before another thread can read it, swapped in under the array's lock, the
         // old item given up after)

@@ -683,6 +683,9 @@ type ObjDecl =
         /// values it holds: name, pointer type of its fields, the Zig names of the structs of
         /// fields of its chain, the field, and the type of the function value
         Thunks: (string * Ty * string * string * Ty) list
+        /// the interfaces the class implements, each with the slots of its table (as an
+        /// interface value made of an object of the class has them): `o :?> I` finds them
+        Ifaces: (Ty * (string * (string * Ty list)) list) list
     }
 
 type CycleInfo =
@@ -708,6 +711,9 @@ let emptyCycleInfo =
 type FileState() =
     let mutable varCounter = 0
     member val Fns = List<FnInfo>()
+    /// local generic values (`let f_opt = Some f`, generalized by F#) lifted as functions without
+    /// parameters: each use calls it at its own type arguments
+    member val GenericValues = HashSet<string>()
     /// record and union types seen so far, by full name
     member val Ents = Dictionary<string, Ent>()
     /// the ones this file declares, in the order they were first needed

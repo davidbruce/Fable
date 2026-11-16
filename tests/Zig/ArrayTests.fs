@@ -45,6 +45,9 @@ type Things =
 
 type Animal = Duck of int | Dog of int
 
+type ZeroCounter = { mutable Count: int; Label: string }
+type ZeroChain = { Value: int; Rest: ZeroChain option }
+
 [<Fact>]
 let ``test Array expressions works`` () =
     let a1: int[] = [||]
@@ -302,6 +305,29 @@ let ``test Array.zeroCreate works`` () =
     let xs = Array.zeroCreate 2
     equal 2 xs.Length
     equal 0 xs.[1]
+
+[<Fact>]
+let ``test Array.zeroCreate of reference records and functions gives nulls`` () =
+    let counters = Array.zeroCreate<ZeroCounter> 3
+    counters |> Array.forall (fun c -> isNull (box c)) |> equal true
+    counters.[0] <- { Count = 1; Label = "a" }
+    counters.[2] <- { Count = 2; Label = "b" }
+    counters.[2].Count <- counters.[2].Count + 5
+    isNull (box counters.[1]) |> equal true
+    counters.[0].Count + counters.[2].Count |> equal 8
+    counters.[2].Label |> equal "b"
+    let chains = Array.zeroCreate<ZeroChain> 2
+    sprintf "%A" chains |> equal "[|null; null|]"
+    obj.ReferenceEquals(chains.[0], null) |> equal true
+    chains.[1] <- { Value = 3; Rest = Some { Value = 4; Rest = None } }
+    chains.[1].Rest.Value.Value |> equal 4
+    let fs = Array.zeroCreate<int -> int> 2
+    isNull (box fs.[0]) |> equal true
+    fs.[1] <- fun x -> x + 1
+    fs.[1] 41 |> equal 42
+    throwsAnyError (fun () -> fs.[0] 1)
+    let d = Unchecked.defaultof<ZeroCounter>
+    isNull (box d) |> equal true
 
 // See https://github.com/fable-compiler/repl/issues/96
 [<Fact>]

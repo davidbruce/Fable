@@ -307,3 +307,48 @@ let ``test Passing a function reference in a TCO context does not capture unneed
         else loop _unused (acc + applyFn alwaysFortyTwo) (n - 1)
 
     loop "ignored" 0 5 |> equal 210
+
+[<Fact>]
+let ``test deep mutual tail recursion over non-scalar and heterogeneous signatures`` () =
+    let rec stateA (n: int) (tag: string) (acc: int) =
+        if n <= 0 then
+            tag + ":" + string acc
+        else
+            let nextTag = "a" + string (n % 7)
+            stateB (n - 1) [ n % 5; acc % 13 ] nextTag (acc + tag.Length)
+
+    and stateB (n: int) (xs: int list) (tag: string) (acc: int) =
+        if n <= 0 then
+            tag + ":" + string (acc + xs.Length)
+        else
+            stateA (n - 1) ("b" + string xs.Length) (acc + 1)
+
+    // 120,000 mutual frames would overflow native stack without state-machine fusion.
+    stateA 120000 ("init" + string 0) 0 |> equal "b2:180003"
+
+let rec private evenPick<'T> (n: int) (a: 'T) (b: 'T) : 'T =
+    if n <= 0 then a
+    else oddPick<'T> (n - 1) b a
+
+and private oddPick<'T> (n: int) (a: 'T) (b: 'T) : 'T =
+    if n <= 0 then b
+    else evenPick<'T> (n - 1) b a
+
+[<Fact>]
+let ``test generic and raising mutual tail recursion runs in constant stack`` () =
+    evenPick 100000 ("first-" + string 1) ("second-" + string 2) |> equal "first-1"
+    evenPick 100001 ("first-" + string 1) ("second-" + string 2) |> equal "first-1"
+    evenPick 100000 [ 1; 2 ] [ 3; 4 ] |> equal [ 1; 2 ]
+    oddPick 100000 [ 1; 2 ] [ 3; 4 ] |> equal [ 3; 4 ]
+
+    let rec checkedA (n: int) (s: string) =
+        if n < 0 then failwith ("neg:" + s)
+        elif n = 0 then s
+        else checkedB (n - 1) s
+
+    and checkedB (n: int) (s: string) =
+        if n = 0 then s + "!"
+        else checkedA (n - 1) s
+
+    checkedA 100001 ("ok" + string 1) |> equal "ok1!"
+    throwsError "neg:boom" (fun () -> checkedA -1 ("boom" + "") |> ignore)

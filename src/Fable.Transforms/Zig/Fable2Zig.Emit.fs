@@ -59,6 +59,12 @@ type IfaceVt =
         Gens: string list
     }
 
+type SccInfo =
+    {
+        StateTypeName: string
+        TagOf: Map<string, string>
+    }
+
 type Em =
     {
         Out: StringBuilder
@@ -66,6 +72,8 @@ type Em =
         Used: HashSet<string>
         Mutated: Set<int>
         Loop: LoopInfo option
+        /// mutual tail-recursion SCC state machine when compiling an SCC arm
+        Scc: SccInfo option
         /// the function being emitted, and the functions of the file by name
         Self: FnInfo
         Fns: Dictionary<string, FnInfo>
@@ -164,6 +172,41 @@ let adapterRef (a: Adapter) =
     | [] -> a.Name
     | gens -> gens |> List.map genName |> String.concat ", " |> sprintf "%s(%s)" a.Name
 
+/// The static vtable of an interface made of a source of a kind with these slots (one per
+/// distinct interface, source and slots in the file)
+let ifaceVtFor
+    (ifaceVts: Dictionary<string, IfaceVt>)
+    (ifaceTy: Ty)
+    (kind: IfaceVtKind)
+    (srcKey: string)
+    (srcTys: Ty list)
+    (slots: (string * (string * Ty list)) list)
+    : IfaceVt
+    =
+    let slotKeyStr =
+        slots
+        |> List.map (fun (s, (t, tys)) -> s + "=" + t + "<" + (tys |> List.map tyKey |> String.concat ",") + ">")
+        |> String.concat ";"
+
+    let key = tyKey ifaceTy + "|" + srcKey + "|" + slotKeyStr
+
+    match ifaceVts.TryGetValue key with
+    | true, v -> v
+    | _ ->
+        let slotTypeArgs = slots |> List.collect (fun (_, (_, tys)) -> tys)
+
+        let v =
+            {
+                Name = $"@\"fable_iface_vt$%d{ifaceVts.Count}\""
+                IfaceTy = ifaceTy
+                Kind = kind
+                Slots = slots
+                Gens = freeGens (ifaceTy :: srcTys @ slotTypeArgs)
+            }
+
+        ifaceVts[key] <- v
+        v
+
 /// The namespace of a static interface vtable, where it is used.
 let ifaceVtRef (v: IfaceVt) =
     match v.Gens with
@@ -219,7 +262,123 @@ let projAccess (t: Ty) (case: string) (field: string) (x: string) =
     | TEnt(e, _) when e.Kind = KRecord -> $"%s{x}.%s{fieldIdent field}"
     | _ -> $"%s{x}.%s{fieldIdent case}.%s{fieldIdent field}"
 
-let rec ex (em: Em) (e: Expr) : string =
+/// Format a cross-file call concisely using `fable_rt.callM`/`callG` or `xcallM`/`xcallG`/`xcallPlain`.
+let rec private formatCrossCall
+    (em: Em)
+    (f: string)
+    (typeArgs: Ty list)
+    (xs: Expr list)
+    (t: Ty)
+    (ds: Var list option)
+    : string option
+    =
+    let dot = f.IndexOf '.'
+
+    if dot < 0 then
+        None
+    else
+        let modAlias = f.Substring(0, dot)
+        let memberName = topIdent (f.Substring(dot + 1))
+
+        let errDrops =
+            match ds with
+            | None
+            | Some [] -> ".{}"
+            | Some vs -> vs |> List.map (vname em) |> String.concat ", " |> sprintf ".{ %s }"
+
+        if isManaged t || xs |> List.exists (typeOf >> isManaged) then
+            let usesChars =
+                xs
+                |> List.map (fun x ->
+                    if not (isManaged (typeOf x)) then
+                        'p'
+                    else
+                        match x with
+                        | EDup(inner, _) when not (touchesMutable inner) -> 'k'
+                        | _ -> 'g'
+                )
+                |> Array.ofList
+
+            let usesStr = System.String(usesChars)
+
+            let args =
+                xs
+                |> List.map (fun x ->
+                    if not (isManaged (typeOf x)) then
+                        ex em x
+                    else
+                        match x with
+                        | EDup(inner, _) when not (touchesMutable inner) -> ex em inner
+                        | _ -> ex em x
+                )
+
+            let argsTuple =
+                match args with
+                | [] -> ".{}"
+                | _ -> args |> String.concat ", " |> sprintf ".{ %s }"
+
+            match ds with
+            | Some _ when canPlainTry em && em.Self.Raises = RAlways ->
+                if typeArgs.IsEmpty then
+                    Some
+                        $"(try fable_rt.xcallM(%s{modAlias}, \"%s{memberName}\", \"%s{usesStr}\", %s{argsTuple}, %s{errDrops}))"
+                else
+                    let gns =
+                        typeArgs
+                        |> List.map zigType
+                        |> String.concat ", "
+                        |> sprintf "%s.%s(%s)" modAlias memberName
+
+                    Some $"(try fable_rt.xcallG(%s{gns}, \"%s{usesStr}\", %s{argsTuple}, %s{errDrops}))"
+            | Some _ when canPlainTry em ->
+                let c =
+                    if typeArgs.IsEmpty then
+                        $"fable_rt.callM(%s{modAlias}, \"%s{memberName}\", \"%s{usesStr}\", %s{argsTuple}, %s{errDrops})"
+                    else
+                        let gns =
+                            typeArgs
+                            |> List.map zigType
+                            |> String.concat ", "
+                            |> sprintf "%s.%s(%s)" modAlias memberName
+
+                        $"fable_rt.callG(%s{gns}, \"%s{usesStr}\", %s{argsTuple}, %s{errDrops})"
+
+                em.Counter <- em.Counter + 1
+                let lbl = $"call%d{em.Counter}"
+                let raw = freshName em "raw"
+
+                Some
+                    $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) try %s{raw} else %s{raw}; }})"
+            | _ ->
+                if typeArgs.IsEmpty then
+                    Some $"fable_rt.callM(%s{modAlias}, \"%s{memberName}\", \"%s{usesStr}\", %s{argsTuple}, .{{}})"
+                else
+                    let gns =
+                        typeArgs
+                        |> List.map zigType
+                        |> String.concat ", "
+                        |> sprintf "%s.%s(%s)" modAlias memberName
+
+                    Some $"fable_rt.callG(%s{gns}, \"%s{usesStr}\", %s{argsTuple}, .{{}})"
+        else
+            match ds with
+            | Some _ when canPlainTry em && em.Self.Raises = RAlways ->
+                let args = xs |> List.map (ex em) |> String.concat ", "
+                Some $"(try fable_rt.xcallPlain(%s{fnRef f typeArgs}(%s{args}), %s{errDrops}))"
+            | _ -> None
+
+and canPlainTry (em: Em) =
+    em.TryLabels.Count = 0
+    && (
+        match em.Loop with
+        | Some {
+                   Trmc = true
+                   Plug = Some _
+               } -> false
+        | _ -> true
+    )
+
+and ex (em: Em) (e: Expr) : string =
     match e with
     | EVar v -> vname em v
     | ELit(s, _) -> s
@@ -322,29 +481,9 @@ let rec ex (em: Em) (e: Expr) : string =
         | "conv", [ x ] -> $"fable_rt.conv(%s{zigType t}, @as(%s{zigType argT}, %s{x}))"
         | _ -> fail None "internal: unknown primitive %s/%d" op a.Length
     | ECall(f, typeArgs, xs, t) ->
-        if f.Contains "." && (isManaged t || xs |> List.exists (typeOf >> isManaged)) then
-            // A function of another file: this file does not know what it borrows, so the call
-            // says what the caller does with each argument and `across` settles the rest when
-            // the Zig is compiled.
-            let uses, args =
-                xs
-                |> List.map (fun x ->
-                    if not (isManaged (typeOf x)) then
-                        ".plain", ex em x
-                    else
-                        match x with
-                        | EDup(inner, _) when not (touchesMutable inner) -> ".keep", ex em inner
-                        | _ -> ".give", ex em x
-                )
-                |> List.unzip
-
-            let tuple (items: string list) =
-                match items with
-                | [] -> ".{}"
-                | _ -> items |> String.concat ", " |> sprintf ".{ %s }"
-
-            $"fable_rt.across(%s{fnRef f typeArgs}, %s{sigName f}, %s{tuple uses}, %s{tuple args})"
-        else
+        match formatCrossCall em f typeArgs xs t None with
+        | Some txt -> txt
+        | None ->
             let args = xs |> List.map (ex em) |> String.concat ", "
             $"%s{fnRef f typeArgs}(%s{args})"
     | ECallClo(f, xs, resTy) ->
@@ -384,30 +523,7 @@ let rec ex (em: Em) (e: Expr) : string =
                 let sty = typeOf sub
                 IVtUpcast sty, "up:" + tyKey sty, [ sty ]
 
-        let slotKeyStr =
-            slots
-            |> List.map (fun (s, (t, tys)) -> s + "=" + t + "<" + (tys |> List.map tyKey |> String.concat ",") + ">")
-            |> String.concat ";"
-
-        let key = tyKey ifaceTy + "|" + srcKey + "|" + slotKeyStr
-
-        let vt =
-            match em.IfaceVts.TryGetValue key with
-            | true, v -> v
-            | _ ->
-                let slotTypeArgs = slots |> List.collect (fun (_, (_, tys)) -> tys)
-
-                let v =
-                    {
-                        Name = $"@\"fable_iface_vt$%d{em.IfaceVts.Count}\""
-                        IfaceTy = ifaceTy
-                        Kind = kind
-                        Slots = slots
-                        Gens = freeGens (ifaceTy :: srcTys @ slotTypeArgs)
-                    }
-
-                em.IfaceVts[key] <- v
-                v
+        let vt = ifaceVtFor em.IfaceVts ifaceTy kind srcKey srcTys slots
 
         let ns = ifaceVtRef vt
 
@@ -528,30 +644,46 @@ let rec ex (em: Em) (e: Expr) : string =
     // A call that may raise: on its error edge the function gives up what it still owns and
     // leaves, to the handler of the enclosing `try` or to its own caller.
     | EOnRaise(call, ds) ->
-        let c = ex em call
-        let edge = edgeText em ds
+        match call with
+        | ECall(f, typeArgs, xs, t) when f.Contains "." && canPlainTry em ->
+            match formatCrossCall em f typeArgs xs t (Some ds) with
+            | Some txt -> txt
+            | None ->
+                let c = ex em call
+                em.Counter <- em.Counter + 1
+                let lbl = $"call%d{em.Counter}"
+                let raw = freshName em "raw"
+                let edge = edgeText em ds
 
-        let definite =
-            match call with
-            | ECallClo _
-            | ECallVt _
-            | ECallIface _
-            | ERt _ -> true
-            | ECall(f, _, _, _) ->
-                match em.Fns.TryGetValue f with
-                | true, g -> g.Raises = RAlways
+                $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) (%s{raw} catch %s{edge}) else %s{raw}; }})"
+        | _ ->
+            let definite =
+                match call with
+                | ECallClo _
+                | ECallVt _
+                | ECallIface _
+                | ERt _ -> true
+                | ECall(f, _, _, _) ->
+                    match em.Fns.TryGetValue f with
+                    | true, g -> g.Raises = RAlways
+                    | _ -> false
                 | _ -> false
-            | _ -> false
 
-        if definite then
-            $"(%s{c} catch %s{edge})"
-        else
-            // whether this function raises is only known when the Zig is compiled
-            em.Counter <- em.Counter + 1
-            let lbl = $"call%d{em.Counter}"
-            let raw = freshName em "raw"
+            if definite && ds.IsEmpty && canPlainTry em then
+                $"(try %s{ex em call})"
+            else
+                let c = ex em call
+                let edge = edgeText em ds
 
-            $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) (%s{raw} catch %s{edge}) else %s{raw}; }})"
+                if definite then
+                    $"(%s{c} catch %s{edge})"
+                else
+                    // whether this function raises is only known when the Zig is compiled
+                    em.Counter <- em.Counter + 1
+                    let lbl = $"call%d{em.Counter}"
+                    let raw = freshName em "raw"
+
+                    $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) (%s{raw} catch %s{edge}) else %s{raw}; }})"
     | EEmit(macro, xs, ty)
     | ERt(macro, xs, ty) ->
         let args = xs |> List.map (ex em) |> Array.ofList
@@ -668,7 +800,12 @@ and leaveText (em: Em) : string =
 
 and edgeText (em: Em) (ds: Var list) : string =
     let drops =
-        ds |> List.map (fun d -> dropCode (vname em d) + " ") |> String.concat ""
+        match ds with
+        | [] -> ""
+        | [ d ] -> dropCode (vname em d) + " "
+        | _ ->
+            let names = ds |> List.map (vname em) |> String.concat ", "
+            $"fable_rt.dropAll(.{{ %s{names} }}); "
 
     $"{{ %s{drops}%s{leaveText em} }}"
 
@@ -752,7 +889,7 @@ let trmcSite (self: string) (e: Expr) =
 /// After a statement that has no value: leave through `dest` if that is where control goes.
 let finishUnit (em: Em) (ind: string) (dest: Dest) =
     match dest with
-    | DReturn when em.Loop.IsSome -> line em ind "return;"
+    | DReturn when em.Loop.IsSome || em.Scc.IsSome -> line em ind "return;"
     | DBreak l -> line em ind $"break :%s{l} {{}};"
     | DReturn
     | DDiscard -> ()
@@ -943,7 +1080,10 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
         && dest <> DDiscard
         && not (
             dest = DReturn
-            && (em.Loop.IsSome || (tailTarget em t).IsSome || (tailTarget em f).IsSome)
+            && (em.Loop.IsSome
+                || em.Scc.IsSome
+                || (tailTarget em t).IsSome
+                || (tailTarget em f).IsSome)
         )
         ->
         emitValue em ind e dest
@@ -1156,12 +1296,29 @@ and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
 
     match dest with
     | DReturn ->
-        match em.Loop, e with
-        | Some loop, (ECall(f, _, args, _) | EOnRaise(ECall(f, _, args, _), _)) when f = loop.Self ->
+        match em.Loop, em.Scc, e with
+        | Some loop, _, (ECall(f, _, args, _) | EOnRaise(ECall(f, _, args, _), _)) when f = loop.Self ->
             emitTailJump em ind args
-        | Some loop, _ when loop.Trmc ->
+        | Some loop, _, _ when loop.Trmc ->
             L $"hole.* = %s{ex em e};"
             L "return result;"
+        | _, Some scc, (ECall(g, tArgs, args, _) | EOnRaise(ECall(g, tArgs, args, _), [])) when
+            em.TryLabels.Count = 0
+            && tArgs = (em.Self.TypeParams |> List.map TGen)
+            && scc.TagOf.ContainsKey g
+            ->
+            let tag = scc.TagOf[g]
+
+            if args.IsEmpty then
+                L $"_st = .%s{tag};"
+            else
+                let inits =
+                    args |> List.mapi (fun i a -> $".a%d{i} = %s{ex em a}") |> String.concat ", "
+
+                L $"const _next: %s{scc.StateTypeName} = .{{ .%s{tag} = .{{ %s{inits} }} }};"
+                L "_st = _next;"
+
+            L "continue :tail;"
         | _ when (tailTarget em e).IsSome -> L $"return %s{(tailTarget em e).Value};"
         | _ ->
             if isVoid (typeOf e) then
@@ -1282,6 +1439,31 @@ let private storedInto (body: Expr) : Set<int> =
 let private hasManaged (fn: FnInfo) =
     isManaged fn.Ret || fn.Params |> List.exists (fun p -> isManaged p.Ty)
 
+/// The runtime's `cell` is inlined, so the work Zig does at compile time for each counts against
+/// the function's quota of backward branches: a literal of many cells, a 9 by 9 list of lists,
+/// runs out of it; and so does each inlined `dup` and `drop` (a state machine fusing many
+/// functions has hundreds of them). The line that raises the quota, if the body needs it.
+let branchQuota (bodyText: string) : string =
+    let count (what: string) =
+        let mutable n = 0
+        let mutable i = bodyText.IndexOf(what, System.StringComparison.Ordinal)
+
+        while i >= 0 do
+            n <- n + 1
+            i <- bodyText.IndexOf(what, i + 1, System.StringComparison.Ordinal)
+
+        n
+
+    let cells = count "fable_rt.cell("
+    let counts = count "fable_rt.dup(" + count "fable_rt.drop("
+
+    if cells > 32 || counts > 128 then
+        "    @setEvalBranchQuota("
+        + string (max 10000 (cells * 200 + counts * 50))
+        + ");\n"
+    else
+        ""
+
 /// The `[<StackArena>]` functions of the file being written.
 let private currentArenas =
     new System.Threading.ThreadLocal<Dictionary<string, int> ref>(fun () -> ref (Dictionary<string, int>()))
@@ -1373,6 +1555,7 @@ let emitFunction
 
                 Set.unionMany [ assignedIn fn.Body; storedInto fn.Body; Set.ofSeq addressed ]
             Loop = loop
+            Scc = None
             Self = fn
             Fns = fns
             Curried2 = curried2
@@ -1423,6 +1606,14 @@ let emitFunction
 
     let bodyText = dropUnreadPaths (em.Out.ToString())
 
+    // `NativePtr.stackalloc`: memory of the function, given up when it returns
+    let bodyText =
+        if bodyText.Contains "fable_stack.alloc(" then
+            "    var fable_stack: fable_rt.StackAlloc = .{};\n    defer fable_stack.deinit();\n"
+            + bodyText
+        else
+            bodyText
+
     // `[<StackArena(bytes)>]`: the function's cells come from a buffer on its stack
     let bodyText =
         match currentArenas.Value.Value.TryGetValue fn.Name with
@@ -1435,27 +1626,7 @@ let emitFunction
             + bodyText
         | _ -> bodyText
 
-    // (the runtime's `cell` is inlined, so the work Zig does at compile time for each counts
-    // against the function's quota of backward branches: a literal of many cells, a 9 by 9
-    // list of lists, runs out of it)
-    let bodyText =
-        let cells =
-            let mutable n = 0
-            let mutable i = bodyText.IndexOf("fable_rt.cell(", System.StringComparison.Ordinal)
-
-            while i >= 0 do
-                n <- n + 1
-                i <- bodyText.IndexOf("fable_rt.cell(", i + 1, System.StringComparison.Ordinal)
-
-            n
-
-        if cells > 32 then
-            "    @setEvalBranchQuota("
-            + string (max 10000 (cells * 200))
-            + ");\n"
-            + bodyText
-        else
-            bodyText
+    let bodyText = branchQuota bodyText + bodyText
 
     let sigParams =
         ps
@@ -1532,10 +1703,17 @@ let emitFunction
             |> List.map (fun g -> $"    _ = %s{genName g};\n")
             |> String.concat ""
 
+        let sigDecl =
+            if hasManaged fn && not fn.IsLocal then
+                $"        pub const sig = %s{sigName fn.Name};\n"
+            else
+                ""
+
         out
             .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{comptimeParams}) type {{")
             .Append(discards)
             .AppendLine("    return struct {")
+            .Append(sigDecl)
             .AppendLine($"        pub fn call(%s{sigParams}) %s{retType fn} {{")
             .Append(indented unused)
             .Append(indented bodyText)
@@ -2197,7 +2375,7 @@ let emitFile (state: FileState) : string =
 
     out
         .AppendLine(
-            $"pub const @\"$cycles\" = fable_rt.joinCycles(.{{ .holds = %s{b cyc.Holds}, .generic = %s{b cyc.Generic}, .instantiated = %s{b cyc.Instantiated}, .captures = %s{b cyc.Captures}, .cap_generic = %s{b cyc.CapGeneric}, .cap_instantiated = %s{b cyc.CapInstantiated}, .stack_traces = %s{b state.UsesStackTrace}, .reflection = %s{b state.UsesReflection} }}, %s{used});"
+            $"pub const @\"$cycles\" = fable_rt.joinCycles(.{{ .holds = %s{b cyc.Holds}, .generic = %s{b cyc.Generic}, .instantiated = %s{b cyc.Instantiated}, .captures = %s{b cyc.Captures}, .cap_generic = %s{b cyc.CapGeneric}, .cap_instantiated = %s{b cyc.CapInstantiated}, .stack_traces = %s{b state.UsesStackTrace}, .reflection = %s{b state.UsesReflection}, .exn_show = __FABLE_EXN_SHOW__ }}, %s{used});"
         )
         .AppendLine()
     |> ignore
@@ -2456,9 +2634,457 @@ let emitFile (state: FileState) : string =
     for fn in state.Fns do
         fns[fn.Name] <- fn
 
+    // Mutual tail recursion: intra-file SCCs of >= 2 functions with matching return type, type
+    // parameters, and error behavior (not already covered by scalar sibling tail jumps) fuse into a
+    // single state-machine loop (`switch (_st) { ... continue :tail; }`).
+    let rec isScalarTy (t: Ty) =
+        match t with
+        | TPrim _ -> true
+        | _ -> false
+
+    let tailEdges = Dictionary<string, Set<string>>()
+
+    for fn in state.Fns do
+        let rec collectTail (e: Expr) =
+            match e with
+            | ELet(_, (ECall _ | EOnRaise(ECall _, _)), ECon _) -> Set.empty
+            | ELet(_, rhs, _) when alwaysRaises rhs -> Set.empty
+            | ELet(_, _, b)
+            | EDrop(_, b)
+            | EUnpack(_, b)
+            | EPromote(_, b) -> collectTail b
+            | ESeq(a, _) when alwaysRaises a -> Set.empty
+            | ESeq(_, b) -> collectTail b
+            | EIf(_, t, f, _) -> Set.union (collectTail t) (collectTail f)
+            | ECall(g, tArgs, args, _)
+            | EOnRaise(ECall(g, tArgs, args, _), []) when
+                fns.ContainsKey g
+                && tArgs = (fn.TypeParams |> List.map TGen)
+                && args.Length = fns[g].Params.Length
+                ->
+                Set.singleton g
+            | _ -> Set.empty
+
+        tailEdges[fn.Name] <- collectTail fn.Body
+
+    let sccs = List<FnInfo list>()
+
+    do
+        let idx = ref 0
+        let indexOf = Dictionary<string, int>()
+        let lowOf = Dictionary<string, int>()
+        let onStack = HashSet<string>()
+        let stack = Stack<string>()
+
+        let rec strongconnect (v: string) =
+            indexOf[v] <- idx.Value
+            lowOf[v] <- idx.Value
+            idx.Value <- idx.Value + 1
+            stack.Push v
+            onStack.Add v |> ignore
+
+            for w in tailEdges[v] do
+                if not (indexOf.ContainsKey w) then
+                    strongconnect w
+                    lowOf[v] <- min lowOf[v] lowOf[w]
+                elif onStack.Contains w then
+                    lowOf[v] <- min lowOf[v] indexOf[w]
+
+            if lowOf[v] = indexOf[v] then
+                let comp = List<FnInfo>()
+                let mutable stop = false
+
+                while not stop do
+                    let w = stack.Pop()
+                    onStack.Remove w |> ignore
+                    comp.Add fns[w]
+
+                    if w = v then
+                        stop <- true
+
+                if comp.Count >= 2 then
+                    sccs.Add(List.rev (List.ofSeq comp))
+
+        for fn in state.Fns do
+            if not (indexOf.ContainsKey fn.Name) then
+                strongconnect fn.Name
+
+    let sccByMember = Dictionary<string, FnInfo list * string * Map<string, string>>()
+
+    for scc in sccs do
+        let rep = scc.Head
+        let repRet = zigType rep.Ret
+        let repRetText = retType rep
+
+        let eligible =
+            scc
+            |> List.forall (fun fn ->
+                not (state.Arenas.ContainsKey fn.Name)
+                && fn.RetFrom.IsNone
+                && (trmcSite fn.Name fn.Body).IsNone
+                && fn.TypeParams = rep.TypeParams
+                && zigType fn.Ret = repRet
+                && retType fn = repRetText
+            )
+
+        let allScalarSameSig =
+            rep.Raises = RNever
+            && scc
+               |> List.forall (fun fn ->
+                   (fn.Ret :: (fn.Params |> List.map (fun p -> p.Ty))) |> List.forall isScalarTy
+                   && (fn.Params |> List.map (fun p -> zigType p.Ty)) =
+                       (rep.Params |> List.map (fun p -> zigType p.Ty))
+               )
+
+        if eligible && not allScalarSameSig then
+            let mutable sccBase = $"%s{rep.Name}$scc"
+
+            while rootNames.Contains(topIdent sccBase) do
+                sccBase <- sccBase + "_"
+
+            rootNames.Add(topIdent sccBase) |> ignore
+
+            let tagMap = scc |> List.mapi (fun i fn -> fn.Name, $"s%d{i}") |> Map.ofList
+
+            for fn in scc do
+                sccByMember[fn.Name] <- scc, sccBase, tagMap
+
+    let emittedSccs = HashSet<string>()
+
+    let emitScc (scc: FnInfo list) (sccBase: string) (tagMap: Map<string, string>) =
+        let rep = scc.Head
+        let generic = not rep.TypeParams.IsEmpty
+
+        let stateTypeLocal =
+            if generic then
+                "State"
+            else
+                $"@\"%s{topIdent sccBase}$State\""
+
+        let sccInfo =
+            {
+                StateTypeName = stateTypeLocal
+                TagOf = tagMap
+            }
+
+        let variantDecls =
+            scc
+            |> List.map (fun fn ->
+                let tag = tagMap[fn.Name]
+
+                if fn.Params.IsEmpty then
+                    tag + ","
+                else
+                    let fs =
+                        fn.Params
+                        |> List.mapi (fun i p -> $"a%d{i}: %s{zigType p.Ty}")
+                        |> String.concat ", "
+
+                    $"%s{tag}: struct {{ %s{fs} }},"
+            )
+
+        let arms =
+            scc
+            |> List.map (fun fn ->
+                let tag = tagMap[fn.Name]
+                let emUsed = HashSet(rootNames)
+                emUsed.Add "_st" |> ignore
+                emUsed.Add "_args" |> ignore
+                emUsed.Add "_next" |> ignore
+
+                let em =
+                    {
+                        Out = StringBuilder()
+                        Names = Dictionary()
+                        Used = emUsed
+                        Mutated = Set.union (assignedIn fn.Body) (storedInto fn.Body)
+                        Loop = None
+                        Scc = Some sccInfo
+                        Self = fn
+                        Fns = fns
+                        Curried2 = state.Curried2
+                        CanTail = false
+                        TryLabels = Stack()
+                        Adapters = adapters
+                        IfaceVts = ifaceVts
+                        Counter = 0
+                    }
+
+                let binds = List<string>()
+
+                let paramNames =
+                    fn.Params
+                    |> List.mapi (fun i p ->
+                        let name = vname em p
+
+                        let kw =
+                            if em.Mutated.Contains p.Id then
+                                "var"
+                            else
+                                "const"
+
+                        binds.Add($"%s{kw} %s{name} = _args.a%d{i};")
+                        name
+                    )
+
+                stmt em "" fn.Body DReturn
+                let rawBody = dropUnreadPaths (em.Out.ToString())
+                let unusedText = ensureUsed paramNames rawBody
+
+                let bodyText =
+                    (binds |> Seq.map (fun b -> b + "\n") |> String.concat "")
+                    + unusedText.Replace("    _ = ", "_ = ")
+                    + rawBody
+
+                tag, not fn.Params.IsEmpty, bodyText
+            )
+
+        let retTxt = retType rep
+
+        let quota =
+            branchQuota (arms |> List.map (fun (_, _, t) -> t) |> String.concat "\n")
+
+        if generic then
+            let comptimeParams =
+                rep.TypeParams
+                |> List.map (fun g -> $"comptime %s{genName g}: type")
+                |> String.concat ", "
+
+            let allText =
+                (variantDecls |> String.concat "\n")
+                + "\n"
+                + retTxt
+                + "\n"
+                + (arms |> List.map (fun (_, _, t) -> t) |> String.concat "\n")
+
+            let discards =
+                rep.TypeParams
+                |> List.filter (fun g -> not (allText.Contains(genName g)))
+                |> List.map (fun g -> $"    _ = %s{genName g};\n")
+                |> String.concat ""
+
+            out
+                .AppendLine($"fn %s{topIdent sccBase}(%s{comptimeParams}) type {{")
+                .Append(discards)
+                .AppendLine("    return struct {")
+                .AppendLine("        pub const State = union(enum) {")
+            |> ignore
+
+            for v in variantDecls do
+                out.AppendLine($"            %s{v}") |> ignore
+
+            out
+                .AppendLine("        };")
+                .AppendLine($"        pub fn run(init_st: State) %s{retTxt} {{")
+                .Append(quota)
+                .AppendLine("            var _st = init_st;")
+                .AppendLine("            tail: while (true) {")
+                .AppendLine("                switch (_st) {")
+            |> ignore
+
+            for (tag, hasArgs, armBody) in arms do
+                let pat =
+                    if hasArgs then
+                        $"            .%s{tag} => |_args| {{"
+                    else
+                        $"            .%s{tag} => {{"
+
+                out.AppendLine($"    %s{pat}") |> ignore
+
+                for lineTxt in armBody.Split('\n') do
+                    if lineTxt <> "" then
+                        out.AppendLine("                    " + lineTxt) |> ignore
+
+                out.AppendLine("                },") |> ignore
+
+            out
+                .AppendLine("                }")
+                .AppendLine("            }")
+                .AppendLine("        }")
+                .AppendLine("    };")
+                .AppendLine("}")
+                .AppendLine()
+            |> ignore
+        else
+            out.AppendLine($"const %s{stateTypeLocal} = union(enum) {{") |> ignore
+
+            for v in variantDecls do
+                out.AppendLine($"    %s{v}") |> ignore
+
+            out
+                .AppendLine("};")
+                .AppendLine($"fn %s{topIdent sccBase}(init_st: %s{stateTypeLocal}) %s{retTxt} {{")
+                .Append(quota)
+                .AppendLine("    var _st = init_st;")
+                .AppendLine("    tail: while (true) {")
+                .AppendLine("        switch (_st) {")
+            |> ignore
+
+            for (tag, hasArgs, armBody) in arms do
+                let pat =
+                    if hasArgs then
+                        $"            .%s{tag} => |_args| {{"
+                    else
+                        $"            .%s{tag} => {{"
+
+                out.AppendLine(pat) |> ignore
+
+                for lineTxt in armBody.Split('\n') do
+                    if lineTxt <> "" then
+                        out.AppendLine("                " + lineTxt) |> ignore
+
+                out.AppendLine("            },") |> ignore
+
+            out.AppendLine("        }").AppendLine("    }").AppendLine("}").AppendLine()
+            |> ignore
+
+    let emitSccMemberWrapper (fn: FnInfo) (sccBase: string) (tagMap: Map<string, string>) =
+        let used = HashSet(rootNames)
+        let names = Dictionary<int, string>()
+
+        let paramDecls =
+            fn.Params
+            |> List.mapi (fun i p ->
+                let n =
+                    let b = cleanIdent p.Base
+
+                    let b =
+                        if isReservedIdent b then
+                            b + "_"
+                        else
+                            b
+
+                    let mutable cand = b
+                    let mutable k = 1
+
+                    while used.Contains cand do
+                        cand <- $"%s{b}_%d{k}"
+                        k <- k + 1
+
+                    used.Add cand |> ignore
+                    names[p.Id] <- cand
+                    cand
+
+                n, $"%s{n}: %s{zigType p.Ty}", i
+            )
+
+        let sigParams =
+            paramDecls |> List.map (fun (_, decl, _) -> decl) |> String.concat ", "
+
+        let tag = tagMap[fn.Name]
+
+        let visibility =
+            if fn.IsLocal then
+                ""
+            else
+                "pub "
+
+        let generic = not fn.TypeParams.IsEmpty
+
+        let tArgs = fn.TypeParams |> List.map genName |> String.concat ", "
+
+        let stateRef =
+            if generic then
+                $"%s{topIdent sccBase}(%s{tArgs}).State"
+            else
+                $"@\"%s{topIdent sccBase}$State\""
+
+        let initVal =
+            if fn.Params.IsEmpty then
+                $"@as(%s{stateRef}, .%s{tag})"
+            else
+                let fs =
+                    paramDecls
+                    |> List.map (fun (n, _, i) -> $".a%d{i} = %s{n}")
+                    |> String.concat ", "
+
+                $"%s{stateRef}{{ .%s{tag} = .{{ %s{fs} }} }}"
+
+        let dispatchCall =
+            if generic then
+                $"%s{topIdent sccBase}(%s{tArgs}).run(_init)"
+            else
+                $"%s{topIdent sccBase}(_init)"
+
+        let tailStmt =
+            match isVoid fn.Ret, fn.Raises with
+            | true, RNever -> $"%s{dispatchCall};"
+            | true, RAlways -> $"try %s{dispatchCall};"
+            | true, RDepends _ ->
+                $"if (comptime fable_rt.isRaised(@TypeOf(%s{dispatchCall}))) try %s{dispatchCall} else %s{dispatchCall};"
+            | false, RNever -> $"return %s{dispatchCall};"
+            | false, RAlways -> $"return try %s{dispatchCall};"
+            | false, RDepends _ ->
+                $"if (comptime fable_rt.isRaised(@TypeOf(%s{dispatchCall}))) return try %s{dispatchCall} else return %s{dispatchCall};"
+
+        if generic then
+            let comptimeParams =
+                fn.TypeParams
+                |> List.map (fun g -> $"comptime %s{genName g}: type")
+                |> String.concat ", "
+
+            let sigDecl =
+                if hasManaged fn && not fn.IsLocal then
+                    $"        pub const sig = %s{sigName fn.Name};\n"
+                else
+                    ""
+
+            out
+                .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{comptimeParams}) type {{")
+                .AppendLine("    return struct {")
+                .Append(sigDecl)
+                .AppendLine($"        pub fn call(%s{sigParams}) %s{retType fn} {{")
+                .AppendLine($"            const _init: %s{stateRef} = %s{initVal};")
+                .AppendLine($"            %s{tailStmt}")
+                .AppendLine("        }")
+                .AppendLine("    };")
+                .AppendLine("}")
+            |> ignore
+        else
+            out
+                .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{sigParams}) %s{retType fn} {{")
+                .AppendLine($"    const _init: %s{stateRef} = %s{initVal};")
+                .AppendLine($"    %s{tailStmt}")
+                .AppendLine("}")
+            |> ignore
+
+        if hasManaged fn && not fn.IsLocal then
+            let borrows =
+                match fn.Modes with
+                | [] -> ".{}"
+                | modes ->
+                    modes
+                    |> List.map (fun m ->
+                        if m = MBorrowed then
+                            "true"
+                        else
+                            "false"
+                    )
+                    |> String.concat ", "
+                    |> sprintf ".{ %s }"
+
+            let resultBorrowed =
+                if fn.RetFrom.IsSome then
+                    "true"
+                else
+                    "false"
+
+            out.AppendLine(
+                $"pub const %s{sigName fn.Name} = .{{ .borrows = %s{borrows}, .result_borrowed = %s{resultBorrowed} }};"
+            )
+            |> ignore
+
+        out.AppendLine() |> ignore
+
     for fn in state.Fns do
         try
-            emitFunction out rootNames adapters ifaceVts fns state.Curried2 fn
+            match sccByMember.TryGetValue fn.Name with
+            | true, (scc, sccBase, tagMap) ->
+                if emittedSccs.Add sccBase then
+                    emitScc scc sccBase tagMap
+
+                emitSccMemberWrapper fn sccBase tagMap
+            | _ -> emitFunction out rootNames adapters ifaceVts fns state.Curried2 fn
         with ZigError(msg, None) ->
             raise (ZigError(msg, fn.Range))
 
@@ -2589,6 +3215,22 @@ let emitFile (state: FileState) : string =
 
                 $"fable_rt.objTypeWith(%s{zigType d.Chain}, \"%s{d.DotnetName}\", %s{parent}, &.{{ %s{tables} }}, %s{toString}, %s{eq}, %s{hs}, %s{cmp})"
 
+        // (the interfaces the class implements, with its tables of them: `o :?> I`)
+        let value =
+            if d.Ifaces.IsEmpty then
+                value
+            else
+                let entries =
+                    d.Ifaces
+                    |> List.map (fun (ifaceTy, slots) ->
+                        let vt = ifaceVtFor ifaceVts ifaceTy IVtObj "obj" [] slots
+
+                        $".{{ .id = fable_rt.ifaceId(%s{zigType ifaceTy}), .vt = @ptrCast(&%s{ifaceVtRef vt}.vt) }}"
+                    )
+                    |> String.concat ", "
+
+                $"fable_rt.withIfaces(%s{value}, &.{{ %s{entries} }})"
+
         if generic then
             let comptimeParams =
                 d.TypeParams
@@ -2659,6 +3301,15 @@ let emitFile (state: FileState) : string =
             // are given up after it)
             let takesArgs = not fn.Params.IsEmpty
 
+            let mainCallExpr =
+                if takesArgs then
+                    $"%s{topIdent fn.Name}(undefined)"
+                else
+                    $"%s{topIdent fn.Name}()"
+
+            out.AppendLine($"pub const @\"$main_raises\" = fable_rt.isRaised(@TypeOf(%s{mainCallExpr}));")
+            |> ignore
+
             out
                 .AppendLine(
                     if takesArgs then
@@ -2706,4 +3357,25 @@ let emitFile (state: FileState) : string =
                 .AppendLine("}")
             |> ignore
 
-    out.ToString()
+    let bodyText = out.ToString()
+
+    let usesExnShow =
+        state.Tests.Count > 0
+        || bodyText.Contains "fable_rt.anyText"
+        || bodyText.Contains "fable_rt.toText"
+        || bodyText.Contains "fable_rt.genericText"
+        || bodyText.Contains "fable_rt.exnMessage"
+        || bodyText.Contains "fable_rt.exnText"
+        || bodyText.Contains "fable_rt.toString"
+        || bodyText.Contains "fable_rt.writeToString"
+        || bodyText.Contains "fable_rt.threadStart"
+        || bodyText.Contains ".kind = 'A'"
+        || bodyText.Contains ".kind = 'O'"
+
+    bodyText.Replace(
+        "__FABLE_EXN_SHOW__",
+        if usesExnShow then
+            "true"
+        else
+            "false"
+    )

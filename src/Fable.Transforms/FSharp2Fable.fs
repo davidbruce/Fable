@@ -1273,6 +1273,9 @@ let private transformExpr (com: IFableCompiler) (ctx: Context) appliedGenArgs fs
             | _ ->
                 let ctx, value =
                     match value with
+                    // (Zig: a generic value keeps its type parameters, and each use instantiates
+                    // it, as .NET's generic method for it does; see Fable2Zig's generic values)
+                    | FSharpExprPatterns.TypeLambda(_, lambda) when com.Options.Language = Zig -> ctx, lambda
                     | FSharpExprPatterns.TypeLambda(genArgs, lambda) ->
                         let ctx = resolveTypeLambdaGenArgs ctx genArgs lambda
                         ctx, lambda

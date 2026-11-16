@@ -699,6 +699,22 @@ let call
         | Fable.GenericParam _ ->
             ctx.State.UsesRuntime <- true
             EEmit("fable_rt.defaultOf($R)", [], mapType ctx r t)
+        // (a record, a union, a function, a tuple of them: .NET's null, or the nearest value,
+        // see fable_rt.nullOf)
+        | Fable.DeclaredType(entRef, _) when
+            (match ctx.Com.TryGetEntity entRef with
+             | Some ent -> ent.IsFSharpRecord || ent.IsFSharpUnion
+             | None -> false)
+            ->
+            ctx.State.UsesRuntime <- true
+            EEmit("fable_rt.nullOf($R)", [], mapType ctx r t)
+        | Fable.LambdaType _
+        | Fable.DelegateType _
+        | Fable.List _
+        | Fable.Tuple _
+        | Fable.AnonymousRecordType _ ->
+            ctx.State.UsesRuntime <- true
+            EEmit("fable_rt.nullOf($R)", [], mapType ctx r t)
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t
     // ---- System.Text.Encoding: UTF-8 and UTF-16 (the runtime's TextEncoding) ----
     | "System.Text.Encoding", "get_UTF8", [] ->
@@ -740,11 +756,11 @@ let call
     | "System.String", "get_Length", [ s ] when neverNullIn ctx s -> pure' "fable_rt.strLength($0)" [ s ] tI32
     | "System.String", "get_Length", [ s ] -> rt "fable_rt.strLen($0)" [ s ] tI32
     | "Microsoft.FSharp.Core.StringModule", "Length", [ s ] -> pure' "fable_rt.strLength($0)" [ s ] tI32
-    // (`for i in 0 .. s.Length - 1`: in range, and the string not null)
-    | "System.String", "get_Chars", [ (Fable.IdentExpr si) as s; (Fable.IdentExpr ii) as i ]
-    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions",
-      "GetString",
-      [ (Fable.IdentExpr si) as s; (Fable.IdentExpr ii) as i ] when ctx.InBounds.Contains(si.Name + "|" + ii.Name) ->
+    // (`for i in 0 .. s.Length - 1` or guarded `while i < s.Length`: in range, and not null)
+    | "System.String", "get_Chars", [ s; i ]
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetString", [ s; i ] when
+        Fable.Transforms.Zig.Lower.isArrayIndexInBounds ctx s i
+        ->
         pure' "$0.?.units()[@as(usize, @intCast($1))]" [ s; i ] tChar
     | "System.String", "get_Chars", [ s; i ]
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetString", [ s; i ] ->
