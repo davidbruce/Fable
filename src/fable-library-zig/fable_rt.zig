@@ -144,6 +144,7 @@ pub const thread = if (sgc.per_thread) struct {
     pub threadlocal var collector_ready: bool = false;
     pub threadlocal var current: ?Exn = null;
     pub threadlocal var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
+    pub threadlocal var stamps: std.AutoHashMapUnmanaged(usize, u32) = .empty;
     pub threadlocal var book: ?std.mem.Allocator = null;
     pub threadlocal var null_arrays: std.ArrayList(NullArray) = .empty;
     pub threadlocal var async_state: ?*ObjHeader = null;
@@ -154,6 +155,9 @@ pub const thread = if (sgc.per_thread) struct {
     pub var collector_ready: bool = false;
     pub var current: ?Exn = null;
     pub var weak: std.AutoHashMapUnmanaged(usize, *WeakHandle) = .empty;
+    /// the identity hashes given to cells that are not objects (lists, arrays): by address,
+    /// until the cell is freed (see `physicalHash`)
+    pub var stamps: std.AutoHashMapUnmanaged(usize, u32) = .empty;
     pub var book: ?std.mem.Allocator = null;
     pub var null_arrays: std.ArrayList(NullArray) = .empty;
     pub var async_state: ?*ObjHeader = null;
@@ -202,6 +206,8 @@ pub inline fn cellReuse(comptime T: type, comptime tag: std.meta.Tag(T), tok: an
             tok.* = null;
             const c: *C = @ptrCast(@alignCast(p));
             c.* = init;
+            // (a new cell: not the identity hash the dead one was given)
+            if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(c));
             if (comptime hasGc(C)) {
                 // (a cell that is built in again is a new cell: it gets an age of its own)
                 thread.collector.allocs += 1;
@@ -730,6 +736,8 @@ pub inline fn free(c: anytype) void {
     if (track) thread.stats.frees += 1;
     // (a cell that weak references point at: they see it is gone)
     if (thread.weak.count() != 0) weakGone(@intFromPtr(c));
+    // (a cell whose identity hash was taken: the next cell made here gets a new one)
+    if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(c));
     // (the blocks a cell holds besides itself: an array's items, a dictionary's entries)
     if (comptime @hasDecl(@TypeOf(c.*), "fable_array")) allocator.free(c.items);
     if (comptime @hasDecl(@TypeOf(c.*), "fable_free")) @TypeOf(c.*).fable_free(c);
@@ -1759,6 +1767,7 @@ pub fn Lazy(comptime T: type) type {
         const Self = @This();
         pub const fable_identity = {};
         pub const fable_cyclic = functions_in_cycles or holdsCyclic(T);
+        pub const fable_args = .{T};
         @"$rc": u32 = 1,
         @"$gc": GcHdr(fable_cyclic) = undefined,
         state: union(enum) {
@@ -3654,14 +3663,31 @@ pub fn objStamp(o: Obj) i32 {
     return @bitCast(s);
 }
 
+/// The identity hash of a cell that has no header of its own for it (a list, an array): a number
+/// of its own while it lives, kept by address and forgotten when it is freed (see `free`)
+fn cellStamp(addr: usize) i32 {
+    const got = thread.stamps.getOrPut(bookkeeping(), addr) catch oom();
+    if (!got.found_existing) {
+        var s = (next_stamp.fetchAdd(1, .monotonic) +% 1) *% 0x9E3779B1;
+        if (s == 0) s = 1;
+        got.value_ptr.* = s;
+    }
+    return @bitCast(got.value_ptr.*);
+}
+
 /// `LanguagePrimitives.PhysicalHash x`: of a value that is a reference (a cell, an object, a
 /// string), its identity; of any other, its hash
 pub fn physicalHash(x: anytype) i32 {
     const T = @TypeOf(x);
-    if (comptime isCellPtr(T)) return @truncate(@as(isize, @bitCast(@intFromPtr(x) >> 4)));
+    if (comptime isCellPtr(T)) return cellStamp(@intFromPtr(x));
+    // (a list: its first cell; the empty list is one value, as on .NET)
+    if (comptime isListType(T)) return switch (x) {
+        .Cons => |c| cellStamp(@intFromPtr(c)),
+        else => 1,
+    };
     if (comptime @typeInfo(T) == .optional and isCellPtr(@typeInfo(T).optional.child)) {
         const p = x orelse return 0;
-        return @truncate(@as(isize, @bitCast(@intFromPtr(p) >> 4)));
+        return cellStamp(@intFromPtr(p));
     }
     if (T == Any) {
         const p = x orelse return 0;
@@ -3803,6 +3829,27 @@ pub fn genericText(x: anytype) Raised!String {
         .int, .float, .bool => format(.{x}),
         else => if (T == BigInt or T == NetDecimal) format(.{x}) else anyText(x),
     };
+}
+
+/// The `k`th type argument of a type that names them (`Lazy(T)`: `T`)
+pub fn typeArg(comptime P: type, comptime k: usize) type {
+    const S = switch (@typeInfo(P)) {
+        .pointer => |p| p.child,
+        .optional => |o| switch (@typeInfo(o.child)) {
+            .pointer => |p| p.child,
+            else => o.child,
+        },
+        else => P,
+    };
+    if (!@hasDecl(S, "fable_args")) @compileError("fable: the type arguments of " ++ @typeName(P) ++ " are not known here");
+    return S.fable_args[k];
+}
+
+/// `x :> T` of a value whose type is a type parameter constrained to `T`: `x` itself, when Zig
+/// instantiates the parameter with `T`
+pub fn asSame(comptime T: type, x: anytype) T {
+    if (@TypeOf(x) == T) return x;
+    @compileError("fable: a value of type " ++ @typeName(@TypeOf(x)) ++ " is used as a " ++ @typeName(T));
 }
 
 /// .NET's `default(T)` of a type that has one here (numbers, chars, bools, strings, options,
@@ -4782,6 +4829,8 @@ pub fn collectorDeinit() void {
     if (thread.collector_ready) thread.collector.deinit();
     thread.weak.deinit(bookkeeping());
     thread.weak = .empty;
+    thread.stamps.deinit(bookkeeping());
+    thread.stamps = .empty;
 }
 
 /// The collector's counters (see fable_sgc.zig), or null if no cell ever needed it.
@@ -5759,6 +5808,7 @@ pub const OutOfMemoryException = fable_exn.OutOfMemoryException;
 pub const NotFiniteNumberException = fable_exn.NotFiniteNumberException;
 pub const RankException = fable_exn.RankException;
 pub const ArrayTypeMismatchException = fable_exn.ArrayTypeMismatchException;
+pub const MissingMethodException = fable_exn.MissingMethodException;
 pub const raise = fable_exn.raise;
 pub const div = fable_exn.div;
 pub const rem = fable_exn.rem;

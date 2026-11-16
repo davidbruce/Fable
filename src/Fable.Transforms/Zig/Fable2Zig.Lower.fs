@@ -1200,6 +1200,27 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 inner
 
         lw ctx (Fable.Let(fv, f, Fable.Lambda(a1, innerCurried, None)))
+    // (a function of several arguments read from a field, which may hold null
+    // (`[<DefaultValue>]`): null as it is, as .NET has it; else made curried as a variable is)
+    | Fable.Extended(Fable.Curry(Fable.Get(_, Fable.FieldGet _, _, _) as f, arity), r) when arity >= 2 ->
+        let n = ctx.State.NewVar("field_fn", tVoid, VLocal, false).Id
+        let fId = AST.makeTypedIdent f.Type $"fieldFn$%d{n}"
+        // (the field holds the function of all the arguments at once)
+        let read = lw ctx f
+        let v = ctx.State.NewVar("field_fn", typeOf read, VLocal, false)
+        let curriedTy = mapType ctx r e.Type
+        ctx.Vars[fId.Name] <- v
+
+        ELet(
+            v,
+            read,
+            EIf(
+                EEmit("fable_rt.isNullOf($0)", [ EVar v ], tBool),
+                EEmit("fable_rt.nullOf($R)", [], curriedTy),
+                lw ctx (Fable.Extended(Fable.Curry(Fable.IdentExpr fId, arity), r)),
+                curriedTy
+            )
+        )
     | Fable.Extended(Fable.Curry(f, arity), _) -> lw ctx (Replacements.Api.curryExprAtRuntime ctx.Com arity f)
 
     // `match w.TryGetTarget() with | true, x -> ...` where x's type has no default value (null on
@@ -3979,7 +4000,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             if typeOf coerced = targetTy then
                 coerced
             else
-                fail e.Range "the Zig target does not support %s yet" (exprKind e)
+                match unwrapNullness x.Type with
+                // (a value of a type parameter constrained to a type (`'b :> Lazy<'a>`): of that
+                // type, when Zig instantiates the parameter with it)
+                | Fable.GenericParam _ ->
+                    bindArgs ctx [ ir ] (fun xs -> EEmit("fable_rt.asSame($R, fable_rt.dup($0))", xs, targetTy))
+                | _ -> fail e.Range "the Zig target does not support %s yet" (exprKind e)
 
     // Pattern matching arrives as a decision tree whose leaves name a target and the values
     // its variables are bound to. A target reached from several leaves is lowered once per leaf.
@@ -5144,7 +5170,48 @@ and liftGroup
                 v
             )
 
-        let bodyIr = lw inner body
+        // (a type parameter that only a constraint of one of the function's names (`'b :> Lazy<'c>`,
+        // F#'s generalization of a local function): the type argument of that one)
+        let aliases =
+            let known = Set.ofList (ctx.TypeParams @ ownGens)
+
+            let rec constrained (t: Fable.Type) =
+                match t with
+                | Fable.GenericParam(name, _, constraints) when known.Contains name ->
+                    [
+                        for c in constraints do
+                            match c with
+                            | Fable.Constraint.CoercesTo(Fable.DeclaredType(_, targs)) ->
+                                for k, targ in List.indexed targs do
+                                    match targ with
+                                    | Fable.GenericParam(v, _, _) when not (known.Contains v) ->
+                                        v, TPrim $"fable_rt.typeArg(%s{genName name}, %d{k})"
+                                    | _ -> ()
+                            | _ -> ()
+                    ]
+                | Fable.DeclaredType(_, ts)
+                | Fable.Tuple(ts, _) -> List.collect constrained ts
+                | Fable.Array(t, _)
+                | Fable.List t
+                | Fable.Option(t, _) -> constrained t
+                | Fable.LambdaType(a, b) -> constrained a @ constrained b
+                | Fable.DelegateType(ts, b) -> List.collect constrained ts @ constrained b
+                | _ -> []
+
+            args
+            |> List.collect (fun a -> constrained a.Type)
+            |> List.distinctBy fst
+            |> List.filter (fun (v, _) -> not (ctx.State.GenAliases.ContainsKey v))
+
+        for v, ty in aliases do
+            ctx.State.GenAliases[v] <- ty
+
+        let bodyIr =
+            try
+                lw inner body
+            finally
+                for v, _ in aliases do
+                    ctx.State.GenAliases.Remove v |> ignore
 
         ctx.State.Fns.Add
             {
@@ -8745,7 +8812,9 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                                 + System.Text.RegularExpressions.Regex.Replace(f.Name, "[^A-Za-z0-9_]", "_")
 
                             state.StaticFields[c.Name + "." + f.Name] <- name
-                            staticTypes[name] <- f.FieldType
+                            // (a function of several arguments is kept uncurried, as in an
+                            // object's field)
+                            staticTypes[name] <- FableTransforms.uncurryType f.FieldType
                 | None -> ()
 
                 match com.TryGetEntity c.Entity with

@@ -57,6 +57,95 @@ let private tryParseIntoWith
 let private tryParseInto = tryParseIntoWith "tryParse"
 
 /// The lowered call, or null when the member is not one of this file's.
+/// `Activator.CreateInstance` of a type known here, by one of its constructors (its name, its
+/// member and the types of its parameters): the call, with the arguments unboxed to the
+/// parameters' types, the object as `t`
+let private activatorNew
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (entRef: Fable.EntityRef)
+    (gargs: Fable.Type list)
+    (ctorName: string, ctorRef: Fable.MemberRef, ps: Fable.Type list)
+    (args: Fable.Expr list)
+    (t: Fable.Type)
+    : Fable.Expr
+    =
+    let made = Fable.DeclaredType(entRef, gargs)
+
+    let subst =
+        match ctx.Com.TryGetEntity entRef with
+        | Some ent when ent.GenericParameters.Length = gargs.Length ->
+            List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) gargs
+            |> Map.ofList
+        | _ -> Map.empty
+
+    let ps = ps |> List.map (substFableType subst)
+
+    // (a constructor of no parameters takes unit)
+    let args =
+        match ps, args with
+        | [ Fable.Unit ], [] -> [ Fable.Value(Fable.UnitConstant, None) ]
+        | _ -> args
+
+    let args =
+        List.map2
+            (fun (p: Fable.Type) (a: Fable.Expr) ->
+                match a with
+                | Fable.TypeCast(inner, Fable.Any) when inner.Type = p -> inner
+                | _ when a.Type = p -> a
+                | _ -> Fable.TypeCast(a, p)
+            )
+            ps
+            args
+
+    let ctorType =
+        Fable.LambdaType(
+            (match ps with
+             | [ p ] -> p
+             | _ -> Fable.Tuple(ps, false)),
+            made
+        )
+
+    let call =
+        Fable.Call(
+            Fable.IdentExpr(AST.makeTypedIdent ctorType ctorName),
+            Fable.CallInfo.Create(args = args, sigArgTypes = ps, genArgs = gargs, memberRef = ctorRef),
+            made,
+            r
+        )
+
+    Fable.TypeCast(call, t)
+
+/// How many arguments a constructor of these parameters takes (none for unit)
+let private ctorArity (ps: Fable.Type list) =
+    match ps with
+    | [ Fable.Unit ] -> 0
+    | _ -> ps.Length
+
+/// A call of a .NET member of the library, as Fable writes one
+let private dotnetMember
+    (path: string)
+    (selector: string)
+    (thisArg: Fable.Expr option)
+    (args: Fable.Expr list)
+    (t: Fable.Type)
+    (r: SourceLocation option)
+    =
+    Fable.Call(
+        Fable.Import(
+            {
+                Selector = selector
+                Path = Replacements.DotnetPrefix + path
+                Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = thisArg.IsSome))
+            },
+            Fable.Any,
+            None
+        ),
+        Fable.CallInfo.Create(?thisArg = thisArg, args = args),
+        t,
+        r
+    )
+
 let call
     (ctx: Ctx)
     (r: SourceLocation option)
@@ -1360,6 +1449,93 @@ let call
         | Some Fable.Any -> pure' "fable_rt.objectNew()" [] tAny
         | Some ty -> EEmit($"fable_rt.box(fable_rt.defaultOf(%s{zigType (mapType ctx r ty)}))", [], tAny)
         | None -> failwith "unreachable"
+    // `Activator.CreateInstance(t, args)` of a type known here with the arguments in an array
+    // known only when the program runs: the constructor with as many parameters as it has items
+    // (.NET's MissingMethodException when there is none)
+    | "System.Activator", "CreateInstance", [ t0; arr ] when
+        (match staticTypeOf ctx t0 with
+         | Some(Fable.DeclaredType(ent, _)) -> fileCtors().ContainsKey ent.FullName
+         | _ -> false)
+        && (
+            match arr with
+            | Fable.Value(Fable.NewArray _, _) -> false
+            | _ ->
+                match arr.Type with
+                | Fable.Array(Fable.Any, _) -> true
+                | _ -> false
+        )
+        ->
+        let entRef, gargs =
+            match staticTypeOf ctx t0 with
+            | Some(Fable.DeclaredType(e, gs)) -> e, gs
+            | _ -> failwith "unreachable"
+
+        let items = AST.makeTypedIdent arr.Type "ctorArgs"
+        let itemsExpr = Fable.IdentExpr items
+
+        let length =
+            dotnetMember "System.Array" "get_Length" (Some itemsExpr) [] (Fable.Number(Int32, Fable.NumberInfo.Empty)) r
+
+        let missing =
+            let message =
+                let name =
+                    match ctx.Com.TryGetEntity entRef with
+                    | Some ent -> dotnetTypeName ctx.Com ent
+                    | None -> entRef.FullName
+
+                Fable.Value(Fable.StringConstant $"Constructor on type '%s{name}' not found.", None)
+
+            Fable.Extended(
+                Fable.Throw(
+                    Some(
+                        dotnetMember
+                            "System.MissingMethodException"
+                            ".ctor"
+                            None
+                            [ message ]
+                            (Fable.DeclaredType(
+                                {
+                                    FullName = "System.MissingMethodException"
+                                    Path = Fable.CoreAssemblyName "System.Runtime"
+                                },
+                                []
+                            ))
+                            r
+                    ),
+                    t
+                ),
+                r
+            )
+
+        let byCount =
+            fileCtors().[entRef.FullName]
+            |> List.distinctBy (fun (_, _, ps) -> ctorArity ps)
+            |> List.rev
+            |> List.fold
+                (fun otherwise ((_, _, ps) as ctor) ->
+                    let args =
+                        List.init
+                            (ctorArity ps)
+                            (fun i ->
+                                dotnetMember
+                                    "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"
+                                    "GetArray"
+                                    None
+                                    [ itemsExpr; AST.makeIntConst i ]
+                                    Fable.Any
+                                    r
+                            )
+
+                    Fable.IfThenElse(
+                        AST.makeEqOp r length (AST.makeIntConst (ctorArity ps)) BinaryEqual,
+                        activatorNew ctx r entRef gargs ctor args t,
+                        otherwise,
+                        r
+                    )
+                )
+                missing
+
+        lw ctx (Fable.Let(items, arr, byCount))
     // `Activator.CreateInstance(t, args)` of a type known here (`MakeGenericType` of known types,
     // see `staticTypeOf`): the constructor of that type with as many parameters, called with the
     // arguments unboxed to their types, the object boxed
@@ -1378,50 +1554,11 @@ let call
             | [ Fable.Value(Fable.NewArray(Fable.ArrayValues xs, _, _), _) ] -> xs
             | xs -> xs
 
-        let made = Fable.DeclaredType(entRef, gargs)
-
-        let subst =
-            match ctx.Com.TryGetEntity entRef with
-            | Some ent when ent.GenericParameters.Length = gargs.Length ->
-                List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) gargs
-                |> Map.ofList
-            | _ -> Map.empty
-
         match
             fileCtors().[entRef.FullName]
-            |> List.tryFind (fun (_, _, ps) -> ps.Length = args.Length)
+            |> List.tryFind (fun (_, _, ps) -> ctorArity ps = args.Length)
         with
-        | Some(ctorName, ctorRef, ps) ->
-            let ps = ps |> List.map (substFableType subst)
-
-            let args =
-                List.map2
-                    (fun (p: Fable.Type) (a: Fable.Expr) ->
-                        match a with
-                        | Fable.TypeCast(inner, Fable.Any) when inner.Type = p -> inner
-                        | _ when a.Type = p -> a
-                        | _ -> Fable.TypeCast(a, p)
-                    )
-                    ps
-                    args
-
-            let ctorType =
-                Fable.LambdaType(
-                    (match ps with
-                     | [ p ] -> p
-                     | _ -> Fable.Tuple(ps, false)),
-                    made
-                )
-
-            let call =
-                Fable.Call(
-                    Fable.IdentExpr(AST.makeTypedIdent ctorType ctorName),
-                    Fable.CallInfo.Create(args = args, sigArgTypes = ps, genArgs = gargs, memberRef = ctorRef),
-                    made,
-                    r
-                )
-
-            lw ctx (Fable.TypeCast(call, t))
+        | Some ctor -> lw ctx (activatorNew ctx r entRef gargs ctor args t)
         | None -> fail r "the Zig target found no constructor of %s with %d parameters" entRef.FullName args.Length
     // (`unbox<'T> o` as an inline function leaves it: `:?>`)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "UnboxGeneric", [ x ] ->

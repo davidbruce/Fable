@@ -135,6 +135,7 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(listEnt ctx.State, [ mapType ctx r v ])
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Collections.Generic.HashSet`1" ->
         TEnt(netEnt ctx.State "HashSet", [ mapType ctx r t ])
+    | Fable.GenericParam(name = name) when ctx.State.GenAliases.ContainsKey name -> ctx.State.GenAliases[name]
     | Fable.GenericParam(name = name) -> TGen name
     | Fable.DeclaredType(ent, _) when dotnetExceptions.ContainsKey ent.FullName -> tExn
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = refName -> TEnt(refEnt ctx.State, [ mapType ctx r t ])

@@ -330,6 +330,7 @@ pub const OutOfMemoryException = Class("System.OutOfMemoryException", SystemExce
 pub const NotFiniteNumberException = Class("System.NotFiniteNumberException", ArithmeticException);
 pub const RankException = Class("System.RankException", SystemException);
 pub const ArrayTypeMismatchException = Class("System.ArrayTypeMismatchException", SystemException);
+pub const MissingMethodException = Class("System.MissingMethodException", SystemException);
 
 /// Raise an exception of a .NET class with a message.
 pub fn raise(comptime C: type, message: String) Raised {

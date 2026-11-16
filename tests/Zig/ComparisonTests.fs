@@ -1205,3 +1205,13 @@ let ``test EqualityComparer.Create works`` () =
     cmp.Equals(1, 1) |> equal false
     cmp.Equals(1, 2) |> equal true
 
+[<Fact>]
+let ``test LanguagePrimitives.PhysicalHash with lists works`` () =
+    (LanguagePrimitives.PhysicalHash [1;2], LanguagePrimitives.PhysicalHash [1;2]) ||> notEqual
+    (LanguagePrimitives.PhysicalHash [2;1], LanguagePrimitives.PhysicalHash [1;2]) ||> notEqual
+
+[<Fact>]
+let ``test LanguagePrimitives.PhysicalHash with arrays works`` () =
+    (LanguagePrimitives.PhysicalHash [|1;2|], LanguagePrimitives.PhysicalHash [|1;2|]) ||> notEqual
+    (LanguagePrimitives.PhysicalHash [|2;1|], LanguagePrimitives.PhysicalHash [|1;2|]) ||> notEqual
+

@@ -716,6 +716,9 @@ type FileState() =
     /// local generic values (`let f_opt = Some f`, generalized by F#) lifted as functions without
     /// parameters: each use calls it at its own type arguments
     member val GenericValues = HashSet<string>()
+    /// type parameters a function does not take, known from those it does: `'c` of
+    /// `'b :> Lazy<'c>` is the type argument of `'b` (see fable_rt.typeArg)
+    member val GenAliases = Dictionary<string, Ty>()
     /// record and union types seen so far, by full name
     member val Ents = Dictionary<string, Ent>()
     /// the ones this file declares, in the order they were first needed

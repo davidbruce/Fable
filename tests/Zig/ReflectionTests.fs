@@ -1035,3 +1035,26 @@ let ``test GetType works when a generic base takes the class itself`` () =
     ping.IsSubclassOf(typeof<PairBase<PairPong>>) |> equal true
     PairPong().GetType().IsSubclassOf(typeof<PairBase<PairPing>>) |> equal true
 
+
+type ActivatorDefault() =
+    member _.Value = "Hi"
+
+type ActivatorGreeting(greeting: string) =
+    member _.Value = greeting
+    new() = ActivatorGreeting("none")
+    new(a: string, n: int) = ActivatorGreeting(a + string n)
+
+[<Fact>]
+let ``test Create objects with System.Activator and arguments known when the program runs`` () =
+    (create2<ActivatorDefault> [||]).Value |> equal "Hi"
+    (create2<ActivatorGreeting> [| "Yo" |]).Value |> equal "Yo"
+    let args = Array.append [| box "a" |] [| box 2 |]
+    (create2<ActivatorGreeting> args).Value |> equal "a2"
+    (create2<ActivatorGreeting> (Array.sub args 0 0)).Value |> equal "none"
+    (create2<ActivatorGreeting> (Array.sub args 0 1)).Value |> equal "a"
+    let missing =
+        try
+            create2<ActivatorDefault> [| box 1; box 2; box 3 |] |> ignore
+            ""
+        with :? System.MissingMethodException as e -> e.Message
+    missing.StartsWith "Constructor on type" |> equal true

@@ -733,6 +733,7 @@ let dotnetExceptions =
         "NotFiniteNumberException"
         "RankException"
         "ArrayTypeMismatchException"
+        "MissingMethodException"
         "UriFormatException"
     ]
     |> List.map (fun name -> "System." + name, "fable_rt." + name)
@@ -778,6 +779,7 @@ let defaultExnMessages =
             "System.NotFiniteNumberException", "Number encountered was not a finite quantity."
             "System.RankException", "Attempted to operate on an array with the incorrect number of dimensions."
             "System.ArrayTypeMismatchException", "Attempted to access an element as a type incompatible with the array."
+            "System.MissingMethodException", "Attempted to access a missing method."
             "System.Collections.Generic.KeyNotFoundException", "The given key was not present in the dictionary."
             "System.IO.IOException", "I/O error occurred."
             "System.IO.FileNotFoundException", "Unable to find the specified file."

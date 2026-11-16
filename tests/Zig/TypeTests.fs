@@ -2209,6 +2209,14 @@ let byrefFunc(n: byref<int>) =
 
 let describeLazy (x: Lazy<'a>) : string = string (x.Force())
 
+let walkLazyTree (tree: LazyTree<Lazy<'a>>) : string =
+    let rec loop (LazyNode(root, xs)) =
+        match xs with
+        | [] -> describeLazy root
+        | x :: _ -> loop x
+
+    loop tree
+
 let inline inlinedFunc(n: 't[]) =
     n.Length
 
@@ -2624,3 +2632,31 @@ let ``test Overloads distinguished by a flexible type work`` () =
     t.For([|1; 2; 3|], fun i -> sum <- sum + i) |> equal 3
     sum |> equal 6
 
+
+type ClassWithFunctionDefaultValues() =
+    [<DefaultValue>] val mutable G: int -> int -> int
+    [<DefaultValue>] val mutable H: int -> int
+    [<DefaultValue>] static val mutable private S: int -> int -> int
+    static member SIsNull = isNull (box ClassWithFunctionDefaultValues.S)
+    static member SetS f = ClassWithFunctionDefaultValues.S <- f
+    static member CallS a b = ClassWithFunctionDefaultValues.S a b
+
+[<Fact>]
+let ``test DefaultValue fields of function types are null until set`` () =
+    let c = ClassWithFunctionDefaultValues()
+    isNull (box c.G) |> equal true
+    isNull (box c.H) |> equal true
+    let g = c.G
+    isNull (box g) |> equal true
+    c.G <- fun x y -> x + y
+    isNull (box c.G) |> equal false
+    c.G 2 3 |> equal 5
+    ClassWithFunctionDefaultValues.SIsNull |> equal true
+    ClassWithFunctionDefaultValues.SetS(fun a b -> a * b)
+    ClassWithFunctionDefaultValues.SIsNull |> equal false
+    ClassWithFunctionDefaultValues.CallS 3 4 |> equal 12
+
+[<Fact>]
+let ``test Local function generic over a Lazy subtype constraint works`` () =
+    LazyNode(lazy 5, [LazyNode(lazy 7, [])]) |> walkLazyTree |> equal "7"
+    LazyNode(lazy 5, []) |> walkLazyTree |> equal "5"
