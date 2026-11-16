@@ -357,6 +357,9 @@ let ``test Set enumerator Current raises InvalidOperationException outside the e
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+
+
+
 [<Fact>]
 let ``test Set.IsEmpty works`` () =
     let xs = Set.empty<int>
@@ -418,3 +421,5 @@ let ``test Set functions raise ArgumentException on empty sets`` () =
     raisedExceptionType (fun () -> s.MaximumElement) |> equal "ArgumentException"
     raisedExceptionType (fun () -> Set.intersectMany ([]: Set<int> list)) |> equal "ArgumentException"
 
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----

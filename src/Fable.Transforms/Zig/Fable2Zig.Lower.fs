@@ -19,6 +19,28 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         lw ctx (asCollectionBase ctx x (fun x -> Fable.Call(callee, { info with ThisArg = Some x }, t, r)))
     | Fable.TypeCast(x, target) when (collectionBase ctx.Com x.Type).IsSome ->
         lw ctx (asCollectionBase ctx x (fun x -> Fable.TypeCast(x, target)))
+    // (`let coll = rs :> ICollection<_>` of a ResizeArray, a HashSet or a Dictionary: the variable
+    // is the collection, so that what is done through it is done to the collection, as on .NET)
+    | Fable.Let(id, Fable.TypeCast(Uncast inner, (Fable.DeclaredType(view, _))), body) when
+        not id.IsMutable
+        && (view.FullName = "System.Collections.Generic.ICollection`1"
+            || view.FullName = "System.Collections.Generic.IReadOnlyCollection`1")
+        && (
+            match inner.Type with
+            | Fable.Array _ -> true
+            | Fable.DeclaredType(ent, _) ->
+                ent.FullName = "System.Collections.Generic.List`1"
+                || ent.FullName = "System.Collections.Generic.HashSet`1"
+                || ent.FullName = "System.Collections.Generic.Dictionary`2"
+            | _ -> false
+        )
+        ->
+        let id' = { id with Type = inner.Type }
+
+        let body =
+            FableTransforms.replaceValues (Map.ofList [ id.Name, Fable.TypeCast(Fable.IdentExpr id', id.Type) ]) body
+
+        lw ctx (Fable.Let(id', inner, body))
     // (a unit that does something, the one argument of a call (`box (ignore (f ()))`): it is done,
     // then the call made of `()`)
     | Fable.Call(callee,
@@ -775,7 +797,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let firstS = first |> List.map fresh
         let restS = rest |> List.map fresh
         let rTy = peelArgs g.Type k
-        let staged = AST.makeTypedIdent rTy "staged"
+        let staged = AST.makeTypedIdent rTy (tempName ctx "staged")
 
         let stage =
             Fable.Delegate(
@@ -1041,7 +1063,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     // made, as F# computes it)
     | Fable.Delegate(args, body, name, tags) when (etaHead args body).IsSome ->
         let head, rebuild = (etaHead args body).Value
-        let held = AST.makeTypedIdent head.Type "applied"
+        let held = AST.makeTypedIdent head.Type (tempName ctx "applied")
         lw ctx (Fable.Let(held, head, Fable.Delegate(args, rebuild (Fable.IdentExpr held), name, tags)))
     // (a delegate of no parameters takes the unit here, as its type says)
     | Fable.Delegate([], body, name, tags) ->
@@ -2068,7 +2090,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         let cell = Fable.Get(x, Fable.FieldGet { fi with FieldType = Some kept }, kept, r1)
 
-        let v = AST.makeTypedIdent optT "self"
+        let v = AST.makeTypedIdent optT (tempName ctx "self")
 
         let failInit =
             Fable.Call(
@@ -2336,7 +2358,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.DeclaredType({ Path = Fable.SourcePath _ }, _) when
             implements ctx.Com x.Type "System.Collections.Generic.IEnumerable`1" = Some true
             ->
-            let obj = AST.makeTypedIdent x.Type "enumerable"
+            let obj = AST.makeTypedIdent x.Type (tempName ctx "enumerable")
 
             let getEnumerator =
                 Fable.Call(
@@ -3051,7 +3073,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | this :: rawArgs when not rawArgs.IsEmpty ->
                     match etaHead rawArgs m.Body with
                     | Some(head, rebuild) ->
-                        let held = AST.makeTypedIdent head.Type "applied"
+                        let held = AST.makeTypedIdent head.Type (tempName ctx "applied")
                         preBindings <- (held, head) :: preBindings
                         { m with Body = rebuild (Fable.IdentExpr held) }
                     | None -> m
@@ -6148,7 +6170,9 @@ and dotnetCall
                     | _ -> fail r "internal: TryParse"
 
             let ty = mapType ctx r valueType
-            let tmp = AST.makeTypedIdent (Fable.Option(valueType, false)) "parsed"
+            // (a name of its own: the program's variable may be called `parsed`)
+            let tmp =
+                AST.makeTypedIdent (Fable.Option(valueType, false)) (tempName ctx "parsed")
 
             let parsed =
                 Fable.Emit(
@@ -6317,7 +6341,7 @@ and asCollectionBase (ctx: Ctx) (x: Fable.Expr) (k: Fable.Expr -> Fable.Expr) : 
     match x with
     | Fable.IdentExpr id -> k (Fable.IdentExpr { id with Type = baseType })
     | _ ->
-        let tmp = AST.makeTypedIdent baseType "collection"
+        let tmp = AST.makeTypedIdent baseType (tempName ctx "collection")
         Fable.Let(tmp, x, k (Fable.IdentExpr tmp))
 
 /// What a `for ... in` loop walks, lowered: a list (of a list, a set, or a map's entries) or

@@ -1277,6 +1277,13 @@ let ``test %A and ToString for voption, struct tuple, uint16, and functions`` ()
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+#if !FABLE_COMPILER_ZIG // (a format known only when the program runs, given its values: printf whose type F# takes from each use)
+let spr fmt =
+    let fmt = Printf.StringFormat<_>(fmt)
+    sprintf fmt
+#endif
+
+
 
 
 
@@ -2030,3 +2037,50 @@ let ``test String.Normalize gives each of Unicode's forms`` () =
     "é".IsNormalized(System.Text.NormalizationForm.FormD) |> equal true
     hex ("\uDC00".Normalize()) |> equal "FFFD"
     throwsAnyError (fun () -> "a￾".Normalize() |> ignore)
+
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test Fix #2398: Exception when two successive string format placeholders and value of first one ends in %`` () =
+    sprintf "%c%s" '%' "text" |> equal "%text"
+
+[<Fact>]
+let ``test Interpolated strings keep empty lines`` () =
+    let s1 = $"""1
+
+
+    {1+1}
+
+
+3"""
+    let s2 = """1
+
+
+    2
+
+
+3"""
+    equal s1 s2
+    equal s1.Length s2.Length
+
+[<Fact>]
+let ``test Can use backslash is interpolated strings`` () =
+    $"\n{1+1}\n" |> equal """
+2
+"""
+
+#if !FABLE_COMPILER_ZIG // (a format known only when the program runs, given its values: printf whose type F# takes from each use)
+[<Fact>]
+let ``test Printf works with generic argument`` () =
+    spr "bar %s" "a" |> equal "bar a"
+    spr "foo %i %i" 3 5 |> equal "foo 3 5"
+    let f1 = spr "foo %i %i"
+    let f2 = f1 2
+    f2 2 |> equal "foo 2 2"
+    let f1 = spr "foo %i %i %i"
+    let f2 = f1 2
+    let f3 = f2 2
+    f3 2 |> equal "foo 2 2 2"
+#endif
+

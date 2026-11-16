@@ -310,6 +310,19 @@ let ``test Dictionary enumeration to KeyValuePair arrays and lists works`` () =
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+type Table<'K, 'V when 'K: equality and 'K: not null> () =
+
+    let dic = new Dictionary<'K,'V>()
+
+    let addKeyValue key value =
+        dic.[key] <- value
+
+    member _.add key value =
+        addKeyValue key value
+
+    member _.Dic = dic
+
+
 type DictKey =
     | Int of int
     | Str of string
@@ -471,4 +484,98 @@ let ``test Dictionary compares ResizeArray keys by reference`` () =
     dic.Count |> equal 2
     dic.ContainsKey key |> equal true
     dic.ContainsKey(ResizeArray [ 1 ]) |> equal false
+
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test Dictionary with type as key works`` () =
+    // See #2202
+    let cache = Dictionary<Type, int>()
+    cache.Add(typeof<int>, 1)
+    cache.Add(typeof<string>, 2)
+    cache.Add(typeof<int64>, 3)
+    equal 3 cache.Count
+    equal cache.[typeof<int>] 1
+    equal cache.[typeof<string>] 2
+    equal cache.[typeof<int64>] 3
+
+[<Fact>]
+let ``test Check that generics are not duplicated `` () =
+    // See #3911
+    let table = Table<_,_>()
+    table.add "A" 1
+    table.add "B" 2
+    table.add "C" 3
+    table.Dic.Count |> equal 3
+
+[<Fact>]
+let ``test Dictionary IReadOnlyCollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |] |> Array.map KeyValuePair
+    let coll = (Dictionary xs) :> IReadOnlyCollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Dictionary ICollection.IsReadOnly works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |] |> Array.map KeyValuePair
+    let coll = (Dictionary xs) :> ICollection<KeyValuePair<_,_>>
+    coll.IsReadOnly |> equal false
+
+[<Fact>]
+let ``test Dictionary ICollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |] |> Array.map KeyValuePair
+    let coll = (Dictionary xs) :> ICollection<KeyValuePair<_,_>>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Dictionary ICollection.Contains works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |] |> Array.map KeyValuePair
+    let coll = (Dictionary xs) :> ICollection<KeyValuePair<_,_>>
+    coll.Contains(KeyValuePair("B", 3)) |> equal false
+    coll.Contains(KeyValuePair("D", 3)) |> equal false
+    coll.Contains(KeyValuePair("B", 2)) |> equal true
+
+[<Fact>]
+let ``test Dictionary ICollection.CopyTo works`` () =
+    // See #3914
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |] |> Array.map KeyValuePair
+    let coll = (Dictionary xs) :> ICollection<KeyValuePair<_,_>>
+    let ys = [| ("D", 4); ("E", 5); ("F", 6) |] |> Array.map KeyValuePair
+    coll.CopyTo(ys, 0)
+    ys = xs |> equal true
+
+[<Fact>]
+let ``test Dictionary ICollection.Clear works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |] |> Array.map KeyValuePair
+    let coll = (Dictionary xs) :> ICollection<KeyValuePair<_,_>>
+    coll.Clear()
+    coll.Count |> equal 0
+
+[<Fact>]
+let ``test Dictionary ICollection.Add works`` () =
+    // See #3914
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |] |> Array.map KeyValuePair
+    let coll = (Dictionary xs) :> ICollection<KeyValuePair<_,_>>
+    throwsAnyError (fun _ -> coll.Add(KeyValuePair("A", 1)))
+    throwsAnyError (fun _ -> coll.Add(KeyValuePair("A", 2)))
+    coll.Add(KeyValuePair("D", 4))
+    coll.Count |> equal 4
+
+[<Fact>]
+let ``test Dictionary ICollection.Remove works`` () =
+    // See #3914
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |] |> Array.map KeyValuePair
+    let coll = (Dictionary xs) :> ICollection<KeyValuePair<_,_>>
+    coll.Remove(KeyValuePair("B", 3)) |> equal false
+    coll.Remove(KeyValuePair("D", 3)) |> equal false
+    coll.Remove(KeyValuePair("B", 2)) |> equal true
+    coll.Count |> equal 2
+
+[<Fact>]
+let ``test Dictionary with a structural comparer compares array keys by value`` () =
+    let dic = Dictionary<int[], int>(HashIdentity.Structural)
+    dic.[[| 1 |]] <- 1
+    dic.ContainsKey [| 1 |] |> equal true
+    (dict [ [| 1 |], 1 ]).ContainsKey [| 1 |] |> equal true
+    (readOnlyDict [ [| 1 |], 1 ]).ContainsKey [| 1 |] |> equal true
 

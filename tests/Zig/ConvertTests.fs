@@ -1633,6 +1633,12 @@ let ``test Encoding.UTF8.GetString for range works`` () =
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+let private adaptExponentValue (value: string) =
+    value.ToLowerInvariant().Replace("e+00", "e+").Replace("e+0", "e+")
+
+let private negZero = 1. / Double.NegativeInfinity
+
+
 let private toPlainArray (bytes: byte[]) : byte[] = bytes
 
 
@@ -2272,4 +2278,845 @@ let ``test System.Double.Parse honors NumberStyles`` () =
     result.Value |> equal 15.0
     Single.Parse("1,5", NumberStyles.Float ||| NumberStyles.AllowThousands, CultureInfo.InvariantCulture) |> equal 15.0f
     (fun () -> Single.Parse("1,5", NumberStyles.Float, CultureInfo.InvariantCulture)) |> throwsAnyError
+
+
+// ---- ported from tests/Js/Main (2026-11-16, ToString formats) ----
+
+[<Fact>]
+let ``test byte.ToString 'E' works`` () =
+    (255uy).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255uy).ToString("E15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+    (255uy).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255uy).ToString("e15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+[<Fact>]
+let ``test sbyte.ToString 'E' works`` () =
+    (127y).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "1.27e+2"
+
+    (127y).ToString("E15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "1.270000000000000e+2"
+
+    // (-127y).ToString("E", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-1.270000e+2"
+
+    (127y).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "1.27e+2"
+
+    (127y).ToString("e15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "1.270000000000000e+2"
+
+    // (-127y).ToString("e", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-1.270000e+2"
+
+[<Fact>]
+let ``test int16.ToString 'E' works`` () =
+    (255s).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255s).ToString("E15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+    // (-255s).ToString("E", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-2.550000e+2"
+
+    (255s).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255s).ToString("e15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+    // (-255s).ToString("e", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-2.550000e+2"
+
+[<Fact>]
+let ``test uint16.ToString 'E' works`` () =
+    (255us).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255us).ToString("E15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+    (255us).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255us).ToString("e15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+[<Fact>]
+let ``test int32.ToString 'E' works`` () =
+    (255).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255).ToString("E15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+    // (-255).ToString("E", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-2.550000e+2"
+
+    (255).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255).ToString("e15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+    // (-255).ToString("e", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-2.550000e+2"
+
+    (235672367).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.36e+8"
+
+[<Fact>]
+let ``test uint32.ToString 'E' works`` () =
+    (255u).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    // (255u).ToString("E15", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "2.550000000000000e+2"
+
+    (255u).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    // (255u).ToString("e15", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "2.550000000000000e+2"
+
+[<Fact>]
+let ``test int64.ToString 'E' works`` () =
+    (255L).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255L).ToString("E15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+    (-255L).ToString("E", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "-2.550000e+2"
+
+    (255L).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255L).ToString("e15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+    (-255L).ToString("e", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "-2.550000e+2"
+
+[<Fact>]
+let ``test uint64.ToString 'E' works`` () =
+    (255UL).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255UL).ToString("E15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+    (255UL).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255UL).ToString("e15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.550000000000000e+2"
+
+[<Fact>]
+let ``test float.ToString 'E' works`` () =
+    (255.2357).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255.2357).ToString("E15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.552357000000000e+2"
+
+    // (-255.2357).ToString("E", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-2.552357e+2"
+
+    (255.2357).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255.2357).ToString("e15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.552357000000000e+2"
+
+    // (-255.2357).ToString("e", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-2.552357e+2"
+
+[<Fact>]
+let ``test float32.ToString 'E' works`` () =
+    (255.2357f).ToString("E2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255.2357f).ToString("E5", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55236e+2"
+
+    // (-255.2357f).ToString("E", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-2.552357e+2"
+
+    (255.2357f).ToString("e2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55e+2"
+
+    (255.2357f).ToString("e5", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.55236e+2"
+
+    // (-255.2357f).ToString("e", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "-2.552357e+2"
+
+[<Fact>]
+let ``test byte.ToString 'F' works`` () =
+    (255uy).ToString("F2") |> equal "255.00"
+
+    (255uy).ToString("F15", CultureInfo.InvariantCulture)
+    |> equal "255.000000000000000"
+
+[<Fact>]
+let ``test sbyte.ToString 'F' works`` () =
+    (127y).ToString("F2", CultureInfo.InvariantCulture) |> equal "127.00"
+
+    (127y).ToString("F15", CultureInfo.InvariantCulture)
+    |> equal "127.000000000000000"
+
+    (-127y).ToString("F", CultureInfo.InvariantCulture) |> equal "-127.00"
+
+[<Fact>]
+let ``test int16.ToString 'F' works`` () =
+    (255s).ToString("F2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    (255s).ToString("F15", CultureInfo.InvariantCulture)
+    |> equal "255.000000000000000"
+
+    (-255s).ToString("F", CultureInfo.InvariantCulture) |> equal "-255.00"
+
+[<Fact>]
+let ``test uint16.ToString 'F' works`` () =
+    (255us).ToString("F2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    (255us).ToString("F15", CultureInfo.InvariantCulture)
+    |> equal "255.000000000000000"
+
+[<Fact>]
+let ``test int32.ToString 'F' works`` () =
+    (255).ToString("F2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    (255).ToString("F15", CultureInfo.InvariantCulture)
+    |> equal "255.000000000000000"
+
+    (-255).ToString("F", CultureInfo.InvariantCulture) |> equal "-255.00"
+
+    (235672367).ToString("F2", CultureInfo.InvariantCulture) |> equal "235672367.00"
+
+    (235672367).ToString("F0", CultureInfo.InvariantCulture) |> equal "235672367"
+
+[<Fact>]
+let ``test uint32.ToString 'F' works`` () =
+    (255u).ToString("F2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    (255u).ToString("F15", CultureInfo.InvariantCulture)
+    |> equal "255.000000000000000"
+
+[<Fact>]
+let ``test int64.ToString 'F' works`` () =
+    (255L).ToString("F2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    (255L).ToString("F15", CultureInfo.InvariantCulture)
+    |> equal "255.000000000000000"
+
+    (-255L).ToString("F", CultureInfo.InvariantCulture) |> equal "-255.00"
+
+[<Fact>]
+let ``test uint64.ToString 'F' works`` () =
+    // (255UL).ToString("F2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    (255UL).ToString("F15", CultureInfo.InvariantCulture)
+    |> equal "255.000000000000000"
+
+[<Fact>]
+let ``test float.ToString 'F' works`` () =
+    (255.2357).ToString("F2", CultureInfo.InvariantCulture) |> equal "255.24"
+
+    (255.2357).ToString("F15", CultureInfo.InvariantCulture)
+    |> equal "255.235700000000008"
+
+    (-255.2357).ToString("F", CultureInfo.InvariantCulture) |> equal "-255.24"
+
+[<Fact>]
+let ``test float32.ToString 'F' works`` () =
+    (255.2357f).ToString("F2", CultureInfo.InvariantCulture) |> equal "255.24"
+
+    (255.2357f).ToString("F5", CultureInfo.InvariantCulture)
+    |> equal "255.23570"
+
+    (-255.2357f).ToString("F", CultureInfo.InvariantCulture) |> equal "-255.24"
+
+[<Fact>]
+let ``test byte.ToString 'G' works`` () =
+    (255uy).ToString("G2") |> adaptExponentValue |> equal "2.6e+2"
+
+    (255uy).ToString("G15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "255"
+
+[<Fact>]
+let ``test sbyte.ToString 'G' works`` () =
+    (127y).ToString("G2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "1.3e+2"
+
+    (127y).ToString("G15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "127"
+
+    (-127y).ToString("G", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "-127"
+
+[<Fact>]
+let ``test int16.ToString 'G' works`` () =
+    (255s).ToString("G2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.6e+2"
+
+    (255s).ToString("G15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "255"
+
+    (-255s).ToString("G", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "-255"
+
+[<Fact>]
+let ``test uint16.ToString 'G' works`` () =
+    (255us).ToString("G2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.6e+2"
+
+    (255us).ToString("G15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "255"
+
+[<Fact>]
+let ``test int32.ToString 'G' works`` () =
+    (255).ToString("G2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.6e+2"
+
+    (255).ToString("G15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "255"
+
+    (-255).ToString("G", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "-255"
+
+    (235672367).ToString("G2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.4e+8"
+
+    // JS holds this int as -0
+    [ -("0".Length - 1) ]
+    |> List.map (fun x -> x.ToString("G", CultureInfo.InvariantCulture), x.ToString("g5", CultureInfo.InvariantCulture))
+    |> equal [ ("0", "0") ]
+
+[<Fact>]
+let ``test uint32.ToString 'G' works`` () =
+    (255u).ToString("G2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.6e+2"
+
+    (255u).ToString("G15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "255"
+
+[<Fact>]
+let ``test int64.ToString 'G' works`` () =
+    // (255L).ToString("G2", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "2.6e+2"
+
+    (255L).ToString("G15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "255"
+
+    (-255L).ToString("G", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "-255"
+
+[<Fact>]
+let ``test uint64.ToString 'G' works`` () =
+    // (255UL).ToString("G2", CultureInfo.InvariantCulture)
+    // |> adaptExponentValue
+    // |> equal "2.6e+2"
+
+    (255UL).ToString("G15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "255"
+
+[<Fact>]
+let ``test float.ToString 'G' works`` () =
+    (255.2357).ToString("G2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.6e+2"
+
+    (255.2357).ToString("G15", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "255.2357"
+
+    (-255.2357).ToString("G", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "-255.2357"
+
+[<Fact>]
+let ``test float32.ToString 'G' works`` () =
+    (255.2357f).ToString("G2", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "2.6e+2"
+
+    (255.2357f).ToString("G5", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "255.24"
+
+    (-255.2357f).ToString("G", CultureInfo.InvariantCulture)
+    |> adaptExponentValue
+    |> equal "-255.2357"
+
+[<Fact>]
+let ``test float.ToString 'G' chooses the notation like .NET`` () =
+    (1e-4).ToString("G", CultureInfo.InvariantCulture) |> equal "0.0001"
+    (1.5e-5).ToString("G", CultureInfo.InvariantCulture) |> equal "1.5E-05"
+    (1.5e-5).ToString("g", CultureInfo.InvariantCulture) |> equal "1.5e-05"
+    (1e16).ToString("G", CultureInfo.InvariantCulture) |> equal "10000000000000000"
+    (1e17).ToString("G", CultureInfo.InvariantCulture) |> equal "1E+17"
+    (123456789012345678901.0).ToString("G", CultureInfo.InvariantCulture) |> equal "1.2345678901234568E+20"
+    negZero.ToString("G", CultureInfo.InvariantCulture) |> equal "-0"
+    (123.456).ToString("G0", CultureInfo.InvariantCulture) |> equal "123.456"
+    (1.5e-5).ToString("G3", CultureInfo.InvariantCulture) |> equal "1.5E-05"
+    (1.5e-5).ToString("G17", CultureInfo.InvariantCulture) |> equal "1.5E-05"
+    (5e-5).ToString("G17", CultureInfo.InvariantCulture) |> equal "5.0000000000000002E-05"
+    negZero.ToString("G17", CultureInfo.InvariantCulture) |> equal "-0"
+    (1e16).ToString("G16", CultureInfo.InvariantCulture) |> equal "1E+16"
+    (1e17).ToString("G20", CultureInfo.InvariantCulture) |> equal "100000000000000000"
+    (0.1 + 0.2).ToString("G20", CultureInfo.InvariantCulture) |> equal "0.30000000000000004441"
+    $"{1.5e-5:G}" |> equal "1.5E-05"
+    String.Format(CultureInfo.InvariantCulture, "{0:g}", 1e17) |> equal "1e+17"
+
+[<Fact>]
+let ``test float32.ToString 'G' chooses the digits and notation like .NET`` () =
+    (0.1f).ToString("G", CultureInfo.InvariantCulture) |> equal "0.1"
+    (float32 negZero).ToString("G", CultureInfo.InvariantCulture) |> equal "-0"
+    (1.5e-5f).ToString("G", CultureInfo.InvariantCulture) |> equal "1.5E-05"
+    (1e8f).ToString("G", CultureInfo.InvariantCulture) |> equal "100000000"
+    (1e9f).ToString("g", CultureInfo.InvariantCulture) |> equal "1e+09"
+    (123456789.f).ToString("G", CultureInfo.InvariantCulture) |> equal "123456790"
+    (0.1f).ToString("G9", CultureInfo.InvariantCulture) |> equal "0.100000001"
+    (1e8f).ToString("G5", CultureInfo.InvariantCulture) |> equal "1E+08"
+
+[<Fact>]
+let ``test ToString 'G' keeps the trailing zeros of the integer part`` () =
+    (100000).ToString("G", CultureInfo.InvariantCulture) |> equal "100000"
+    (100).ToString("G", CultureInfo.InvariantCulture) |> equal "100"
+    (0).ToString("G", CultureInfo.InvariantCulture) |> equal "0"
+    (-1200).ToString("G", CultureInfo.InvariantCulture) |> equal "-1200"
+    (100.0).ToString("G", CultureInfo.InvariantCulture) |> equal "100"
+    (100000L).ToString("G", CultureInfo.InvariantCulture) |> equal "100000"
+    (100000).ToString("G4", CultureInfo.InvariantCulture) |> equal "1E+05"
+    (100000).ToString("g4", CultureInfo.InvariantCulture) |> equal "1e+05"
+    (1.5).ToString("G4", CultureInfo.InvariantCulture) |> equal "1.5"
+
+[<Fact>]
+let ``test ToString 'E' pads the exponent and keeps its case`` () =
+    (100000).ToString("E", CultureInfo.InvariantCulture) |> equal "1.000000E+005"
+    (100000).ToString("e", CultureInfo.InvariantCulture) |> equal "1.000000e+005"
+    (100000).ToString("E0", CultureInfo.InvariantCulture) |> equal "1E+005"
+    (100000).ToString("E2", CultureInfo.InvariantCulture) |> equal "1.00E+005"
+    (1234.5678).ToString("E", CultureInfo.InvariantCulture) |> equal "1.234568E+003"
+    (0.00012).ToString("E2", CultureInfo.InvariantCulture) |> equal "1.20E-004"
+    (-1234.5).ToString("E2", CultureInfo.InvariantCulture) |> equal "-1.23E+003"
+    $"{100000L:E}" |> equal "1.000000E+005"
+    $"{100000L:E2}" |> equal "1.00E+005"
+
+[<Fact>]
+let ``test ToString 'E' keeps every digit of a 64 bit integer`` () =
+    (0L).ToString("E2", CultureInfo.InvariantCulture) |> equal "0.00E+000"
+    (100000L).ToString("e4", CultureInfo.InvariantCulture) |> equal "1.0000e+005"
+    (999999L).ToString("E2", CultureInfo.InvariantCulture) |> equal "1.00E+006"
+    (9223372036854775807L).ToString("E17", CultureInfo.InvariantCulture)
+    |> equal "9.22337203685477581E+018"
+    (-9223372036854775808L).ToString("E2", CultureInfo.InvariantCulture) |> equal "-9.22E+018"
+    (18446744073709551615UL).ToString("E", CultureInfo.InvariantCulture) |> equal "1.844674E+019"
+
+[<Fact>]
+let ``test ToString with a custom percent format multiplies by 100`` () =
+    (100000).ToString("0.0%", CultureInfo.InvariantCulture) |> equal "10000000.0%"
+    (0.1234).ToString("0.00%", CultureInfo.InvariantCulture) |> equal "12.34%"
+    (0.5).ToString("#.##%", CultureInfo.InvariantCulture) |> equal "50%"
+    (0.42).ToString("0%", CultureInfo.InvariantCulture) |> equal "42%"
+    (-0.5).ToString("0.0%", CultureInfo.InvariantCulture) |> equal "-50.0%"
+    (0.5).ToString("0.0%%", CultureInfo.InvariantCulture) |> equal "5000.0%%"
+    (0.5).ToString("%0.0", CultureInfo.InvariantCulture) |> equal "%50.0"
+
+[<Fact>]
+let ``test ToString with a custom format scales by trailing commas`` () =
+    (100000).ToString("0,", CultureInfo.InvariantCulture) |> equal "100"
+    (100000).ToString("0,,", CultureInfo.InvariantCulture) |> equal "0"
+    (-123456789).ToString("0,,", CultureInfo.InvariantCulture) |> equal "-123"
+    (1234567890).ToString("#,#,,", CultureInfo.InvariantCulture) |> equal "1,235"
+    (123456789).ToString("0,,.0", CultureInfo.InvariantCulture) |> equal "123.5"
+    (1234567.0).ToString("0,,", CultureInfo.InvariantCulture) |> equal "1"
+    // A comma that is not next to the decimal point only turns on digit grouping
+    (123456789).ToString("#,,#", CultureInfo.InvariantCulture) |> equal "123,456,789"
+    (100000).ToString("#,#", CultureInfo.InvariantCulture) |> equal "100,000"
+    // .NET ignores commas placed after the decimal placeholders
+    (123456789).ToString("0.0,,", CultureInfo.InvariantCulture) |> equal "123456789.0"
+
+[<Fact>]
+let ``test byte.ToString 'N' works`` () =
+    (255uy).ToString("N2") |> equal "255.00"
+
+    // (255uy).ToString("N15", CultureInfo.InvariantCulture) |> equal "255.000000000000000"
+
+    (255uy).ToString("N", CultureInfo.InvariantCulture) |> equal "255.00"
+
+[<Fact>]
+let ``test sbyte.ToString 'N' works`` () =
+    (127y).ToString("N2", CultureInfo.InvariantCulture) |> equal "127.00"
+
+    // (127y).ToString("N15", CultureInfo.InvariantCulture) |> equal "127.000000000000000"
+
+    (-127y).ToString("N", CultureInfo.InvariantCulture) |> equal "-127.00"
+
+[<Fact>]
+let ``test int16.ToString 'N' works`` () =
+    (255s).ToString("N2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    // (255s).ToString("N15", CultureInfo.InvariantCulture) |> equal "255.000000000000000"
+
+    (-255s).ToString("N", CultureInfo.InvariantCulture) |> equal "-255.00"
+
+[<Fact>]
+let ``test uint16.ToString 'N' works`` () =
+    (255us).ToString("N2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    // (255us).ToString("N15", CultureInfo.InvariantCulture) |> equal "255.000000000000000"
+
+    (255us).ToString("N", CultureInfo.InvariantCulture) |> equal "255.00"
+
+[<Fact>]
+let ``test int32.ToString 'N' works`` () =
+    (255).ToString("N2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    // (255).ToString("N15", CultureInfo.InvariantCulture) |> equal "255.000000000000000"
+
+    (-255).ToString("N", CultureInfo.InvariantCulture) |> equal "-255.00"
+
+    (235672367).ToString("N2", CultureInfo.InvariantCulture) |> equal "235,672,367.00"
+
+    // #2582: zero precision must not leave a trailing dot
+    (255).ToString("N0", CultureInfo.InvariantCulture) |> equal "255"
+    (-255).ToString("N0", CultureInfo.InvariantCulture) |> equal "-255"
+    (1000000).ToString("N0", CultureInfo.InvariantCulture) |> equal "1,000,000"
+
+[<Fact>]
+let ``test uint32.ToString 'N' works`` () =
+    (255u).ToString("N2", CultureInfo.InvariantCulture) |> equal "255.00"
+
+    // (255u).ToString("N15", CultureInfo.InvariantCulture) |> equal "255.000000000000000"
+
+    (255u).ToString("N", CultureInfo.InvariantCulture) |> equal "255.00"
+
+[<Fact>]
+let ``test int64.ToString 'N' works`` () =
+    (255L).ToString("N2", CultureInfo.InvariantCulture)
+    |> equal "255.00"
+
+    (255L).ToString("N15", CultureInfo.InvariantCulture) |> equal "255.000000000000000"
+
+    (-255L).ToString("N", CultureInfo.InvariantCulture) |> equal "-255.00"
+
+[<Fact>]
+let ``test uint64.ToString 'N' works`` () =
+    (255UL).ToString("N2", CultureInfo.InvariantCulture)
+    |> equal "255.00"
+
+    (255UL).ToString("N15", CultureInfo.InvariantCulture) |> equal "255.000000000000000"
+
+    (255UL).ToString("N", CultureInfo.InvariantCulture) |> equal "255.00"
+
+[<Fact>]
+let ``test float.ToString 'N' works`` () =
+    (255.2357).ToString("N2", CultureInfo.InvariantCulture) |> equal "255.24"
+
+    (255.2357).ToString("N4", CultureInfo.InvariantCulture) |> equal "255.2357"
+
+    (-255.2357).ToString("N", CultureInfo.InvariantCulture) |> equal "-255.24"
+
+    // #2582: zero precision must not leave a trailing dot
+    (255.7).ToString("N0", CultureInfo.InvariantCulture) |> equal "256"
+    (-255.7).ToString("N0", CultureInfo.InvariantCulture) |> equal "-256"
+
+[<Fact>]
+let ``test float32.ToString 'N' works`` () =
+    (255.2357f).ToString("N2", CultureInfo.InvariantCulture) |> equal "255.24"
+
+    (255.2357).ToString("N4", CultureInfo.InvariantCulture) |> equal "255.2357"
+
+    (-255.2357f).ToString("N", CultureInfo.InvariantCulture)
+    |> equal "-255.24"
+
+[<Fact>]
+let ``test byte.ToString 'P' works`` () =
+    (255uy).ToString("P2")
+    // In .NET byte seems to not have a space before the % sign
+    |> fun str -> str.Replace(" %", "%")
+    |> equal "25,500.00%"
+
+    (255uy).ToString("P15", CultureInfo.InvariantCulture) |> equal "25,500.000000000000000 %"
+
+    (255uy).ToString("P", CultureInfo.InvariantCulture) |> equal "25,500.00 %"
+
+[<Fact>]
+let ``test sbyte.ToString 'P' works`` () =
+    (127y).ToString("P2", CultureInfo.InvariantCulture) |> equal "12,700.00 %"
+
+    (127y).ToString("P15", CultureInfo.InvariantCulture) |> equal "12,700.000000000000000 %"
+
+    (-127y).ToString("P", CultureInfo.InvariantCulture) |> equal "-12,700.00 %"
+
+[<Fact>]
+let ``test int16.ToString 'P' works`` () =
+    (255s).ToString("P2", CultureInfo.InvariantCulture) |> equal "25,500.00 %"
+
+    (255s).ToString("P15", CultureInfo.InvariantCulture) |> equal "25,500.000000000000000 %"
+
+    (-255s).ToString("P", CultureInfo.InvariantCulture) |> equal "-25,500.00 %"
+
+[<Fact>]
+let ``test uint16.ToString 'P' works`` () =
+    (255us).ToString("P2", CultureInfo.InvariantCulture) |> equal "25,500.00 %"
+
+    (255us).ToString("P15", CultureInfo.InvariantCulture) |> equal "25,500.000000000000000 %"
+
+    (255us).ToString("P", CultureInfo.InvariantCulture) |> equal "25,500.00 %"
+
+[<Fact>]
+let ``test int32.ToString 'P' works`` () =
+    (255).ToString("P2", CultureInfo.InvariantCulture) |> equal "25,500.00 %"
+
+    (255).ToString("P15", CultureInfo.InvariantCulture) |> equal "25,500.000000000000000 %"
+
+    (-255).ToString("P", CultureInfo.InvariantCulture) |> equal "-25,500.00 %"
+
+    (235672367).ToString("P2", CultureInfo.InvariantCulture) |> equal "23,567,236,700.00 %"
+    (1).ToString("P2", CultureInfo.InvariantCulture) |> equal "100.00 %"
+    (0.34).ToString("P2", CultureInfo.InvariantCulture) |> equal "34.00 %"
+
+    // #2582: zero precision must not leave a trailing dot
+    (1).ToString("P0", CultureInfo.InvariantCulture) |> equal "100 %"
+    (-1).ToString("P0", CultureInfo.InvariantCulture) |> equal "-100 %"
+    (0.5).ToString("P0", CultureInfo.InvariantCulture) |> equal "50 %"
+
+[<Fact>]
+let ``test uint32.ToString 'P' works`` () =
+    (255u).ToString("P2", CultureInfo.InvariantCulture) |> equal "25,500.00 %"
+
+    (255u).ToString("P15", CultureInfo.InvariantCulture) |> equal "25,500.000000000000000 %"
+
+    (255u).ToString("P", CultureInfo.InvariantCulture) |> equal "25,500.00 %"
+
+[<Fact>]
+let ``test int64.ToString 'P' works`` () =
+    (255L).ToString("P2", CultureInfo.InvariantCulture)
+    |> equal "25,500.00 %"
+
+    (255L).ToString("P15", CultureInfo.InvariantCulture) |> equal "25,500.000000000000000 %"
+
+    (-255L).ToString("P", CultureInfo.InvariantCulture) |> equal "-25,500.00 %"
+
+[<Fact>]
+let ``test uint64.ToString 'P' works`` () =
+    (255UL).ToString("P2", CultureInfo.InvariantCulture)
+    |> equal "25,500.00 %"
+
+    (255UL).ToString("P15", CultureInfo.InvariantCulture) |> equal "25,500.000000000000000 %"
+
+    (255UL).ToString("P", CultureInfo.InvariantCulture) |> equal "25,500.00 %"
+
+[<Fact>]
+let ``test float.ToString 'P' works`` () =
+    (255.2357).ToString("P2", CultureInfo.InvariantCulture) |> equal "25,523.57 %"
+
+    (255.2357).ToString("P5", CultureInfo.InvariantCulture) |> equal "25,523.57000 %"
+
+    (-255.2357).ToString("P", CultureInfo.InvariantCulture) |> equal "-25,523.57 %"
+
+[<Fact>]
+let ``test float32.ToString 'P' works`` () =
+    (255.2357f).ToString("P2", CultureInfo.InvariantCulture) |> equal "25,523.57 %"
+
+    (255.2357f).ToString("P3", CultureInfo.InvariantCulture)
+    |> equal "25,523.570 %"
+
+    (-255.2357f).ToString("P", CultureInfo.InvariantCulture)
+    |> equal "-25,523.57 %"
+
+[<Fact>]
+let ``test float.ToString 'R' works`` () =
+    (0.).ToString("R", CultureInfo.InvariantCulture) |> equal "0"
+    negZero.ToString("R", CultureInfo.InvariantCulture) |> equal "-0"
+    (1.5).ToString("R") |> equal "1.5"
+    (0.1 + 0.2).ToString("R", CultureInfo.InvariantCulture) |> equal "0.30000000000000004"
+    (1e-4).ToString("R", CultureInfo.InvariantCulture) |> equal "0.0001"
+    (1.5e-5).ToString("R", CultureInfo.InvariantCulture) |> equal "1.5E-05"
+    (1.5e-5).ToString("r", CultureInfo.InvariantCulture) |> equal "1.5e-05"
+    (1.5e-5).ToString("R3", CultureInfo.InvariantCulture) |> equal "1.5E-05"
+    (1e-7).ToString("R", CultureInfo.InvariantCulture) |> equal "1E-07"
+    (1e15).ToString("R", CultureInfo.InvariantCulture) |> equal "1000000000000000"
+    (1e16).ToString("R", CultureInfo.InvariantCulture) |> equal "10000000000000000"
+    (1e17).ToString("R", CultureInfo.InvariantCulture) |> equal "1E+17"
+    (12345678901234567.0).ToString("R", CultureInfo.InvariantCulture) |> equal "12345678901234568"
+    (123456789012345678901.0).ToString("R", CultureInfo.InvariantCulture) |> equal "1.2345678901234568E+20"
+    (1e21).ToString("r", CultureInfo.InvariantCulture) |> equal "1e+21"
+    Double.Epsilon.ToString("R", CultureInfo.InvariantCulture) |> equal "5E-324"
+    Double.MaxValue.ToString("R", CultureInfo.InvariantCulture) |> equal "1.7976931348623157E+308"
+    Double.MinValue.ToString("R", CultureInfo.InvariantCulture) |> equal "-1.7976931348623157E+308"
+    nan.ToString("R", CultureInfo.InvariantCulture) |> equal "NaN"
+    infinity.ToString("R", CultureInfo.InvariantCulture) |> equal "Infinity"
+    (-infinity).ToString("R", CultureInfo.InvariantCulture) |> equal "-Infinity"
+
+[<Fact>]
+let ``test float32.ToString 'R' works`` () =
+    (0.1f).ToString("R", CultureInfo.InvariantCulture) |> equal "0.1"
+    (0.1f + 0.2f).ToString("R", CultureInfo.InvariantCulture) |> equal "0.3"
+    (float32 negZero).ToString("R", CultureInfo.InvariantCulture) |> equal "-0"
+    (1.5e-5f).ToString("r", CultureInfo.InvariantCulture) |> equal "1.5e-05"
+    (1e8f).ToString("R", CultureInfo.InvariantCulture) |> equal "100000000"
+    (1e9f).ToString("R", CultureInfo.InvariantCulture) |> equal "1E+09"
+    (123456789.f).ToString("R", CultureInfo.InvariantCulture) |> equal "123456790"
+    (1234.5678f).ToString("R", CultureInfo.InvariantCulture) |> equal "1234.5677"
+    (-306242.625f).ToString("R", CultureInfo.InvariantCulture) |> equal "-306242.62"
+    (1.2621775e-29f).ToString("R", CultureInfo.InvariantCulture) |> equal "1.2621775E-29"
+    Single.Epsilon.ToString("R", CultureInfo.InvariantCulture) |> equal "1E-45"
+    Single.MaxValue.ToString("R", CultureInfo.InvariantCulture) |> equal "3.4028235E+38"
+    nanf.ToString("R", CultureInfo.InvariantCulture) |> equal "NaN"
+
+[<Fact>]
+let ``test ToString 'R' works for integers and decimals`` () =
+    (5).ToString("R", CultureInfo.InvariantCulture) |> equal "5"
+    (-2147483648).ToString("r", CultureInfo.InvariantCulture) |> equal "-2147483648"
+    (5uy).ToString("R", CultureInfo.InvariantCulture) |> equal "5"
+    Int64.MaxValue.ToString("R", CultureInfo.InvariantCulture) |> equal "9223372036854775807"
+    UInt64.MaxValue.ToString("R", CultureInfo.InvariantCulture) |> equal "18446744073709551615"
+    (1.50M).ToString("R", CultureInfo.InvariantCulture) |> equal "1.50"
+    (1.2345M).ToString("R3", CultureInfo.InvariantCulture) |> equal "1.23"
+    // JS holds this int as -0
+    [ -("0".Length - 1) ] |> List.map (fun x -> x.ToString("R", CultureInfo.InvariantCulture)) |> equal [ "0" ]
+
+[<Fact>]
+let ``test String.Format and interpolation support 'R'`` () =
+    String.Format("{0:R}", 1.5e-5) |> equal "1.5E-05"
+    String.Format(CultureInfo.InvariantCulture, "{0:r}", negZero) |> equal "-0"
+    String.Format(CultureInfo.InvariantCulture, "{0,8:R}", 1.5) |> equal "     1.5"
+    String.Format("{0:R}", 12345678901234567890I) |> equal "12345678901234567890"
+    $"{1e17:R}" |> equal "1E+17"
+    $"{0.1 + 0.2:R}" |> equal "0.30000000000000004"
+    let format = "R"
+    (1e-7).ToString(format, CultureInfo.InvariantCulture) |> equal "1E-07"
+
+[<Fact>]
+let ``test float.ToString() chooses the notation like .NET`` () =
+    let values = [ negZero; 1e-4; 1.5e-5; 1e-7; 1e16; 1e17; 123456789012345678901.0; 1e21; Double.Epsilon ]
+
+    let expected =
+        [
+            "-0"
+            "0.0001"
+            "1.5E-05"
+            "1E-07"
+            "10000000000000000"
+            "1E+17"
+            "1.2345678901234568E+20"
+            "1E+21"
+            "5E-324"
+        ]
+
+    values |> List.map string |> equal expected
+    values |> List.map (fun x -> x.ToString()) |> equal expected
+    values |> List.map (fun x -> $"{x}") |> equal expected
+    values |> List.map (fun x -> String.Format("{0}", x)) |> equal expected
+    values |> List.map (sprintf "%O") |> equal expected
+    $"%.1f{2.5} {1e17}" |> equal "2.5 1E+17"
+    String.Format("{0,6}", negZero) |> equal "    -0"
+
+[<Fact>]
+let ``test float32.ToString() chooses the digits and notation like .NET`` () =
+    let values = [ float32 negZero; 1.5e-5f; 3.14f; 1e8f; 1e15f ]
+    let expected = [ "-0"; "1.5E-05"; "3.14"; "100000000"; "1E+15" ]
+    values |> List.map string |> equal expected
+    values |> List.map (fun x -> x.ToString()) |> equal expected
+    values |> List.map (fun x -> $"{x}") |> equal expected
+
+[<Fact>]
+let ``test Negated integer zero is written without a sign`` () =
+    let x = List.head [ 0 ]
+    String.Format("{0}", -x) |> equal "0"
+    String.Format("{0}", x * -1) |> equal "0"
+    String.Format("{0} {1} {2} {3}", -x, x * -1, -0.0, 1.5) |> equal "0 0 -0 1.5"
+    String.Format("{0} {1}", byte x, -(int16 x)) |> equal "0 0"
+    String.Format("{0:N0} {0:G}", -x) |> equal "0 0"
+    sprintf "%O" (-x) |> equal "0"
+    string (-x) |> equal "0"
+    (-x).ToString() |> equal "0"
+    $"{-x}" |> equal "0"
 

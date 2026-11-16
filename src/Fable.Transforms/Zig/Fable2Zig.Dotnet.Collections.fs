@@ -189,6 +189,9 @@ let call
         ->
         lw ctx (Fable.TypeCast(source, t))
     | "Microsoft.FSharp.Collections.ComparisonIdentity", "FromFunction", [ f ] -> arrayLib "comparerOfFunction" [ f ]
+    // (F#'s equality and hash, arrays by their items, as an IEqualityComparer)
+    | "Microsoft.FSharp.Collections.HashIdentity", "Structural", [] ->
+        arrayLib "structuralEqualityComparer" [ Fable.Value(Fable.UnitConstant, None) ]
     | "Microsoft.FSharp.Collections.ComparisonIdentity", "Structural", [] ->
         arrayLib "structuralComparer" [ Fable.Value(Fable.UnitConstant, None) ]
     // `Comparer<'T>.Default`: F#'s comparison, as an IComparer
@@ -409,6 +412,9 @@ let call
         | "Contains", [ x ] -> pure' "fable_rt.raContains($0, $1)" [ r0; x ] tBool
         | "IndexOf", [ x ] -> pure' "fable_rt.raIndexOf($0, $1)" [ r0; x ] tI32
         | "Clear", [] -> pure' "fable_rt.raClear($0)" [ r0 ] tVoid
+        | "CopyTo", [ a ] -> rt "fable_rt.raCopyTo($0, 0, $1, 0, null)" [ r0; a ] tVoid
+        | "CopyTo", [ a; i ] -> rt "fable_rt.raCopyTo($0, 0, $1, $2, null)" [ r0; a; i ] tVoid
+        | "CopyTo", [ si; a; i; n ] -> rt "fable_rt.raCopyTo($0, $1, $2, $3, $4)" [ r0; si; a; i; n ] tVoid
         | "Reverse", [] -> pure' "fable_rt.raReverse($0)" [ r0 ] tVoid
         | "Sort", [] -> pure' "fable_rt.raSort($0)" [ r0 ] tVoid
         | "ToArray", [] -> pure' "fable_rt.raToArray($0)" [ r0 ] (mapType ctx r t)
@@ -512,6 +518,14 @@ let call
                 |> lw ctx
                 |> ofSeq
             | _ -> fail r "the Zig target does not support dict of this kind of sequence yet"
+    // `Dictionary(pairs)` of an array or a list of KeyValuePairs (.NET's default comparer)
+    | "System.Collections.Generic.Dictionary`2", ".ctor", [ Uncast source ] when
+        (match source.Type with
+         | Fable.Array(Fable.DeclaredType(kv, _), (Fable.MutableArray | Fable.ImmutableArray))
+         | Fable.List(Fable.DeclaredType(kv, _)) -> kv.FullName = "System.Collections.Generic.KeyValuePair`2"
+         | _ -> false)
+        ->
+        rt "fable_rt.dictOfItems($R, $0)" [ source ] (mapType ctx r t)
     // `Dictionary(other)`: a copy of another dictionary or of a map
     | "System.Collections.Generic.Dictionary`2", ".ctor", [ Uncast source ] when
         (match source.Type with
@@ -536,6 +550,97 @@ let call
         ->
         ctx.State.UsesRuntime <- true
         bindArgs ctx (args |> List.map (lw ctx)) (fun _ -> ERt("fable_rt.mapNotMutable($R)", [], mapType ctx r t))
+    // (an `ICollection` or `IReadOnlyCollection` that is a ResizeArray, a HashSet or a Dictionary
+    // (a `let` of one keeps the collection, see Lower): the collection's own members, a
+    // dictionary's taking its entries as pairs)
+    | ("System.Collections.Generic.ICollection`1" | "System.Collections.Generic.IReadOnlyCollection`1"),
+      _,
+      Uncast c :: rest when
+        (match c.Type with
+         | Fable.Array(_, Fable.ResizeArray) -> true
+         | Fable.DeclaredType(ent, _) ->
+             ent.FullName = "System.Collections.Generic.List`1"
+             || ent.FullName = "System.Collections.Generic.HashSet`1"
+             || ent.FullName = "System.Collections.Generic.Dictionary`2"
+         | _ -> false)
+        ->
+        let full =
+            match c.Type with
+            | Fable.Array(_, Fable.ResizeArray) -> "System.Collections.Generic.List`1"
+            | Fable.DeclaredType(ent, _) -> ent.FullName
+            | _ -> ""
+
+        match full, name, rest with
+        | _, "get_IsReadOnly", [] -> bindArgs ctx [ lwStmt ctx c ] (fun _ -> ELit("false", tBool))
+        | "System.Collections.Generic.Dictionary`2", "Add", [ kv ] -> rt "fable_rt.dictAddPair($0, $1)" [ c; kv ] tVoid
+        | "System.Collections.Generic.Dictionary`2", "Contains", [ kv ] ->
+            pure' "fable_rt.dictContainsPair($0, $1)" [ c; kv ] tBool
+        | "System.Collections.Generic.Dictionary`2", "Remove", [ kv ] ->
+            rt "fable_rt.dictRemovePair($0, $1)" [ c; kv ] tBool
+        | "System.Collections.Generic.Dictionary`2", "CopyTo", [ a; i ] ->
+            rt "fable_rt.dictCopyTo($0, $1, $2)" [ c; a; i ] tVoid
+        | "System.Collections.Generic.Dictionary`2", ("get_Count" | "Clear"), [] ->
+            dotnetCall
+                ctx
+                r
+                full
+                name
+                { info with
+                    ThisArg = Some c
+                    Args = []
+                }
+                t
+        // (`ICollection<'T>.Add` of a HashSet gives nothing; its own `Add` says whether it added)
+        | "System.Collections.Generic.HashSet`1", "Add", [ x ] ->
+            bindArgs
+                ctx
+                [
+                    dotnetCall
+                        ctx
+                        r
+                        full
+                        name
+                        { info with
+                            ThisArg = Some c
+                            Args = [ x ]
+                        }
+                        Fable.Boolean
+                ]
+                (fun _ -> EUnit)
+        | ("System.Collections.Generic.List`1" | "System.Collections.Generic.HashSet`1"), _, _ ->
+            dotnetCall
+                ctx
+                r
+                full
+                name
+                { info with
+                    ThisArg = Some c
+                    Args = rest
+                }
+                t
+        | _ -> fail r "the Zig target does not support %s of a collection seen as an interface yet" name
+    // (`IsReadOnly`, `Contains` and `CopyTo` of an `ICollection` that is a list here (a map's
+    // entries, a set's items) or an array: read-only, as on .NET)
+    | "System.Collections.Generic.ICollection`1", ("get_IsReadOnly" | "Contains" | "CopyTo"), Uncast c :: rest when
+        (match c.Type with
+         | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> true
+         | Fable.DeclaredType(ent, _) ->
+             ent.FullName = mapName
+             || ent.FullName = setName
+             || ent.FullName = "System.Collections.Generic.ICollection`1"
+         | _ -> false)
+        ->
+        let isArray =
+            match c.Type with
+            | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> true
+            | _ -> false
+
+        match name, rest with
+        | "get_IsReadOnly", _ -> bindArgs ctx [ lwStmt ctx c ] (fun _ -> ELit("true", tBool))
+        | "Contains", [ x ] when isArray -> pure' "fable_rt.arrayContainsItem($0, $1)" [ c; x ] tBool
+        | "Contains", [ x ] -> pure' "fable_rt.listContains($0, $1)" [ c; x ] tBool
+        | "CopyTo", [ a; i ] -> rt "fable_rt.collCopyTo($0, $1, $2)" [ c; a; i ] tVoid
+        | _ -> fail r "the Zig target does not support ICollection.%s with these arguments yet" name
     | ("System.Collections.Generic.IDictionary`2" | "System.Collections.Generic.IReadOnlyDictionary`2"), _, _ ->
         dotnetCall ctx r "System.Collections.Generic.Dictionary`2" name info t
     // (what a dictionary is as a collection of its entries)
@@ -551,7 +656,9 @@ let call
         else
             pure' "fable_rt.htCount($0)" [ d ] tI32
     // (an `IList<'T>` is an array here)
-    | ("System.Collections.Generic.ICollection`1" | "System.Collections.Generic.IList`1"), "get_Count", [ Uncast xs ] when
+    | ("System.Collections.Generic.ICollection`1" | "System.Collections.Generic.IReadOnlyCollection`1" | "System.Collections.Generic.IList`1"),
+      "get_Count",
+      [ Uncast xs ] when
         (match xs.Type with
          | Fable.Array _ -> true
          | Fable.DeclaredType(e, _) -> e.FullName = "System.Collections.Generic.IList`1"
@@ -569,6 +676,24 @@ let call
     | ("System.Collections.Generic.Dictionary`2.KeyCollection" | "System.Collections.Generic.Dictionary`2.ValueCollection" | "System.Collections.Generic.ICollection`1"),
       "get_Count",
       [ xs ] -> pure' "fable_rt.listCount($0)" [ xs ] tI32
+    // (a map's entries or a set's items seen as an `IReadOnlyCollection`: the list of them here)
+    | "System.Collections.Generic.IReadOnlyCollection`1", "get_Count", [ xs ] when
+        (match xs with
+         | Fable.TypeCast(Uncast inner, _) ->
+             match inner.Type with
+             | Fable.DeclaredType(m, _) -> m.FullName = mapName || m.FullName = setName
+             | _ -> false
+         // (a variable that holds such a list)
+         | Fable.IdentExpr i ->
+             match ctx.Vars.TryGetValue i.Name with
+             | true, v ->
+                 match v.Ty with
+                 | TEnt(e, _) -> e = listEnt ctx.State
+                 | _ -> false
+             | _ -> false
+         | _ -> false)
+        ->
+        pure' "fable_rt.listCount($0)" [ xs ] tI32
     // (.NET's default comparer: array keys by reference)
     | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"), ".ctor", [] ->
         pure' "fable_rt.htByRef(fable_rt.htNew($R))" [] (mapType ctx r t)

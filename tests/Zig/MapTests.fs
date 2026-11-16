@@ -409,3 +409,40 @@ let ``test Map raises NotSupportedException when mutated through IDictionary or 
     raisedExceptionType (fun () -> dic.[2] <- "b") |> equal "NotSupportedException"
     raisedExceptionType (fun () -> coll.Clear()) |> equal "NotSupportedException"
 
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test Map IReadOnlyCollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Map xs) :> IReadOnlyCollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Map ICollection.IsReadOnly works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Map xs) :> ICollection<_>
+    coll.IsReadOnly |> equal true
+
+[<Fact>]
+let ``test Map ICollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Map xs) :> ICollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Map ICollection.Contains works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Map xs) :> ICollection<_>
+    coll.Contains(KeyValuePair("B", 3)) |> equal false
+    coll.Contains(KeyValuePair("D", 3)) |> equal false
+    coll.Contains(KeyValuePair("B", 2)) |> equal true
+
+[<Fact>]
+let ``test Map ICollection.CopyTo works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Map xs) :> ICollection<_>
+    let ys = [| ("D", 4); ("E", 5); ("F", 6) |] |> Array.map KeyValuePair
+    coll.CopyTo(ys, 0)
+    ys = (xs |> Array.map KeyValuePair) |> equal true
+

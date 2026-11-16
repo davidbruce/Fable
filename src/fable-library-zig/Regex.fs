@@ -1117,23 +1117,18 @@ let private substitute (re: RegexOf) (m: MatchOf) (replacement: string) : string
 
                 i <- i + 2
             elif System.Char.IsDigit d then
-                // (the longest number that is a group's)
+                // (all the digits are the group's number; .NET does not take a shorter one when
+                // that is not a group: the `$` is then kept as it is)
                 let mutable j = i + 1
-                let mutable best = -1
-                let mutable bestEnd = i + 1
                 let mutable v = 0
 
                 while j < r.Length && System.Char.IsDigit r.[j] && v < 100000 do
                     v <- v * 10 + (int r.[j] - int '0')
                     j <- j + 1
 
-                    if v < count then
-                        best <- v
-                        bestEnd <- j
-
-                if best >= 0 then
-                    sb.Append(m.groups.[best].value) |> ignore
-                    i <- bestEnd
+                if v < count then
+                    sb.Append(m.groups.[v].value) |> ignore
+                    i <- j
                 else
                     sb.Append('$') |> ignore
                     i <- i + 1

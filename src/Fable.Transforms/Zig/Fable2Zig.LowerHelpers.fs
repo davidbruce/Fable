@@ -225,6 +225,11 @@ let (|PrintfCall|_|) (e: Fable.Expr) : (string * string * Fable.Expr list) optio
     | _ -> None
 
 /// `kprintf cont fmt args` as `cont (sprintf fmt args)`.
+/// A name for a variable a rewrite binds around the program's code, which no name of the
+/// program can be (`parsed$12`)
+let tempName (ctx: Ctx) (baseName: string) : string =
+    baseName + "$" + string (ctx.State.NewVar(baseName, tVoid, VLocal, false).Id)
+
 /// (for the names of the values of a printf that is used as a function)
 let internal printfValues =
     new System.Threading.ThreadLocal<int ref>(fun () -> ref 0)

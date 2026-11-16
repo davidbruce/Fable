@@ -589,6 +589,9 @@ let ``test Implicit conversion from DateTime preserves value`` () =
 
 
 
+
+
+
 open System.Globalization
 
 [<Fact>]
@@ -815,3 +818,132 @@ let ``test DateTimeOffset.Parse doesn't confuse day and offset`` () =
     d.Year + d.Month + d.Day |> equal 2040
     d.Offset |> equal (TimeSpan.FromHours(-8.))
 
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test DateTimeOffset.ToString('D') works`` () =
+    let format (d: DateTimeOffset) = d.ToString("D", CultureInfo.InvariantCulture)
+
+    DateTimeOffset(2014, 9, 1, 16, 37, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "Monday, 01 September 2014"
+
+    DateTimeOffset(2014, 9, 1, 16, 37, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "Monday, 01 September 2014"
+
+    DateTimeOffset(2014, 9, 1, 16, 37, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "Monday, 01 September 2014"
+
+[<Fact>]
+let ``test DateTimeOffset.ToString('d') works`` () =
+    let format (d: DateTimeOffset) = d.ToString("d", CultureInfo.InvariantCulture)
+
+    DateTimeOffset(2014, 9, 1, 16, 37, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "09/01/2014"
+
+    DateTimeOffset(2014, 9, 1, 16, 37, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "09/01/2014"
+
+    DateTimeOffset(2014, 9, 1, 16, 37, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "09/01/2014"
+
+[<Fact>]
+let ``test DateTimeOffset.ToString('T') works`` () =
+    let format (d: DateTimeOffset) = d.ToString("T", CultureInfo.InvariantCulture)
+
+    DateTimeOffset(2014, 9, 1, 5, 7, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "05:07:02"
+
+    DateTimeOffset(2014, 9, 1, 5, 7, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "05:07:02"
+
+    DateTimeOffset(2014, 9, 1, 5, 7, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "05:07:02"
+
+[<Fact>]
+let ``test DateTimeOffset.ToString('t') works`` () =
+    let format (d: DateTimeOffset) = d.ToString("t", CultureInfo.InvariantCulture)
+
+    DateTimeOffset(2014, 9, 1, 5, 7, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "05:07"
+
+    DateTimeOffset(2014, 9, 1, 5, 7, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "05:07"
+
+    DateTimeOffset(2014, 9, 1, 5, 7, 2, TimeSpan.FromHours 2)
+    |> format
+    |> equal "05:07"
+
+[<Fact>]
+let ``test DateTimeOffset.ToString('R') works`` () =
+    // R always formats in UTC
+    DateTimeOffset(2014, 9, 1, 16, 37, 2, TimeSpan.FromHours 2).ToString("R", CultureInfo.InvariantCulture)
+    |> equal "Mon, 01 Sep 2014 14:37:02 GMT"
+
+[<Fact>]
+let ``test DateTimeOffset.ToString('u') works`` () =
+    // u always formats in UTC
+    DateTimeOffset(2014, 9, 1, 16, 37, 2, TimeSpan.FromHours 2).ToString("u", CultureInfo.InvariantCulture)
+    |> equal "2014-09-01 14:37:02Z"
+
+[<Fact>]
+let ``test DateTimeOffset.ToString('s') works`` () =
+    // s uses the offset-local time with no timezone designator
+    DateTimeOffset(2014, 9, 1, 16, 37, 2, TimeSpan.Zero).ToString("s", CultureInfo.InvariantCulture)
+    |> equal "2014-09-01T16:37:02"
+
+[<Fact>]
+let ``test DateTimeOffset.ToString uses the offset's date in every local timezone`` () =
+    // At +14 and -12 the offset's date differs from the UTC date, so one of them differs from any local date
+    let early = DateTimeOffset(2014, 9, 1, 0, 30, 5, TimeSpan.FromHours 14)
+    let late = DateTimeOffset(2014, 9, 1, 23, 30, 5, TimeSpan.FromHours -12)
+    for d in [ early; late ] do
+        let format (f: string) = d.ToString(f, CultureInfo.InvariantCulture)
+        let time = if d = early then "00:30" else "23:30"
+        format "D" |> equal "Monday, 01 September 2014"
+        format "d" |> equal "09/01/2014"
+        format "F" |> equal ("Monday, 01 September 2014 " + time + ":05")
+        format "f" |> equal ("Monday, 01 September 2014 " + time)
+        format "G" |> equal ("09/01/2014 " + time + ":05")
+        format "g" |> equal ("09/01/2014 " + time)
+        format "M" |> equal "September 01"
+        format "Y" |> equal "2014 September"
+        format "dd/MM/yyyy HH:mm" |> equal ("01/09/2014 " + time)
+
+[<Fact>]
+let ``test DateTimeOffset <-> Ticks isomorphism`` () =
+    let checkIsomorphism (d: DateTimeOffset) =
+        try
+            let ticks = d.Ticks
+            let utcTicks = d.UtcTicks
+            let offset = d.Offset
+            let fromTicks = DateTimeOffset (ticks, offset)
+            let fromUtcTicks = DateTimeOffset (utcTicks, TimeSpan.Zero)
+
+            equal d fromTicks
+            equal d fromUtcTicks
+            equal ticks fromTicks.Ticks
+            equal utcTicks fromTicks.UtcTicks
+            if offset <> TimeSpan.Zero
+            then notEqual ticks utcTicks
+            else equal ticks utcTicks
+        with e ->
+            failwithf "%A: %O" d e
+    checkIsomorphism DateTimeOffset.MinValue
+    checkIsomorphism DateTimeOffset.MaxValue
+    checkIsomorphism DateTimeOffset.Now
+    checkIsomorphism DateTimeOffset.UtcNow
+    checkIsomorphism <| DateTimeOffset(2014, 10, 9, 13, 23, 30, 500, TimeSpan.Zero)
+    // checkIsomorphism <| DateTimeOffset(2014, 10, 9, 13, 23, 30, 500, TimeSpan.FromHours 1.0)
+    // checkIsomorphism <| DateTimeOffset(2014, 10, 9, 13, 23, 30, 500, TimeSpan.FromHours -5.0)

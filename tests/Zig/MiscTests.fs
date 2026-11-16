@@ -1927,6 +1927,12 @@ let ``test GetType of exceptions`` () =
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+
+
+
+
+
+
 let (>>*) (f: string -> unit) () (x: string) = f x
 
 type RecordWithMutableFn = { mutable MutableFn: string -> unit }
@@ -2309,3 +2315,37 @@ let ``test Doc comments containing */ do not break the output`` () =
     { Value = 2 }.Value |> equal 2
     DocCommentClass().Get() |> equal 1
 
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test Hoisted vars don't conflict with while loop`` () =
+    // see #4031
+    let mutable output = ""
+
+    let xs = [
+        { MutableFn = fun s -> output <- sprintf "%s\n%s %s" output "First" s }
+        { MutableFn = fun s -> output <- sprintf "%s\n%s %s" output "Second" s }
+    ]
+    let ys = buildRecordWithMutableFnWithWhile xs
+
+    xs |> List.iter (fun x -> x.MutableFn "output")
+    ys |> List.iter (fun y -> y "output")
+    System.Text.RegularExpressions.Regex.Replace(output.Trim(), @"\s+", " ")
+    |> equal "First output Second output Second output First output"
+
+[<Fact>]
+let ``test Hoisted vars don't conflict with for loop`` () =
+    // see #4031
+    let mutable output = ""
+
+    let xs = [
+        { MutableFn = fun s -> output <- sprintf "%s\n%s %s" output "First" s }
+        { MutableFn = fun s -> output <- sprintf "%s\n%s %s" output "Second" s }
+    ]
+    let ys = buildRecordWithMutableFnWithFor xs
+
+    xs |> List.iter (fun x -> x.MutableFn "output")
+    ys |> List.iter (fun y -> y "output")
+    System.Text.RegularExpressions.Regex.Replace(output.Trim(), @"\s+", " ")
+    |> equal "First output Second output Second output First output"

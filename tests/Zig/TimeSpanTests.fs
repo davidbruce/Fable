@@ -903,3 +903,6 @@ let ``test TimeSpan arithmetic keeps single ticks`` () =
     (-a).Ticks |> equal -1234567L
     a.Duration().Ticks |> equal 1234567L
 
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+

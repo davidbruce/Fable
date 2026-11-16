@@ -2570,6 +2570,51 @@ pub fn dictOfList(comptime D: type, pairs: anytype, comptime read_only: bool) D 
     return d;
 }
 
+/// `(c :> ICollection<'T>).Contains x` of what is a list here (a map's entries, a set's items)
+pub fn listContains(xs: anytype, x: anytype) bool {
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        if (eql(rest.Cons.Head, x)) return true;
+    }
+    return false;
+}
+
+/// `(a :> ICollection<'T>).Contains x` of an array
+pub fn arrayContainsItem(a: anytype, x: anytype) bool {
+    for (a.items) |y| {
+        if (eql(y, x)) return true;
+    }
+    return false;
+}
+
+/// `c.CopyTo(array, index)` of what is a list here, or of an array: its items into `a` from
+/// `index`, .NET's exceptions when they do not fit
+pub fn collCopyTo(xs: anytype, a: anytype, index: i32) Raised!void {
+    if (index < 0) return raise(ArgumentOutOfRangeException, str("Non-negative number required. (Parameter 'arrayIndex')"));
+    const X = @TypeOf(xs);
+    const n: usize = if (comptime isArrayPtr(X)) xs.items.len else @intCast(listCount(xs));
+    if (@as(usize, @intCast(index)) + n > a.items.len) {
+        return raise(ArgumentException, str("Destination array was not long enough. Check the destination index, length, and the array's lower bounds. (Parameter 'destinationArray')"));
+    }
+    var i: usize = @intCast(index);
+    if (comptime isArrayPtr(X)) {
+        for (xs.items) |x| {
+            const v = dup(x);
+            drop(a.items[i]);
+            a.items[i] = v;
+            i += 1;
+        }
+        return;
+    }
+    var rest = xs;
+    while (rest == .Cons) : (rest = rest.Cons.Tail) {
+        const v = dup(rest.Cons.Head);
+        drop(a.items[i]);
+        a.items[i] = v;
+        i += 1;
+    }
+}
+
 /// `List.length`, of what `d.Keys` and `d.Values` give
 pub fn listCount(xs: anytype) i32 {
     var n: i32 = 0;
@@ -2710,6 +2755,70 @@ pub fn dictToList(d: anytype) List(struct { KeyOf(@TypeOf(d)), ValueOf(@TypeOf(d
         if (e.kv) |kv| items.append(allocator, .{ kv.key, kv.value }) catch oom();
     }
     return listOf(P, items.items);
+}
+
+/// `Dictionary(pairs)` of an array or a list of pairs: .NET's ArgumentException on a key given
+/// twice
+pub fn dictOfItems(comptime D: type, items: anytype) Raised!D {
+    const d = htByRef(htNew(D));
+    errdefer drop(d);
+    const X = @TypeOf(items);
+    if (comptime isArrayPtr(X)) {
+        for (items.items) |kv| try dictAdd(d, kv[0], kv[1]);
+    } else {
+        var rest = items;
+        while (rest == .Cons) : (rest = rest.Cons.Tail) try dictAdd(d, rest.Cons.Head[0], rest.Cons.Head[1]);
+    }
+    return d;
+}
+
+/// `(d :> ICollection<KeyValuePair<K, V>>).Add kv`
+pub fn dictAddPair(d: anytype, kv: anytype) Raised!void {
+    return dictAdd(d, kv[0], kv[1]);
+}
+
+/// `(d :> ICollection<KeyValuePair<K, V>>).Contains kv`: the key, with this value
+pub fn dictContainsPair(d: anytype, kv: anytype) bool {
+    const shared = isShared(d);
+    if (shared) lockEnter(@intFromPtr(d));
+    defer if (shared) lockExit(@intFromPtr(d));
+    const i = htFind(d, kv[0]) orelse return false;
+    return eql(d.entries[i].kv.?.value, kv[1]);
+}
+
+/// `(d :> ICollection<KeyValuePair<K, V>>).Remove kv`: only the key with this value
+pub fn dictRemovePair(d: anytype, kv: anytype) Raised!bool {
+    if (!dictContainsPair(d, kv)) return false;
+    return htRemove(d, kv[0]);
+}
+
+/// `(d :> ICollection<KeyValuePair<K, V>>).CopyTo(array, index)`: the entries, in order
+pub fn dictCopyTo(d: anytype, a: anytype, index: i32) Raised!void {
+    const entries = dictToList(d);
+    defer drop(entries);
+    return collCopyTo(entries, a, index);
+}
+
+/// `r.CopyTo(array)`, `r.CopyTo(array, index)` and `r.CopyTo(start, array, index, count)`:
+/// the items into the array, .NET's exceptions when they do not fit
+pub fn raCopyTo(r: anytype, start: i32, a: anytype, index: i32, count: ?i32) Raised!void {
+    const shared = isShared(r);
+    if (shared) lockEnter(@intFromPtr(r));
+    defer if (shared) lockExit(@intFromPtr(r));
+    const n: i32 = count orelse @as(i32, @intCast(r.items.len)) - start;
+    if (start < 0 or index < 0 or n < 0) return raise(ArgumentOutOfRangeException, str("Non-negative number required."));
+    if (@as(usize, @intCast(start)) + @as(usize, @intCast(n)) > r.items.len or
+        @as(usize, @intCast(index)) + @as(usize, @intCast(n)) > a.items.len)
+    {
+        return raise(ArgumentException, str("Destination array was not long enough. Check the destination index, length, and the array's lower bounds. (Parameter 'destinationArray')"));
+    }
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        const v = dup(r.items[@as(usize, @intCast(start)) + k]);
+        const at = @as(usize, @intCast(index)) + k;
+        drop(a.items[at]);
+        a.items[at] = v;
+    }
 }
 
 pub fn dictKeys(d: anytype) List(KeyOf(@TypeOf(d))) {

@@ -310,8 +310,8 @@ pub fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
         for (text) |c| t.put(c);
         return out[0..t.len];
     }
-    // (`G` of a decimal: every digit of its scale)
-    if (isDec and (letter == 'G' or letter == 'g') and given == null) return decAscii(value, out);
+    // (`G` and `R` of a decimal: every digit of its scale)
+    if (isDec and (letter == 'G' or letter == 'g' or letter == 'R' or letter == 'r') and given == null) return decAscii(value, out);
     if (!whole and !isDec) {
         if (std.math.isNan(value)) return "NaN";
         if (std.math.isInf(value)) return if (value > 0) "Infinity" else "-Infinity";

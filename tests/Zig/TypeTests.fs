@@ -2173,6 +2173,66 @@ let ``test Generic values holding generic functions are used at several types`` 
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+
+
+
+
+
+
+
+
+
+
+
+
+[<Mangle>]
+type IGenericMangledInterface<'T> =
+    abstract Upper: string -> string
+    abstract Ping: unit -> string
+    abstract Value: 'T with get, set
+    abstract ReadOnlyValue: string with get
+    abstract SetterOnlyValue: 'T with set
+
+type GenericMangledClass() =
+    let mutable innerValue = ""
+
+    interface IGenericMangledInterface<string> with
+        member _.Upper s = s.ToUpper()
+        member _.Ping() = "pong"
+
+        member _.Value
+            with get () = innerValue
+            and set v = innerValue <- v
+
+        member _.ReadOnlyValue = innerValue
+
+        member _.SetterOnlyValue
+            with set v = innerValue <- v
+
+[<Mangle>]
+type IUpperMangledInterface =
+    abstract Upper: string -> string
+    abstract Ping: unit -> string
+    abstract Value: string with get, set
+    abstract ReadOnlyValue: string with get
+    abstract SetterOnlyValue: string with set
+
+type UpperMangledClass() =
+    let mutable innerValue = ""
+
+    interface IUpperMangledInterface with
+        member _.Upper s = s.ToUpper()
+        member _.Ping() = "pong"
+
+        member _.Value
+            with get () = innerValue
+            and set v = innerValue <- v
+
+        member _.ReadOnlyValue = innerValue
+        member _.SetterOnlyValue
+            with set v = innerValue <- v
+
+
 type FlexibleOverloads() =
     member _.For(xs: 'a list, f: 'a -> 'b list) : 'b list = xs |> List.collect f
     member _.For(xs: #seq<'a>, f: 'a -> unit) : int =
@@ -2692,3 +2752,38 @@ let ``test Class implementing a generic interface method with a renamed type par
 
     let encodable = GenericMethodEncodableClass() :> IGenericMethodEncodable
     encodable.Encode(helpers) |> equal "S:x"
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test mangled method on interface works`` () =
+    let upper = UpperMangledClass()
+    (upper :> IUpperMangledInterface).Upper("hello") |> equal "HELLO"
+    (upper :> IUpperMangledInterface).Ping() |> equal "pong"
+    (upper :> IUpperMangledInterface).Value |> equal ""
+    (upper :> IUpperMangledInterface).Value <- "value"
+    (upper :> IUpperMangledInterface).Value |> equal "value"
+    (upper :> IUpperMangledInterface).ReadOnlyValue |> equal "value"
+    (upper :> IUpperMangledInterface).SetterOnlyValue <- "setter only value"
+    (upper :> IUpperMangledInterface).Value |> equal "setter only value"
+
+[<Fact>]
+let ``test mangled method on generic interface works`` () =
+    let upper = GenericMangledClass()
+    (upper :> IGenericMangledInterface<string>).Upper("hello") |> equal "HELLO"
+    (upper :> IGenericMangledInterface<string>).Ping() |> equal "pong"
+    (upper :> IGenericMangledInterface<string>).Value |> equal ""
+    (upper :> IGenericMangledInterface<string>).Value <- "value"
+    (upper :> IGenericMangledInterface<string>).Value |> equal "value"
+    (upper :> IGenericMangledInterface<string>).ReadOnlyValue |> equal "value"
+    (upper :> IGenericMangledInterface<string>).SetterOnlyValue <- "setter only value"
+    (upper :> IGenericMangledInterface<string>).Value |> equal "setter only value"
+
+[<Fact>]
+let ``test Function-typed DefaultValue fields are null`` () =
+    let c = ClassWithDefaultValueFunctionField(fun a b -> a + b)
+    isNull (box c.G) |> equal true
+    c.F 2 3 |> equal 5
+    c.G <- fun a b -> a * b
+    c.G 2 3 |> equal 6
+

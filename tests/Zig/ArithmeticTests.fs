@@ -2160,3 +2160,18 @@ let ``test BigInteger checked conversions throw on overflow`` () =
     (fun () -> byte 256I) |> throwsError ""
     (fun () -> sbyte 200I) |> throwsError ""
 
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test float32 conversions round like .NET`` () =
+    float32 2.7 |> equal 2.7f
+    float32 16777217 |> equal 16777216.f
+    float32 16777217L |> equal 16777216.f
+    float32 2.7M |> equal 2.7f
+    float32 "2.7" |> equal 2.7f
+    Single.Parse("2.7", CultureInfo.InvariantCulture) |> equal 2.7f
+    let mutable parsed = 0.f
+    Single.TryParse("2.7", NumberStyles.Float, CultureInfo.InvariantCulture, &parsed) |> equal true
+    parsed |> equal 2.7f
+

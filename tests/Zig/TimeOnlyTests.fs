@@ -66,6 +66,9 @@ let ``test TimeOnly.ToString with format works`` () =
 
 
 
+
+
+
 open System.Globalization
 
 [<Fact>]
@@ -333,3 +336,5 @@ let ``test TimeOnly.Add* accept fractional values and are tick-precise`` () =
     t.AddHours(1.0 / 3.0).Ticks - t.Ticks |> equal 12_000_000_000L
     t.AddMinutes(0.00001).Ticks - t.Ticks |> equal 6_000L
 
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----

@@ -519,3 +519,13 @@ let ``test HashSet compares ResizeArrays by reference`` () =
     xs.Contains item |> equal true
     xs.Contains(ResizeArray [ 1 ]) |> equal false
 
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test HashSet with a structural comparer compares arrays by value`` () =
+    let xs = HashSet<int[]>(HashIdentity.Structural)
+    xs.Add [| 1 |] |> equal true
+    xs.Add [| 1 |] |> equal false
+    xs.Contains [| 1 |] |> equal true
+

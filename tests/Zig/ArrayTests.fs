@@ -2,6 +2,7 @@ module Fable.Tests.Zig.ArrayTests
 
 open Fable.Tests.Util
 open Fable.Tests.Util.Testing
+open System.Collections.Generic
 open Fable.Tests.Util
 
 type ParamArrayTest =
@@ -1760,6 +1761,12 @@ let ``test specialized Array HOFs handle negative counts and abandon buffers on 
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+
+
+
+
+
+
 [<Struct>]
 type MyStruct(value: int, flag: bool) =
     member _.Value = value
@@ -2202,4 +2209,73 @@ let ``test Array.removeManyAt raises ArgumentException only when FSharp.Core doe
     Array.removeManyAt 0 0 empty |> equal [||]
     Array.removeManyAt 1 2 xs |> equal [|1|]
     Array.removeManyAt 0 2 [|"a"; "b"; "c"|] |> equal [|"c"|]
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test Array IReadOnlyCollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = xs :> IReadOnlyCollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Array ICollection.IsReadOnly works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = xs :> ICollection<_>
+    coll.IsReadOnly |> equal true
+
+[<Fact>]
+let ``test Array ICollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = xs :> ICollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Array ICollection.Contains works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = xs :> ICollection<_>
+    coll.Contains(("B", 3)) |> equal false
+    coll.Contains(("D", 3)) |> equal false
+    coll.Contains(("B", 2)) |> equal true
+
+[<Fact>]
+let ``test Array ICollection.CopyTo works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = xs :> ICollection<_>
+    let ys = [| ("D", 4); ("E", 5); ("F", 6) |]
+    coll.CopyTo(ys, 0)
+    ys = xs |> equal true
+
+[<Fact>]
+let ``test Array IReadOnlyCollection.Count with typed arrays works`` () =
+    let xs = [| 1; 2; 3 |]
+    let coll = xs :> IReadOnlyCollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Array ICollection.IsReadOnly with typed arrays works`` () =
+    let xs = [| 1; 2; 3 |]
+    let coll = xs :> ICollection<_>
+    coll.IsReadOnly |> equal true
+
+[<Fact>]
+let ``test Array ICollection.Count with typed arrays works`` () =
+    let xs = [| 1; 2; 3 |]
+    let coll = xs :> ICollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Array ICollection.Contains with typed arrays works`` () =
+    let xs = [| 1; 2; 3 |]
+    let coll = xs :> ICollection<_>
+    coll.Contains(4) |> equal false
+    coll.Contains(2) |> equal true
+
+[<Fact>]
+let ``test Array ICollection.CopyTo with typed arrays works`` () =
+    let xs = [| 1; 2; 3 |]
+    let coll = xs :> ICollection<_>
+    let ys = [| 4; 5; 6 |]
+    coll.CopyTo(ys, 0)
+    ys = xs |> equal true
 

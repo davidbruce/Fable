@@ -1,5 +1,7 @@
 module Fable.Tests.Zig.ResizeArrayTests
 
+open System.Collections.Generic
+
 open Fable.Tests.Util
 open Fable.Tests.Util.Testing
 open System.Text
@@ -422,9 +424,185 @@ let ``test ResizeArray uses reference equality not structural equality`` () = //
     equal false (xs <> xs)
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#if !FABLE_COMPILER_ZIG // (a class implementing the non-generic IList, and a ResizeArray seen as the non-generic IEnumerable, are not supported by the Zig target yet)
+type CustomList() =
+    let items = ResizeArray<obj>()
+    member _.Items = items
+    interface System.Collections.IList with
+        member _.Item
+            with get i = items.[i]
+            and set i v = items.[i] <- v
+        member _.IndexOf(item) = items.IndexOf(item)
+        member _.Insert(i, item) = items.Insert(i, item)
+        member _.RemoveAt(i) = items.RemoveAt(i)
+        member _.Count = items.Count
+        member _.IsReadOnly = false
+        member _.IsFixedSize = false
+        member _.IsSynchronized = false
+        member _.SyncRoot = box items
+        member _.Add(item) =
+            items.Add(item)
+            items.Count - 1
+        member _.Clear() = items.Clear()
+        member _.Contains(item) = items.Contains(item)
+        member _.CopyTo(array, arrayIndex) = items.CopyTo(array :?> obj[], arrayIndex)
+        member _.Remove(item) = items.Remove(item) |> ignore
+    interface IEnumerable<obj> with
+        member _.GetEnumerator() = (items :> IEnumerable<obj>).GetEnumerator()
+    interface System.Collections.IEnumerable with
+        member _.GetEnumerator() = (items :> System.Collections.IEnumerable).GetEnumerator()
+#endif
+
+
 [<Fact>]
 let ``test ResizeArray.ConvertAll works`` () =
     let xs = ResizeArray<_> [1.; 2.; 3.; 4.]
     let ys = xs.ConvertAll(System.Converter(fun x -> int x))
     ys |> Seq.toList |> equal [1;2;3;4]
+
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test ResizeArray.Item throws on out of bounds access`` () =
+    let xs = ResizeArray [0]
+    throwsAnyError (fun () -> xs.Item 1 |> ignore)
+
+[<Fact>]
+let ``test ResizeArray.CopyTo works`` () =
+    let xs = ResizeArray<_> [|1;2;3;4|]
+    let ys = [|5;6;7;8;9|]
+    xs.CopyTo(ys)
+    ys |> equal [|1;2;3;4;9|]
+
+[<Fact>]
+let ``test ResizeArray.CopyTo works II`` () =
+    let xs = ResizeArray<_> [|1;2;3;4|]
+    let ys = [|5;6;7;8;9|]
+    xs.CopyTo(ys, 1)
+    ys |> equal [|5;1;2;3;4|]
+
+[<Fact>]
+let ``test ResizeArray.CopyTo works III`` () =
+    let xs = ResizeArray<_> [|1;2;3;4|]
+    let ys = [|5;6;7;8;9|]
+    xs.CopyTo(2, ys, 1, 2)
+    ys |> equal [|5;3;4;8;9|]
+
+#if !FABLE_COMPILER_ZIG // (a class implementing the non-generic IList, and a ResizeArray seen as the non-generic IEnumerable, are not supported by the Zig target yet)
+[<Fact>]
+let ``test IList.Clear works on a custom collection`` () =
+    let xs = CustomList()
+    xs.Items.Add(box 1)
+    xs.Items.Add(box 2)
+    (xs :> System.Collections.IList).Clear()
+    xs.Items.Count |> equal 0
+#endif
+
+[<Fact>]
+let ``test ResizeArray index out of bounds get throws`` () =
+    // See #3812
+    let xs = ResizeArray [1; 2; 3]
+    throwsAnyError (fun () -> xs[-1] |> ignore)
+    throwsAnyError (fun () -> xs[10] |> ignore)
+
+[<Fact>]
+let ``test ResizeArray index out of bounds set throws`` () =
+    // See #3812
+    let xs = ResizeArray [1; 2; 3]
+    throwsAnyError (fun () -> xs.[-1] <- 42)
+    throwsAnyError (fun () -> xs.[10] <- 42)
+
+[<Fact>]
+let ``test ResizeArray IReadOnlyCollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (ResizeArray xs) :> IReadOnlyCollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test ResizeArray ICollection.IsReadOnly works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (ResizeArray xs) :> ICollection<_>
+    coll.IsReadOnly |> equal false
+
+[<Fact>]
+let ``test ResizeArray ICollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (ResizeArray xs) :> ICollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test ResizeArray ICollection.Contains works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (ResizeArray xs) :> ICollection<_>
+    coll.Contains(("B", 3)) |> equal false
+    coll.Contains(("D", 3)) |> equal false
+    coll.Contains(("B", 2)) |> equal true
+
+[<Fact>]
+let ``test Dictionary ICollection.CopyTo works`` () =
+    // See #3914
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (ResizeArray xs) :> ICollection<_>
+    let ys = [| ("D", 4); ("E", 5); ("F", 6) |]
+    coll.CopyTo(ys, 0)
+    ys = xs |> equal true
+
+[<Fact>]
+let ``test ResizeArray ICollection.Clear works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (ResizeArray xs) :> ICollection<_>
+    coll.Clear()
+    coll.Count |> equal 0
+
+[<Fact>]
+let ``test ResizeArray ICollection.Add works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (ResizeArray xs) :> ICollection<_>
+    coll.Add(("A", 1))
+    coll.Add(("A", 2))
+    coll.Add(("D", 4))
+    coll.Count |> equal 6
+
+[<Fact>]
+let ``test ResizeArray ICollection.Remove works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (ResizeArray xs) :> ICollection<_>
+    coll.Remove(("B", 3)) |> equal false
+    coll.Remove(("D", 3)) |> equal false
+    coll.Remove(("B", 2)) |> equal true
+    coll.Count |> equal 2
 

@@ -1442,3 +1442,133 @@ let ``test DateTime.TryParse rejects JS-permissive strings that .NET rejects`` (
     r4 |> equal true
     d4.Year |> equal 2014
 
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test DateTime.ToString('D') works`` () =
+    let format (d: DateTime) = d.ToString("D", CultureInfo.InvariantCulture)
+
+    DateTime(2014, 9, 1, 16, 37, 2)
+    |> format
+    |> equal "Monday, 01 September 2014"
+
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Local)
+    |> format
+    |> equal "Monday, 01 September 2014"
+
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "Monday, 01 September 2014"
+
+[<Fact>]
+let ``test DateTime.ToString('d') works`` () =
+    let format (d: DateTime) = d.ToString("d", CultureInfo.InvariantCulture)
+
+    DateTime(2014, 9, 1, 16, 37, 2)
+    |> format
+    |> equal "09/01/2014"
+
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Local)
+    |> format
+    |> equal "09/01/2014"
+
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "09/01/2014"
+
+[<Fact>]
+let ``test DateTime.ToString('T') works`` () =
+    let format (d: DateTime) = d.ToString("T", CultureInfo.InvariantCulture)
+
+    DateTime(2014, 9, 1, 5, 7, 2)
+    |> format
+    |> equal "05:07:02"
+
+    DateTime(2014, 9, 1, 5, 7, 2, DateTimeKind.Local)
+    |> format
+    |> equal "05:07:02"
+
+    DateTime(2014, 9, 1, 5, 7, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "05:07:02"
+
+[<Fact>]
+let ``test DateTime.ToString('t') works`` () =
+    let format (d: DateTime) = d.ToString("t", CultureInfo.InvariantCulture)
+
+    DateTime(2014, 9, 1, 5, 7, 2)
+    |> format
+    |> equal "05:07"
+
+    DateTime(2014, 9, 1, 5, 7, 2, DateTimeKind.Local)
+    |> format
+    |> equal "05:07"
+
+    DateTime(2014, 9, 1, 5, 7, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "05:07"
+
+[<Fact>]
+let ``test DateTime.ToString('R') works`` () =
+    let format (d: DateTime) = d.ToString("R", CultureInfo.InvariantCulture)
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "Mon, 01 Sep 2014 16:37:02 GMT"
+
+[<Fact>]
+let ``test DateTime.ToString('s') works`` () =
+    let format (d: DateTime) = d.ToString("s", CultureInfo.InvariantCulture)
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "2014-09-01T16:37:02"
+
+[<Fact>]
+let ``test DateTime.ToString('u') works`` () =
+    let format (d: DateTime) = d.ToString("u", CultureInfo.InvariantCulture)
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "2014-09-01 16:37:02Z"
+
+[<Fact>]
+let ``test DateTime.ToString('F') works`` () =
+    let format (d: DateTime) = d.ToString("F", CultureInfo.InvariantCulture)
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "Monday, 01 September 2014 16:37:02"
+
+[<Fact>]
+let ``test DateTime.ToString('f') works`` () =
+    let format (d: DateTime) = d.ToString("f", CultureInfo.InvariantCulture)
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "Monday, 01 September 2014 16:37"
+
+[<Fact>]
+let ``test DateTime.ToString('G') works`` () =
+    let format (d: DateTime) = d.ToString("G", CultureInfo.InvariantCulture)
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "09/01/2014 16:37:02"
+
+[<Fact>]
+let ``test DateTime.ToString('g') works`` () =
+    let format (d: DateTime) = d.ToString("g", CultureInfo.InvariantCulture)
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "09/01/2014 16:37"
+
+[<Fact>]
+let ``test DateTime.ToString('M') works`` () =
+    let format (d: DateTime) = d.ToString("M", CultureInfo.InvariantCulture)
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "September 01"
+
+[<Fact>]
+let ``test DateTime.ToString('Y') works`` () =
+    let format (d: DateTime) = d.ToString("Y", CultureInfo.InvariantCulture)
+    DateTime(2014, 9, 1, 16, 37, 2, DateTimeKind.Utc)
+    |> format
+    |> equal "2014 September"
+

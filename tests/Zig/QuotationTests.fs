@@ -353,3 +353,13 @@ let ``test Untyped quotation works`` () =
     match q with
     | Value(v, _t) -> equal 42 (v :?> int)
     | _ -> failwith "Expected Value"
+
+// ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+[<Fact>]
+let ``test NewRecord leaves out DefaultValue fields`` () =
+    (match <@ { A = 1; C = "c" }: QuotationDefaultValueRecord @> with
+     | NewRecord(_, args) -> args |> Seq.map (function Value(v, _) -> string v | _ -> "?") |> String.concat ","
+     | _ -> "other")
+    |> equal "1,c"
+
