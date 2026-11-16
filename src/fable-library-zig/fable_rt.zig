@@ -361,6 +361,134 @@ fn adoptRegion(x: anytype) void {
     }
 }
 
+// ---- `Fable.Core.Zig.Iso<'T>`: a value moved between threads whole (Verona's isolated region,
+// Pony's `iso`). `Iso.pack x` takes `x`, which must be isolated: every cell and string it reaches
+// counted once (the caller gave it up: nothing else refers to any part of it), no function,
+// object, exception or interface in it (reached through hooks), no cell the cycle collector
+// follows, no weak reference to any of it. The value is kept as bytes the runtime does not walk,
+// so sharing the Iso (posting it to a MailboxProcessor, capturing it in a thread) marks only the
+// Iso: the value's counts stay plain, and any number of hops cost one pointer each.
+// `Iso.unpack` takes the value out once (an atomic swap: one taker), owned by the thread that
+// unpacks it, unshared. ----
+
+pub fn Iso(comptime T: type) type {
+    return *struct {
+        const Self = @This();
+        pub const fable_identity = {};
+        pub const fable_iso = T;
+        @"$rc": u32 = 1,
+        /// 1 while the value is in it
+        full: std.atomic.Value(u8) = .init(1),
+        /// the value, as bytes nothing walks (see above)
+        held: [@sizeOf(T)]u8 align(@alignOf(T)) = undefined,
+
+        fn ptr(c: *Self) *T {
+            return @ptrCast(&c.held);
+        }
+
+        pub fn fable_free(c: *Self) void {
+            if (c.full.load(.acquire) == 1) drop(c.ptr().*);
+        }
+
+        pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
+            _ = x;
+            _ = depth;
+            return b.word("Fable.Core.Zig.Iso`1");
+        }
+    };
+}
+
+/// Is `x` isolated (see above)? Counts read after the other threads' last releases.
+fn isolated(x: anytype) bool {
+    const T = @TypeOf(x);
+    if (comptime !isManaged(T)) return true;
+    if (comptime isFunc(T) or isIface(T) or T == Obj or T == Exn or T == Any) return false;
+    if (T == String) {
+        const p = x orelse return true;
+        const rc = @atomicLoad(u32, &p.rc, .acquire);
+        return rc == Str.literal or rc & ~shared_bit == 1;
+    }
+    if (comptime isSlice(T)) {
+        for (x) |item| if (!isolated(item)) return false;
+        return true;
+    }
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            const C = ptr.child;
+            if (comptime hasGc(C) or @hasDecl(C, "fable_weak") or @hasDecl(C, "fable_object") or @hasDecl(C, "fable_iso")) return false;
+            var cur = x;
+            while (true) {
+                if (!countedOnce(cur)) return false;
+                if (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(cur))) return false;
+                var next: ?T = null;
+                inline for (@typeInfo(C).@"struct".field_names) |name| {
+                    if (comptime isCount(name)) continue;
+                    const F = @TypeOf(@field(cur, name));
+                    if (F == T) next = @field(cur, name) else if (F == ?T) next = @field(cur, name) else if (!isolated(@field(cur, name))) return false;
+                }
+                cur = next orelse return true;
+            }
+        },
+        .optional => return if (x) |v| isolated(v) else true,
+        .@"struct" => |st| {
+            inline for (st.field_names) |name| if (!isolated(@field(x, name))) return false;
+            return true;
+        },
+        .@"union" => {
+            var cur = x;
+            while (true) {
+                var next: ?T = null;
+                switch (cur) {
+                    inline else => |p| {
+                        const P = @TypeOf(p);
+                        if (comptime isCellPtr(P)) {
+                            const C = @typeInfo(P).pointer.child;
+                            if (comptime hasGc(C)) return false;
+                            if (!countedOnce(p)) return false;
+                            if (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(p))) return false;
+                            inline for (@typeInfo(C).@"struct".field_names) |name| {
+                                if (comptime isCount(name)) continue;
+                                if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else if (!isolated(@field(p, name))) return false;
+                            }
+                        } else if (!isolated(p)) return false;
+                    },
+                }
+                cur = next orelse return true;
+            }
+        },
+        else => return true,
+    }
+}
+
+/// `Iso.pack x` (`x` owned: the caller gives it, or keeps it, which makes it not isolated)
+pub fn isoPack(comptime T: type) type {
+    return struct {
+        pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
+
+        pub fn call(x: T) Raised!Iso(T) {
+            if (!isolated(x)) {
+                drop(x);
+                return raise(InvalidOperationException, str("Iso.pack: the value is not isolated (something else refers to a part of it, or it holds a function, an object or a value the cycle collector follows)."));
+            }
+            // (its cells are the Iso's, wherever it goes: plain counts, no identity stamps of this
+            // thread's)
+            adoptRegion(x);
+            const I = @typeInfo(Iso(T)).pointer.child;
+            const c = allocator.create(I) catch oom();
+            if (track) thread.stats.allocs += 1;
+            c.* = .{};
+            c.ptr().* = x;
+            return c;
+        }
+    };
+}
+
+/// `Iso.unpack iso`: the value, once (InvalidOperationException after)
+pub fn isoUnpack(iso: anytype) Raised!@typeInfo(@TypeOf(iso)).pointer.child.fable_iso {
+    if (iso.full.swap(0, .acq_rel) != 1) return raise(InvalidOperationException, str("Iso.unpack: the value was taken already."));
+    return iso.ptr().*;
+}
+
 /// `markShared`, or false where the value reaches a cell the cycle collector follows (what was
 /// marked before it stays marked: its counts are atomic from then on, which is still right)
 pub fn tryMarkShared(x: anytype) bool {
@@ -7280,6 +7408,54 @@ pub fn testOuter(x: i32) MayRaise(i32, .{testCheck}) {
 
 pub fn testPlain(x: i32) MayRaise(i32, .{testSum}) {
     return x;
+}
+
+/// (an allocator that refuses what is larger than a megabyte: the program's allocation fails,
+/// the exception's own does not)
+const RefusingLarge = struct {
+    inner: std.mem.Allocator,
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *RefusingLarge = @ptrCast(@alignCast(ctx));
+        if (len > 1 << 20) return null;
+        return self.inner.rawAlloc(len, alignment, ret);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const self: *RefusingLarge = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ret);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        const self: *RefusingLarge = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ret);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *RefusingLarge = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ret);
+    }
+
+    fn get(self: *RefusingLarge) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocFn, .resize = resizeFn, .remap = remapFn, .free = freeFn } };
+    }
+};
+
+test "out of memory: an array that cannot be allocated raises OutOfMemoryException (the .dotnet policy)" {
+    try std.testing.expect(oom_policy == .dotnet); // (tests are built in Debug)
+    try std.testing.expect(oom_catchable);
+    var refusing: RefusingLarge = .{ .inner = allocator };
+    const saved = allocator;
+    allocator = refusing.get();
+    defer allocator = saved;
+    try std.testing.expectError(error.Raised, arrayCreate(Array(i64), 10_000_000, 0));
+    const e = take();
+    defer drop(e);
+    try std.testing.expect(OutOfMemoryException.is(e));
+    // (a small one still is)
+    const small = try arrayCreate(Array(i64), 8, 1);
+    defer drop(small);
+    try std.testing.expectEqual(@as(usize, 8), small.items.len);
 }
 
 test "an exception owns its fields and is taken by one handler" {

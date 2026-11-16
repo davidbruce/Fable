@@ -2090,17 +2090,26 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         if info.Macro.Contains "fable_rt." then
             ctx.State.UsesRuntime <- true
 
-        // (an instance member: the object is `$0`, the arguments follow, as in the other targets)
-        let args =
-            (Option.toList info.CallInfo.ThisArg @ info.CallInfo.Args)
-            |> List.filter (fun a -> not (isUnit a.Type))
-            |> List.map (lw ctx)
+        // (`Fable.Core.Zig.Iso.pack x`: a call that takes `x`, given up when it is its last use,
+        // dup'ed when the caller goes on using it, which makes it not isolated; see fable_rt.isoPack)
+        if info.Macro = "$iso_pack($0)" then
+            ctx.State.UsesRuntime <- true
+            let x = info.CallInfo.Args.Head
 
-        // (`[<Emit("try f($0)")>]`: a call that may raise, whose exception goes on as F#'s does)
-        if info.Macro.StartsWith("try ", System.StringComparison.Ordinal) then
-            bindArgs ctx args (fun xs -> ERt(info.Macro.Substring 4, xs, ty))
+            bindArgs ctx [ lw ctx x ] (fun xs -> ECall("fable_rt.isoPack", [ mapTypeArg ctx r x.Type ], xs, ty))
         else
-            bindArgs ctx args (fun xs -> EEmit(info.Macro, xs, ty))
+
+            // (an instance member: the object is `$0`, the arguments follow, as in the other targets)
+            let args =
+                (Option.toList info.CallInfo.ThisArg @ info.CallInfo.Args)
+                |> List.filter (fun a -> not (isUnit a.Type))
+                |> List.map (lw ctx)
+
+            // (`[<Emit("try f($0)")>]`: a call that may raise, whose exception goes on as F#'s does)
+            if info.Macro.StartsWith("try ", System.StringComparison.Ordinal) then
+                bindArgs ctx args (fun xs -> ERt(info.Macro.Substring 4, xs, ty))
+            else
+                bindArgs ctx args (fun xs -> EEmit(info.Macro, xs, ty))
 
     // a field of an exception, which is known to be of the declared type
     | Fable.Get(x, Fable.FieldGet info, t, r) when

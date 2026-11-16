@@ -943,8 +943,10 @@ let netEnt (state: FileState) (name: string) : Ent =
             | "HashSet" -> [ "T" ], [ "key", TGen "T" ]
             | "StringBuilder"
             | "Random" -> [], []
-            // (a weak reference holds nothing that keeps its target alive)
-            | "Weak" -> [ "T" ], []
+            // (a weak reference holds nothing that keeps its target alive; an Iso, nothing the
+            // runtime walks)
+            | "Weak"
+            | "Iso" -> [ "T" ], []
             | _ -> [ "T" ], [ "items", TGen "T" ]
 
         let e =

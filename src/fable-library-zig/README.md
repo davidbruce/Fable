@@ -45,7 +45,11 @@ Under .NET these do nothing (or what .NET does), so the same program runs on bot
 
 Threads are real threads: `Thread`, `Async.Parallel`, `Async.StartChild`, `MailboxProcessor`,
 `Task.Run` and the like. A value is marked shared when it reaches another thread, and from then
-on its count changes atomically; the rest of the program pays one test of a bit.
+on its count changes atomically; the rest of the program pays one test of a bit. A message a
+MailboxProcessor's receiver alone holds is its own again when it takes it (plain counts, changed
+in place). To move a value without ever marking it, `Fable.Core.Zig.Iso.pack value` (the value
+given up, nothing else referring to a part of it) and `Iso.unpack` on the other side: each hop
+moves one pointer.
 
 ## Calling Zig
 

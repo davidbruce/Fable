@@ -70,6 +70,39 @@ module Collector =
 [<Emit("fable_rt.sameCell($0, $1)")>]
 let sameCell (a: 'T) (b: 'T) : bool = obj.ReferenceEquals(a, b)
 
+/// A value moved between threads whole (Verona's isolated region, Pony's `iso`). Made by
+/// `Iso.pack`, which takes a value nothing else refers to; posted to a MailboxProcessor or
+/// captured by a thread, it moves by one pointer, its value never marked shared; `Iso.unpack`
+/// gives the value, once, to the thread that unpacks it. Under .NET it holds the value.
+[<Sealed>]
+type Iso<'T>(value: 'T) =
+    let gate = obj ()
+    let mutable held = Some value
+
+    /// The value, once (InvalidOperationException after)
+    member _.Take() : 'T =
+        lock
+            gate
+            (fun () ->
+                match held with
+                | Some v ->
+                    held <- None
+                    v
+                | None -> raise (System.InvalidOperationException "Iso.unpack: the value was taken already.")
+            )
+
+[<RequireQualifiedAccess>]
+module Iso =
+    /// Take `value` into an Iso. In the Zig target the value must be isolated: the caller gives
+    /// it up (no later use), nothing else refers to any part of it, and it holds no function,
+    /// object, or value of a type that can be part of a cycle (InvalidOperationException if not).
+    [<Emit("$iso_pack($0)")>]
+    let pack (value: 'T) : Iso<'T> = Iso<'T>(value)
+
+    /// The value of an Iso, once
+    [<Emit("try fable_rt.isoUnpack($0)")>]
+    let unpack (iso: Iso<'T>) : 'T = iso.Take()
+
 /// What the runtime did, for programs and tests that want to see it. The runtime counts in
 /// Debug and ReleaseSafe builds only.
 [<RequireQualifiedAccess>]

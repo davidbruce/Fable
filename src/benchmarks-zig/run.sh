@@ -7,6 +7,11 @@ setopt null_glob
 cd "$(dirname "$0")"
 ROOT=$(cd ../.. && pwd)
 DOTNET="${DOTNET:-dotnet}"
+# (a dotnet given by its path: first on PATH too, as `dotnet run` starts other dotnet processes)
+if [[ "$DOTNET" == */* ]]; then
+    export PATH="$(dirname "$DOTNET"):$PATH"
+    export DOTNET_ROOT="${DOTNET_ROOT:-$(dirname "$DOTNET")}"
+fi
 best() {
     local b=999999
     for _ in 1 2 3; do
@@ -24,7 +29,8 @@ names=(${@:-nbody lists maps strings virtual messages})
 for d in $names; do
     (cd $d
      rm -rf fable_modules; rm -f *.zig
-     ${=DOTNET} run -c Release --no-build --project $ROOT/src/Fable.Cli -- . --lang zig --extension .zig --noCache --exclude Fable.Core >/dev/null 2>&1
+     out=$(${=DOTNET} run -c Release --no-build --project $ROOT/src/Fable.Cli -- . --lang zig --extension .zig --noCache --exclude Fable.Core 2>&1)
+     [ -f Program.zig ] || { echo "$d: Fable failed"; echo "$out" | tail -5; exit 0; }
      mkdir -p fable_modules && cp -r $ROOT/temp/fable-library-zig fable_modules/
      zig build-exe -O ReleaseFast Program.zig -femit-bin=bench-zig >/dev/null 2>&1 || { echo "$d: zig build failed"; exit 0; }
      ${=DOTNET} build -c Release -o bin/bench >/dev/null 2>&1

@@ -571,3 +571,66 @@ let ``test A value made in a stack arena is not shared with a thread`` () =
 #else
     shareFromArena () |> equal false
 #endif
+
+type IsoMsg =
+    | Work of Fable.Core.Zig.Iso<int list>
+    | Buffer of Fable.Core.Zig.Iso<ResizeArray<int>>
+    | Sum of AsyncReplyChannel<int>
+
+[<Fact>]
+let ``test Iso moves a value between threads whole`` () =
+    let mb =
+        MailboxProcessor.Start(fun inbox ->
+            let rec loop total =
+                async {
+                    match! inbox.Receive() with
+                    | Work iso ->
+                        let xs = Fable.Core.Zig.Iso.unpack iso
+                        return! loop (total + List.sum (List.map (fun x -> x * 2) xs))
+                    | Buffer iso ->
+                        let b = Fable.Core.Zig.Iso.unpack iso
+                        b.Add 100
+                        return! loop (total + Seq.sum b)
+                    | Sum ch -> ch.Reply total
+                }
+
+            loop 0
+        )
+
+    let t =
+        Thread(fun () ->
+            for i in 1..100 do
+                mb.Post(Work(Fable.Core.Zig.Iso.pack [ i; i + 1 ]))
+                mb.Post(Buffer(Fable.Core.Zig.Iso.pack (ResizeArray [ i ])))
+        )
+
+    t.Start()
+    t.Join()
+    mb.PostAndReply Sum |> equal 35450
+
+[<Fact>]
+let ``test An Iso gives its value once`` () =
+    let iso = Fable.Core.Zig.Iso.pack [ 3 ]
+    Fable.Core.Zig.Iso.unpack iso |> equal [ 3 ]
+
+    (try
+        Fable.Core.Zig.Iso.unpack iso |> ignore
+        "twice"
+     with :? System.InvalidOperationException ->
+         "taken")
+    |> equal "taken"
+
+#if FABLE_COMPILER_ZIG
+[<Fact>]
+let ``test Iso.pack refuses a value that is not isolated`` () =
+    let kept = [ 1; 2 ]
+
+    (try
+        Fable.Core.Zig.Iso.pack kept |> ignore
+        "packed"
+     with :? System.InvalidOperationException ->
+         "not isolated")
+    |> equal "not isolated"
+
+    kept.Length |> equal 2
+#endif

@@ -107,6 +107,10 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Lazy`1" -> TEnt(lazyEnt ctx.State, [ mapType ctx r t ])
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.WeakReference`1" ->
         TEnt(netEnt ctx.State "Weak", [ mapType ctx r t ])
+    // (`Fable.Core.Zig.Iso<'T>`: fable_rt.Iso, which holds its value as bytes the runtime does
+    // not walk)
+    | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "Fable.Core.Zig.Iso`1" ->
+        TEnt(netEnt ctx.State "Iso", [ mapType ctx r t ])
     // a byref: a pointer (`inref` to what cannot be assigned)
     | Fable.DeclaredType(ent, [ t; kind ]) when ent.FullName = "Microsoft.FSharp.Core.byref`2" ->
         let isIn =
