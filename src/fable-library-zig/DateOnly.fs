@@ -170,6 +170,29 @@ let timeAddHours (t: TimeOnlyOf) (h: float) =
 let timeAddMinutes (t: TimeOnlyOf) (m: float) =
     timeAdd t { TimeSpanOf.ticks = int64 (m * float ticksPerMinute) }
 
+/// `t.Add(span, &wrappedDays)` and the hours and minutes: the time and the days it wrapped
+/// (.NET's: whole days of the span, plus one when the clock went past midnight; negative for a
+/// span backwards)
+let private withDays (t: TimeOnlyOf) (spanTicks: int64) : TimeOnlyOf * int =
+    let total = t.timeTicks + spanTicks
+    let days = total / ticksPerDay
+
+    let days =
+        if total < 0L && total % ticksPerDay <> 0L then
+            days - 1L
+        else
+            days
+
+    wrap (t.timeTicks + spanTicks % ticksPerDay), int days
+
+let timeAddWrapped (t: TimeOnlyOf) (span: TimeSpanOf) : TimeOnlyOf * int = withDays t span.ticks
+
+let timeAddHoursWrapped (t: TimeOnlyOf) (h: float) : TimeOnlyOf * int =
+    withDays t (int64 (h * float ticksPerHour))
+
+let timeAddMinutesWrapped (t: TimeOnlyOf) (m: float) : TimeOnlyOf * int =
+    withDays t (int64 (m * float ticksPerMinute))
+
 /// `t1 - t2`: the span forward from `t2` to `t1`, around the clock
 let timeSubtract (a: TimeOnlyOf) (b: TimeOnlyOf) : TimeSpanOf =
     let d = a.timeTicks - b.timeTicks
@@ -220,3 +243,176 @@ let timeToStringFormat (t: TimeOnlyOf) (format: string) : string =
     | f -> formatCustom asDate f
 
 let timeToString (t: TimeOnlyOf) = timeToStringFormat t "t"
+
+// ---- Parse and TryParse: as DateTime.Parse reads the text, without the part the type has not ----
+
+/// (digits only, as a number; None for anything else)
+let private digitsValue (s: string) : int option =
+    if s.Length = 0 || s.Length > 9 then
+        None
+    else
+        let mutable v = 0
+        let mutable ok = true
+
+        for i in 0 .. s.Length - 1 do
+            let c = s.[i]
+
+            if c >= '0' && c <= '9' then
+                v <- v * 10 + int c - int '0'
+            else
+                ok <- false
+
+        if ok then
+            Some v
+        else
+            None
+
+/// (a year of one or two digits: the invariant calendar's, 2000 to 2049 and else the 1900s)
+let private fullYear (text: string) (y: int) : int =
+    if text.Length <= 2 then
+        if y <= 49 then
+            2000 + y
+        else
+            1900 + y
+    else
+        y
+
+/// The numeric dates of the invariant culture: `y-m-d` when the first part has three digits or
+/// more, else `m/d/y`, the parts separated by one of `/`, `-`, `.` and `,`
+let private numericDate (s: string) : DateOnlyOf option =
+    let t = s.Trim()
+    let sep = [| '/'; '-'; '.'; ',' |] |> Array.tryFind (fun c -> t.Contains c)
+
+    match sep with
+    | None -> None
+    | Some c ->
+        let parts = t.Split c
+
+        if parts.Length <> 3 then
+            None
+        else
+            match digitsValue parts.[0], digitsValue parts.[1], digitsValue parts.[2] with
+            | Some a, Some b, Some cc ->
+                let y, m, d =
+                    if parts.[0].Length >= 3 then
+                        a, b, cc
+                    else
+                        fullYear parts.[2] cc, a, b
+
+                if y >= 1 && y <= 9999 && m >= 1 && m <= 12 && d >= 1 && d <= daysInMonth y m then
+                    Some(create y m d)
+                else
+                    None
+            | _ -> None
+
+let private dateOfText (s: string) : DateOnlyOf option =
+    if isNull s then
+        None
+    else
+        match numericDate s with
+        | Some d -> Some d
+        | None ->
+            match tryParseOption s with
+            | Some d when d.ticks % ticksPerDay = 0L && not (s.Contains ":") -> Some(fromDateTime d)
+            | _ -> None
+
+/// `h:m`, `h:m:s` and `h:m:s.fraction`, white space around the parts allowed
+let private numericTime (s: string) : TimeOnlyOf option =
+    let parts = s.Split ':' |> Array.map (fun p -> p.Trim())
+
+    if parts.Length < 2 || parts.Length > 3 then
+        None
+    else
+        let secText, fraction =
+            if parts.Length = 3 then
+                match parts.[2].IndexOf '.' with
+                | -1 -> parts.[2], ""
+                | i -> parts.[2].Substring(0, i), parts.[2].Substring(i + 1)
+            else
+                "0", ""
+
+        let fracTicks =
+            if fraction = "" then
+                Some 0L
+            elif fraction.Length > 7 then
+                None
+            else
+                digitsValue fraction
+                |> Option.map (fun f -> int64 f * pown 10L (7 - fraction.Length))
+
+        let short = parts.[0].Length <= 2 && parts.[1].Length <= 2 && secText.Length <= 2
+
+        match digitsValue parts.[0], digitsValue parts.[1], digitsValue secText, fracTicks with
+        | Some h, Some m, Some sec, Some f when short && h < 24 && m < 60 && sec < 60 ->
+            Some(
+                timeOfTicks (
+                    int64 h * ticksPerHour
+                    + int64 m * ticksPerMinute
+                    + int64 sec * ticksPerSecond
+                    + f
+                )
+            )
+        | _ -> None
+
+/// (a time of day only: no date part, which DateTime.Parse would read, in the text)
+let private timeOfText (s: string) : TimeOnlyOf option =
+    if isNull s || not (s.Contains ":") then
+        None
+    else
+        let mutable hasDate = false
+
+        for i in 0 .. s.Length - 1 do
+            let c = s.[i]
+
+            if
+                c = '/'
+                || c = '-'
+                || c = ','
+                || (System.Char.IsLetter c && not ("AaPpMm".Contains c))
+            then
+                hasDate <- true
+
+        if hasDate then
+            None
+        else
+            // (digits, colons and a fraction only: the numeric form decides)
+            let mutable numeric = true
+
+            for i in 0 .. s.Length - 1 do
+                let c = s.[i]
+
+                if not ((c >= '0' && c <= '9') || c = ':' || c = '.' || c = ' ') then
+                    numeric <- false
+
+            if numeric then
+                numericTime s
+            else
+                match tryParseOption s with
+                | Some d -> Some(timeFromDateTime d)
+                | None -> None
+
+let parse (s: string) : DateOnlyOf =
+    if isNull s then
+        raise (System.ArgumentNullException("s", "Value cannot be null."))
+
+    match dateOfText s with
+    | Some d -> d
+    | None -> raise (System.FormatException("String '" + s + "' was not recognized as a valid DateOnly."))
+
+let tryParse (s: string) : bool * DateOnlyOf =
+    match dateOfText s with
+    | Some d -> true, d
+    | None -> false, minValue ()
+
+let timeParse (s: string) : TimeOnlyOf =
+    if isNull s then
+        raise (System.ArgumentNullException("s", "Value cannot be null."))
+
+    match timeOfText s with
+    | Some t -> t
+    | None -> raise (System.FormatException("String '" + s + "' was not recognized as a valid TimeOnly."))
+
+let timeTryParse (s: string) : bool * TimeOnlyOf =
+    match timeOfText s with
+    | Some t -> true, t
+    | None -> false, timeMinValue ()

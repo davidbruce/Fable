@@ -2630,6 +2630,11 @@ let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr
                         let v = ctx.State.NewVar(tempName ir, typeOf ir, VLocal, false)
                         binds.Add((v, ir))
                         EVar v
+                // (a unit made by statements, a loop: run before, the unit given)
+                elif i <= last && not (isFlat ir) && isVoid (typeOf ir) then
+                    let v = ctx.State.NewVar("unitArg", tVoid, VLocal, false)
+                    binds.Add((v, ir))
+                    EUnit
                 else
                     ir
             )
@@ -4847,6 +4852,9 @@ let rec hasDefault (ctx: Ctx) (t: Fable.Type) : bool =
     | Fable.Option _
     | Fable.Nullable _ -> true
     | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> true
+    // (a function: one that raises NullReferenceException, see fable_rt.nullOf)
+    | Fable.LambdaType _
+    | Fable.DelegateType _ -> true
     | Fable.Tuple(ts, _) -> List.forall (hasDefault ctx) ts
     | Fable.DeclaredType(entRef, _) when
         entRef.FullName = "System.Span`1"
@@ -4954,6 +4962,12 @@ let fieldDefaults (ctx: Ctx) (ent: Fable.Entity) (name: string) : Fable.Expr opt
     ent.FSharpFields
     |> List.tryFind (fun f -> f.Name = name && not f.IsStatic && hasDefault ctx f.FieldType)
     |> Option.map (fun f ->
+        // (a function field is kept uncurried: its null is made at that shape, not adapted to it)
+        let ty =
+            match f.FieldType with
+            | Fable.LambdaType _ -> FableTransforms.uncurryType f.FieldType
+            | t -> t
+
         Fable.Call(
             Fable.Import(
                 {
@@ -4964,8 +4978,8 @@ let fieldDefaults (ctx: Ctx) (ent: Fable.Entity) (name: string) : Fable.Expr opt
                 Fable.Any,
                 None
             ),
-            Fable.CallInfo.Create(genArgs = [ f.FieldType ]),
-            f.FieldType,
+            Fable.CallInfo.Create(genArgs = [ ty ]),
+            ty,
             None
         )
     )
@@ -6126,6 +6140,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         |> ignore
 
         lw ctx body
+
+    // (a function value that applies the null of a function, as F# fills a function field that a
+    // constructor leaves to its default: the null of the function at this shape)
+    | Fable.Delegate(args, Fable.CurriedApply(g, appArgs, _, _), _, _) when
+        appArgs.Length = args.Length
+        && (
+            match g with
+            | Fable.Call(Fable.Import(imp, _, _), _, _, _) -> imp.Selector = "DefaultOf"
+            | Fable.Value(Fable.Null _, _) -> true
+            | _ -> false
+        )
+        ->
+        ctx.State.UsesRuntime <- true
+        EEmit("fable_rt.nullOf($R)", [], mapType ctx e.Range e.Type)
 
     // A function value of several arguments made of a function of fewer (`doMap` of one,
     // given as `SetState -> 'model -> Dispatch -> unit`): it carries that first stage, which a
@@ -9251,7 +9279,13 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         lwStmt ctx body
                 )
 
-        bindArgs ctx [ startIr; limitIr ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, bodyIr))
+        // (the start is evaluated before the bound, as .NET does: the loop computes the bound
+        // first, so a start with effects is bound before it)
+        if isFlat startIr && not (isPure startIr) && not (isPure limitIr) then
+            let sv = ctx.State.NewVar("start", typeOf startIr, VLocal, false)
+            ELet(sv, startIr, bindArgs ctx [ limitIr ] (fun xs -> EFor(iv, EVar sv, xs[0], isUp, bodyIr)))
+        else
+            bindArgs ctx [ startIr; limitIr ] (fun xs -> EFor(iv, xs[0], xs[1], isUp, bodyIr))
 
     // (`box e.InnerException`: null when there is none)
     | Fable.TypeCast(Fable.Call(Fable.Import(imp, _, _), info, _, _), Fable.Any) when

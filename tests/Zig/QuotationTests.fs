@@ -337,3 +337,19 @@ let ``test a captured local is a Value, not a Var`` () =
      | Lambda(_, Var _) -> "Var"
      | _ -> "?")
     |> equal "Var"
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+type QuotationDefaultValueRecord = { A: int; [<DefaultValue>] mutable B: int; C: string }
+
+type QuotationIndexerTest(values: int[]) =
+    member _.Item
+        with get (i: int) = values.[i]
+
+
+[<Fact>]
+let ``test Untyped quotation works`` () =
+    let q = <@@ 42 @@>
+    match q with
+    | Value(v, _t) -> equal 42 (v :?> int)
+    | _ -> failwith "Expected Value"

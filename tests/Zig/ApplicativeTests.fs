@@ -1817,3 +1817,45 @@ module PartialActivePatternsCanReturnBool =
 let ``test Partial active patterns can return bool`` () =
     let result = PartialActivePatternsCanReturnBool.isFoo "FOO"
     equal true result
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+type ImplicitReturnTypeOverload =
+    { Field: int }
+    static member op_Implicit(s: string) : int = s.Length
+    static member op_Implicit(s: string) : float = float s.Length + 0.5
+
+
+[<Fact>]
+let ``test op_Implicit overloads can be distinguished by return type`` () =
+    let i: int = ImplicitReturnTypeOverload.op_Implicit "hello"
+    let f: float = ImplicitReturnTypeOverload.op_Implicit "hello"
+    i |> equal 5
+    f |> equal 5.5
+
+[<Fact>]
+let ``test Ident of uncurried inner lambdas is uncurried too`` () =
+    // See #3415
+    let copy1 xs =
+        let copySnd x y = x + y
+        ignore copySnd // just to prevent inlining
+        copySnd 3 xs |> id
+
+    // copySnd is hoisted in release mode
+    let copy2 xs =
+        let copy x =
+            let copySnd x y = x + y
+            ignore copySnd // just to prevent inlining
+            copySnd 3 x
+        copy xs |> id
+
+    copy1 5 |> equal 8
+    copy2 5 |> equal 8
+
+[<Fact>]
+let ``test Null functions in record fields can be read back`` () =
+    let r = { myFunction = Unchecked.defaultof<_> }
+    let f = r.myFunction
+    throwsAnyError (fun () -> f 1 2 3)
+    throwsAnyError (fun () -> r.myFunction 1 2 3)
+

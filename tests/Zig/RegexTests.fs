@@ -659,3 +659,14 @@ let ``test negative lookbehind works`` () =
     let text = "A1 B2 A3 C4"
     let ms = r.Matches(text) |> Seq.map (fun m -> m.Value) |> Seq.toList
     ms |> equal [ "2"; "4" ]
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Match.Groups iteration works II`` () =
+    // See #2167
+    let m = Regex.Match("foo bar baz", @"(\w+) \w+ (\w+)")
+    let li = [for g in m.Groups -> g.Value]
+    let x = li |> List.skip 1 |> List.reduce (+)
+    equal "foobaz" x
+

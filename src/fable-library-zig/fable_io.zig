@@ -378,6 +378,38 @@ pub fn deleteFile(path: String) Raised!void {
     }
 }
 
+/// `File.Copy(source, dest, overwrite)`: the bytes of the file, into a new one (IOException when
+/// `dest` exists and `overwrite` is false, as on .NET)
+pub fn copyFile(source: String, dest: String, overwrite: bool) Raised!void {
+    try checkPath(source);
+    try checkPath(dest);
+    if (!overwrite and fileExists(dest)) {
+        const z = utf8z(dest);
+        defer freeZ(z);
+        return fail(.EXIST, z, false);
+    }
+    const bytes = try readAllBytes(source);
+    defer rt.drop(bytes);
+    try writeAllBytes(dest, bytes);
+}
+
+/// `File.Move(source, dest, overwrite)`
+pub fn moveFile(source: String, dest: String, overwrite: bool) Raised!void {
+    try checkPath(source);
+    try checkPath(dest);
+    const zs = utf8z(source);
+    defer freeZ(zs);
+    const zd = utf8z(dest);
+    defer freeZ(zd);
+    if (!fileExists(source)) return fail(.NOENT, zs, false);
+    if (!overwrite and fileExists(dest)) return fail(.EXIST, zd, false);
+    const rc = sys.rename(zs, zd);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |e| return fail(e, zs, false),
+    }
+}
+
 // ---- directories ----
 
 /// `Directory.Exists(path)`

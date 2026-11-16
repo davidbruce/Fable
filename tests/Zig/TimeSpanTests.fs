@@ -757,3 +757,149 @@ let ``test TimeSpan.Days works with negative TimeSpan`` () =
     let actual = TimeSpan.Parse("-1.23:45:06.78999").Days
     let expected = -1
     equal actual expected
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+open System.Globalization
+
+[<Fact>]
+let ``test TimeSpan.ToString("g", CultureInfo.InvariantCulture) works`` () =
+    TimeSpan(0L).ToString("g", CultureInfo.InvariantCulture) |> equal "0:00:00"
+    TimeSpan.FromSeconds(12345.).ToString("g", CultureInfo.InvariantCulture) |> equal "3:25:45"
+    TimeSpan.FromDays(18.).ToString("g", CultureInfo.InvariantCulture) |> equal "18:0:00:00"
+    TimeSpan.FromMilliseconds(25.).ToString("g", CultureInfo.InvariantCulture) |> equal "0:00:00.025"
+
+[<Fact>]
+let ``test TimeSpan.ToString("G", CultureInfo.InvariantCulture) works`` () =
+    TimeSpan(0L).ToString("G", CultureInfo.InvariantCulture) |> equal "0:00:00:00.0000000"
+    TimeSpan.FromSeconds(12345.).ToString("G", CultureInfo.InvariantCulture) |> equal "0:03:25:45.0000000"
+    TimeSpan.FromDays(18.).ToString("G", CultureInfo.InvariantCulture) |> equal "18:00:00:00.0000000"
+    TimeSpan.FromMilliseconds(25.).ToString("G", CultureInfo.InvariantCulture) |> equal "0:00:00:00.0250000"
+
+[<Fact>]
+let ``test TimeSpan.Ticks works with big values`` () =
+    TimeSpan(10675199, 2, 48, 5, 477).Ticks |> equal 9223372036854770000L
+    TimeSpan(-10675199, -2, -48, -5, -477).Ticks |> equal -9223372036854770000L
+    TimeSpan.FromSeconds(922337203685L).Ticks |> equal 9223372036850000000L
+    TimeSpan.FromMinutes(15372286728.).Ticks |> equal 9223372036800000000L
+    TimeSpan.FromDays(10675199.).Ticks |> equal 9223371936000000000L
+    TimeSpan.FromMilliseconds(922337203685477L).Ticks |> equal 9223372036854770000L
+
+[<Fact>]
+let ``test TimeSpan.Ticks keeps sub-millisecond values`` () =
+    TimeSpan.FromMilliseconds(1.0001).Ticks |> equal 10001L
+    TimeSpan.FromMilliseconds(1.0005).Ticks |> equal 10005L
+    TimeSpan.FromMilliseconds(-1.0001).Ticks |> equal -10001L
+    TimeSpan.FromSeconds(0.0010001).Ticks |> equal 10001L
+    (TimeSpan.FromMilliseconds(1.0) * 1.0001).Ticks |> equal 10001L
+    TimeSpan.FromMilliseconds(900719925474.1).Ticks |> equal 9007199254741000L
+    TimeSpan.FromMilliseconds(-900719925474.1).Ticks |> equal -9007199254741000L
+    TimeSpan.FromMilliseconds(1e12 + 0.3).Ticks |> equal 10000000000003000L
+
+[<Fact>]
+let ``test TimeSpan Comparison works`` () =
+    let test (ms1: float) (ms2: float) expected =
+        let t1 = TimeSpan.FromMilliseconds(ms1)
+        let t2 = TimeSpan.FromMilliseconds(ms2)
+        let res1 = compare t1 t2
+        let res2 = t1.CompareTo(t2)
+        let res3 = TimeSpan.Compare(t1, t2)
+        equal true (res1 = res2 && res2 = res3)
+        equal expected res1
+    test 1000. 2000. -1
+    test 2000. 1000. 1
+    test -2000. -2000. 0
+    test 200. -200. 1
+    test 0. 1000. -1
+    test 1000. 1000. 0
+    test 0. 0. 0
+
+[<Fact>]
+let ``test TimeSpan GreaterThan works`` () =
+    let test (ms1: float) (ms2: float) expected =
+        let t1 = TimeSpan.FromMilliseconds(ms1)
+        let t2 = TimeSpan.FromMilliseconds(ms2)
+        t1 > t2
+        |> equal expected
+    test 1000. 2000. false
+    test 2000. 1000. true
+    test -2000. -2000. false
+
+[<Fact>]
+let ``test TimeSpan LessThan works`` () =
+    let test (ms1: float) (ms2: float) expected =
+        let t1 = TimeSpan.FromMilliseconds(ms1)
+        let t2 = TimeSpan.FromMilliseconds(ms2)
+        t1 < t2
+        |> equal expected
+    test 1000. 2000. true
+    test 2000. 1000. false
+    test -2000. -2000. false
+
+[<Fact>]
+let ``test TimeSpan Equality works`` () =
+    let test (ms1: float) (ms2: float) expected =
+        let t1 = TimeSpan.FromMilliseconds(ms1)
+        let t2 = TimeSpan.FromMilliseconds(ms2)
+        t1 = t2
+        |> equal expected
+    test 1000. 2000. false
+    test 2000. 1000. false
+    test -2000. -2000. true
+
+[<Fact>]
+let ``test TimeSpan Inequality works`` () =
+    let test (ms1: float) (ms2: float) expected =
+        let t1 = TimeSpan.FromMilliseconds(ms1)
+        let t2 = TimeSpan.FromMilliseconds(ms2)
+        t1 <> t2
+        |> equal expected
+    test 1000. 2000. true
+    test 2000. 1000. true
+    test -2000. -2000. false
+
+[<Fact>]
+let ``test TimeSpan holds the full Int64 tick range exactly`` () =
+    TimeSpan.FromTicks(1234567890123456789L).Ticks |> equal 1234567890123456789L
+    TimeSpan.FromTicks(Int64.MaxValue).Ticks |> equal Int64.MaxValue
+
+[<Fact>]
+let ``test TimeSpan constructor keeps the microsecond argument`` () =
+    TimeSpan(0, 0, 0, 0, 0, 5).Ticks |> equal 50L
+    TimeSpan(1, 2, 3, 4, 5, 6).Ticks |> equal 937_840_050_060L
+
+[<Fact>]
+let ``test TimeSpan.Parse keeps all seven fractional digits`` () =
+    TimeSpan.Parse("00:00:00.1234567").Ticks |> equal 1234567L
+
+[<Fact>]
+let ``test TimeSpan.ToString keeps all seven fractional digits`` () =
+    TimeSpan.FromTicks(1234567L).ToString() |> equal "00:00:00.1234567"
+    TimeSpan.FromTicks(1L).ToString() |> equal "00:00:00.0000001"
+    TimeSpan.FromTicks(1234567L).ToString("g", CultureInfo.InvariantCulture) |> equal "0:00:00.1234567"
+    TimeSpan.FromTicks(1000000L).ToString("g", CultureInfo.InvariantCulture) |> equal "0:00:00.1"
+    TimeSpan.FromTicks(1234567L).ToString("G", CultureInfo.InvariantCulture) |> equal "0:00:00:00.1234567"
+    TimeSpan.Parse("-1.02:03:04.0050000").ToString() |> equal "-1.02:03:04.0050000"
+
+[<Fact>]
+let ``test TimeSpan.FromMilliseconds truncates below a tick`` () =
+    // 0.00005ms is half a tick; .NET drops it rather than rounding up
+    TimeSpan.FromMilliseconds(0.00005).Ticks |> equal 0L
+    TimeSpan.FromMilliseconds(0.0001).Ticks |> equal 1L
+
+[<Fact>]
+let ``test TimeSpan multiplication and division are tick-precise`` () =
+    let day = TimeSpan.FromDays(1.0)
+    (day * 1000.0).Ticks |> equal 864_000_000_000_000L
+    (day / 3.0).Ticks |> equal 288_000_000_000L
+    day / TimeSpan.FromHours(1.0) |> equal 24.0
+
+[<Fact>]
+let ``test TimeSpan arithmetic keeps single ticks`` () =
+    let a = TimeSpan.FromTicks(1234567L)
+    let b = TimeSpan.FromTicks(1L)
+    (a + b).Ticks |> equal 1234568L
+    (a - b).Ticks |> equal 1234566L
+    (-a).Ticks |> equal -1234567L
+    a.Duration().Ticks |> equal 1234567L
+

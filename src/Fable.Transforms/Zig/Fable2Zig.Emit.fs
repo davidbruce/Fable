@@ -786,7 +786,13 @@ and ex (em: Em) (e: Expr) : string =
     | EAddr(x, _) -> "&" + ex em x
     | EDeref(x, _) -> ex em x + ".*"
     | EIf(c, t, f, _) when isFlat c && isFlat t && isFlat f -> simpleIf em c t f
-    | _ -> fail None "internal: this expression is not part of the Zig target yet"
+    | other ->
+        let text = (sprintf "%A" other).Replace("\n", " ").Replace("  ", " ")
+
+        fail
+            None
+            "internal: this expression is not part of the Zig target yet (%s)"
+            (text.Substring(0, min 400 text.Length))
 
 /// How the function is left when an exception is in flight.
 and leaveText (em: Em) : string =
@@ -1065,10 +1071,14 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
                 else
                     "const"
 
-            if isFlat rhs || isSimpleIf rhs then
-                L $"%s{kw} %s{name}: %s{zigType v.Ty} = %s{ex em rhs};"
-            else
-                block rhs (fun lbl -> $"%s{kw} %s{name}: %s{zigType v.Ty} = %s{lbl}: {{")
+            // (a unit made by a statement, a loop: the statement, then the unit)
+            match rhs with
+            | EFor _
+            | EWhile _ when isVoid v.Ty ->
+                stmt em ind rhs DDiscard
+                L $"%s{kw} %s{name}: void = {{}};"
+            | _ when isFlat rhs || isSimpleIf rhs -> L $"%s{kw} %s{name}: %s{zigType v.Ty} = %s{ex em rhs};"
+            | _ -> block rhs (fun lbl -> $"%s{kw} %s{name}: %s{zigType v.Ty} = %s{lbl}: {{")
 
         stmt em ind body dest
     // (after what always raises, nothing runs: Zig refuses code after its jump)

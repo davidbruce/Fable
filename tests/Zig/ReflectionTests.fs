@@ -731,3 +731,307 @@ let ``test Activator.CreateInstance with an array of arguments`` () =
     let p = System.Activator.CreateInstance(typeof<ReflPoint>, [| box 3; box 4 |]) :?> ReflPoint
     p.ToString() |> equal "(3, 4)"
     p.X + p.Y |> equal 7
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<AbstractClass>]
+type PairBase<'Other>() =
+    member _.Dummy() = 2
+
+type R =
+  | A of int
+  | B of string
+
+[<AbstractClass>]
+type SelfBase<'Inheritor when 'Inheritor :> SelfBase<'Inheritor>>() =
+    member _.Dummy() = 1
+
+
+type PairPing() =
+    inherit PairBase<PairPong>()
+
+and PairPong() =
+    inherit PairBase<PairPing>()
+
+type SelfInheritor() =
+    inherit SelfBase<SelfInheritor>()
+
+type Service<'a> = {
+    GetRecord: int -> int64 -> Async<'a>
+}
+with
+    static member inline RouteBuilder _ m =
+        let name = typeof<'a>.Name
+        sprintf "/api/%s/%s" name m
+
+type SingleCaseUnion =
+  SingleCaseUnion of string * anotherString: string
+
+type TestRecord = {
+    String: string
+    Int: int
+}
+
+type TestUnion =
+    | StringCase of SomeString: string * string
+    | IntCase of SomeInt: int
+
+let inline create2<'T> (args: obj[]) =
+    System.Activator.CreateInstance(typeof<'T>, args) :?> 'T
+
+
+[<Fact>]
+let ``test Type Name of generic argument in inlined function`` () =
+    Service<R>.RouteBuilder "" "Add" |> equal "/api/R/Add"
+
+[<Fact>]
+let ``test FullName of complex array types is printed correctly `` () =
+    let fullName1 = typeof<(string * int)[]>.FullName
+    let fullName2 = typeof<(string * float)[]>.FullName
+    let fullName3 = typeof<string[]>.FullName
+    let fullName4 = typeof<string[][]>.FullName
+
+    let t1 = typeof<(string * int)[]>
+    let t2 = typeof<(string * float)[]>
+    let t3 = typeof<string[]>
+    let t4 = typeof<string[][]>
+
+    equal fullName1 t1.FullName
+    equal fullName2 t2.FullName
+    equal fullName3 t3.FullName
+    equal fullName4 t4.FullName
+
+    t1.FullName = t2.FullName |> equal false
+    t1.FullName = t3.FullName |> equal false
+    t2.FullName = t3.FullName |> equal false
+    t3.FullName = t4.FullName |> equal false
+
+[<Fact>]
+let ``test Name of complex array types is printed correctly `` () =
+    let name1 = typeof<(string * int)[]>.Name
+    let name2 = typeof<(string * float)[]>.Name
+    let name3 = typeof<string[]>.Name
+    let name4 = typeof<string[][]>.Name
+
+    let t1 = typeof<(string * int)[]>
+    let t2 = typeof<(string * float)[]>
+    let t3 = typeof<string[]>
+    let t4 = typeof<string[][]>
+
+    equal name1 t1.Name
+    equal name2 t2.Name
+    equal name3 t3.Name
+    equal name4 t4.Name
+
+    t1.Name = t2.Name |> equal true
+    t1.Name = t3.Name |> equal false
+    t2.Name = t3.Name |> equal false
+    t3.Name = t4.Name |> equal false
+
+[<Fact>]
+let ``test Namespace of complex array types is printed correctly `` () =
+    let namespace1 = typeof<(string * int)[]>.Namespace
+    let namespace2 = typeof<(string * float)[]>.Namespace
+    let namespace3 = typeof<string[]>.Namespace
+
+    let t1 = typeof<(string * int)[]>
+    let t2 = typeof<(string * float)[]>
+    let t3 = typeof<string[]>
+
+    equal namespace1 t1.Namespace
+    equal namespace2 t2.Namespace
+    equal namespace3 t3.Namespace
+
+    t1.Namespace = t2.Namespace |> equal true
+    t1.Namespace = t3.Namespace |> equal true
+    t2.Namespace = t3.Namespace |> equal true
+
+[<Fact>]
+let ``test Create primitive types with System.Activator`` () =
+    create2<obj> [||] |> notEqual Unchecked.defaultof<obj> // It should not be null
+    // Value types should zero-init
+    create2<char> [||] |> equal Unchecked.defaultof<char>
+    create2<bool> [||] |> equal Unchecked.defaultof<bool>
+    create2<int8> [||] |> equal Unchecked.defaultof<int8>
+    create2<uint8> [||] |> equal Unchecked.defaultof<uint8>
+    create2<int16> [||] |> equal Unchecked.defaultof<int16>
+    create2<uint16> [||] |> equal Unchecked.defaultof<uint16>
+    create2<int32> [||] |> equal Unchecked.defaultof<int32>
+    create2<uint32> [||] |> equal Unchecked.defaultof<uint32>
+    create2<int64> [||] |> equal Unchecked.defaultof<int64>
+    create2<uint64> [||] |> equal Unchecked.defaultof<uint64>
+    create2<single> [||] |> equal Unchecked.defaultof<single>
+    create2<double> [||] |> equal Unchecked.defaultof<double>
+    create2<decimal> [||] |> equal Unchecked.defaultof<decimal>
+    // TODO: Fix Unchecked.defaultof<MyEnum> to be 0
+    create2<MyEnum> [||] |> equal (LanguagePrimitives.EnumOfValue 0y)
+
+[<Fact>]
+let ``test Reflection: Array`` () =
+    let arType = typeof<int[]>
+    let liType = typeof<int list>
+    equal true arType.IsArray
+    equal false liType.IsArray
+    let elType = arType.GetElementType()
+    typeof<int> = elType |> equal true
+    typeof<bool> = elType |> equal false
+    liType.GetElementType() |> equal null
+
+[<Fact>]
+let ``test FSharp.Reflection: Record`` () =
+    let typ = typeof<TestRecord>
+    let record = { String = "a"; Int = 1 }
+    let recordTypeFields = FSharpType.GetRecordFields typ
+    let recordValueFields = FSharpValue.GetRecordFields record
+
+    let expectedRecordFields =
+        [|
+            "String", box "a"
+            "Int", box 1
+        |]
+
+    let recordFields =
+        recordTypeFields
+        |> Array.map (fun field -> field.Name)
+        |> flip Array.zip recordValueFields
+
+    let isRecord = FSharpType.IsRecord typ
+    let matchRecordFields = recordFields = expectedRecordFields
+    let matchIndividualRecordFields =
+        Array.zip recordTypeFields recordValueFields
+        |> Array.forall (fun (info, value) ->
+            FSharpValue.GetRecordField(record, info) = value
+        )
+    let canMakeSameRecord =
+        unbox<TestRecord> (FSharpValue.MakeRecord(typ, recordValueFields)) = record
+
+    let all = isRecord && matchRecordFields && matchIndividualRecordFields && canMakeSameRecord
+    all |> equal true
+
+[<Fact>]
+let ``test FSharpValue.GetRecordFields with anonymous record returns all fields including None`` () =
+    let fields = FSharpValue.GetRecordFields {| a = 3; b = (None: int option); c = Some 89 |}
+    fields.Length |> equal 3
+    fields.[0] |> equal (box 3)
+    fields.[1] |> equal (box None)
+    fields.[2] |> equal (box (Some 89))
+
+[<Fact>]
+let ``test Reflection functions accept allowAccessToPrivateRepresentation`` () =
+    let recordType = typeof<TestRecord>
+    let record = { String = "a"; Int = 1 }
+
+    FSharpType.GetRecordFields(recordType, allowAccessToPrivateRepresentation = true).Length |> equal 2
+
+    let values = FSharpValue.GetRecordFields(record, allowAccessToPrivateRepresentation = true)
+    let rebuilt =
+        FSharpValue.MakeRecord(recordType, values, allowAccessToPrivateRepresentation = true) :?> TestRecord
+    rebuilt |> equal record
+
+    let unionType = typeof<TestUnion>
+    let intCase = FSharpType.GetUnionCases(unionType).[1]
+    let u = FSharpValue.MakeUnion(intCase, [| box 5 |], allowAccessToPrivateRepresentation = true) :?> TestUnion
+    let info, fields = FSharpValue.GetUnionFields(u, unionType, allowAccessToPrivateRepresentation = true)
+    info.Name |> equal "IntCase"
+    fields.[0] |> equal (box 5)
+
+[<Fact>]
+let ``test FSharp.Reflection: Union`` () =
+    let typ = typeof<TestUnion>
+    let unionCase1 = StringCase("a", "b")
+    let unionCase2 = IntCase 1
+    let unionTypeFields = FSharpType.GetUnionCases typ
+    unionTypeFields |> Array.map (fun x -> x.Name) |> equal [| "StringCase"; "IntCase" |]
+    let unionCase1Info, unionCase1ValueFields = FSharpValue.GetUnionFields(unionCase1, typ)
+    let unionCase2Info, unionCase2ValueFields = FSharpValue.GetUnionFields(unionCase2, typ)
+    let unionCaseInfos = [| unionCase1Info; unionCase2Info |]
+    let unionCaseValueFields = [| unionCase1ValueFields; unionCase2ValueFields |]
+
+    let expectedUnionCase1Fields = 0, "StringCase", [| typeof<string>; typeof<string> |], [| "SomeString"; "Item2" |], [| box "a"; box "b" |]
+    let expectedUnionCase2Fields = 1, "IntCase", [| typeof<int> |], [| "SomeInt" |], [| box 1 |]
+    let expectedUnionFields = [| expectedUnionCase1Fields; expectedUnionCase2Fields |]
+
+    let unionFields =
+        Array.zip unionCaseInfos unionCaseValueFields
+        |> Array.map (fun (info, values) ->
+            let types =
+                info.GetFields()
+                |> Array.map (fun field -> field.PropertyType)
+            let names =
+                info.GetFields()
+                |> Array.map (fun field -> field.Name)
+            info.Tag, info.Name, types, names, values)
+
+    let canMakeSameUnionCases =
+        unbox<TestUnion> (FSharpValue.MakeUnion(unionCase1Info, unionCase1ValueFields)) = unionCase1
+        && unbox<TestUnion> (FSharpValue.MakeUnion(unionCase2Info, unionCase2ValueFields)) = unionCase2
+
+    FSharpType.IsUnion typ |> equal true
+    unionFields |> equal expectedUnionFields
+    canMakeSameUnionCases |> equal true
+
+[<Fact>]
+let ``test FSharp.Reflection: Single-Case Union`` () =
+    let typ = typeof<SingleCaseUnion>
+    let unionCase1 = SingleCaseUnion("a", "b")
+    let unionTypeFields = FSharpType.GetUnionCases typ
+    unionTypeFields |> Array.map (fun x -> x.Name) |> equal [| "SingleCaseUnion" |]
+    let unionCase1Info, unionCase1ValueFields = FSharpValue.GetUnionFields(unionCase1, typ)
+    let unionCaseInfos = [| unionCase1Info |]
+    let unionCaseValueFields = [| unionCase1ValueFields |]
+
+    let expectedUnionCase1Fields = 0, "SingleCaseUnion", [| typeof<string>; typeof<string> |], [| "Item1"; "anotherString" |], [| box "a"; box "b" |]
+    let expectedUnionFields = [| expectedUnionCase1Fields |]
+
+    let unionFields =
+        Array.zip unionCaseInfos unionCaseValueFields
+        |> Array.map (fun (info, values) ->
+            let types =
+                info.GetFields()
+                |> Array.map (fun field -> field.PropertyType)
+            let names =
+                info.GetFields()
+                |> Array.map (fun field -> field.Name)
+            info.Tag, info.Name, types, names, values)
+
+    let builtUnion = FSharpValue.MakeUnion(unionCase1Info, unionCase1ValueFields) :?> SingleCaseUnion
+
+    FSharpType.IsUnion typ |> equal true
+    unionFields |> equal expectedUnionFields
+    builtUnion = unionCase1 |> equal true
+    builtUnion = SingleCaseUnion("c", "d") |> equal false
+
+[<Fact>]
+let ``test FSharp.Reflection: List is a union type`` () =
+    let typ = typeof<int list>
+    FSharpType.IsUnion(typ) |> equal true
+    let ucis = FSharpType.GetUnionCases(typ)
+    ucis.Length |> equal 2
+    ucis.[0].Name |> equal "Empty"
+    ucis.[1].Name |> equal "Cons"
+
+[<Fact>]
+let ``test FSharp.Reflection: ignored args should not cause typescript error`` () =
+    let typ = typeof<SingleCaseUnion>
+    // In the typescript library, these functions only take 1 parameter
+    ignore <| FSharpType.GetUnionCases(typ, allowAccessToPrivateRepresentation = true)
+    ignore <| FSharpType.IsUnion(typ, allowAccessToPrivateRepresentation = true)
+    ignore <| FSharpType.IsRecord(typ, allowAccessToPrivateRepresentation = true)
+    ignore <| FSharpType.GetUnionCases(typ, System.Reflection.BindingFlags.Default)
+    ignore <| FSharpType.IsUnion(typ, System.Reflection.BindingFlags.Default)
+    ignore <| FSharpType.IsRecord(typ, System.Reflection.BindingFlags.Default)
+    ()
+
+[<Fact>]
+let ``test GetType works when a generic base takes the class itself`` () =
+    // See #3607
+    let t = SelfInheritor().GetType()
+    t.Name |> equal "SelfInheritor"
+    t = typeof<SelfInheritor> |> equal true
+    t.IsSubclassOf(typeof<SelfBase<SelfInheritor>>) |> equal true
+    SelfInheritor().Dummy() |> equal 1
+    let ping = PairPing().GetType()
+    ping.Name |> equal "PairPing"
+    ping.IsSubclassOf(typeof<PairBase<PairPong>>) |> equal true
+    PairPong().GetType().IsSubclassOf(typeof<PairBase<PairPing>>) |> equal true
+

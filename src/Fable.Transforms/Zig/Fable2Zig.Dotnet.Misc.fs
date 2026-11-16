@@ -22,7 +22,15 @@ let private outArgOf (ctx: Ctx) (rest: Fable.Expr list) : Fable.Ident option =
 
 /// `X.TryParse(s, ..., &v)` of a library type: its `tryParse` gives the pair, the value goes to
 /// `v` and the flag is the result
-let private tryParseInto (ctx: Ctx) r (info: Fable.CallInfo) (lib: string) (s: Fable.Expr) (out: Fable.Ident) =
+let private tryParseIntoWith
+    (fn: string)
+    (ctx: Ctx)
+    r
+    (info: Fable.CallInfo)
+    (lib: string)
+    (s: Fable.Expr)
+    (out: Fable.Ident)
+    =
     let outVar = ctx.Vars[out.Name]
 
     let pairIr =
@@ -30,7 +38,7 @@ let private tryParseInto (ctx: Ctx) r (info: Fable.CallInfo) (lib: string) (s: F
             ctx
             r
             lib
-            "tryParse"
+            fn
             { info with
                 ThisArg = None
                 GenericArgs = []
@@ -42,6 +50,8 @@ let private tryParseInto (ctx: Ctx) r (info: Fable.CallInfo) (lib: string) (s: F
     let pair = ctx.State.NewVar("parsed", typeOf pairIr, VLocal, false)
 
     ELet(pair, pairIr, ESeq(EAssign(outVar, EGet(EVar pair, PItem 1, outVar.Ty)), EGet(EVar pair, PItem 0, tBool)))
+
+let private tryParseInto = tryParseIntoWith "tryParse"
 
 /// The lowered call, or null when the member is not one of this file's.
 let call
@@ -1147,6 +1157,12 @@ let call
             call "appendAllLines" [ p; lines ]
         | "System.IO.File", "Exists", [ p ] -> pure'' "fileExists" [ p ] tBool
         | "System.IO.File", "Delete", [ p ] -> io "deleteFile" [ p ] tVoid
+        | "System.IO.File", "Copy", [ a; b ] ->
+            io "copyFile" [ a; b; Fable.Value(Fable.BoolConstant false, None) ] tVoid
+        | "System.IO.File", "Copy", [ a; b; o ] -> io "copyFile" [ a; b; o ] tVoid
+        | "System.IO.File", "Move", [ a; b ] ->
+            io "moveFile" [ a; b; Fable.Value(Fable.BoolConstant false, None) ] tVoid
+        | "System.IO.File", "Move", [ a; b; o ] -> io "moveFile" [ a; b; o ] tVoid
         // Directory
         | "System.IO.Directory", "Exists", [ p ] -> pure'' "dirExists" [ p ] tBool
         | "System.IO.Directory", "CreateDirectory", [ p ] -> call "createDirectory" [ p ]
@@ -1314,6 +1330,25 @@ let call
                 "the Zig target does not support %s.%s with these arguments yet"
                 (entity.Substring(entity.LastIndexOf '.' + 1))
                 name
+    // (`Activator.CreateInstance(t)` of a number, a char, a bool, without arguments: its default,
+    // boxed; of `obj`: a new object)
+    | "System.Activator", "CreateInstance", t0 :: rest when
+        (match rest with
+         | []
+         | [ Fable.Value(Fable.NewArray(Fable.ArrayValues [], _, _), _) ] -> true
+         | _ -> false)
+        && (
+            match Fable.Transforms.Zig.Lower.staticTypeOf ctx t0 with
+            | Some(Fable.Number _ | Fable.Char | Fable.Boolean | Fable.Any) -> true
+            | _ -> false
+        )
+        ->
+        ctx.State.UsesRuntime <- true
+
+        match Fable.Transforms.Zig.Lower.staticTypeOf ctx t0 with
+        | Some Fable.Any -> pure' "fable_rt.objectNew()" [] tAny
+        | Some ty -> EEmit($"fable_rt.box(fable_rt.defaultOf(%s{zigType (mapType ctx r ty)}))", [], tAny)
+        | None -> failwith "unreachable"
     // `Activator.CreateInstance(t, args)` of a type known here (`MakeGenericType` of known types,
     // see `staticTypeOf`): the constructor of that type with as many parameters, called with the
     // arguments unboxed to their types, the object boxed
@@ -1377,6 +1412,12 @@ let call
 
             lw ctx (Fable.TypeCast(call, t))
         | None -> fail r "the Zig target found no constructor of %s with %d parameters" entRef.FullName args.Length
+    // (`unbox<'T> o` as an inline function leaves it: `:?>`)
+    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "UnboxGeneric", [ x ] ->
+        if unwrapNullness x.Type = Fable.Any then
+            unboxed ctx r x t
+        else
+            lw ctx (Fable.TypeCast(x, t))
     // `new 'T()` of a type parameter that is not known here: an inline function's own body,
     // which Zig looks at only if something calls it (its callers have it inlined)
     | ("Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions" | "System.Activator"), "CreateInstance", _ when
@@ -1563,11 +1604,54 @@ let call
         | getter, [ x ] when getter.StartsWith("get_", System.StringComparison.Ordinal) ->
             call (lowerFirst (getter.Substring 4)) [ x ]
         | ("AddDays" | "AddMonths" | "AddYears"), [ d; v ] when isDate -> call (lowerFirst name) [ d; v ]
+        // (the days wrapped, as F# gives the out argument: the second item)
+        | ("Add" | "AddHours" | "AddMinutes"), (x :: v :: _) when
+            not isDate
+            && (
+                match t with
+                | Fable.Tuple _ -> true
+                | _ -> false
+            )
+            ->
+            call (timeName (lowerFirst name) + "Wrapped") [ x; v ]
         | ("Add" | "AddHours" | "AddMinutes"), [ x; v ] when not isDate -> call (timeName (lowerFirst name)) [ x; v ]
-        | ("Add" | "AddHours" | "AddMinutes"), [ x; v; _ ] when not isDate ->
-            // (the days wrapped, an out argument: not given)
-            call (timeName (lowerFirst name)) [ x; v ]
+        | ("Add" | "AddHours" | "AddMinutes"), [ x; v; out ] when not isDate && (outArgOf ctx [ out ]).IsSome ->
+            // (the days wrapped, an out argument: the second item of what the library gives)
+            let outVar = ctx.Vars[(outArgOf ctx [ out ]).Value.Name]
+
+            let pairIr =
+                libraryCall
+                    ctx
+                    r
+                    "DateOnly"
+                    (timeName (lowerFirst name) + "Wrapped")
+                    { info with
+                        ThisArg = None
+                        GenericArgs = []
+                        SignatureArgTypes = []
+                    }
+                    [ x; v ]
+                    (Fable.Tuple([ t; Fable.Number(Int32, Fable.NumberInfo.Empty) ], false))
+
+            let pair = ctx.State.NewVar("added", typeOf pairIr, VLocal, false)
+
+            ELet(
+                pair,
+                pairIr,
+                ESeq(EAssign(outVar, EGet(EVar pair, PItem 1, outVar.Ty)), EGet(EVar pair, PItem 0, mapType ctx r t))
+            )
+        | ("Add" | "AddHours" | "AddMinutes"), [ x; v; _ ] when not isDate -> call (timeName (lowerFirst name)) [ x; v ]
         | "op_Subtraction", [ a; b ] when not isDate -> call "timeSubtract" [ a; b ]
+        | "Parse", s :: _ -> call (fn "parse") [ s ]
+        | "TryParse", s :: rest when
+            (match t with
+             | Fable.Tuple _ -> true
+             | _ -> false)
+            && rest.Length <= 2
+            ->
+            call (fn "tryParse") [ s ]
+        | "TryParse", s :: rest when (outArgOf ctx rest).IsSome ->
+            tryParseIntoWith (fn "tryParse") ctx r info "DateOnly" s (outArgOf ctx rest).Value
         | "IsBetween", [ x; a; b ] -> call "isBetween" [ x; a; b ]
         | "ToTimeSpan", [ x ] -> call "toTimeSpan" [ x ]
         | "ToDateTime", [ d; tm ] -> call "toDateTime" [ d; tm; int32Const 0 ]

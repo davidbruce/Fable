@@ -2170,3 +2170,439 @@ let ``test Generic values holding generic functions are used at several types`` 
     let twiceOpt = Some twice
     twiceOpt |> Option.map (fun g -> g 1) |> equal (Some [ 1; 1 ])
     twiceOpt |> Option.map (fun g -> g "a") |> equal (Some [ "a"; "a" ])
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+type IGenericMethodHelpers<'JsonValue> =
+    abstract encodeString: string -> 'JsonValue
+
+
+type IGenericMethodBox<'T> =
+    abstract Get: unit -> 'T
+
+type ClassWithDefaultValueFunctionField =
+    val F: int -> int -> int
+    [<DefaultValue>] val mutable G: int -> int -> int
+    new (f) = { F = f }
+
+type LazyTree<'a> = LazyNode of 'a * LazyTree<'a> list
+
+[<AllowNullLiteral>]
+type MyUser =
+    class end
+
+type TypeWithByRefMember() =
+    static member DoubleIntByRef (x: byref<int>) : unit = x <- 2 * x
+
+let byrefFunc(n: byref<int>) =
+    n <- n + n
+
+let describeLazy (x: Lazy<'a>) : string = string (x.Force())
+
+let inline inlinedFunc(n: 't[]) =
+    n.Length
+
+let mapGenericMethodBox<'item> (value: 'item) : IGenericMethodBox<'item seq> =
+    { new IGenericMethodBox<'item seq> with
+        member _.Get() : 'item seq = Seq.map (fun (x: 'item) -> value) [ value ]
+    }
+
+
+type ClassWithDefaultValueStaticFields() =
+
+    [<DefaultValue>]
+    static val mutable private int: int
+    [<DefaultValue>]
+    static val mutable private bool: bool
+    [<DefaultValue>]
+    static val mutable private string: string
+    [<DefaultValue>]
+    static val mutable private guid: Guid
+    [<DefaultValue>]
+    static val mutable private char: char
+
+    [<DefaultValue>]
+    static val mutable private dateTime: DateTime
+
+    [<DefaultValue>]
+    static val mutable private timeOnly : TimeOnly
+    [<DefaultValue>]
+    static val mutable private dateOnly : DateOnly
+    [<DefaultValue>]
+    static val mutable private dateTimeOffset : DateTimeOffset
+    [<DefaultValue>]
+    static val mutable private int8 : int8
+    [<DefaultValue>]
+    static val mutable private uInt8 : uint8
+    [<DefaultValue>]
+    static val mutable private int16 : Int16
+    [<DefaultValue>]
+    static val mutable private uInt16 : UInt16
+    [<DefaultValue>]
+    static val mutable private int32 : Int32
+    [<DefaultValue>]
+    static val mutable private uInt32 : UInt32
+    [<DefaultValue>]
+    static val mutable private int64 : Int64
+    [<DefaultValue>]
+    static val mutable private uInt64 : UInt64
+    [<DefaultValue>]
+    static val mutable private bigInt : bigint
+    [<DefaultValue>]
+    static val mutable private nativeInt : nativeint
+    [<DefaultValue>]
+    static val mutable private uNativeInt : unativeint
+    [<DefaultValue>]
+    static val mutable private float32 : float32
+    [<DefaultValue>]
+    static val mutable private float64 : float
+    [<DefaultValue>]
+    static val mutable private decimal : Decimal
+
+    [<DefaultValue>]
+    static val mutable private timeSpan: TimeSpan
+    [<DefaultValue>]
+    static val mutable private allowNullLiteralClass: MyUser
+    [<DefaultValue>]
+    static val mutable private nullableInt: Nullable<int>
+    [<DefaultValue>]
+    static val mutable private tuple2: TimeSpan * DateTime
+    [<DefaultValue>]
+    static val mutable private structTuple2: struct (TimeSpan * DateTime)
+
+    static member IncrCount() =
+        ClassWithDefaultValueStaticFields.int <- ClassWithDefaultValueStaticFields.int + 1
+        ClassWithDefaultValueStaticFields.int
+
+    static member Int = ClassWithDefaultValueStaticFields.int
+    static member Bool = ClassWithDefaultValueStaticFields.bool
+    static member String = ClassWithDefaultValueStaticFields.string
+    static member Guid = ClassWithDefaultValueStaticFields.guid
+    static member Char = ClassWithDefaultValueStaticFields.char
+    static member TimeSpan = ClassWithDefaultValueStaticFields.timeSpan
+    static member AllowNullLiteralClass = ClassWithDefaultValueStaticFields.allowNullLiteralClass
+    static member NullableInt = ClassWithDefaultValueStaticFields.nullableInt
+    static member Tuple2 = ClassWithDefaultValueStaticFields.tuple2
+    static member DateTime = ClassWithDefaultValueStaticFields.dateTime
+    static member TimeOnly = ClassWithDefaultValueStaticFields.timeOnly
+    static member DateOnly = ClassWithDefaultValueStaticFields.dateOnly
+    static member DateTimeOffset = ClassWithDefaultValueStaticFields.dateTimeOffset
+    static member Int8 = ClassWithDefaultValueStaticFields.int8
+    static member UInt8 = ClassWithDefaultValueStaticFields.uInt8
+    static member Int16 = ClassWithDefaultValueStaticFields.int16
+    static member UInt16 = ClassWithDefaultValueStaticFields.uInt16
+    static member Int32 = ClassWithDefaultValueStaticFields.int32
+    static member UInt32 = ClassWithDefaultValueStaticFields.uInt32
+    static member Int64 = ClassWithDefaultValueStaticFields.int64
+    static member UInt64 = ClassWithDefaultValueStaticFields.uInt64
+    static member BigInt = ClassWithDefaultValueStaticFields.bigInt
+    static member NativeInt = ClassWithDefaultValueStaticFields.nativeInt
+    static member UNativeInt = ClassWithDefaultValueStaticFields.uNativeInt
+    static member Float32 = ClassWithDefaultValueStaticFields.float32
+    static member Float64 = ClassWithDefaultValueStaticFields.float64
+    static member Decimal = ClassWithDefaultValueStaticFields.decimal
+    static member StructTuple2 = ClassWithDefaultValueStaticFields.structTuple2
+
+[<Fable.Core.AttachMembers>]
+type GenericClassWithLetBinding<'TKey, 'TItem when 'TKey: comparison>(maker: 'TKey -> 'TItem) =
+    let mutable cache = Map.empty
+    let makeForKey key =
+        let v = maker key
+        cache <- cache.Add(key, v)
+        v
+    member _.Get(key: 'TKey) : 'TItem =
+        cache.TryFind key |> Option.defaultWith (fun () -> makeForKey key)
+
+type GenericClassWithStaticMember<'T>() =
+    static member Length(xs: 'T list) = xs.Length
+
+[<Struct>]
+type SimpleRecord =
+    { A: string; B: string }
+    member this.WithA(a: string) =
+        let this = this
+        { this with A = a }
+
+let inline callWithByrefCreatedFromByrefInlined(n: byref<int>) =
+    let f = &n
+    byrefFunc &f
+
+let inline doubleIntByRef (x: ^a) (input: int) : int =
+    let mutable value = input
+    (^a: (static member DoubleIntByRef: byref<int> -> unit) &value)
+    value
+
+let genericByrefFunc(n: byref<'t[]>) =
+    inlinedFunc n
+
+[<Fact>]
+let ``test Type testing with JS primitive types works`` () =
+    let test (o: obj) =
+        match o with
+        | :? string -> "string"
+        | :? float -> "number"
+        | :? bool -> "boolean"
+        | :? unit -> "unit"
+        | :? System.Text.RegularExpressions.Regex -> "RegExp"
+        | :? (int[]) | :? (string[]) -> "Array"
+        | _ -> "unknown"
+    "A" :> obj |> test |> equal "string"
+    3. :> obj |> test |> equal "number"
+    false :> obj |> test |> equal "boolean"
+    () :> obj |> test |> equal "unit"
+    // Workaround to make sure Fable is passing the argument
+    let a = () :> obj in test a |> equal "unit"
+    System.Text.RegularExpressions.Regex(".") :> obj |> test |> equal "RegExp"
+    [|"A"|] :> obj |> test |> equal "Array"
+    [|1;2|] :> obj |> test |> equal "Array"
+
+[<Fact>]
+let ``test Guid.CreateVersion7 works`` () =
+    let g1 = Guid.CreateVersion7()
+    let g2 = Guid.CreateVersion7()
+    g1 = g2 |> equal false
+    let s1 = string g1
+    equal 36 s1.Length
+    // Check version nibble is '7'
+    equal '7' s1[14]
+    // Check variant nibble is 8, 9, a, or b
+    let variantChar = s1[19]
+    (variantChar = '8' || variantChar = '9' || variantChar = 'a' || variantChar = 'b') |> equal true
+
+[<Fact>]
+let ``test Guid.CreateVersion7 with DateTimeOffset works`` () =
+    let dto = DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero)
+    let g1 = Guid.CreateVersion7(dto)
+    let g2 = Guid.CreateVersion7(dto)
+    g1 = g2 |> equal false
+    let s1 = string g1
+    equal 36 s1.Length
+    equal '7' s1[14]
+    let variantChar = s1[19]
+    (variantChar = '8' || variantChar = '9' || variantChar = 'a' || variantChar = 'b') |> equal true
+
+[<Fact>]
+let ``test Guid.CreateVersion7 is monotonic`` () =
+    [1 .. 100]
+    |> List.map (fun ms -> DateTimeOffset(2024, 1, 1, 0, 0, 0, ms, TimeSpan.Zero))
+    |> List.map (fun dto -> Guid.CreateVersion7(dto))
+    |> List.pairwise
+    |> List.iter (fun (g1, g2) -> g1 < g2 |> equal true)
+
+[<Fact>]
+let ``test copying struct records works`` () =
+    // See #3371
+    let simple : SimpleRecord = { A = ""; B = "B" }
+    let simpleRecord = { simple with A = "A" }
+    simpleRecord.A |> equal "A"
+    simpleRecord.B |> equal "B"
+    simple.A |> equal ""
+    simple.B |> equal "B"
+
+[<Fact>]
+let ``test copy-update expression on this in struct member works`` () =
+    // See #3828
+    let r : SimpleRecord = { A = "hello"; B = "world" }
+    let r2 = r.WithA("foo")
+    r2.A |> equal "foo"
+    r2.B |> equal "world"
+
+[<Fact>]
+let ``test Exception ToString contains the message`` () =
+    // See #4197
+    let msg =
+        try
+            failwith "test message"
+            ""
+        with ex -> ex.ToString()
+
+    msg.Contains("test message") |> equal true
+
+[<Fact>]
+let ``test ArgumentException with message and inner exception works`` () =
+    let inner = exn "the inner cause"
+    let ex = System.ArgumentException("outer message", inner)
+    ex.Message |> equal "outer message"
+    ex.InnerException.Message |> equal "the inner cause"
+
+[<Fact>]
+let ``test Generic static member on generic attached class re-declares type param`` () =
+    GenericClassWithStaticMember<int>.Length([1; 2; 3]) |> equal 3
+
+[<Fact>]
+let ``test Generic attached class with let-binding helper does not shadow class type params`` () =
+    let src = GenericClassWithLetBinding<string, int>(fun k -> k.Length)
+    src.Get("hello") |> equal 5
+    src.Get("hi") |> equal 2
+
+[<Fact>]
+let ``test IsSubclassOf returns true for System.Object`` () =
+    typeof<SubclassTest2>.IsSubclassOf(typeof<obj>) |> equal true
+    typeof<string>.IsSubclassOf(typeof<obj>) |> equal true
+    typeof<int>.IsSubclassOf(typeof<obj>) |> equal true
+    typeof<unit -> unit>.IsSubclassOf(typeof<obj>) |> equal true
+
+[<Fact>]
+let ``test SRTP works with byref`` () =
+    let result = doubleIntByRef (TypeWithByRefMember()) 7
+    result |> equal 14
+
+[<Fact>]
+let ``test inline byref works`` () =
+    let mutable an_int = 22
+    callWithByrefCreatedFromByrefInlined &an_int
+    an_int |> equal 44
+
+[<Fact>]
+let ``test inline byref works (with separate binding for reference)`` () =
+    let mutable an_int = 33
+    let intRef = &an_int
+    ignore intRef
+    callWithByrefCreatedFromByrefInlined &intRef
+    an_int |> equal 66
+
+[<Fact>]
+let ``test inline with generic byref works`` () =
+    let mutable arr = [| 1; 2; 3 |]
+    let result = genericByrefFunc &arr
+    result |> equal 3
+
+[<Fact>]
+let ``test Static [<DefaultValue>] fields are zero-initialized`` () =
+    ClassWithDefaultValueStaticFields.Int |> equal 0
+    ClassWithDefaultValueStaticFields.Bool |> equal false
+    ClassWithDefaultValueStaticFields.String |> equal null
+    ClassWithDefaultValueStaticFields.Guid |> equal Guid.Empty
+    ClassWithDefaultValueStaticFields.Char |> equal '\000'
+    ClassWithDefaultValueStaticFields.TimeSpan |> equal TimeSpan.Zero
+    ClassWithDefaultValueStaticFields.TimeOnly |> equal TimeOnly.MinValue
+    ClassWithDefaultValueStaticFields.DateOnly |> equal DateOnly.MinValue
+    ClassWithDefaultValueStaticFields.DateTime |> equal DateTime.MinValue
+    ClassWithDefaultValueStaticFields.DateTimeOffset |> equal DateTimeOffset.MinValue
+    ClassWithDefaultValueStaticFields.Int8 |> equal 0y
+    ClassWithDefaultValueStaticFields.UInt8 |> equal 0uy
+    ClassWithDefaultValueStaticFields.Int16 |> equal 0s
+    ClassWithDefaultValueStaticFields.UInt16 |> equal 0us
+    ClassWithDefaultValueStaticFields.Int32 |> equal 0
+    ClassWithDefaultValueStaticFields.UInt32 |> equal 0u
+    ClassWithDefaultValueStaticFields.Int64 |> equal 0L
+    ClassWithDefaultValueStaticFields.UInt64 |> equal 0UL
+    ClassWithDefaultValueStaticFields.BigInt |> equal 0I
+    ClassWithDefaultValueStaticFields.NativeInt |> equal 0n
+    ClassWithDefaultValueStaticFields.UNativeInt |> equal 0un
+    ClassWithDefaultValueStaticFields.Float32 |> equal 0.f
+    ClassWithDefaultValueStaticFields.Float64 |> equal 0.
+    ClassWithDefaultValueStaticFields.Decimal |> equal 0M
+
+    ClassWithDefaultValueStaticFields.IncrCount() |> equal 1
+
+[<Fact>]
+let ``test Instance [<DefaultValue>] fields are skipped by explicit constructors`` () =
+    let c = ClassWithDefaultValueInstanceFields(1, "y")
+    c.X |> equal 1
+    c.D |> equal 0
+    c.S |> equal null
+    c.Y |> equal "y"
+    c.D <- 5
+    c.S <- "s"
+    c.D |> equal 5
+    c.S |> equal "s"
+
+    let mutable s = StructWithDefaultValueInstanceField(2, "z")
+    s.X |> equal 2
+    s.D |> equal 0
+    s.Y |> equal "z"
+    s.D <- 6
+    s.D |> equal 6
+
+[<Fact>]
+let ``test Nested lambda does not shadow an outer generic type parameter`` () =
+    let box = mapGenericMethodBox 42
+    box.Get() |> List.ofSeq |> equal [ 42 ]
+
+[<Fact>]
+let ``test Explicit constructor calls the base constructor`` () =
+    let child = ValClassChild(3, 1.5)
+    child.Id |> equal 30
+    child.Label |> equal "base"
+    child.Extra |> equal 1.5
+    child.Describe() |> equal "base:30"
+    (child :> ValClassBase).Id |> equal 30
+    (box child :? ValClassBase) |> equal true
+
+[<Fact>]
+let ``test Explicit constructors chain through several levels`` () =
+    let g = ValClassGrandChild(2, 0.5, true)
+    g.Id |> equal 40
+    g.Label |> equal "base"
+    g.Extra |> equal 0.5
+    g.Flag |> equal true
+    g.Describe() |> equal "base:40"
+
+[<Fact>]
+let ``test Explicit constructor runs the base constructor once`` () =
+    valClassBaseCalls <- 0
+    let c = ValClassCountingChild(5, 6)
+    valClassBaseCalls |> equal 1
+    c.N |> equal 5
+    c.M |> equal 6
+
+[<Fact>]
+let ``test Explicit constructor calls a parameterless base constructor`` () =
+    let c = ValClassDefaultChild(9)
+    c.Tag |> equal "default"
+    c.Value |> equal 9
+
+[<Fact>]
+let ``test Explicit constructor resolves the generic arguments of the base class`` () =
+    let intBox = ValClassIntBox(5, "x")
+    intBox.Value |> equal 5
+    intBox.Tag |> equal "x"
+    let pairBox = ValClassPairBox("a", "b")
+    pairBox.Value |> equal ("a", "b")
+    pairBox.Count |> equal 2
+
+[<Fact>]
+let ``test Explicit constructor returns the object after its then block`` () =
+    let before = valClassThenCalls
+    let c = ValClassThen()
+    c.Value |> equal 1
+    valClassThenCalls - before |> equal 1
+
+[<Fact>]
+let ``test Explicit constructor keeps sequences of its own constructor calls in field values`` () =
+    let c = ValClassSequenceInit(5, 6)
+    c.Next.Id |> equal 6
+    isNull c.Boxed |> equal true
+    let d = ValClassSequenceInit(5, 6, 7)
+    (d.Next.Id, d.Id, isNull d.Boxed) |> equal (6, 7, true)
+
+[<Fact>]
+let ``test Explicit constructor with a self identifier works`` () =
+    // See #5166
+    let a = ValClassSelf("abc")
+    a.Name |> equal "abc"
+    a.Count |> equal 3
+    let b = ValClassSelf()
+    b.Name |> equal "ab"
+    b.Count |> equal 20
+    let c = ValClassSelfOutOfOrder()
+    (c.Z, c.W) |> equal (3, 5)
+
+[<Fact>]
+let ``test Primary constructor with a self identifier works with a secondary constructor`` () =
+    let a = SelfPrimaryBase()
+    (a.X, a.Touched) |> equal (1, 1)
+    let b = SelfPrimaryChild()
+    (b.X, b.Touched) |> equal (2, 1)
+
+[<Fact>]
+let ``test Explicit constructor self identifier is the created object`` () =
+    valClassSelfSaved.Clear()
+    let a = ValClassSelfSaved(5)
+    obj.ReferenceEquals(valClassSelfSaved.[0], a) |> equal true
+    let b = ValClassSelfSaved()
+    valClassSelfSaved.Count |> equal 3
+    obj.ReferenceEquals(valClassSelfSaved.[1], b) |> equal true
+    obj.ReferenceEquals(valClassSelfSaved.[2], b) |> equal true
+

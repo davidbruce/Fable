@@ -575,3 +575,20 @@ let ``test mutable list pattern traversal handles unique, shared, and throwing l
                     failwith "mut-list-boom"
             | [] -> ()
     )
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Case testing with erased unions works`` () =
+    let strify = function
+        | Int i -> "i: " + string i
+        | Str s -> "s: " + s
+    Str "foo" |> strify |> equal "s: foo"
+    Int 42 |> strify |> equal "i: 42"
+
+[<Fact>]
+let ``test Union with wrapped type works`` () =
+    let a = AString "hello"
+    let b = match a with AString s -> s + " world"
+    b |> equal "hello world"
+

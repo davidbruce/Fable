@@ -8329,6 +8329,19 @@ fn exnText(t: *TextBuilder, e: Exn) void {
     }
 }
 
+/// `e.ToString()`: .NET's class name and message (its stack trace's frames are left out)
+pub fn exnToString(e: Exn) Raised!String {
+    const m = exnMessage(e);
+    defer drop(m);
+    var b: TextBuilder = .{};
+    b.addAscii(e.type.name);
+    if (unitsOf(m).len > 0) {
+        b.addAscii(": ");
+        b.add(unitsOf(m));
+    }
+    return b.finish();
+}
+
 pub fn exnMessage(e: Exn) String {
     if (e.type.message) |message| return message(e);
     if (comptime exn_show) return anyText(e);

@@ -1097,6 +1097,9 @@ let call
                 }
                 [ x ]
                 t
+        // (an exception: .NET's "Type: message", without the frames of its stack trace)
+        | Fable.DeclaredType _ when mapType ctx r x.Type = TPrim "fable_rt.Exn" ->
+            rt "fable_rt.exnToString($0)" [ x ] tStr
         // (an object: its class's ToString, or .NET's name of its class)
         | Fable.DeclaredType _ when (objOfType ctx r x.Type).IsSome -> rt "fable_rt.objText($0)" [ x ] tStr
         | Fable.Char ->

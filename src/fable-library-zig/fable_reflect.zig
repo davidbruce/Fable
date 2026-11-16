@@ -679,6 +679,8 @@ pub fn isNullType(t: Type) bool {
 
 /// `t.IsSubclassOf(c)`: `c` is one of the classes above `t`
 pub fn isSubclassOf(t: Type, c: Type) bool {
+    // (every type but `obj` itself and the interfaces derives from `obj`)
+    if (std.mem.eql(u8, c.full_name, "System.Object")) return t.kind != .interface and !std.mem.eql(u8, t.full_name, "System.Object");
     var p = t.parent;
     while (p) |x| : (p = x.parent) {
         if (equals(x, c)) return true;

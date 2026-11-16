@@ -1924,3 +1924,388 @@ let ``test GetType of exceptions`` () =
     with e ->
         e.GetType().Name |> equal "ArgumentException"
         e.GetType().Namespace |> equal "System"
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+let (>>*) (f: string -> unit) () (x: string) = f x
+
+type RecordWithMutableFn = { mutable MutableFn: string -> unit }
+
+
+
+
+type DocCommentClass() =
+    /// Member doc */
+    member _.Get() = 1
+
+type ForLoopBound() =
+    let mutable bound = 3
+
+    member val Bound = 3 with get, set
+
+    member _.FieldBoundIterations() =
+        let mutable n = 0
+        for _ = 0 to bound do
+            bound <- 1
+            n <- n + 1
+        n
+
+    member this.PropertyBoundIterations() =
+        let mutable n = 0
+        for _ = 0 to this.Bound do
+            this.Bound <- 1
+            n <- n + 1
+        n
+
+type DocCommentRecord =
+    {
+        /// Field doc */
+        Value: int
+    }
+
+let buildRecordWithMutableFnWithFor (xs: RecordWithMutableFn list) =
+    let mutable items = []
+    for i = 0 to xs.Length - 1 do
+        let x = xs[i]
+        items <- (x.MutableFn >>* ()) :: items
+    items
+
+let buildRecordWithMutableFnWithWhile (xs: RecordWithMutableFn list) =
+    let mutable items = []
+    for x in xs do
+        items <- (x.MutableFn >>* ()) :: items
+    items
+
+let docCommentWithCommentEnd (c: char) = string c
+
+let rec private forLoopBoundTailCall (n: int) acc =
+    if n = 0 then
+        acc
+    else
+        let xs = ResizeArray [ for _ in 1 .. n -> 1 ]
+        let mutable c = 0
+        for _ = 0 to xs.Count - 1 do
+            if xs.Count < 20 then
+                xs.Add 0
+            c <- c + 1
+        forLoopBoundTailCall (n - 1) (acc + c)
+
+let lerp x (alpha: float<'u>) (delta: MiscTestsHelper.Vector2<'u>) = x + alpha * delta
+
+
+[<Fact>]
+let ``test Lambdas returning member expression accessing JS object work`` () =
+    // #2311
+    let x = inlineLambdaWithAnonRecord (fun x -> x.A)
+    x() |> equal 1
+
+[<Fact>]
+let ``test for in descending range with -1 step works`` () =
+    let mutable y = ""
+    for i in 5 .. -1 .. 1 do
+        y <- y + (string i)
+    equal "54321" y
+
+[<Fact>]
+let ``test for in ascending range with 1 step works`` () =
+    let mutable x = ""
+    for i in 1 .. 1 .. 5 do
+        x <- x + (string i)
+    equal "12345" x
+
+[<Fact>]
+let ``test for in const-step range handles empty and single-element ranges`` () =
+    // descending range that never runs (start below stop)
+    let mutable a = 0
+    for i in 0 .. -1 .. 5 do
+        a <- a + i
+    equal 0 a
+    // ascending range that never runs (start above stop)
+    let mutable b = 0
+    for i in 5 .. 1 .. 3 do
+        b <- b + i
+    equal 0 b
+    // single-element ranges
+    let mutable c = 0
+    for i in 3 .. -1 .. 3 do
+        c <- c + i
+    equal 3 c
+
+[<Fact>]
+let ``test for in const-step range with negative bounds works`` () =
+    let acc = ResizeArray<int>()
+    for i in -2 .. -1 .. -6 do
+        acc.Add i
+    equal [| -2; -3; -4; -5; -6 |] (acc.ToArray())
+
+[<Fact>]
+let ``test for in step range other than 1 still works`` () =
+    let mutable a = ""
+    for i in 9 .. -2 .. 0 do
+        a <- a + (string i)
+    equal "97531" a
+    let mutable b = ""
+    for i in 0 .. 2 .. 9 do
+        b <- b + (string i)
+    equal "02468" b
+
+[<Fact>]
+let ``test Captured loop variable in const-step range keeps its value`` () =
+    let fns = ResizeArray<unit -> int>()
+    for i in 3 .. -1 .. 1 do
+        fns.Add(fun () -> i)
+    fns |> Seq.map (fun f -> f ()) |> Seq.toArray |> equal [| 3; 2; 1 |]
+
+[<Fact>]
+let ``test for bound over a collection is evaluated once`` () =
+    let shrinking = ResizeArray [ 1; 2; 3; 4 ]
+    let mutable n = 0
+    for _ in 0 .. shrinking.Count - 1 do
+        if shrinking.Count > 2 then
+            shrinking.RemoveAt 0
+        n <- n + 1
+    equal 4 n
+    let growing = ResizeArray [ 1; 2 ]
+    let mutable m = 0
+    for _ = 0 to growing.Count - 1 do
+        if growing.Count < 8 then
+            growing.Add 9
+        m <- m + 1
+    equal 2 m
+
+[<Fact>]
+let ``test for bound with side effects is evaluated once`` () =
+    let calls = ref 0
+    let hi () =
+        calls.Value <- calls.Value + 1
+        2
+    for _ in 0 .. hi () do
+        ()
+    equal 1 calls.Value
+
+[<Fact>]
+let ``test for downto bound is evaluated once`` () =
+    let xs = ResizeArray [ 1; 2; 3; 4 ]
+    let mutable n = 0
+    for _ = xs.Count - 1 downto xs.Count - 2 do
+        xs.RemoveAt 0
+        n <- n + 1
+    equal 2 n
+    let ys = ResizeArray [ 1; 2; 3 ]
+    let mutable m = 0
+    for _ in 3 .. -1 .. ys.Count - 2 do
+        ys.Add 0
+        m <- m + 1
+    equal 3 m
+
+[<Fact>]
+let ``test for bound reading a mutable local changed in the body is evaluated once`` () =
+    let mutable hi = 3
+    let mutable a = 0
+    for _ = 0 to hi do
+        hi <- 10
+        a <- a + 1
+    equal 4 a
+    let mutable lo = 3
+    let mutable b = 0
+    for _ = 5 downto lo do
+        lo <- 0
+        b <- b + 1
+    equal 3 b
+    let mutable x = 2
+    let mutable c = 0
+    for _ = 0 to x + 1 do
+        x <- 100
+        c <- c + 1
+    equal 4 c
+    let mutable str = "abc"
+    let mutable d = 0
+    for _ = 0 to str.Length - 1 do
+        str <- "a"
+        d <- d + 1
+    equal 3 d
+
+[<Fact>]
+let ``test for start is evaluated before the bound and both only once`` () =
+    let log = ResizeArray<string>()
+    let tick name value =
+        log.Add name
+        value
+    for _ = tick "start" 0 to tick "limit" 1 do
+        log.Add "body"
+    for _ = tick "start" 1 downto tick "limit" 0 do
+        log.Add "body"
+    String.concat "," log |> equal "start,limit,body,body,start,limit,body,body"
+
+[<Fact>]
+let ``test Nested for bounds are each evaluated once per entry`` () =
+    let log = ResizeArray<string>()
+    let tick name value =
+        log.Add name
+        value
+    let limit = 0
+    for _ = 0 to tick "outer" 1 + limit do
+        for _ = 0 to tick "inner" 0 + limit do
+            let limit = 5
+            log.Add(string limit)
+    String.concat "," log |> equal "outer,inner,5,inner,5"
+
+[<Fact>]
+let ``test Closures in a for body work when the bound is evaluated once`` () =
+    let fns = ResizeArray<unit -> int>()
+    let xs = ResizeArray [ 1; 2; 3 ]
+    for i = 0 to xs.Count - 1 do
+        let doubled = i * 2
+        fns.Add(fun () -> doubled + i + xs.Count)
+        if xs.Count < 8 then
+            xs.Add 0
+    fns |> Seq.map (fun f -> f ()) |> Seq.toArray |> equal [| 6; 9; 12 |]
+
+[<Fact>]
+let ``test for bound is evaluated once in tail recursive functions`` () =
+    forLoopBoundTailCall 3 0 |> equal 6
+
+[<Fact>]
+let ``test for bound is evaluated once when the loop is in expression position`` () =
+    let growUpTo20 (xs: ResizeArray<int>) =
+        if xs.Count < 20 then
+            xs.Add 0
+    let xs = ResizeArray [ 1; 2 ]
+    let unitResult = (for _ = 0 to xs.Count - 1 do growUpTo20 xs)
+    equal () unitResult
+    equal 4 xs.Count
+    let ys = ResizeArray [ 1; 2 ]
+    let run enabled =
+        if enabled then
+            for _ = 0 to ys.Count - 1 do
+                growUpTo20 ys
+    run true
+    equal 4 ys.Count
+    let zs = ResizeArray [ 1; 2 ]
+    let count =
+        try
+            for _ = 0 to zs.Count - 1 do
+                growUpTo20 zs
+            zs.Count
+        with _ -> -1
+    equal 4 count
+
+[<Fact>]
+let ``test for bound that needs statements is evaluated once`` () =
+    let log = ResizeArray<string>()
+    let tick name value =
+        log.Add name
+        value
+    let xs = ResizeArray [ 1; 2 ]
+    let mutable a = 0
+    for _ = 0 to (match xs.Count with 2 -> tick "match" 3 | _ -> 0) do
+        if xs.Count < 20 then
+            xs.Add 0
+        a <- a + 1
+    equal 4 a
+    let mutable b = 0
+    for _ = 0 to (let x = tick "let" 1 in x + tick "let2" 1) do
+        b <- b + 1
+    equal 3 b
+    let mutable c = 0
+    for _ = 0 to (try tick "try" 1 with _ -> 0) do
+        c <- c + 1
+    equal 2 c
+    String.concat "," log |> equal "match,let,let2,try"
+
+[<Fact>]
+let ``test for bound is evaluated once inside a seq expression`` () =
+    let count =
+        seq {
+            let xs = ResizeArray [ 1; 2 ]
+            let grow () =
+                for _ = 0 to xs.Count - 1 do
+                    if xs.Count < 20 then
+                        xs.Add 0
+                xs.Count
+            yield grow ()
+        }
+        |> Seq.head
+    equal 4 count
+
+[<Fact>]
+let ``test for bound reading the length of a mutable array in other shapes is evaluated once`` () =
+    let mutable a = [| 1; 2; 3 |]
+    let mutable n = 0
+    for _ = 3 downto a.Length - 1 do
+        a <- [| 1 |]
+        n <- n + 1
+    equal 2 n
+    a <- [| 1; 2; 3 |]
+    let mutable m = 0
+    for _ = 0 to a.Length do
+        a <- [| 1 |]
+        m <- m + 1
+    equal 4 m
+    a <- [| 1; 2; 3 |]
+    let mutable p = 0
+    for _ = 0 to a.Length - 2 do
+        a <- [| 1 |]
+        p <- p + 1
+    equal 2 p
+    a <- [| 1; 2; 3 |]
+    let mutable q = 0
+    for _ = 0 to a.Length do
+        if q < 10 then a <- Array.append a [| 0 |]
+        q <- q + 1
+    equal 4 q
+
+[<Fact>]
+let ``test Units of measure work with unsigned ints`` () =
+    // See #2955
+    let s1 = 1uy<km>
+    let s2 = 2us<h>
+    let s3 = 3u<km/h>
+    let s4 = 4ul<mi>
+    $"%i{s1}%i{s2}%i{s3}%i{s4}" |> equal "1234"
+
+[<Fact>]
+let ``test Can resolve trait calls from another file with units of measure`` () =
+    // See #2880
+    let expected = MiscTestsHelper.Vector2 (8.209999999999999<mi^2>, 7.72<mi^2>)
+    let x = MiscTestsHelper.Vector2(4.5<mi^2>, 4.5<mi^2>)
+    MiscTestsHelper.Vector2(5.3<mi>, 4.6<mi>) |> lerp x 0.7<mi> |> equal expected
+
+[<Fact>]
+let ``test Can use `use` with null`` () =
+    // See #2719
+    let mutable x = 0
+    let msg =
+        use __ = null : IDisposable
+        "hooray"
+    msg |> equal "hooray"
+    x |> equal 0
+
+    let msg =
+        use __ = { new IDisposable with member _.Dispose() = x <- 1 }
+        "booh"
+    msg |> equal "booh"
+    x |> equal 1
+
+[<Fact>]
+let ``test invalidArg and invalidOp work in expression position`` () =
+    let pick b = if b then 1 else invalidArg "b" "This is invalid"
+    pick true |> equal 1
+    throwsError "This is invalid (Parameter 'b')" (fun () -> pick false)
+    let wrap (x: int) = x + 1
+    throwsError "This is invalid" (fun () -> wrap (invalidOp "This is invalid"))
+    Option.defaultWith (fun () -> invalidOp "This is invalid") (Some 3) |> equal 3
+    throwsError "This is invalid" (fun () -> Option.defaultWith (fun () -> invalidOp "This is invalid") None)
+
+[<Fact>]
+let ``test Stopwatch.Frequency and IsHighResolution work`` () =
+    Diagnostics.Stopwatch.Frequency > 0L |> equal true
+    Diagnostics.Stopwatch.IsHighResolution |> equal true
+
+[<Fact>]
+let ``test Doc comments containing */ do not break the output`` () =
+    // See #5252
+    docCommentWithCommentEnd 'x' |> equal "x"
+    { Value = 2 }.Value |> equal 2
+    DocCommentClass().Get() |> equal 1
+
