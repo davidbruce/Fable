@@ -5542,6 +5542,122 @@ pub inline fn ifaceClosure(comptime I: type, comptime Captures: type, captures: 
     return .{ .data = @ptrCast(&e.header), .vt = vt };
 }
 
+// ---- generic methods of interfaces: one slot, its type parameters erased to `obj` (as Koka
+// compiles polymorphism), and values converted where the slot is called ----
+
+fn ifaceOf(comptime T: type) ?type {
+    if (isIface(T)) return T;
+    if (@typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child)) return @typeInfo(T).optional.child;
+    return null;
+}
+
+/// `x` (borrowed) as a value of type `To` (owned): the same, boxed into an object, unboxed from
+/// one, or an interface adapted to its erased instantiation (or back)
+pub fn erasedConv(comptime To: type, x: anytype) To {
+    const From = @TypeOf(x);
+    if (From == To) return dup(x);
+    if (To == Any) return box(x);
+    if (From == Any) {
+        if (tryUnbox(?To, x)) |v| return v;
+        @panic("fable: an erased value of a generic method is not of the type it is used as");
+    }
+    if (comptime ifaceOf(To) != null and ifaceOf(From) != null) return ifaceAdapt(To, x);
+    @compileError("fable: a generic method of an interface cannot convert " ++ @typeName(From) ++ " to " ++ @typeName(To) ++ " yet");
+}
+
+/// The interface `src` (borrowed) seen as the interface type `Target`, whose members take and give
+/// the same values erased to `obj` (or the other way): each member converts what it is given
+/// (a member takes its arguments over, as every slot does), calls the member of `src` with them,
+/// and converts what it gives back
+pub fn ifaceAdapt(comptime Target: type, src: anytype) Target {
+    const S = @TypeOf(src);
+    const I = ifaceOf(Target).?;
+    const SI = ifaceOf(S).?;
+    const s: SI = if (comptime @typeInfo(S) == .optional) (src orelse return if (comptime @typeInfo(Target) == .optional) null else nullRefPanic()) else src;
+    const A = IfaceAdapter(I, SI);
+    return ifaceClosure(I, A.Held, .{ .c0 = dup(s) }, &A.vt);
+}
+
+fn nullRefPanic() noreturn {
+    @panic("fable: a null interface given to a generic method");
+}
+
+fn erasedBack(comptime R: type, raw: anytype) R {
+    const Raw = @TypeOf(raw);
+    if (comptime @typeInfo(Raw) == .error_union) {
+        const v = raw catch {
+            if (comptime @typeInfo(R) == .error_union) return error.Raised;
+            @panic("fable: an erased member raised where its slot cannot");
+        };
+        return erasedBack(R, v);
+    }
+    const Out = if (@typeInfo(R) == .error_union) @typeInfo(R).error_union.payload else R;
+    const out = erasedConv(Out, raw);
+    drop(raw);
+    return out;
+}
+
+fn IfaceAdapter(comptime I: type, comptime SI: type) type {
+    const Vt = @typeInfo(@FieldType(I, "vt")).pointer.child;
+    const SVt = @typeInfo(@FieldType(SI, "vt")).pointer.child;
+    return struct {
+        const Held = struct { c0: SI };
+
+        fn Thunk(comptime name: []const u8) type {
+            const F = @typeInfo(@typeInfo(@FieldType(Vt, name)).pointer.child).@"fn";
+            const SF = @typeInfo(@typeInfo(@FieldType(SVt, name)).pointer.child).@"fn";
+            const R = F.return_type.?;
+            const P = F.param_types;
+            const SP = SF.param_types;
+            return switch (P.len) {
+                2 => struct {
+                    fn f(d: ?*anyopaque, a0: P[1].?) R {
+                        const c = captured(Held, @ptrCast(@alignCast(d)));
+                        const x0 = erasedConv(SP[1].?, a0);
+                        drop(a0);
+                        return erasedBack(R, @field(c.c0.vt, name)(c.c0.data, x0));
+                    }
+                },
+                3 => struct {
+                    fn f(d: ?*anyopaque, a0: P[1].?, a1: P[2].?) R {
+                        const c = captured(Held, @ptrCast(@alignCast(d)));
+                        const x0 = erasedConv(SP[1].?, a0);
+                        drop(a0);
+                        const x1 = erasedConv(SP[2].?, a1);
+                        drop(a1);
+                        return erasedBack(R, @field(c.c0.vt, name)(c.c0.data, x0, x1));
+                    }
+                },
+                4 => struct {
+                    fn f(d: ?*anyopaque, a0: P[1].?, a1: P[2].?, a2: P[3].?) R {
+                        const c = captured(Held, @ptrCast(@alignCast(d)));
+                        const x0 = erasedConv(SP[1].?, a0);
+                        drop(a0);
+                        const x1 = erasedConv(SP[2].?, a1);
+                        drop(a1);
+                        const x2 = erasedConv(SP[3].?, a2);
+                        drop(a2);
+                        return erasedBack(R, @field(c.c0.vt, name)(c.c0.data, x0, x1, x2));
+                    }
+                },
+                else => @compileError("fable: an interface member of this many parameters cannot be adapted yet"),
+            };
+        }
+
+        const vt: Vt = blk: {
+            var v: Vt = undefined;
+            for (@typeInfo(Vt).@"struct".field_names) |name| {
+                if (std.mem.eql(u8, name, "$meta")) {
+                    v.@"$meta" = &env_iface_meta;
+                } else {
+                    @field(v, name) = Thunk(name).f;
+                }
+            }
+            break :blk v;
+        };
+    };
+}
+
 /// Extract a first-class `Func` closure from a fat-pointer interface method slot (borrows `iface`).
 pub fn ifaceMethod(comptime F: type, iface: anytype, comptime field: []const u8) F {
     const I = @TypeOf(iface);

@@ -2186,6 +2186,14 @@ type FlexibleOverloads() =
 type IGenericMethodHelpers<'JsonValue> =
     abstract encodeString: string -> 'JsonValue
 
+type IGenericMethodEncodable =
+    abstract member Encode<'JsonValue> : helpers: IGenericMethodHelpers<'JsonValue> -> 'JsonValue
+
+// Class implementation that names the method's type parameter ('json) differently
+// from the interface ('JsonValue)
+type GenericMethodEncodableClass() =
+    interface IGenericMethodEncodable with
+        member _.Encode<'json>(helpers: IGenericMethodHelpers<'json>) = helpers.encodeString "x"
 
 type IGenericMethodBox<'T> =
     abstract Get: unit -> 'T
@@ -2660,3 +2668,27 @@ let ``test DefaultValue fields of function types are null until set`` () =
 let ``test Local function generic over a Lazy subtype constraint works`` () =
     LazyNode(lazy 5, [LazyNode(lazy 7, [])]) |> walkLazyTree |> equal "7"
     LazyNode(lazy 5, []) |> walkLazyTree |> equal "5"
+
+[<Fact>]
+let ``test Object expression implementing a generic interface method works`` () =
+    let helpers =
+        { new IGenericMethodHelpers<string> with
+            member _.encodeString v = "S:" + v
+        }
+
+    let encodable =
+        { new IGenericMethodEncodable with
+            member _.Encode(helpers) = helpers.encodeString "x"
+        }
+
+    encodable.Encode(helpers) |> equal "S:x"
+
+[<Fact>]
+let ``test Class implementing a generic interface method with a renamed type parameter works`` () =
+    let helpers =
+        { new IGenericMethodHelpers<string> with
+            member _.encodeString v = "S:" + v
+        }
+
+    let encodable = GenericMethodEncodableClass() :> IGenericMethodEncodable
+    encodable.Encode(helpers) |> equal "S:x"

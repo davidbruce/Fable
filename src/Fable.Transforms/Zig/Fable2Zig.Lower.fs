@@ -2121,6 +2121,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             else
                 rawArgs
 
+        // (a generic method's slot has its type parameters erased to `obj`: a value of another
+        // type is boxed or unboxed, an interface of them adapted, see fable_rt.erasedConv)
+        let erased (a: Ty) (b: Ty) =
+            a <> b && (a = tAny || b = tAny || (isFatIfaceTy a && isFatIfaceTy b))
+
+        let convertTo (ty: Ty) (x: Expr) =
+            let c = coerceTy ctx ty x
+
+            if erased (typeOf c) ty then
+                ctx.State.UsesRuntime <- true
+                bindArgs ctx [ c ] (fun xs -> EEmit("fable_rt.erasedConv($R, $0)", xs, ty))
+            else
+                c
+
         match resolveIfaceSlot ctx x.Type ifaceStructTy info.Name (Some argCount) with
         | Some(f, ptys, ret), _ ->
             let args =
@@ -2130,7 +2144,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     let lowered = wrappedRawArgs |> List.map (lw ctx)
 
                     if ptys.Length = lowered.Length then
-                        List.map2 (coerceTy ctx) ptys lowered
+                        List.map2 convertTo ptys lowered
                     else
                         lowered
 
@@ -2142,7 +2156,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                         ctx
                         x
                         given.Head
-                        (fun iface -> coerceTy ctx (mapType ctx r t) (ECallIface(iface, f, given.Tail, ret)))
+                        (fun iface -> convertTo (mapType ctx r t) (ECallIface(iface, f, given.Tail, ret)))
                 )
         | None, Some(f, fnTy) ->
             let args =
@@ -3210,8 +3224,32 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                             (candidates |> List.map fst |> String.concat ", ")
                 )
 
+            // (a generic method's own type parameters: `obj`, as its slot has them erased)
+            let erased =
+                slotDelegates
+                |> List.collect (fun (_, fnExpr) ->
+                    match fnExpr with
+                    | Fable.Delegate(args, body, _, _) ->
+                        freeGens (
+                            mapType ctx e.Range body.Type
+                            :: (args |> List.map (fun a -> mapType ctx e.Range a.Type))
+                        )
+                    | _ -> []
+                )
+                |> List.distinct
+                |> List.filter (fun g ->
+                    not (List.contains g ctx.TypeParams) && not (ctx.State.GenAliases.ContainsKey g)
+                )
+
+            for g in erased do
+                ctx.State.GenAliases[g] <- tAny
+
             let lifted =
-                liftGroup ctx e.Range (slotDelegates |> List.map (fun (f, fnExpr) -> None, cleanIdent f, fnExpr))
+                try
+                    liftGroup ctx e.Range (slotDelegates |> List.map (fun (f, fnExpr) -> None, cleanIdent f, fnExpr))
+                finally
+                    for g in erased do
+                        ctx.State.GenAliases.Remove g |> ignore
 
             let captureNames =
                 match lifted with
@@ -9097,14 +9135,27 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
         for d in file.Declarations do
             eprintfn "DUMP %A" d
 
+    /// the type parameters of the type a member is of
+    let typeParamsOfType (info: Fable.MemberFunctionOrValue) : string list =
+        match info.DeclaringEntity |> Option.bind com.TryGetEntity with
+        | Some ent when not ent.IsFSharpModule -> ent.GenericParameters |> List.map (fun g -> g.Name)
+        | _ -> []
+
+    /// (the implementation of a generic method of an interface: its slot has the method's type
+    /// parameters erased to `obj`, and so has it)
+    let isErasedImpl (info: Fable.MemberFunctionOrValue) =
+        info.IsOverrideOrExplicitInterfaceImplementation
+        && info.CompiledName.Contains "."
+        && not info.GenericParameters.IsEmpty
+
     /// the type parameters of a function: those of the type it is a member of, then its own
     let typeParamsOf (info: Fable.MemberFunctionOrValue) : string list =
-        let ofType =
-            match info.DeclaringEntity |> Option.bind com.TryGetEntity with
-            | Some ent when not ent.IsFSharpModule -> ent.GenericParameters |> List.map (fun g -> g.Name)
-            | _ -> []
+        let ofType = typeParamsOfType info
 
-        ofType @ (info.GenericParameters |> List.map (fun g -> g.Name)) |> List.distinct
+        if isErasedImpl info then
+            ofType
+        else
+            ofType @ (info.GenericParameters |> List.map (fun g -> g.Name)) |> List.distinct
 
     let effBodyType (info: Fable.MemberFunctionOrValue) (body: Fable.Expr) =
         match info.ReturnParameter.Type with
@@ -9165,6 +9216,27 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 TypeParams = typeParams
                 InCtor = inObjCtor
             }
+
+        // (an erased implementation: its own type parameters, and those Fable names in its types
+        // from the interface's declaration, are `obj` in its body)
+        let erasedHere =
+            if isErasedImpl info then
+                let ofType = set (typeParamsOfType info)
+
+                let rec gens (t: Fable.Type) =
+                    match t with
+                    | Fable.GenericParam(n, _, _) -> [ n ]
+                    | t -> t.Generics |> List.collect gens
+
+                (info.GenericParameters |> List.map (fun g -> g.Name))
+                @ (d.Body.Type :: (d.Args |> List.map (fun a -> a.Type)) |> List.collect gens)
+                |> List.distinct
+                |> List.filter (fun g -> not (ofType.Contains g) && not (state.GenAliases.ContainsKey g))
+            else
+                []
+
+        for g in erasedHere do
+            state.GenAliases[g] <- tAny
 
         try
             let retFable = effBodyType info d.Body
@@ -9310,6 +9382,9 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             report
                 d.Body.Range
                 $"internal error of the Zig target while compiling %s{d.Name}: %s{e.GetType().Name}: %s{e.Message}"
+
+        for g in erasedHere do
+            state.GenAliases.Remove g |> ignore
 
     settleCyclic state
     settleCycles state

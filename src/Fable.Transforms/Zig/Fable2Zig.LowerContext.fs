@@ -191,32 +191,33 @@ let slotKey (ent: Fable.Entity) (compiled: string) (paramTypes: Fable.Type list)
     else
         compiled
 
+/// A type of a member of an interface with the type parameters that are not the interface's
+/// (those of a generic method) as `obj`
+let eraseForeign (ent: Fable.Entity) (t: Fable.Type) : Fable.Type =
+    let own = ent.GenericParameters |> List.map (fun g -> g.Name) |> set
+
+    let rec erase (t: Fable.Type) =
+        match t with
+        | Fable.GenericParam(name, _, _) when not (own.Contains name) -> Fable.Any
+        | t -> t.MapGenerics erase
+
+    erase t
+
 let interfaceMembers (ent: Fable.Entity) : (string * Fable.Type list * Fable.Type) list =
     dispatchSlots ent
     |> Seq.distinctBy (fun m -> slotKey ent m.CompiledName (paramTypesOf m))
-    // (a generic member, `abstract eval<'a>: ...`, is no field of the struct: a function value
-    // has one type; calls of it are refused)
-    |> Seq.filter (fun m ->
-        let own = ent.GenericParameters |> List.map (fun g -> g.Name) |> set
-
-        let rec foreign (t: Fable.Type) =
-            match t with
-            | Fable.GenericParam(name, _, _) -> not (own.Contains name)
-            | t -> t.Generics |> List.exists foreign
-
-        let types =
-            m.ReturnParameter.Type
-            :: (m.CurriedParameterGroups |> List.concat |> List.map (fun p -> p.Type))
-
-        not (List.exists foreign types)
-    )
+    // (a generic member, `abstract Encode<'J>: ...`: one field of the struct, of its type
+    // parameters erased to `obj`, as Koka compiles polymorphism; its callers box and unbox, and
+    // adapt an interface of them, see fable_rt.erasedConv)
     |> Seq.map (fun m ->
         let args =
             match m.CurriedParameterGroups |> List.concat |> List.map (fun p -> p.Type) with
             | [] -> [ Fable.Unit ]
             | ts -> ts
 
-        slotKey ent m.CompiledName (paramTypesOf m), args, m.ReturnParameter.Type
+        slotKey ent m.CompiledName (paramTypesOf m),
+        List.map (eraseForeign ent) args,
+        eraseForeign ent m.ReturnParameter.Type
     )
     |> List.ofSeq
 
