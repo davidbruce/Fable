@@ -397,3 +397,119 @@ pub fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
     }
     return out[0..t.len];
 }
+
+/// A standard format (`N2`, `X8`, `G`) known when the program runs: the text, or null when the
+/// format is not one for this kind of number
+pub fn standardText(letter: u8, given: ?i32, value: anytype, out: []u8) ?[]const u8 {
+    const T = @TypeOf(value);
+    const isDec = comptime isDecimal(T);
+    const whole = !isDec and @typeInfo(T) == .int;
+    var t: Text = .{ .buf = out };
+
+    if (letter == 'X' or letter == 'x' or letter == 'B' or letter == 'b') {
+        if (comptime !whole) return null else return wholeBits(letter, given, value, out);
+    }
+    // (`G` and `R` of a decimal: every digit of its scale)
+    if (isDec and (letter == 'G' or letter == 'g' or letter == 'R' or letter == 'r') and given == null) return decAscii(value, out);
+    if (!whole and !isDec) {
+        if (std.math.isNan(value)) return "NaN";
+        if (std.math.isInf(value)) return if (value > 0) "Infinity" else "-Infinity";
+    }
+
+    const negative = if (isDec) value.m < 0 else if (whole) value < 0 else std.math.signbit(value);
+    const shortest = !whole and !isDec and (letter == 'R' or letter == 'r' or ((letter == 'G' or letter == 'g') and (given orelse 0) == 0));
+    var d: Decimal = .{};
+    if (isDec) {
+        d = decDigits(value);
+    } else if (whole) {
+        if (value != 0) {
+            const text = std.fmt.bufPrint(&d.digits, "{d}", .{@abs(@as(i128, value))}) catch unreachable;
+            for (d.digits[0..text.len]) |*c| c.* -= '0';
+            d.len = text.len;
+            d.point = @intCast(text.len);
+        }
+    } else if (shortest) {
+        d = Decimal.shortest(@abs(value));
+    } else {
+        d = Decimal.exact(@abs(@as(f64, value)));
+    }
+    // (a whole number has no exact half to decide: .NET rounds its digits half up)
+    // (and neither does .NET's formatting of a decimal)
+    const even = !whole and !isDec;
+
+    switch (letter) {
+        'D', 'd' => {
+            if (comptime !whole) return null;
+            if (negative) t.put('-');
+            const have: i32 = @max(d.point, 1);
+            var pad: i32 = @as(i32, given orelse 0) - have;
+            while (pad > 0) : (pad -= 1) t.put('0');
+            wholeDigits(&t, &d, false);
+        },
+        'N', 'n', 'F', 'f', 'P', 'p', 'C', 'c' => {
+            const places: i32 = @min(given orelse 2, 80);
+            const percent = letter == 'P' or letter == 'p';
+            const currency = letter == 'C' or letter == 'c';
+            if (percent and d.len != 0) d.point += 2;
+            d.roundTo(d.point + places, even);
+            // (a decimal that rounds to zero is written without its sign; a float keeps it)
+            var zero = true;
+            for (d.digits[0..d.len]) |c| {
+                if (c != 0) zero = false;
+            }
+            const signed = negative and !(isDec and zero);
+            if (signed) t.put(if (currency) '(' else '-');
+            if (currency) t.put(0xA4);
+            if (letter == 'F' or letter == 'f') wholeDigits(&t, &d, false) else wholeDigits(&t, &d, true);
+            fraction(&t, &d, places);
+            if (percent) {
+                t.put(' ');
+                t.put('%');
+            }
+            if (signed and currency) t.put(')');
+        },
+        'E', 'e' => {
+            const places: i32 = @min(given orelse 6, 80);
+            d.roundTo(places + 1, even);
+            if (negative) t.put('-');
+            t.put(d.digit(0));
+            if (places > 0) {
+                t.put('.');
+                var k: i32 = 1;
+                while (k <= places) : (k += 1) t.put(d.digit(k));
+            }
+            t.exponent(letter, d.point - 1, 3);
+        },
+        'G', 'g', 'R', 'r' => {
+            const e: u8 = if (letter == 'g' or letter == 'r') 'e' else 'E';
+            if (negative) t.put('-');
+            const limit: i32 = if (shortest)
+                (if (T == f32) 9 else 17)
+            else if (whole and (letter == 'R' or letter == 'r' or (given orelse 0) == 0))
+                std.math.maxInt(i32)
+            else
+                given.?;
+            if (!shortest) d.roundTo(limit, even);
+            if (d.len == 0) t.put('0') else t.general(&d, limit, e);
+        },
+        else => return null,
+    }
+    return out[0..t.len];
+}
+
+fn wholeBits(letter: u8, given: ?i32, value: anytype, out: []u8) []const u8 {
+    const T = @TypeOf(value);
+    var t: Text = .{ .buf = out };
+        const bits: @Int(.unsigned, @typeInfo(T).int.bits) = @bitCast(value);
+        var raw: [140]u8 = undefined;
+        const text = switch (letter) {
+            'X' => std.fmt.bufPrint(&raw, "{X}", .{bits}),
+            'x' => std.fmt.bufPrint(&raw, "{x}", .{bits}),
+            else => std.fmt.bufPrint(&raw, "{b}", .{bits}),
+        } catch unreachable;
+        var pad: i32 = (given orelse 0) - @as(i32, @intCast(text.len));
+        while (pad > 0) : (pad -= 1) t.put('0');
+        for (text) |c| t.put(c);
+        return out[0..t.len];
+}
+

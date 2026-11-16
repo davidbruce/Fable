@@ -1965,6 +1965,7 @@ pub fn ResizeArray(comptime T: type) type {
     return *struct {
         const Self = @This();
         pub const fable_identity = {};
+        pub const fable_resize_array = T;
         pub const fable_cyclic = holdsCyclic(T);
         @"$rc": u32 = 1,
         @"$gc": GcHdr(fable_cyclic) = undefined,
@@ -3167,6 +3168,9 @@ pub const ObjType = struct {
     compare: ?*const fn (Obj, Obj) i32 = null,
     /// a boxed array (`o :? System.Array`)
     is_array: bool = false,
+    /// the items of a boxed collection (an array, a list, a ResizeArray, a string), each boxed:
+    /// what `o :? IEnumerable` finds and iterates
+    items: ?*const fn (Obj) Array(Any) = null,
     /// the reflection information of the boxed type (when the program asks for it, see
     /// `reflection`)
     reflect: ?*const fn () reflect.Type = null,
@@ -3550,6 +3554,7 @@ pub fn boxType(comptime T: type) *const ObjType {
             .hash = boxHash,
             .compare = if (comparable(T)) boxCompare else null,
             .is_array = @typeInfo(T) == .pointer and @hasDecl(@typeInfo(T).pointer.child, "fable_array"),
+            .items = if (hasItems(T)) &itemsOf else null,
             .reflect = if (reflection) &reflectOf else null,
             .unwrap_box = if (isIface(T)) &unwrapIfaceBox else null,
             .unwrap_obj = if (isIface(T)) &unwrapIfaceObj else null,
@@ -3557,6 +3562,23 @@ pub fn boxType(comptime T: type) *const ObjType {
         };
         pub fn reflectOf() reflect.Type {
             return reflect.typeOf(T);
+        }
+        pub fn itemsOf(o: Obj) Array(Any) {
+            const x = boxed(T, o).value;
+            var out: std.ArrayList(Any) = .empty;
+            defer out.deinit(allocator);
+            if (comptime T == String) {
+                for (unitsOf(x)) |c| out.append(allocator, box(c)) catch oom();
+            } else if (comptime isListType(T)) {
+                var rest = x;
+                while (rest == .Cons) : (rest = rest.Cons.Tail) out.append(allocator, box(rest.Cons.Head)) catch oom();
+            } else {
+                for (x.items) |item| out.append(allocator, box(item)) catch oom();
+            }
+            const A = Array(Any);
+            const items = arrayItems(A, out.items.len);
+            @memcpy(items, out.items);
+            return arrayFrom(A, items);
         }
         pub fn boxText(_: ?*Env, o: Obj, _: void) Raised!String {
             const x = boxed(T, o).value;
@@ -3689,6 +3711,28 @@ pub fn tryUnbox(comptime OT: type, o: Any) OT {
 }
 
 /// `o :? System.Array`: a boxed array
+fn hasItems(comptime T: type) bool {
+    if (T == String) return true;
+    if (isListType(T)) return true;
+    const info = @typeInfo(T);
+    if (info != .pointer or info.pointer.size != .one or @typeInfo(info.pointer.child) != .@"struct") return false;
+    return @hasDecl(info.pointer.child, "fable_array") or @hasDecl(info.pointer.child, "fable_resize_array");
+}
+
+/// `o :? System.Collections.IEnumerable` of an object
+pub fn objHasItems(o: Any) bool {
+    const p = o orelse return false;
+    return p.type.items != null;
+}
+
+/// `o :?> IEnumerable` of an object: its items, boxed (an InvalidCastException when it is not
+/// a collection)
+pub fn objItems(o: Any) Raised!Array(Any) {
+    const p = o orelse return nullRef();
+    const f = p.type.items orelse return raise(InvalidCastException, str("Unable to cast object to type 'System.Collections.IEnumerable'."));
+    return f(p);
+}
+
 pub fn isArray(o: Any) bool {
     const p = o orelse return false;
     return p.type.is_array;
@@ -3878,8 +3922,13 @@ pub fn strFormatObjs(pattern: String, args: Array(Any)) Raised!String {
             while (i < p.len and p[i] >= '0' and p[i] <= '9') : (i += 1) width = width * 10 + (p[i] - '0');
             if (negative) width = -width;
         }
+        // (`:format`, up to the closing brace)
+        var spec: []const u16 = &.{};
         if (i < p.len and p[i] == ':') {
-            return raise(NotSupportedException, str("The Zig target does not support a format in a String.Format pattern known only when the program runs."));
+            const start = i + 1;
+            i = start;
+            while (i < p.len and p[i] != '}') i += 1;
+            spec = p[start..i];
         }
         if (digits == 0 or i >= p.len or p[i] != '}') {
             return raise(FormatException, str("Input string was not in a correct format."));
@@ -3888,7 +3937,10 @@ pub fn strFormatObjs(pattern: String, args: Array(Any)) Raised!String {
         if (index >= items.len) {
             return raise(FormatException, str("Index (zero based) must be greater than or equal to zero and less than the size of the argument list."));
         }
-        const text = try anyToString(items[index], true);
+        const text = if (spec.len != 0)
+            (try formatBoxed(items[index], spec)) orelse try anyToString(items[index], true)
+        else
+            try anyToString(items[index], true);
         defer drop(text);
         const t = unitsOf(text);
         const pad: usize = if (@abs(width) > t.len) @intCast(@abs(width) - t.len) else 0;
@@ -3897,6 +3949,34 @@ pub fn strFormatObjs(pattern: String, args: Array(Any)) Raised!String {
         if (width < 0) for (0..pad) |_| b.addOne(' ');
     }
     return b.finish();
+}
+
+/// A boxed number with a .NET format known when the program runs (`{0:N2}` of
+/// `String.Format(pattern, args)`): its text; null for a value that is not a number, whose
+/// `ToString` the format does not change here
+fn formatBoxed(v: Any, spec: []const u16) Raised!?String {
+    var ascii: [64]u8 = undefined;
+    if (spec.len > ascii.len) return raise(FormatException, str("Format specifier was invalid."));
+    for (spec, 0..) |c, k| ascii[k] = if (c < 128) @intCast(c) else '?';
+    const fmt = ascii[0..spec.len];
+    const standard = fmt.len <= 3 and std.ascii.isAlphabetic(fmt[0]) and for (fmt[1..]) |c| {
+        if (!std.ascii.isDigit(c)) break false;
+    } else true;
+    const given: ?i32 = if (standard and fmt.len > 1) (std.fmt.parseInt(i32, fmt[1..], 10) catch null) else null;
+    inline for (.{ i32, i64, f64, f32, u8, i8, i16, c_ushort, u32, u64, NetDecimal }) |T| {
+        if (tryUnbox(?T, v)) |x| {
+            var out: [512]u8 = undefined;
+            const text: ?[]const u8 = if (standard)
+                fable_netformat.standardText(fmt[0], given, x, &out)
+            else
+                fable_netformat.customText(fmt, x, &out);
+            const t = text orelse return raise(FormatException, str("Format specifier was invalid."));
+            var b: TextBuilder = .{};
+            b.addAscii(t);
+            return b.finish();
+        }
+    }
+    return null;
 }
 
 pub fn anyToString(o: Any, comptime null_is_empty: bool) Raised!String {

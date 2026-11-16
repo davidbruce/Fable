@@ -128,6 +128,12 @@ let call
          | Fable.DeclaredType(_, [ item ]), Fable.DeclaredType(a, []) ->
              a.FullName = "System.Array" && item <> Fable.Any
          | Fable.DeclaredType(_, [ item ]), Fable.Array(Fable.Any, _) -> item <> Fable.Any
+         // (a list or a sequence of objects, and an object that is a collection)
+         | Fable.DeclaredType(_, [ item ]), Fable.List Fable.Any -> item <> Fable.Any
+         | Fable.DeclaredType(_, [ item ]), Fable.DeclaredType(e, [ Fable.Any ]) ->
+             e.FullName = "System.Collections.Generic.IEnumerable`1" && item <> Fable.Any
+         | Fable.DeclaredType(_, [ item ]), Fable.DeclaredType(e, []) ->
+             e.FullName = "System.Collections.IEnumerable" && item <> Fable.Any
          | _ -> false)
         ->
         let item =

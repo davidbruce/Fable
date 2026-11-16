@@ -1630,7 +1630,7 @@ let ``test Accessing union tags `` () =
 
 type Type1 = { t1: string }
 
-#if !FABLE_COMPILER_ZIG // (this type test)
+#if !FABLE_COMPILER_ZIG // (erased unions are JavaScript and Python interop)
 [<Fact>]
 let ``test conditional expressions`` () = // See #2782
     let test (u2: U2<string, Type1>) =

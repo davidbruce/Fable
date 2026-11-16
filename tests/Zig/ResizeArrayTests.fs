@@ -457,7 +457,6 @@ let ``test ResizeArray uses reference equality not structural equality`` () = //
 
 
 
-#if !FABLE_COMPILER_ZIG // (a class implementing the non-generic IList, and a ResizeArray seen as the non-generic IEnumerable, are not supported by the Zig target yet)
 type CustomList() =
     let items = ResizeArray<obj>()
     member _.Items = items
@@ -484,7 +483,7 @@ type CustomList() =
         member _.GetEnumerator() = (items :> IEnumerable<obj>).GetEnumerator()
     interface System.Collections.IEnumerable with
         member _.GetEnumerator() = (items :> System.Collections.IEnumerable).GetEnumerator()
-#endif
+
 
 
 [<Fact>]
@@ -522,7 +521,6 @@ let ``test ResizeArray.CopyTo works III`` () =
     xs.CopyTo(2, ys, 1, 2)
     ys |> equal [|5;3;4;8;9|]
 
-#if !FABLE_COMPILER_ZIG // (a class implementing the non-generic IList, and a ResizeArray seen as the non-generic IEnumerable, are not supported by the Zig target yet)
 [<Fact>]
 let ``test IList.Clear works on a custom collection`` () =
     let xs = CustomList()
@@ -530,7 +528,7 @@ let ``test IList.Clear works on a custom collection`` () =
     xs.Items.Add(box 2)
     (xs :> System.Collections.IList).Clear()
     xs.Items.Count |> equal 0
-#endif
+
 
 [<Fact>]
 let ``test ResizeArray index out of bounds get throws`` () =

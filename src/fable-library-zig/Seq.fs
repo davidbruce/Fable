@@ -1693,6 +1693,20 @@ let ofGetEnumerator<'T> (get: unit -> System.Collections.Generic.IEnumerator<'T>
             close
     )
 
+/// `RuntimeHelpers.EnumerateFromFunctions(create, moveNext, current)`, as F# makes a `for` over
+/// a non-generic IEnumerable: an enumerator made at each walk, stepped and read
+let enumerateFromFunctions<'E, 'T> (create: unit -> 'E) (moveNext: 'E -> bool) (current: 'E -> 'T) : SeqOf<'T> =
+    make (fun () ->
+        let e = create ()
+
+        walker
+        <| fun () ->
+            if moveNext e then
+                Some(current e)
+            else
+                None
+    )
+
 /// `(s :> IEnumerable<'T>).GetEnumerator()`: an enumerator over a walk of the sequence.
 /// (`Reset` starts a new walk: what .NET's enumerators of arrays, lists and collections do; one of
 /// a sequence expression raises NotSupportedException on .NET, here it walks the sequence again)

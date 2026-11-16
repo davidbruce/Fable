@@ -169,6 +169,63 @@ let call
 
     match entity, name, args with
     // `(s :> IEnumerable<'T>).GetEnumerator()` of a sequence: an enumerator over a walk of it
+    | "Microsoft.FSharp.Core.CompilerServices.RuntimeHelpers", "EnumerateFromFunctions", [ create; moveNext; current ] ->
+        libraryCall
+            ctx
+            r
+            "Seq"
+            "enumerateFromFunctions"
+            { info with
+                ThisArg = None
+                SignatureArgTypes = []
+                MemberRef = None
+            }
+            [ create; moveNext; current ]
+            t
+    // (`System.Array`, an array of objects here: the enumerator of its items)
+    | "System.Array", "GetEnumerator", [ a ] ->
+        let objSeq =
+            Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEnumerable`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ Fable.Any ]
+            )
+
+        dotnetCall
+            ctx
+            r
+            "System.Collections.Generic.IEnumerable`1"
+            "GetEnumerator"
+            { info with
+                ThisArg =
+                    Some(
+                        Fable.Call(
+                            Fable.Import(
+                                {
+                                    Selector = "OfArray"
+                                    Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Collections.SeqModule"
+                                    Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                                },
+                                Fable.Any,
+                                None
+                            ),
+                            Fable.CallInfo.Create(
+                                args = [ Fable.TypeCast(a, Fable.Array(Fable.Any, Fable.MutableArray)) ],
+                                genArgs = [ Fable.Any ]
+                            ),
+                            objSeq,
+                            r
+                        )
+                    )
+                Args = []
+                GenericArgs = [ Fable.Any ]
+            }
+            t
+    // (the non-generic IEnumerable is a sequence of objects here)
+    | "System.Collections.IEnumerable", "GetEnumerator", _ ->
+        dotnetCall ctx r "System.Collections.Generic.IEnumerable`1" name info t
     | "System.Collections.Generic.IEnumerable`1", "GetEnumerator", [ Uncast source ] when
         isSeqType source.Type
         || (forInSource ctx source).IsSome
@@ -1562,10 +1619,14 @@ let call
         | None -> fail r "the Zig target found no constructor of %s with %d parameters" entRef.FullName args.Length
     // (`unbox<'T> o` as an inline function leaves it: `:?>`)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "UnboxGeneric", [ x ] ->
-        if unwrapNullness x.Type = Fable.Any then
-            unboxed ctx r x t
-        else
-            lw ctx (Fable.TypeCast(x, t))
+        match t with
+        // (an object seen as the non-generic IEnumerable: the items of its collection)
+        | Fable.DeclaredType(e, []) when e.FullName = "System.Collections.IEnumerable" -> lw ctx (Fable.TypeCast(x, t))
+        | _ ->
+            if unwrapNullness x.Type = Fable.Any then
+                unboxed ctx r x t
+            else
+                lw ctx (Fable.TypeCast(x, t))
     // `new 'T()` of a type parameter that is not known here: an inline function's own body,
     // which Zig looks at only if something calls it (its callers have it inlined)
     | ("Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions" | "System.Activator"), "CreateInstance", _ when

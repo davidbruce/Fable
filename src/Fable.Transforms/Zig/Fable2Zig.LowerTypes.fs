@@ -212,6 +212,8 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, _) when
         ent.FullName = "Microsoft.FSharp.Core.PrintfFormat`4"
         || ent.FullName = "Microsoft.FSharp.Core.PrintfFormat`5"
+        // (`FormattableString`: its composite format and its arguments, the same pair)
+        || ent.FullName = "System.FormattableString"
         ->
         TTuple [ tStr; mapType ctx r (Fable.Array(Fable.Any, Fable.MutableArray)) ]
     // (`IList<'T>`, as an array is seen through it: the array; `System.Array`: an array of objects)
@@ -231,6 +233,30 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "Stopwatch" "StopwatchOf", [])
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Timers.Timer" ->
         TEnt(libRecordEnt ctx "Timer" "TimerOf", [])
+    // (the non-generic IEnumerator: an enumerator of objects)
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Collections.IEnumerator" ->
+        mapType
+            ctx
+            r
+            (Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEnumerator`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ Fable.Any ]
+            ))
+    // (the non-generic IEnumerable: a sequence of objects)
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Collections.IEnumerable" ->
+        mapType
+            ctx
+            r
+            (Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEnumerable`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ Fable.Any ]
+            ))
     // (`TimeZoneInfo.Local` and `TimeZoneInfo.Utc`, the zones there are here: whether it is local)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.TimeZoneInfo" -> tBool
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Timers.ElapsedEventArgs" ->

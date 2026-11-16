@@ -91,7 +91,6 @@ let ``test Print.sprintf works`` () =
 let ``test sprintf without arguments works`` () =
     sprintf "hello" |> equal "hello"
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
 [<Fact>]
 let ``test input of print format can be retrieved`` () =
     let pathScan (pf:PrintfFormat<_,_,_,_,'t>) =
@@ -99,7 +98,6 @@ let ``test input of print format can be retrieved`` () =
         formatStr
 
     equal "/hello/%s" (pathScan "/hello/%s")
-#endif
 
 [<Fact>]
 let ``test interpolate works`` () =
@@ -1090,7 +1088,6 @@ let ``test sprintf with double percent should be unescaped`` () =
 let ``test interpolated string with double percent should be unescaped`` () =
     $"{100}%%" |> equal "100%"
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
 [<Fact>]
 let ``test Can create FormattableString`` () =
     let orderAmount = 100
@@ -1112,7 +1109,6 @@ let ``test Can create FormattableString`` () =
 //    s2.GetStrings() |> equal [|""; "This is \""; "\" awesome!"|]
 //    let s3: FormattableString = $"""I have no holes"""
 //    s3.GetStrings() |> equal [|"I have no holes"|]
-#endif
 #endif
 
 [<Fact>]

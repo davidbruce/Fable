@@ -393,6 +393,10 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         | Fable.DeclaredType(cls, []) when cls.FullName = "System.Array" ->
             ctx.State.UsesRuntime <- true
             bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.isArray($0)", xs, tBool))
+        // (`o :? IEnumerable`: a collection, whose items it can give as objects)
+        | Fable.DeclaredType(cls, []) when cls.FullName = "System.Collections.IEnumerable" ->
+            ctx.State.UsesRuntime <- true
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.objHasItems($0)", xs, tBool))
         | Fable.DeclaredType(cls, gs) when (objInfo ctx r cls).IsSome ->
             let o = (objInfo ctx r cls).Value
             ctx.State.UsesRuntime <- true
@@ -2550,6 +2554,68 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             | t -> t
 
         lw ctx (Fable.TypeCast(Fable.TypeCast(x, asArray), target))
+    // (the non-generic IEnumerable: a sequence of objects here. Of an object, the items its
+    // collection gives boxed; of a collection of values, its items boxed)
+    | Fable.TypeCast(x, Fable.DeclaredType(target, [])) when target.FullName = "System.Collections.IEnumerable" ->
+        let seqOf (item: Fable.Type) =
+            Fable.DeclaredType(
+                {
+                    FullName = "System.Collections.Generic.IEnumerable`1"
+                    Path = Fable.CoreAssemblyName "System.Runtime"
+                },
+                [ item ]
+            )
+
+        let seqCall (name: string) (args: Fable.Expr list) (genArgs: Fable.Type list) (t: Fable.Type) =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = name
+                        Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Collections.SeqModule"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(args = args, genArgs = genArgs),
+                t,
+                e.Range
+            )
+
+        let (Uncast inner) = x
+
+        match unwrapNullness inner.Type with
+        | Fable.Any ->
+            ctx.State.UsesRuntime <- true
+
+            let items =
+                Fable.Emit(
+                    {
+                        Macro = "try fable_rt.objItems($0)"
+                        IsStatement = false
+                        CallInfo = Fable.CallInfo.Create(args = [ inner ])
+                    },
+                    Fable.Array(Fable.Any, Fable.MutableArray),
+                    e.Range
+                )
+
+            lw ctx (seqCall "OfArray" [ items ] [ Fable.Any ] (seqOf Fable.Any))
+        | t ->
+            let item =
+                match t with
+                | Fable.Array(i, _)
+                | Fable.List i -> Some i
+                | Fable.String -> Some Fable.Char
+                | Fable.DeclaredType(_, [ i ]) -> Some i
+                | _ -> None
+
+            match item with
+            | Some Fable.Any -> lw ctx (Fable.TypeCast(inner, seqOf Fable.Any))
+            | Some i ->
+                let v = AST.makeTypedIdent i (tempName ctx "item")
+                let boxIt = Fable.Lambda(v, Fable.TypeCast(Fable.IdentExpr v, Fable.Any), None)
+                lw ctx (seqCall "Map" [ boxIt; Fable.TypeCast(inner, seqOf i) ] [ i; Fable.Any ] (seqOf Fable.Any))
+            | None -> fail e.Range "the Zig target cannot see a value of this type as an IEnumerable yet (%A)" t
     // (an array seen as `IList<'T>`: the same array)
     | Fable.TypeCast(x, Fable.DeclaredType(i, [ _ ])) when
         i.FullName = "System.Collections.Generic.IList`1"

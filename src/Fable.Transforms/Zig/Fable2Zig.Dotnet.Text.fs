@@ -93,6 +93,14 @@ let call
                   _)) :: rest when path.EndsWith("System.Console", System.StringComparison.Ordinal) ->
         console (which = "get_Error") (name = "WriteLine") rest
     // ---- StringBuilder ----
+    // (`$"..."` as a FormattableString: its composite format and its arguments)
+    | "System.Runtime.CompilerServices.FormattableStringFactory", "Create", [ format; values ] ->
+        pure' "fable_rt.printfFormatNew($0, $1)" [ format; values ] (mapType ctx r t)
+    | "System.FormattableString", "get_Format", s :: _ -> pure' "fable_rt.printfFormatValue($0)" [ s ] tStr
+    | "System.FormattableString", "get_ArgumentCount", s :: _ -> pure' "fable_rt.arrayLen($0[1])" [ s ] tI32
+    | "System.FormattableString", "GetArgument", [ s; i ] -> rt "fable_rt.arrayGet($0[1], $1)" [ s; i ] tAny
+    | "System.FormattableString", "GetArguments", s :: _ -> pure' "fable_rt.dup($0[1])" [ s ] (mapType ctx r t)
+    | "System.FormattableString", "ToString", s :: _ -> rt "fable_rt.strFormatObjs($0[0], $0[1])" [ s ] tStr
     // (a format of printf given as a value, `f $"x %d{x}"` with `f (fmt: StringFormat<_>)`)
     | ("Microsoft.FSharp.Core.PrintfFormat`4" | "Microsoft.FSharp.Core.PrintfFormat`5"), ".ctor", [ text ] ->
         pure' "fable_rt.printfFormatNew($0, {})" [ text ] (mapType ctx r t)
@@ -1151,6 +1159,9 @@ let call
                 }
                 [ x ]
                 t
+        // (a FormattableString: its format given its arguments, as `String.Format` does)
+        | Fable.DeclaredType(e, []) when e.FullName = "System.FormattableString" ->
+            rt "fable_rt.strFormatObjs($0[0], $0[1])" [ x ] tStr
         | Fable.DeclaredType(e, []) when e.FullName = "System.DateTime" ->
             libraryCall
                 ctx

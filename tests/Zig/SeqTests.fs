@@ -39,7 +39,6 @@ type MyNumber =
 type MyNumberWrapper =
     { MyNumber: MyNumber }
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Can test untyped enumerables`` () =
     let sumEnumerable (enumerable: obj) =
@@ -56,7 +55,6 @@ let ``test Can test untyped enumerables`` () =
     sumEnumerable xs |> equal 3
     sumEnumerable ys |> equal 7
     sumEnumerable zs |> equal -1
-#endif
 
 [<Fact>]
 let ``test Seq.length works`` () =
@@ -839,13 +837,11 @@ let ``test Seq.cache works`` () =
      count.Value
      |> equal 11
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: System.Random, obj and untyped IEnumerable, sums through a type's own +, ranges of uint64, decimal and bigint)
 [<Fact>]
 let ``test Seq.cast works`` () =
     let xs = [box 1; box 2; box 3]
     let ys = Seq.cast<int> xs
     ys |> Seq.head |> equal 1
-#endif
 
 [<Fact>]
 let ``test Seq.compareWith works`` () =

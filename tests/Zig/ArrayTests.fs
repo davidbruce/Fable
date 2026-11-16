@@ -1325,7 +1325,6 @@ let ``test Array.allPairs works`` () =
           (3, 'c'); (3, 'd'); (3, 'e'); (3, 'f'); (4, 'a'); (4, 'b'); (4, 'c');
           (4, 'd'); (4, 'e'); (4, 'f')|]
 
-#if !FABLE_COMPILER_ZIG // (a loop over a non-generic IEnumerable (RuntimeHelpers.EnumerateFromFunctions) is not supported by the Zig target yet)
 [<Fact>]
 let ``test Casting to System.Array works`` () =
     let xs = [|1;2;3;4|] :> System.Array // Numeric array
@@ -1336,7 +1335,6 @@ let ``test Casting to System.Array works`` () =
           (2, 'b'); (2, 'c'); (2, 'd'); (2, 'e'); (2, 'f'); (3, 'a'); (3, 'b');
           (3, 'c'); (3, 'd'); (3, 'e'); (3, 'f'); (4, 'a'); (4, 'b'); (4, 'c');
           (4, 'd'); (4, 'e'); (4, 'f') ]
-#endif
 
 [<Fact>]
 let ``test Testing against System.Array works`` () =

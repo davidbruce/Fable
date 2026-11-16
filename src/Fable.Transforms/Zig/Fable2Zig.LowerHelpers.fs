@@ -847,6 +847,8 @@ let typeTaskBuilders (body: Fable.Expr) : Fable.Expr =
 let isSeqType (t: Fable.Type) : bool =
     match t with
     | Fable.DeclaredType(ent, [ _ ]) -> ent.FullName = "System.Collections.Generic.IEnumerable`1"
+    // (the non-generic IEnumerable: a sequence of objects here)
+    | Fable.DeclaredType(ent, []) -> ent.FullName = "System.Collections.IEnumerable"
     | _ -> false
 
 /// Is this the type of an interface?
