@@ -382,14 +382,19 @@ fn adoptRegion(x: anytype) void {
 }
 
 // ---- `Fable.Core.Zig.Iso<'T>`: a value moved between threads whole (Verona's isolated region,
-// Pony's `iso`). `Iso.pack x` takes `x`, which must be isolated: every cell and string it reaches
-// counted once (the caller gave it up: nothing else refers to any part of it), no function,
-// object, exception or interface in it (reached through hooks), no cell the cycle collector
-// follows, no weak reference to any of it. The value is kept as bytes the runtime does not walk,
-// so sharing the Iso (posting it to a MailboxProcessor, capturing it in a thread) marks only the
-// Iso: the value's counts stay plain, and any number of hops cost one pointer each.
-// `Iso.unpack` takes the value out once (an atomic swap: one taker), owned by the thread that
-// unpacks it, unshared. ----
+// Pony's `iso`). `Iso.pack x` takes `x` (the caller gives it up), which must be isolated: each
+// cell and string it reaches that is not shared already is counted exactly as often as the value
+// refers to it (trees, diamonds and cycles; see `Region`), and what is shared already is left as
+// a part of it. A function's environment, an object or an exception not shared yet is counted
+// the same way and marked shared once the value is found isolated. A structure of the cycle
+// collector it reaches moves whole to the unpacking thread's collector; loose collector cells are
+// flagged as targets. Refused: interfaces, what a `[<StackArena>]` made, cells with a weak
+// reference of this thread's, a shared cell's bit while shared weak handles exist, a structure
+// being checked. The value is kept as bytes the runtime does not walk, so sharing the Iso
+// (posting it to a MailboxProcessor, capturing it in a thread) marks only the Iso: the value's
+// counts stay plain, and any number of hops cost one pointer each. `Iso.unpack` takes the value
+// out once (an atomic swap: one taker), owned by the thread that unpacks it. A MailboxProcessor
+// boxes its messages the same way (`isoSend`, `isoHold`). ----
 
 pub fn Iso(comptime T: type) type {
     return *struct {
