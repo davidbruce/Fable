@@ -175,3 +175,37 @@ let ``test Uri.OriginalString works`` () =
     for case in cases do
         let uri = Uri(case)
         uri.OriginalString |> equal case
+// ---- ported from tests/Js/Main (2026-11-16, last) ----
+
+[<Fact>]
+let ``test Host from uri with port works`` () =
+    let uri = Uri("http://www.test2.com:8080/hello?a=b#c")
+    equal "www.test2.com" uri.Host
+
+[<Fact>]
+let ``test Port default to 80 if no port is specified`` () =
+    let uri = Uri("http://www.test3.com/hello?a=b#c")
+    equal 80 uri.Port
+
+[<Fact>]
+let ``test Port returns specified port`` () =
+    let uri = Uri("http://www.test4.com:80/hello?a=b#c")
+    equal 80 uri.Port
+    let uri = Uri("http://www.test5.com:8080/hello?a=b#c")
+    equal 8080 uri.Port
+
+[<Fact>]
+let ``test IsDefaultPort returns true if no port is specified`` () =
+    let uri = Uri("http://www.test3.com/hello?a=b#c")
+    equal true uri.IsDefaultPort
+
+[<Fact>]
+let ``test IsDefaultPort returns true if specified port is default`` () =
+    let uri = Uri("http://www.test4.com:80/hello?a=b#c")
+    equal true uri.IsDefaultPort
+
+[<Fact>]
+let ``test IsDefaultPort returns false if specified port is not default`` () =
+    let uri = Uri("http://www.test5.com:8080/hello?a=b#c")
+    equal false uri.IsDefaultPort
+

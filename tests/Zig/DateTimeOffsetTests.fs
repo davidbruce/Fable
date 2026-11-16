@@ -592,6 +592,9 @@ let ``test Implicit conversion from DateTime preserves value`` () =
 
 
 
+
+
+
 open System.Globalization
 
 [<Fact>]
@@ -947,3 +950,68 @@ let ``test DateTimeOffset <-> Ticks isomorphism`` () =
     checkIsomorphism <| DateTimeOffset(2014, 10, 9, 13, 23, 30, 500, TimeSpan.Zero)
     // checkIsomorphism <| DateTimeOffset(2014, 10, 9, 13, 23, 30, 500, TimeSpan.FromHours 1.0)
     // checkIsomorphism <| DateTimeOffset(2014, 10, 9, 13, 23, 30, 500, TimeSpan.FromHours -5.0)
+
+// ---- ported from tests/Js/Main (2026-11-16, last) ----
+
+let private dtoUsedDate = DateTime(2007, 9, 1, 9, 30, 17, DateTimeKind.Unspecified)
+let private dtoLocalOffset: TimeSpan = TimeZoneInfo.Local.GetUtcOffset(dtoUsedDate)
+
+[<Fact>]
+let ``test Default (= unspecified)`` () =
+    let dt = DateTime(dtoUsedDate.Year, dtoUsedDate.Month, dtoUsedDate.Day, dtoUsedDate.Hour, dtoUsedDate.Minute, dtoUsedDate.Second)
+    let dto = DateTimeOffset(dt)
+    equal dto.Offset dtoLocalOffset
+
+[<Fact>]
+let ``test Unspecified`` () =
+    let dt = DateTime(dtoUsedDate.Year, dtoUsedDate.Month, dtoUsedDate.Day, dtoUsedDate.Hour, dtoUsedDate.Minute, dtoUsedDate.Second, DateTimeKind.Unspecified)
+    let dto = DateTimeOffset(dt)    // no custom offset -> local offset
+    equal dto.Offset dtoLocalOffset
+
+[<Fact>]
+let ``test UTC`` () =
+    let dt = DateTime(dtoUsedDate.Year, dtoUsedDate.Month, dtoUsedDate.Day, dtoUsedDate.Hour, dtoUsedDate.Minute, dtoUsedDate.Second, DateTimeKind.Utc)
+    let dto = DateTimeOffset(dt)
+    equal dto.Offset TimeSpan.Zero
+
+[<Fact>]
+let ``test Local`` () =
+    let dt = DateTime(dtoUsedDate.Year, dtoUsedDate.Month, dtoUsedDate.Day, dtoUsedDate.Hour, dtoUsedDate.Minute, dtoUsedDate.Second, DateTimeKind.Local)
+    let dto = DateTimeOffset(dt)
+    equal dto.Offset dtoLocalOffset
+
+[<Fact>]
+let ``test 14h 30min offset throws exception`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    (fun _ -> source.ToOffset(TimeSpan(14, 30, 0)))
+    |> throwsErrorContaining "Offset must be within plus or minus 14 hour"
+
+[<Fact>]
+let ``test -(14h 30min) offset throws exception`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    (fun _ -> source.ToOffset(TimeSpan(-14, -30, 0)))
+    |> throwsErrorContaining "Offset must be within plus or minus 14 hour"
+
+[<Fact>]
+let ``test 100h offset throws exception`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    (fun _ -> source.ToOffset(TimeSpan(100, 0, 0)))
+    |> throwsErrorContaining "Offset must be within plus or minus 14 hour"
+
+[<Fact>]
+let ``test -100h offset throws exception`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    (fun _ -> source.ToOffset(TimeSpan(-100, 0, 0)))
+    |> throwsErrorContaining "Offset must be within plus or minus 14 hour"
+
+[<Fact>]
+let ``test 10s offset throws exception`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    (fun _ -> source.ToOffset(TimeSpan(0, 0, 10)))
+    |> throwsErrorContaining "Offset must be specified in whole minutes"
+
+[<Fact>]
+let ``test -10s offset throws exception`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    (fun _ -> source.ToOffset(TimeSpan(0, 0, -10)))
+    |> throwsErrorContaining "Offset must be specified in whole minutes"

@@ -3,6 +3,7 @@ module Fable.Tests.Zig.SetTests
 open Fable.Tests.Util
 open Fable.Tests.Util
 open Fable.Tests.Util.Testing
+open System.Collections.Generic
 
 [<Fact>]
 let ``test set function works`` () =
@@ -423,3 +424,40 @@ let ``test Set functions raise ArgumentException on empty sets`` () =
 
 
 // ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+// ---- ported from tests/Js/Main (2026-11-16, last) ----
+
+[<Fact>]
+let ``test Set IReadOnlyCollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Set xs) :> IReadOnlyCollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Set ICollection.IsReadOnly works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Set xs) :> ICollection<_>
+    coll.IsReadOnly |> equal true
+
+[<Fact>]
+let ``test Set ICollection.Count works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Set xs) :> ICollection<_>
+    coll.Count |> equal 3
+
+[<Fact>]
+let ``test Set ICollection.Contains works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Set xs) :> ICollection<_>
+    coll.Contains(("B", 3)) |> equal false
+    coll.Contains(("D", 3)) |> equal false
+    coll.Contains(("B", 2)) |> equal true
+
+[<Fact>]
+let ``test Set ICollection.CopyTo works`` () =
+    let xs = [| ("A", 1); ("B", 2); ("C", 3) |]
+    let coll = (Set xs) :> ICollection<_>
+    let ys = [| ("D", 4); ("E", 5); ("F", 6) |]
+    coll.CopyTo(ys, 0)
+    ys = xs |> equal true
+

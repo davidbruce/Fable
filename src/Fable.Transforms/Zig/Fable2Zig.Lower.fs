@@ -2615,6 +2615,25 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             (fun xs ->
                 ECall(libraryTarget ctx "Map" "toList", [ k; v ], xs, TEnt(listEnt ctx.State, [ TTuple [ k; v ] ]))
             )
+    // (a set seen as the collection of its items: the list of them, in order)
+    | Fable.TypeCast(x, Fable.DeclaredType(c, [ _ ])) when
+        (c.FullName = "System.Collections.Generic.ICollection`1"
+         || c.FullName = "System.Collections.Generic.IReadOnlyCollection`1")
+        && (
+            match x.Type with
+            | Fable.DeclaredType(m, [ _ ]) -> m.FullName = setName
+            | _ -> false
+        )
+        ->
+        let item =
+            match x.Type with
+            | Fable.DeclaredType(_, [ item ]) -> mapTypeArg ctx e.Range item
+            | _ -> failwith "unreachable"
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs -> ECall(libraryTarget ctx "Set" "toList", [ item ], xs, TEnt(listEnt ctx.State, [ item ])))
     | Fable.TypeCast(x, ifaceTarget) when isInterfaceType ctx.Com ifaceTarget && not (isInterfaceType ctx.Com x.Type) ->
         let ifaceRef, _ =
             match unwrapNullness ifaceTarget with

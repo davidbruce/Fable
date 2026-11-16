@@ -1823,6 +1823,9 @@ let ``test Partial active patterns can return bool`` () =
 
 
 
+
+
+
 type ImplicitReturnTypeOverload =
     { Field: int }
     static member op_Implicit(s: string) : int = s.Length
@@ -1864,3 +1867,5 @@ let ``test Null functions in record fields can be read back`` () =
 
 
 // ---- ported from tests/Js/Main (2026-11-16, remaining) ----
+
+// ---- ported from tests/Js/Main (2026-11-16, last) ----

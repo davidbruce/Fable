@@ -99,7 +99,9 @@ let call
     | "Microsoft.FSharp.Control.FSharpAsync", "FromContinuations", [ f ] -> lib "fromContinuations" [ f ]
     | "Microsoft.FSharp.Control.FSharpAsync", "StartChild", [ c; timeout ] -> lib "startChildWith" [ c; timeout ]
     | "Microsoft.FSharp.Control.FSharpAsync", "StartChild", c :: _ -> lib "startChild" [ c ]
-    | "Microsoft.FSharp.Control.FSharpAsync", "get_CancellationToken", [] -> lib "cancellationToken" unitArg
+    | "Microsoft.FSharp.Control.FSharpAsync", "get_CancellationToken", _ -> lib "cancellationToken" unitArg
+    | "Microsoft.FSharp.Control.FSharpAsync", "OnCancel", [ f ] -> lib "onCancel" [ f ]
+    | "Microsoft.FSharp.Control.FSharpAsync", "Choice", [ cs ] -> lib "choice" [ cs ]
     | "Microsoft.FSharp.Control.FSharpAsync", "TryCancelled", [ c; f ] -> lib "tryCancelled" [ c; f ]
     | "Microsoft.FSharp.Control.FSharpAsync", "Sequential", [ cs ] -> lib "sequential" [ cs ]
     | "Microsoft.FSharp.Control.FSharpAsync", "Sleep", [ span ] when
@@ -127,6 +129,9 @@ let call
             }
             [ task ]
             t
+    // (`StartImmediateAsTask`: `StartAsTask` here starts the computation at once too)
+    | "Microsoft.FSharp.Control.FSharpAsync", "StartImmediateAsTask", args ->
+        dotnetCall ctx r "Microsoft.FSharp.Control.FSharpAsync" "StartAsTask" info t
     | "Microsoft.FSharp.Control.FSharpAsync", "StartAsTask", c :: rest ->
         // (the token, F#'s optional argument, is the last)
         let token =
@@ -194,6 +199,41 @@ let call
             match t with
             | Fable.DeclaredType(_, [ item ]) -> item
             | _ -> Fable.Unit
+
+        // (`let!`, `do!` and `return!` of an Async: the task it is started as, as F# binds it)
+        let given =
+            match member', given with
+            | ("Bind" | "ReturnFrom"), c :: rest when
+                (match c.Type with
+                 | Fable.DeclaredType(e, [ _ ]) -> e.FullName = "Microsoft.FSharp.Control.FSharpAsync`1"
+                 | _ -> false)
+                ->
+                let item = itemOf c.Type
+
+                let asTask =
+                    Fable.Call(
+                        Fable.Import(
+                            {
+                                Selector = "StartAsTask"
+                                Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Control.FSharpAsync"
+                                Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                            },
+                            Fable.Any,
+                            None
+                        ),
+                        Fable.CallInfo.Create(args = [ c ], genArgs = [ item ]),
+                        Fable.DeclaredType(
+                            {
+                                FullName = "System.Threading.Tasks.Task`1"
+                                Path = Fable.CoreAssemblyName "System.Runtime"
+                            },
+                            [ item ]
+                        ),
+                        r
+                    )
+
+                asTask :: rest
+            | _ -> given
 
         let retItem (f: Fable.Expr) =
             match f.Type with
@@ -500,6 +540,67 @@ let call
                 MemberRef = None
             }
             [ f ]
+            t
+    // (`Task.Delay(timeSpan)`: its whole milliseconds)
+    | "System.Threading.Tasks.Task", "Delay", [ span ] when
+        (match span.Type with
+         | Fable.DeclaredType(e, _) -> e.FullName = "System.TimeSpan"
+         | _ -> false)
+        ->
+        let ms =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "get_TotalMilliseconds"
+                        Path = Replacements.DotnetPrefix + "System.TimeSpan"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(thisArg = span),
+                Fable.Number(Float64, Fable.NumberInfo.Empty),
+                r
+            )
+
+        let whole =
+            Fable.Call(
+                Fable.Import(
+                    {
+                        Selector = "ToInt32"
+                        Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
+                        Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                    },
+                    Fable.Any,
+                    None
+                ),
+                Fable.CallInfo.Create(args = [ ms ]),
+                Fable.Number(Int32, Fable.NumberInfo.Empty),
+                r
+            )
+
+        dotnetCall
+            ctx
+            r
+            "System.Threading.Tasks.Task"
+            "Delay"
+            { info with
+                ThisArg = None
+                Args = [ whole ]
+            }
+            t
+    | "System.Threading.Tasks.Task", "Delay", [ ms; token ] ->
+        libraryCall
+            ctx
+            r
+            "Task"
+            "delayToken"
+            { info with
+                ThisArg = None
+                SignatureArgTypes = []
+                MemberRef = None
+            }
+            [ ms; token ]
             t
     | "System.Threading.Tasks.Task", "Delay", [ ms ] ->
         libraryCall

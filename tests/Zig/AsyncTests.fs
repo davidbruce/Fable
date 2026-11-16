@@ -1355,6 +1355,9 @@ let ``test FromContinuations rejects a second completion`` () =
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+type Message = string * AsyncReplyChannel<string>
+
+
 
 
 
@@ -1593,3 +1596,616 @@ let ``test AggregateException holds its inner exceptions`` () =
     [ for x in e.InnerExceptions -> x.Message ] |> equal [ "a"; "b" ]
     e.InnerExceptions.[1].Message |> equal "b"
     AggregateException(e, exn "c").Flatten().InnerExceptions.Count |> equal 3
+
+
+
+// ---- ported from tests/Js/Main (2026-11-16, last) ----
+
+[<Fact>]
+let ``test Cancelling a waiting Receive reports cancel and keeps later posts queued`` () =
+    async {
+        use source = new System.Threading.CancellationTokenSource()
+        let mailbox = new MailboxProcessor<int>((fun _ -> async { return () }), source.Token)
+        let! outcome =
+            Async.FromContinuations(fun (ok, _, _) ->
+                Async.StartWithContinuations(mailbox.Receive(), (fun value -> ok $"value {value}"), (fun _ -> ok "error"), (fun _ -> ok "cancel"), source.Token)
+                source.Cancel())
+        equal "cancel" outcome
+        mailbox.Post 42
+        let! next = mailbox.Receive()
+        equal 42 next
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Cancelling the mailbox token cancels a body waiting in Receive`` () =
+    async {
+        use source = new System.Threading.CancellationTokenSource()
+        let! outcome =
+            Async.FromContinuations(fun (ok, _, _) ->
+                MailboxProcessor<int>.Start((fun inbox -> async {
+                    let received = ref None
+                    try
+                        source.CancelAfter 50
+                        let! message = inbox.Receive()
+                        received.Value <- Some message
+                    finally
+                        match received.Value with
+                        | Some message -> ok $"received {message}"
+                        | None -> ok "cancelled" }), source.Token)
+                |> ignore)
+        equal "cancelled" outcome
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async cancellation works`` () =
+    async {
+        let res1, res2, res3 = ref false, ref false, ref false
+        let tcs1 = new System.Threading.CancellationTokenSource(50)
+        let tcs2 = new System.Threading.CancellationTokenSource()
+        let tcs3 = new System.Threading.CancellationTokenSource()
+        sleepAndAssign tcs1.Token res1
+        sleepAndAssign tcs2.Token res2
+        sleepAndAssign tcs3.Token res3
+        tcs2.Cancel()
+        tcs3.CancelAfter(1000)
+        do! Async.Sleep 500
+        equal false !res1
+        equal false !res2
+        equal true !res3
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test CancellationTokenSource.Register works`` () =
+    async {
+        let mutable x = 0
+        let res1 = ref false
+        let tcs1 = new System.Threading.CancellationTokenSource(50)
+        let foo = tcs1.Token.Register(fun () ->
+            x <- x + 1)
+        sleepAndAssign tcs1.Token res1
+        do! Async.Sleep 500
+        equal false !res1
+        equal 1 x
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test CancellationToken can be disposed`` () =
+    // See #2879
+    async {
+        let res1 = ref false
+        do
+            use tcs1 = new System.Threading.CancellationTokenSource()
+            sleepAndAssign tcs1.Token res1
+        do! Async.Sleep 300
+        // Disposing the CancellationToken doesn't cancel the operation
+        equal true !res1
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test MailboxProcessor.post works`` () =
+    async {
+        let mutable res = None
+        let agent = new MailboxProcessor<int>(fun inbox ->
+            let rec messageLoop() = async {
+                let! msg = inbox.Receive()
+                match msg with
+                | 3 -> () // Finish loop
+                | _ ->
+                    res <- Some msg
+                    return! messageLoop()
+            }
+            messageLoop()
+        )
+        agent.Post(1)
+        equal None res // Mailbox hasn't started yet
+        agent.Start()
+        agent.Post(2)
+        // Not necessary in the JS implementation, but in .NET
+        // MailboxProcessor works in the background so we must wait a bit
+        do! Async.Sleep 200
+        equal (Some 2) res
+        agent.Post(3)
+        equal (Some 2) res  // Mailbox has finished
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test MailboxProcessor.postAndAsyncReply works`` () =
+    async {
+        let formatString = "Msg: {0} - {1}"
+        let agent = MailboxProcessor<Message>.Start(fun inbox ->
+            let rec loop n = async {
+                let! (message, replyChannel) = inbox.Receive()
+                do! Async.Sleep(100) // Delay a bit
+                replyChannel.Reply(String.Format(formatString, n, message))
+                if message <> "Bye" then do! loop (n + 1)
+            }
+            loop 0)
+        let! resp = agent.PostAndAsyncReply(fun replyChannel -> "Hi", replyChannel)
+        equal "Msg: 0 - Hi" resp
+        let! resp = agent.PostAndAsyncReply(fun replyChannel -> "Bye", replyChannel)
+        equal "Msg: 1 - Bye" resp
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test MailboxProcessor delivers falsy messages in order`` () =
+    // See #1588
+    async {
+        let mutable collected = []
+        let agent = MailboxProcessor<int>.Start(fun inbox ->
+            let rec loop () = async {
+                let! msg = inbox.Receive()
+                if msg = -1 then ()
+                else
+                    collected <- msg :: collected
+                    return! loop ()
+            }
+            loop ())
+        for msg in [1; 0; 2; 0; 3] do
+            agent.Post(msg)
+        agent.Post(-1)
+        do! Async.Sleep 200
+        equal [1; 0; 2; 0; 3] (List.rev collected)
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test MailboxProcessor.postAndAsyncReply completes with unit reply`` () =
+    async {
+        let mutable ran = false
+        let agent = MailboxProcessor<AsyncReplyChannel<unit>>.Start(fun inbox ->
+            let rec loop () = async {
+                let! chan = inbox.Receive()
+                chan.Reply()
+                return! loop ()
+            }
+            loop ())
+        do! agent.PostAndAsyncReply(fun ch -> ch)
+        ran <- true
+        equal true ran
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test MailboxProcessor second Reply is ignored`` () =
+    async {
+        let log = ResizeArray<string>()
+        let completed = new MailboxProcessor<unit>(fun _ -> async { return () })
+        let agent = MailboxProcessor<AsyncReplyChannel<int>>.Start(fun inbox -> async {
+            let! channel = inbox.Receive()
+            channel.Reply 1
+            channel.Reply 2
+            log.Add "body done"
+            completed.Post() })
+        let! reply = agent.PostAndAsyncReply(id)
+        equal 1 reply
+        do! completed.Receive()
+        equal [|"body done"|] (log.ToArray())
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test MailboxProcessor reply computation can be awaited twice`` () =
+    async {
+        let agent = MailboxProcessor<AsyncReplyChannel<int>>.Start(fun inbox -> async {
+            let! channel = inbox.Receive()
+            channel.Reply 42 })
+        let work = agent.PostAndAsyncReply(id)
+        let! first = work
+        let! second = work
+        equal 42 first
+        equal 42 second
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartChild cancels the child when the parent's token is cancelled`` () =
+    async {
+        let mutable finallyRan = false
+        let mutable completed = false
+        let cts = new System.Threading.CancellationTokenSource()
+        let child = async {
+            try
+                do! Async.Sleep 500
+                completed <- true
+            finally
+                finallyRan <- true
+        }
+        let parent = async {
+            let! childResult = Async.StartChild child
+            do! childResult
+        }
+        Async.StartImmediate(parent, cts.Token)
+        do! Async.Sleep 200
+        cts.Cancel()
+        do! Async.Sleep 600
+        equal true finallyRan
+        equal false completed
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.Parallel children are cancelled when the parent's token is cancelled`` () =
+    async {
+        let mutable completed = 0
+        let cts = new System.Threading.CancellationTokenSource()
+        let mkChild () = async {
+            do! Async.Sleep 500
+            completed <- completed + 1
+        }
+        let work = async {
+            let! _ = Async.Parallel [ mkChild(); mkChild(); mkChild() ]
+            return ()
+        }
+        Async.StartImmediate(work, cts.Token)
+        do! Async.Sleep 200
+        cts.Cancel()
+        do! Async.Sleep 600
+        equal 0 completed
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.Sequential children are cancelled when the parent's token is cancelled`` () =
+    async {
+        let mutable completed = 0
+        let cts = new System.Threading.CancellationTokenSource()
+        let mkChild () = async {
+            do! Async.Sleep 500
+            completed <- completed + 1
+        }
+        let work = async {
+            let! _ = Async.Sequential [ mkChild(); mkChild(); mkChild() ]
+            return ()
+        }
+        Async.StartImmediate(work, cts.Token)
+        do! Async.Sleep 200
+        cts.Cancel()
+        do! Async.Sleep 600
+        equal 0 completed
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartChild with timeout cancels the child when the timeout expires`` () =
+    async {
+        let mutable completed = false
+        let child = async {
+            do! Async.Sleep 300
+            completed <- true
+        }
+        let mutable timedOut = false
+        try
+            let! childResult = Async.StartChild(child, 100)
+            do! childResult
+        with
+        | :? TimeoutException -> timedOut <- true
+        do! Async.Sleep 400
+        equal true timedOut
+        equal false completed
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartChild with timeout leaves the parent running when the timeout expires`` () =
+    async {
+        let child = async { do! Async.Sleep 300 }
+        try
+            let! childResult = Async.StartChild(child, 100)
+            do! childResult
+        with
+        | :? TimeoutException -> ()
+        let! token = Async.CancellationToken
+        equal false token.IsCancellationRequested
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartChild timeout only runs while the result is awaited`` () =
+    async {
+        let child = async {
+            do! Async.Sleep 150
+            return 42
+        }
+        let! childResult = Async.StartChild(child, 100)
+        do! Async.Sleep 250
+        let! result = childResult
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartChild with a timeout of -1 never times out`` () =
+    async {
+        let child = async {
+            do! Async.Sleep 50
+            return 42
+        }
+        let! childResult = Async.StartChild(child, -1)
+        let! result = childResult
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartChild with a timeout of 0 returns an available result`` () =
+    async {
+        let child = async {
+            do! Async.Sleep 50
+            return 42
+        }
+        let! childResult = Async.StartChild(child, 0)
+        do! Async.Sleep 200
+        let! result = childResult
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartChild with a timeout of 0 raises when the result isn't available and leaves the child running`` () =
+    async {
+        let mutable completed = false
+        let child = async {
+            do! Async.Sleep 300
+            completed <- true
+        }
+        let mutable timedOut = false
+        try
+            let! childResult = Async.StartChild(child, 0)
+            do! childResult
+        with
+        | :? TimeoutException -> timedOut <- true
+        do! Async.Sleep 400
+        equal true timedOut
+        equal true completed
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartChild with timeout raises the child's cancellation callback failure`` () =
+    async {
+        let child = async {
+            let! token = Async.CancellationToken
+            token.Register(fun () -> failwith "cleanup") |> ignore
+            do! Async.Sleep 300
+        }
+        let mutable errors = -1
+        try
+            let! childResult = Async.StartChild(child, 100)
+            do! childResult
+        with error ->
+            errors <- (error :?> AggregateException).InnerExceptions.Count
+        equal 1 errors
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.OnCancel ignores a failing interruption`` () =
+    async {
+        let mutable interrupted = false
+        let mutable cancelled = false
+        let cts = new CancellationTokenSource()
+        Async.StartWithContinuations(
+            async {
+                use! _ = Async.OnCancel(fun () ->
+                    interrupted <- true
+                    failwith "interruption")
+                do! Async.Sleep 300
+            },
+            ignore,
+            ignore,
+            (fun _ -> cancelled <- true),
+            cts.Token)
+        do! Async.Sleep 50
+        cts.Cancel()
+        do! Async.Sleep 50
+        equal true interrupted
+        equal true cancelled
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.Parallel respects maxDegreeOfParallelism`` () =
+    async {
+        let lockObj = obj ()
+        let mutable running = 0
+        let mutable peak = 0
+        let work i = async {
+            lock lockObj (fun () ->
+                running <- running + 1
+                peak <- max peak running)
+            do! Async.Sleep 50
+            lock lockObj (fun () -> running <- running - 1)
+            return i
+        }
+        let! results = Async.Parallel([ for i in 1..10 -> work i ], maxDegreeOfParallelism = 3)
+        equal [| 1..10 |] results
+        equal 3 peak
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.Parallel cancels the other computations when one fails`` () =
+    async {
+        let mutable completed = 0
+        let work i = async {
+            if i = 2 then
+                do! Async.Sleep 20
+                failwith "boom"
+            do! Async.Sleep 300
+            System.Threading.Interlocked.Increment(&completed) |> ignore<int>
+        }
+        let mutable error = ""
+        try
+            let! _ = Async.Parallel [ for i in 0..4 -> work i ]
+            ()
+        with ex -> error <- ex.Message
+        do! Async.Sleep 400
+        equal "boom" error
+        equal 0 completed
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.Parallel with an empty sequence returns an empty array`` () =
+    async {
+        let! results = Async.Parallel(([]: Async<int> list), maxDegreeOfParallelism = 2)
+        equal 0 results.Length
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.Choice returns the first Some and cancels the others`` () =
+    async {
+        let mutable completed = false
+        let fast = async {
+            do! Async.Sleep 20
+            return Some 1
+        }
+        let slow = async {
+            do! Async.Sleep 300
+            completed <- true
+            return Some 2
+        }
+        let none = async { return None }
+        let! result = Async.Choice [ slow; none; fast ]
+        do! Async.Sleep 400
+        equal (Some 1) result
+        equal false completed
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.Choice returns None when every computation does`` () =
+    async {
+        let none = async {
+            do! Async.Sleep 10
+            return (None: int option)
+        }
+        let! result = Async.Choice [ none; none ]
+        equal None result
+        let! empty = Async.Choice ([]: Async<int option> list)
+        equal None empty
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.Choice raises when a computation fails`` () =
+    async {
+        let fails = async {
+            do! Async.Sleep 10
+            return failwith "boom"
+        }
+        let slow = async {
+            do! Async.Sleep 300
+            return Some 1
+        }
+        let mutable error = ""
+        try
+            let! _ = Async.Choice [ slow; fails ]
+            ()
+        with ex -> error <- ex.Message
+        equal "boom" error
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.OnCancel runs the interruption when cancelled`` () =
+    async {
+        let mutable interrupted = false
+        let cts = new CancellationTokenSource()
+        Async.StartImmediate(async {
+            use! _ = Async.OnCancel(fun () -> interrupted <- true)
+            do! Async.Sleep 300
+        }, cts.Token)
+        do! Async.Sleep 50
+        cts.Cancel()
+        do! Async.Sleep 50
+        equal true interrupted
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.OnCancel doesn't run the interruption once disposed`` () =
+    async {
+        let mutable interrupted = false
+        let cts = new CancellationTokenSource()
+        Async.StartImmediate(async {
+            let! registration = Async.OnCancel(fun () -> interrupted <- true)
+            registration.Dispose()
+            do! Async.Sleep 300
+        }, cts.Token)
+        do! Async.Sleep 50
+        cts.Cancel()
+        do! Async.Sleep 50
+        equal false interrupted
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.OnCancel doesn't run the interruption when disposed before the cancellation and again by use!`` () =
+    async {
+        let mutable interrupted = false
+        let cts = new CancellationTokenSource()
+        Async.StartImmediate(async {
+            use! registration = Async.OnCancel(fun () -> interrupted <- true)
+            registration.Dispose()
+            do! Async.Sleep 300
+        }, cts.Token)
+        do! Async.Sleep 50
+        cts.Cancel()
+        do! Async.Sleep 50
+        equal false interrupted
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartAsTask works`` () =
+    async {
+        let t = Async.StartAsTask(async {
+            do! Async.Sleep 10
+            return 42
+        })
+        let! result = Async.AwaitTask t
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartAsTask passes the cancellation token`` () =
+    async {
+        let mutable completed = false
+        let cts = new CancellationTokenSource()
+        let t = Async.StartAsTask(async {
+            do! Async.Sleep 200
+            completed <- true
+        }, cancellationToken = cts.Token)
+        cts.Cancel()
+        let mutable outcome = "pending"
+        // AwaitTask reports a cancelled task as an exception on .NET and as a cancellation in JS
+        Async.StartWithContinuations(
+            Async.AwaitTask t,
+            (fun () -> outcome <- "completed"),
+            (fun _ -> outcome <- "cancelled"),
+            (fun _ -> outcome <- "cancelled"))
+        do! Async.Sleep 300
+        equal "cancelled" outcome
+        equal false completed
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Async.StartImmediateAsTask works`` () =
+    async {
+        let t = Async.StartImmediateAsTask(async { return 42 })
+        let! result = Async.AwaitTask t
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+

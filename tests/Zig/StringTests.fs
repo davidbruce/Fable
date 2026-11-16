@@ -2083,4 +2083,3 @@ let ``test Printf works with generic argument`` () =
     let f3 = f2 2
     f3 2 |> equal "foo 2 2 2"
 #endif
-

@@ -229,6 +229,12 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Thread" -> TPrim "fable_rt.ThreadOf"
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Diagnostics.Stopwatch" ->
         TEnt(libRecordEnt ctx "Stopwatch" "StopwatchOf", [])
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Timers.Timer" ->
+        TEnt(libRecordEnt ctx "Timer" "TimerOf", [])
+    // (`TimeZoneInfo.Local` and `TimeZoneInfo.Utc`, the zones there are here: whether it is local)
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.TimeZoneInfo" -> tBool
+    | Fable.DeclaredType(ent, []) when ent.FullName = "System.Timers.ElapsedEventArgs" ->
+        TEnt(libRecordEnt ctx "Timer" "ElapsedEventArgsOf", [])
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Stack`1" ->
         TEnt(libRecordEnt ctx "Stack" "StackOf_1", [ mapType ctx r item ])
     | Fable.DeclaredType(ent, [ k; v ]) when ent.FullName = "System.Runtime.CompilerServices.ConditionalWeakTable`2" ->
@@ -911,6 +917,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                     "cancelled", tBool
                     "handlers", TEnt(netEnt ctx.State "ResizeArray", [ TOpt(TFn([ tVoid ], tVoid)) ])
                     "disposed", tBool
+                    "canCancel", tBool
                 ]
             | "CancellationTokenOf" -> [ "source", TEnt(libRecordEnt ctx "Async" "CancellationSource", []) ]
             | "TaskOf_1" ->
@@ -951,6 +958,19 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "DateTimeOffsetOf" -> [ "utcTicks", TPrim "i64"; "offsetMinutes", TPrim "i32" ]
             | "TimeOnlyOf" -> [ "timeTicks", TPrim "i64" ]
             | "StopwatchOf" -> [ "elapsed", TPrim "i64"; "startedAt", TPrim "i64"; "running", tBool ]
+            | "ElapsedEventArgsOf" -> [ "signalTime", TEnt(libRecordEnt ctx "DateTime" "DateTimeOf", []) ]
+            | "TimerOf" ->
+                [
+                    "interval", TPrim "f64"
+                    "autoReset", tBool
+                    "enabled", tBool
+                    "elapsed",
+                    TEnt(
+                        libRecordEnt ctx "Event" "DelegateEventOf_1",
+                        [ TEnt(libRecordEnt ctx "Timer" "ElapsedEventArgsOf", []) ]
+                    )
+                    "generation", tI32
+                ]
             | "DirectoryInfoOf" -> [ "fullName", tStr ]
             | "GuidOf" -> [ "a", TPrim "u32"; "b", tI32; "c", tI32; "rest", TPrim "u64" ]
             | "UriOf" ->
@@ -977,6 +997,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "HandOver" -> [ "handedOver" ]
             | "Timer" -> [ "live" ]
             | "StopwatchOf" -> [ "elapsed"; "startedAt"; "running" ]
+            | "TimerOf" -> [ "interval"; "autoReset"; "enabled"; "generation" ]
             | "TaskOf_1" -> [ "fable_task"; "fable_thread" ]
             | "MailboxOf_1" -> [ "waiting"; "started"; "begun"; "running"; "turnToken" ]
             | _ -> []

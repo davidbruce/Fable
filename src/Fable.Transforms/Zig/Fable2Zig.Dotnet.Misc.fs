@@ -1616,6 +1616,68 @@ let call
     | "System.Threading.Thread", "get_IsAlive", [ th ] -> pure' "fable_rt.threadIsAlive($0)" [ th ] tBool
     | "System.Threading.Thread", "get_CurrentThread", [] -> ELit("{}", tVoid)
     | "System.Threading.Thread", "get_ManagedThreadId", _ -> pure' "fable_rt.threadId()" [] tI32
+    // ---- `TimeZoneInfo.Local` and `TimeZoneInfo.Utc` ----
+    | "System.TimeZoneInfo", "get_Local", _ -> ELit("true", tBool)
+    | "System.TimeZoneInfo", "get_Utc", _ -> ELit("false", tBool)
+    | "System.TimeZoneInfo", "GetUtcOffset", [ zone; d ] when
+        (match d.Type with
+         | Fable.DeclaredType(e, _) -> e.FullName = "System.DateTime"
+         | _ -> false)
+        ->
+        libraryCall
+            ctx
+            r
+            "DateTime"
+            "zoneUtcOffset"
+            { info with
+                ThisArg = None
+                SignatureArgTypes = []
+                MemberRef = None
+            }
+            [ zone; d ]
+            t
+    // ---- `System.Timers.Timer`: the library's Timer.fs ----
+    | "System.Timers.Timer", name, args ->
+        let call fn xs =
+            libraryCall
+                ctx
+                r
+                "Timer"
+                fn
+                { info with
+                    ThisArg = None
+                    GenericArgs = []
+                    SignatureArgTypes = []
+                }
+                xs
+                t
+
+        let field (tm: Fable.Expr) (f: string) (ty: Ty) =
+            bindArgs ctx [ lw ctx tm ] (fun xs -> EGet(xs.Head, PField f, ty))
+
+        match name, args |> List.filter (fun a -> a.Type <> Fable.Unit) with
+        | ".ctor", [] ->
+            call
+                "create"
+                [
+                    Fable.Value(Fable.NumberConstant(Fable.NumberValue.Float64 100.0, Fable.NumberInfo.Empty), None)
+                ]
+        | ".ctor", [ ms ] -> call "create" [ ms ]
+        | "Start", [ tm ] -> call "start" [ tm ]
+        | ("Stop" | "Close" | "Dispose"), [ tm ] -> call "stop" [ tm ]
+        | "set_Enabled", [ tm; v ] -> call "setEnabled" [ tm; v ]
+        | "set_Interval", [ tm; v ] -> call "setInterval" [ tm; v ]
+        | "set_AutoReset", [ tm; v ] -> call "setAutoReset" [ tm; v ]
+        | "get_Enabled", [ tm ] -> field tm "enabled" tBool
+        | "get_Interval", [ tm ] -> field tm "interval" (TPrim "f64")
+        | "get_AutoReset", [ tm ] -> field tm "autoReset" tBool
+        | "add_Elapsed", _
+        | "remove_Elapsed", _ ->
+            fail r "the Zig target does not support Timer.%s yet; use timer.Elapsed.Add or Subscribe" name
+        | ("get_Elapsed" | "Elapsed"), [ tm ] -> call "elapsed" [ tm ]
+        | _ -> fail r "the Zig target does not support Timer.%s yet" name
+    | "System.Timers.ElapsedEventArgs", "get_SignalTime", [ a ] ->
+        bindArgs ctx [ lw ctx a ] (fun xs -> EGet(xs.Head, PField "signalTime", mapType ctx r t))
     // ---- `System.Diagnostics.Stopwatch` and `Thread.Sleep`: the library's Stopwatch.fs ----
     | ("System.Diagnostics.Stopwatch" | "System.Threading.Thread"), name, args ->
         let unitArg = [ Fable.Value(Fable.UnitConstant, None) ]

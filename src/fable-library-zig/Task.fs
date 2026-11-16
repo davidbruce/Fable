@@ -194,6 +194,25 @@ let delay (millisecondsDelay: int) : TaskOf<unit> =
 
         t
 
+/// `Task.Delay(ms, token)`: cancelled by the token (a TaskCanceledException when awaited)
+let delayToken (millisecondsDelay: int) (token: Fable.Library.Zig.Async.CancellationTokenOf) : TaskOf<unit> =
+    let t: TaskOf<unit> =
+        {
+            fable_task = None
+            fable_thread = None
+        }
+
+    Fable.Library.Zig.Async.startWithContinuationsToken
+        (Fable.Library.Zig.Async.sleep millisecondsDelay)
+        (fun () -> t.fable_task <- Some(Ok()))
+        (fun e -> t.fable_task <- Some(Error e))
+        (fun _ ->
+            t.fable_task <- Some(Error(System.Threading.Tasks.TaskCanceledException "A task was canceled." :> exn))
+        )
+        (Some token)
+
+    t
+
 let completedTask () : TaskOf<unit> = done' (Ok())
 
 let whenAll<'T> (tasks: SeqOf<TaskOf<'T>>) : TaskOf<'T[]> =

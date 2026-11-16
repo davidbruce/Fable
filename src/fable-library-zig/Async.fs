@@ -16,6 +16,8 @@ type CancellationSource =
         mutable cancelled: bool
         mutable handlers: ResizeArray<(unit -> unit) option>
         mutable disposed: bool
+        /// false for `CancellationToken.None`'s, which nothing can cancel
+        canCancel: bool
     }
 
 /// .NET's `CancellationToken`: the source it reads
@@ -43,13 +45,23 @@ let newSource () : CancellationSource =
         cancelled = false
         handlers = ResizeArray()
         disposed = false
+        canCancel = true
     }
 
 let private canceled () : exn =
     System.OperationCanceledException "The operation was canceled." :> exn
 
 /// `CancellationToken.None`: a token that is never cancelled
-let tokenNone () : CancellationTokenOf = { source = newSource () }
+let tokenNone () : CancellationTokenOf =
+    {
+        source =
+            {
+                cancelled = false
+                handlers = ResizeArray()
+                disposed = false
+                canCancel = false
+            }
+    }
 
 /// `new CancellationTokenSource()`
 let sourceCreate () : CancellationSource = newSource ()
@@ -107,6 +119,9 @@ type private Sched =
         pending: ResizeArray<unit -> unit>
         /// how many `drive`s are running (the outermost lets the scheduler go when it is idle)
         mutable drives: int
+        /// (asked before a due timer runs: `Async.Parallel` on threads cancels a computation of
+        /// its own thread there when another one failed)
+        mutable poll: (unit -> unit) option
     }
 
 #if FABLE_COMPILER
@@ -133,6 +148,7 @@ let private sched () : Sched =
                 depth = 0
                 pending = ResizeArray()
                 drives = 0
+                poll = None
             }
 
         stateSet (box made)
@@ -160,6 +176,9 @@ let private schedule (ms: int) (action: unit -> unit) : Timer =
     st.timerOrder <- st.timerOrder + 1
     st.timers.Add t
     t
+
+/// `action` at `ms` from now, on the scheduler's clock (System.Timers.Timer's ticks, see Timer.fs)
+let scheduleAfter (ms: int) (action: unit -> unit) : unit = schedule ms action |> ignore
 
 /// Run the earliest timer (once it is due); false when there is none
 let private runNextTimer () : bool =
@@ -189,8 +208,13 @@ let private runNextTimer () : bool =
             if wait > 0L then
                 sleepMilliseconds wait
 
-            t.live <- false
-            t.action ()
+            match (sched ()).poll with
+            | Some poll -> poll ()
+            | None -> ()
+
+            if t.live then
+                t.live <- false
+                t.action ()
 
         true
 
@@ -693,6 +717,9 @@ let startChildWith<'T> (computation: AsyncOf<'T>) (timeout: int option) : AsyncO
     make (fun k ->
         let mutable outcome: (Result<'T, exn> * bool) option = None
         let waiters = ResizeArray<Cont<'T>>()
+        // (the child's own source, cancelled with the caller's token or when a timeout expires)
+        let inner = sourceCreate ()
+        let link = tokenRegister k.token (fun () -> sourceCancel inner)
 
         let deliver (o: Result<'T, exn> * bool) (k2: Cont<'T>) =
             match o with
@@ -703,6 +730,7 @@ let startChildWith<'T> (computation: AsyncOf<'T>) (timeout: int option) : AsyncO
         let complete (o: Result<'T, exn> * bool) =
             if outcome.IsNone then
                 outcome <- Some o
+                link.Dispose()
                 let ws = waiters.ToArray()
                 waiters.Clear()
 
@@ -715,23 +743,53 @@ let startChildWith<'T> (computation: AsyncOf<'T>) (timeout: int option) : AsyncO
                 ok = fun x -> complete (Ok x, false)
                 fail = fun e -> complete (Error e, false)
                 cancel = fun e -> complete (Error e, true)
-                token = k.token
+                token = sourceToken inner
                 handOver = None
             }
 
-        match timeout with
-        | Some ms when ms >= 0 ->
-            schedule
-                ms
-                (fun () -> complete (Error(System.TimeoutException "The operation has timed out." :> exn), false))
-            |> ignore
-        | _ -> ()
+        let timedOut () =
+            System.TimeoutException "The operation has timed out." :> exn
 
+        // (the timeout runs while the result is awaited: when it expires the awaiter gets a
+        // TimeoutException and the child is cancelled; a timeout of 0 leaves it running)
         k.ok (
             make (fun k2 ->
-                match outcome with
-                | Some o -> deliver o k2
-                | None -> waiters.Add k2
+                match outcome, timeout with
+                | Some o, _ -> deliver o k2
+                | None, Some 0 -> k2.fail (timedOut ())
+                | None, Some ms when ms > 0 ->
+                    let mutable settled = false
+
+                    let once (f: unit -> unit) =
+                        if not settled then
+                            settled <- true
+                            f ()
+
+                    waiters.Add
+                        {
+                            ok = fun x -> once (fun () -> k2.ok x)
+                            fail = fun e -> once (fun () -> k2.fail e)
+                            cancel = fun e -> once (fun () -> k2.cancel e)
+                            token = k2.token
+                            handOver = None
+                        }
+
+                    schedule
+                        ms
+                        (fun () ->
+                            once (fun () ->
+                                let failure =
+                                    try
+                                        sourceCancel inner
+                                        timedOut ()
+                                    with e ->
+                                        e
+
+                                k2.fail failure
+                            )
+                        )
+                    |> ignore
+                | None, _ -> waiters.Add k2
             )
         )
     )
@@ -763,9 +821,11 @@ let sleep (millisecondsDueTime: int) : AsyncOf<unit> =
                     tokenRegister
                         k.token
                         (fun () ->
+                            // (the cancellation goes on at the scheduler's next turn, as .NET
+                            // queues it: the token's other callbacks run first)
                             if timer.live then
                                 timer.live <- false
-                                k.cancel (canceled ())
+                                schedule 0 (fun () -> k.cancel (canceled ())) |> ignore
                         )
                 )
     )
@@ -816,7 +876,7 @@ let private holdsNoCycles (_x: 'a) : bool = false
 /// there does not stop the others early (their results are left). Otherwise they run here:
 /// all start (each runs until it waits, then they go on as their timers come due), and the
 /// first failure cancels the others.
-let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
+let private parallelWith<'T> (computations: SeqOf<AsyncOf<'T>>) (maxDegree: int option) : AsyncOf<'T[]> =
     make (fun k ->
         let cs = Array.ofList (Seq.toList computations)
         let n = cs.Length
@@ -831,8 +891,11 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
             // (only the type of the results decides: an exception is checked when it comes back)
             let resultType: 'T[] = [||]
 
+            // (on threads only when nothing can cancel the computations: a cancellation of the
+            // caller's token reaches them where they run here, one thread)
             if
                 n > 1
+                && not k.token.source.canCancel
                 && holdsNoCycles resultType
                 && tryShare cs
                 && tryShare results
@@ -854,18 +917,40 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
                             i
                         )
 
+                // (a computation of another thread failed: the others are cancelled where they
+                // run, at their next timer)
+                let failed: bool[] = [| false |]
+
+                if not (tryShare failed) then
+                    failwith "unreachable"
+
+                let hasFailed () = lock failed (fun () -> failed.[0])
+
                 let threads =
                     Array.init
-                        (if n < 8 then
-                             n
-                         else
-                             8)
+                        (System.Math.Min(System.Math.Min(n, 8), defaultArg maxDegree 8))
                         (fun _ ->
                             System.Threading.Thread(fun () ->
                                 let mutable i = take ()
 
                                 while i < n do
-                                    let r, _ = runHere cs.[i] (tokenNone ())
+                                    let local = sourceCreate ()
+                                    let st = sched ()
+
+                                    st.poll <-
+                                        Some(fun () ->
+                                            if not local.cancelled && hasFailed () then
+                                                try
+                                                    sourceCancel local
+                                                with _ ->
+                                                    ()
+                                        )
+
+                                    let r, _ =
+                                        if hasFailed () then
+                                            Some(Error(canceled ())), true
+                                        else
+                                            runHere cs.[i] (sourceToken local)
 
                                     // (an exception that reaches what cannot be shared comes back as
                                     // a new one with its message)
@@ -876,13 +961,15 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
                                         | _ -> r
 
                                     match r with
-                                    | Some(Error _) ->
+                                    | Some(Error e) when not (e :? System.OperationCanceledException) ->
                                         lock
                                             firstFail
                                             (fun () ->
                                                 if firstFail.[0] < 0 then
                                                     firstFail.[0] <- i
                                             )
+
+                                        lock failed (fun () -> failed.[0] <- true)
                                     | _ -> ()
 
                                     results.[i] <- r
@@ -930,7 +1017,17 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
                         link.Dispose()
                         f ()
 
-                for i in 0 .. n - 1 do
+                // (with a degree: that many at once, the next started when one ends)
+                let degree = defaultArg maxDegree n
+                let mutable nextToStart = 0
+
+                let rec startNext () =
+                    if nextToStart < n && not finished then
+                        let i = nextToStart
+                        nextToStart <- nextToStart + 1
+                        startOne i
+
+                and startOne (i: int) =
                     start
                         cs.[i]
                         {
@@ -941,6 +1038,8 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
 
                                     if remaining = 0 then
                                         finish (fun () -> k.ok (results |> Array.map Option.get))
+                                    else
+                                        startNext ()
                             fail =
                                 fun e ->
                                     finish (fun () ->
@@ -951,8 +1050,91 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
                             token = sourceToken inner
                             handOver = None
                         }
+
+                for _ in 1 .. System.Math.Min(degree, n) do
+                    startNext ()
     )
 
+let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> = parallelWith computations None
+
+
+/// `Async.OnCancel(interruption)`: the interruption runs if the computation's token is cancelled
+/// while what this gives is not disposed (what it raises is ignored, as FSharp.Core does)
+let onCancel (interruption: unit -> unit) : AsyncOf<System.IDisposable> =
+    make (fun k ->
+        let registration =
+            tokenRegister
+                k.token
+                (fun () ->
+                    try
+                        interruption ()
+                    with _ ->
+                        ()
+                )
+
+        k.ok registration
+    )
+
+/// `Async.Choice(computations)`: they all start; the first that gives `Some` wins and the others
+/// are cancelled; `None` when every one gives `None`; the first exception, the others cancelled
+let choice<'T> (computations: SeqOf<AsyncOf<'T option>>) : AsyncOf<'T option> =
+    make (fun k ->
+        let cs = Array.ofList (Seq.toList computations)
+        let n = cs.Length
+
+        if n = 0 then
+            k.ok None
+        else
+            let mutable remaining = n
+            let mutable finished = false
+            let inner = sourceCreate ()
+            let link = tokenRegister k.token (fun () -> sourceCancel inner)
+
+            let finish (f: unit -> unit) =
+                if not finished then
+                    finished <- true
+                    link.Dispose()
+                    f ()
+
+            let cancelOthers () =
+                try
+                    sourceCancel inner
+                with _ ->
+                    ()
+
+            for c in cs do
+                start
+                    c
+                    {
+                        ok =
+                            fun r ->
+                                match r with
+                                | Some _ ->
+                                    finish (fun () ->
+                                        cancelOthers ()
+                                        k.ok r
+                                    )
+                                | None ->
+                                    remaining <- remaining - 1
+
+                                    if remaining = 0 then
+                                        finish (fun () -> k.ok None)
+                        fail =
+                            fun e ->
+                                finish (fun () ->
+                                    cancelOthers ()
+                                    k.fail e
+                                )
+                        cancel =
+                            fun e ->
+                                remaining <- remaining - 1
+
+                                if remaining = 0 then
+                                    finish (fun () -> k.cancel e)
+                        token = sourceToken inner
+                        handOver = None
+                    }
+    )
 
 /// `Async.Parallel(computations, maxDegreeOfParallelism)`: the degree checked where the call is
 /// made, as .NET does (the computations then run as `Async.Parallel` runs them)
@@ -967,7 +1149,7 @@ let parallelAllMax<'T> (computations: SeqOf<AsyncOf<'T>>) (maxDegree: int option
         )
     | _ -> ()
 
-    parallelAll computations
+    parallelWith computations maxDegree
 
 let returnValue<'T> (value: 'T) : AsyncOf<'T> = builderReturn value
 

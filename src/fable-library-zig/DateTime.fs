@@ -434,6 +434,19 @@ let toLocalTime (d: DateTimeOf) : DateTimeOf =
             kind = local
         }
 
+/// `TimeZoneInfo.Local.GetUtcOffset(d)` (`isLocal`) and `TimeZoneInfo.Utc.GetUtcOffset(d)`: of a
+/// UTC time, the offset at that instant; of another, the offset of that local time
+let zoneUtcOffset (isLocal: bool) (d: DateTimeOf) : Fable.Library.Zig.TimeSpan.TimeSpanOf =
+    let ticks =
+        if not isLocal then
+            0L
+        elif d.kind = utc then
+            localOffsetTicks d.ticks
+        else
+            offsetAtLocal d.ticks
+
+    { ticks = ticks }
+
 /// The offset that "z", "K" and "O" show: none for UTC, the local zone's otherwise
 let private offsetOf (d: DateTimeOf) : int64 =
     if d.kind = utc then

@@ -665,6 +665,9 @@ let ``test negative lookbehind works`` () =
 
 
 
+
+
+
 [<Fact>]
 let ``test Match.Groups iteration works II`` () =
     // See #2167
@@ -795,3 +798,5 @@ let ``test .Net named group gets replaced`` () =
 
     actual |> equal expected
 
+
+// ---- ported from tests/Js/Main (2026-11-16, last) ----

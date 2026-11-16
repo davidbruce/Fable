@@ -621,7 +621,7 @@ let call
         | _ -> fail r "the Zig target does not support %s of a collection seen as an interface yet" name
     // (`IsReadOnly`, `Contains` and `CopyTo` of an `ICollection` that is a list here (a map's
     // entries, a set's items) or an array: read-only, as on .NET)
-    | "System.Collections.Generic.ICollection`1", ("get_IsReadOnly" | "Contains" | "CopyTo"), Uncast c :: rest when
+    | "System.Collections.Generic.ICollection`1", ("get_IsReadOnly" | "Contains" | "CopyTo"), (Uncast c as c0) :: rest when
         (match c.Type with
          | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> true
          | Fable.DeclaredType(ent, _) ->
@@ -636,10 +636,12 @@ let call
             | _ -> false
 
         match name, rest with
+        // (a map's or a set's: the list it is seen as, which the cast makes)
         | "get_IsReadOnly", _ -> bindArgs ctx [ lwStmt ctx c ] (fun _ -> ELit("true", tBool))
         | "Contains", [ x ] when isArray -> pure' "fable_rt.arrayContainsItem($0, $1)" [ c; x ] tBool
-        | "Contains", [ x ] -> pure' "fable_rt.listContains($0, $1)" [ c; x ] tBool
-        | "CopyTo", [ a; i ] -> rt "fable_rt.collCopyTo($0, $1, $2)" [ c; a; i ] tVoid
+        | "Contains", [ x ] -> pure' "fable_rt.listContains($0, $1)" [ c0; x ] tBool
+        | "CopyTo", [ a; i ] when isArray -> rt "fable_rt.collCopyTo($0, $1, $2)" [ c; a; i ] tVoid
+        | "CopyTo", [ a; i ] -> rt "fable_rt.collCopyTo($0, $1, $2)" [ c0; a; i ] tVoid
         | _ -> fail r "the Zig target does not support ICollection.%s with these arguments yet" name
     | ("System.Collections.Generic.IDictionary`2" | "System.Collections.Generic.IReadOnlyDictionary`2"), _, _ ->
         dotnetCall ctx r "System.Collections.Generic.Dictionary`2" name info t

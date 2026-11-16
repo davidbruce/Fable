@@ -1572,3 +1572,96 @@ let ``test DateTime.ToString('Y') works`` () =
     |> format
     |> equal "2014 September"
 
+
+// ---- ported from tests/Js/Main (2026-11-16, last) ----
+
+[<Fact>]
+let ``test Timer with AutoReset = false works`` () =
+    async {
+        let res = ref 0
+        let t = new Timers.Timer()
+        t.Elapsed.Add(fun ev -> res := !res + 5)
+        t.AutoReset <- false
+        t.Interval <- 25.
+        t.Enabled <- true
+        do! Async.Sleep 100
+        equal 5 !res
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Timer with AutoReset = true works`` () =
+    async {
+        let res = ref 0
+        let t = new Timers.Timer(50.)
+        t.Elapsed.Add(fun ev -> res := !res + 5)
+        t.Start()
+        do! Async.Sleep 200
+        t.Stop()
+        // Snapshot after Stop: a tick landing between the read and the stop is a legal
+        // interleaving, and would be indistinguishable from Stop failing to halt the timer.
+        let afterStop = !res
+        do! Async.Sleep 100
+        // AutoReset keeps the timer firing, so more than one tick lands. The exact number is
+        // timing-dependent — how many 50ms ticks fit in the sleep varies with runner load.
+        afterStop > 5 |> equal true
+        // Stop halts it: no further ticks after the snapshot.
+        equal afterStop !res
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Timer.Elapsed.Subscribe works`` () =
+    async {
+        let res = ref 0
+        let t = new Timers.Timer(50.)
+        let disp = t.Elapsed.Subscribe(fun ev -> res := !res + 5)
+        t.Start()
+        do! Async.Sleep 200
+        disp.Dispose()
+        // Snapshot after Dispose: a tick landing between the read and the unsubscribe is a
+        // legal interleaving, and would be indistinguishable from Dispose failing to detach.
+        let afterDispose = !res
+        do! Async.Sleep 100
+        // The subscriber receives Elapsed events. The exact number is timing-dependent — how
+        // many 50ms ticks fit in the sleep varies with runner load.
+        afterDispose > 5 |> equal true
+        // Dispose detaches it: no further ticks after the snapshot.
+        equal afterDispose !res
+        t.Stop()
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Assigning an event to a variable works`` () =
+    // See #1863
+    let createTimerAndObservable timerInterval =
+        // setup a timer
+        let timer = new System.Timers.Timer(float timerInterval)
+        timer.AutoReset <- true
+        // events are automatically IObservable
+        let observable = timer.Elapsed
+        // return an async task
+        let task = async {
+            timer.Start()
+            do! Async.Sleep 200
+            timer.Stop()
+        }
+        // return a async task and the observable
+        (task,observable)
+    // create the timer and the corresponding observable
+    let basicTimer2 , timerEventStream = createTimerAndObservable 50
+
+    let mutable acc = 1
+    // register that everytime something happens on the
+    // event stream, print the time.
+    timerEventStream |> Observable.subscribe (fun _ ->
+        acc <- acc + 1) |>ignore
+
+    async {
+        do! basicTimer2
+        // printfn "%i" acc
+        acc > 2 |> equal true
+    }
+    |> Async.RunSynchronously
+

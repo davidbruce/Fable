@@ -5,6 +5,9 @@ open Fable.Tests.Util
 open Fable.Tests.Util.Testing
 open System.Threading.Tasks
 
+// Bridge pattern: works on .NET (Async.AwaitTask wraps Task)
+let awaitTask (t: Task<'T>) = Async.AwaitTask t
+
 type DisposableAction(f) =
     interface IDisposable with
         member _.Dispose() = f ()
@@ -233,3 +236,175 @@ let ``test async ternary in closure awaits both branches`` () =
     let fn2 = makeClosure false
     let result2 = fn2 41 |> fun tsk -> tsk.GetAwaiter().GetResult()
     equal None result2
+
+// ---- ported from tests/Js/Main (2026-11-16, last) ----
+
+[<Fact>]
+let ``test Simple task result works`` () =
+    async {
+        let! result = awaitTask (task { return 42 })
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Task.FromResult works`` () =
+    async {
+        let! result = awaitTask (Task.FromResult 42)
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test task let bang works`` () =
+    async {
+        let! result = awaitTask (task {
+            let! x = task { return 10 }
+            let! y = task { return 20 }
+            return x + y
+        })
+        equal 30 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test task do bang works`` () =
+    async {
+        let mutable x = 0
+        let! result = awaitTask (task {
+            do! task { x <- 42 }
+            return x
+        })
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test task return from works`` () =
+    async {
+        let inner = task { return "hello" }
+        let! result = awaitTask (task { return! inner })
+        equal "hello" result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test task try-with works`` () =
+    async {
+        let mutable result = 0
+        let! _ = awaitTask (task {
+            try failwith "boom"
+            with _e -> result <- 42
+        })
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test task sequential composition works`` () =
+    async {
+        let mutable count = 0
+        let! result = awaitTask (task {
+            let! a = task { count <- count + 1; return count }
+            let! b = task { count <- count + 1; return count }
+            return a + b
+        })
+        equal 3 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Task exceptions propagate through bind`` () =
+    async {
+        let mutable result = ""
+        let! _ = awaitTask (task {
+            try
+                let! _ = task { failwith "inner"; return 0 }
+                result <- "no exception"
+            with ex ->
+                result <- ex.Message
+        })
+        equal "inner" result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test TaskCompletionSource works`` () =
+    async {
+        let tcs = TaskCompletionSource<int>()
+        tcs.SetResult(42)
+        let! result = awaitTask tcs.Task
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Task.Delay works`` () =
+    async {
+        let mutable steps = []
+        let! _ = awaitTask (task {
+            steps <- "before" :: steps
+            do! Task.Delay 20
+            do! Task.Delay(TimeSpan.FromMilliseconds 10.)
+            steps <- "after" :: steps
+        })
+        equal [ "after"; "before" ] steps
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test Task.Delay can be cancelled`` () =
+    async {
+        let cts = new System.Threading.CancellationTokenSource()
+        let delay = Task.Delay(1000, cts.Token)
+        cts.Cancel()
+        let! cancelled = awaitTask (task {
+            try
+                do! delay
+                return false
+            with _ -> return true
+        })
+        equal true cancelled
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test task can bind an Async`` () =
+    async {
+        let work = async {
+            do! Async.Sleep 10
+            return 41
+        }
+        let! result = awaitTask (task {
+            let! x = work
+            return x + 1
+        })
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test task can return! an Async`` () =
+    async {
+        let work = async {
+            do! Async.Sleep 10
+            return 42
+        }
+        let! result = awaitTask (task { return! work })
+        equal 42 result
+    }
+    |> Async.RunSynchronously
+
+[<Fact>]
+let ``test task can do! an Async`` () =
+    async {
+        let mutable ran = false
+        let work = async {
+            do! Async.Sleep 10
+            ran <- true
+        }
+        let! _ = awaitTask (task { do! work })
+        equal true ran
+    }
+    |> Async.RunSynchronously
+

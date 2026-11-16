@@ -334,6 +334,11 @@ let port (u: UriOf) =
     else
         defaultPort u.scheme
 
+/// `u.IsDefaultPort`: no port written, or the scheme's own (which the parser leaves out)
+let isDefaultPort (u: UriOf) =
+    requireAbsolute u
+    u.port < 0
+
 let absolutePath (u: UriOf) =
     requireAbsolute u
     u.path
