@@ -343,12 +343,9 @@ let rec private formatCrossCall
 
                         $"fable_rt.callG(%s{gns}, \"%s{usesStr}\", %s{argsTuple}, %s{errDrops})"
 
-                em.Counter <- em.Counter + 1
-                let lbl = $"call%d{em.Counter}"
-                let raw = freshName em "raw"
-
-                Some
-                    $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) try %s{raw} else %s{raw}; }})"
+                // (whether it raises is known only when the Zig is compiled: `lift` makes an
+                // error union of what does not, of no errors, which `try` lets through)
+                Some $"(try fable_rt.lift(%s{c}))"
             | _ ->
                 if typeArgs.IsEmpty then
                     Some $"fable_rt.callM(%s{modAlias}, \"%s{memberName}\", \"%s{usesStr}\", %s{argsTuple}, .{{}})"
@@ -652,12 +649,8 @@ and ex (em: Em) (e: Expr) : string =
             | Some txt -> txt
             | None ->
                 let c = ex em call
-                em.Counter <- em.Counter + 1
-                let lbl = $"call%d{em.Counter}"
-                let raw = freshName em "raw"
                 let edge = edgeText em ds
-
-                $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) (%s{raw} catch %s{edge}) else %s{raw}; }})"
+                $"(fable_rt.lift(%s{c}) catch %s{edge})"
         | _ ->
             let definite =
                 match call with
@@ -680,12 +673,9 @@ and ex (em: Em) (e: Expr) : string =
                 if definite then
                     $"(%s{c} catch %s{edge})"
                 else
-                    // whether this function raises is only known when the Zig is compiled
-                    em.Counter <- em.Counter + 1
-                    let lbl = $"call%d{em.Counter}"
-                    let raw = freshName em "raw"
-
-                    $"(%s{lbl}: {{ const %s{raw} = %s{c}; break :%s{lbl} if (comptime fable_rt.isRaised(@TypeOf(%s{raw}))) (%s{raw} catch %s{edge}) else %s{raw}; }})"
+                    // whether this function raises is only known when the Zig is compiled (see
+                    // fable_rt.lift)
+                    $"(fable_rt.lift(%s{c}) catch %s{edge})"
     | EEmit(macro, xs, ty)
     | ERt(macro, xs, ty) ->
         let args = xs |> List.map (ex em) |> Array.ofList

@@ -1680,10 +1680,14 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 | None -> fail e.Range "internal: ExceptionDispatchInfo.Throw without its object"
             | _ -> fail e.Range "internal: not a call"
 
+        // (lowered in the order they run: what one statement tells of a variable holds for those
+        // after it, not before)
+        let beforeIrs = before |> List.map (lwStmt ctx)
+
         let raiseIr =
             bindArgs ctx [ lw ctx thrown ] (fun xs -> ERaise(xs.Head, mapType ctx e.Range e.Type))
 
-        before |> List.rev |> List.fold (fun acc s -> ESeq(lwStmt ctx s, acc)) raiseIr
+        List.foldBack (fun ir acc -> ESeq(ir, acc)) beforeIrs raiseIr
     // (a guard that raises when something is null: it is not null in what follows)
     | Fable.Sequential es when
         es
@@ -1715,8 +1719,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         match List.rev es with
         | [] -> EUnit
         | last :: restRev ->
+            // (lowered in the order they run: what one statement tells of a variable (an
+            // assignment forgets what was known of it) holds for those after it, not before)
+            let restIrs = List.rev restRev |> List.map (lwStmt ctx)
             let lastIr = lw ctx last
-            restRev |> List.fold (fun acc s -> ESeq(lwStmt ctx s, acc)) lastIr
+            List.foldBack (fun ir acc -> ESeq(ir, acc)) restIrs lastIr
 
     | Fable.IfThenElse(guard, thenExpr, elseExpr, r) ->
         let merged =

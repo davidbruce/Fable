@@ -5991,6 +5991,18 @@ pub const MatchFailureException = fable_exn.MatchFailureException;
 pub const ExnUnder = fable_exn.ExnUnder;
 pub const throw = fable_exn.throw;
 pub const take = fable_exn.take;
+/// What a call gives, as an error union: itself if it is one, else one of no errors. A call of a
+/// function of another file, whether it raises known only when the Zig is compiled, is written
+/// `try fable_rt.lift(f(x))` or `fable_rt.lift(f(x)) catch { ... }`: of no errors, the `try`
+/// lets the value through and the handler is not compiled.
+pub fn Lifted(comptime T: type) type {
+    return if (@typeInfo(T) == .error_union) T else error{}!T;
+}
+
+pub inline fn lift(x: anytype) Lifted(@TypeOf(x)) {
+    return x;
+}
+
 pub const isRaised = fable_exn.isRaised;
 pub const MayRaise = fable_exn.MayRaise;
 pub const Described = fable_exn.Described;
