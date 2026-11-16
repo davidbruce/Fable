@@ -747,7 +747,7 @@ fn isSlice(comptime T: type) bool {
 }
 
 /// The count and the collector's header are not part of what a cell holds.
-fn isCount(comptime field_name: []const u8) bool {
+pub fn isCount(comptime field_name: []const u8) bool {
     return std.mem.eql(u8, field_name, "$rc") or std.mem.eql(u8, field_name, "$gc");
 }
 
@@ -971,7 +971,7 @@ pub fn isCollection(comptime T: type) bool {
 }
 
 /// The entries of a map or a set, in order: the cells of its tree from left to right.
-fn TreeWalk(comptime T: type) type {
+pub fn TreeWalk(comptime T: type) type {
     const Node = @typeInfo(@typeInfo(T).@"union".field_types[1]).pointer.child;
     return struct {
         stack: [64]*Node = undefined,
@@ -1055,7 +1055,7 @@ pub fn treeHash(x: anytype) i32 {
 /// Structural equality, as F#'s `=` on records, unions, tuples and options.
 /// A record or union with `[<ReferenceEquality>]` (or `[<NoEquality>]`): its values are cells,
 /// equal only to themselves
-fn byReference(comptime T: type) bool {
+pub fn byReference(comptime T: type) bool {
     return hookOf(T, "fable_reference_equality");
 }
 
@@ -1940,7 +1940,7 @@ test {
 // ---------------------------------------------------------------------------------------------
 
 /// `seq [a; b; c; d; ...]`: how `%A` writes a .NET collection (four items, then `...`).
-fn showSeq(b: *Shower, items: []const *Layout, more: bool) *Layout {
+pub fn showSeq(b: *Shower, items: []const *Layout, more: bool) *Layout {
     var all: std.ArrayList(*Layout) = .empty;
     all.appendSlice(b.arena, items) catch oom();
     if (more) all.append(b.arena, b.word("...")) catch oom();
@@ -2919,7 +2919,7 @@ pub const bigBitLength = bigint.bigBitLength;
 pub const bigAdd = bigint.bigAdd;
 pub const bigAnd = bigint.bigAnd;
 pub const bigCompare = bigint.bigCompare;
-const bigDigits = bigint.bigDigits;
+pub const bigDigits = bigint.bigDigits;
 pub const bigDivRem = bigint.bigDivRem;
 pub const bigLit = bigint.bigLit;
 pub const bigMul = bigint.bigMul;
@@ -2945,12 +2945,12 @@ pub const decimal = @import("fable_decimal.zig");
 pub const NetDecimal = decimal.NetDecimal;
 pub const decAbs = decimal.decAbs;
 pub const decAdd = decimal.decAdd;
-const decAscii = decimal.decAscii;
+pub const decAscii = decimal.decAscii;
 pub const decCompare = decimal.decCompare;
-const decDigits = decimal.decDigits;
+pub const decDigits = decimal.decDigits;
 pub const decDiv = decimal.decDiv;
 pub const decGetBits = decimal.decGetBits;
-const decHash = decimal.decHash;
+pub const decHash = decimal.decHash;
 pub const decLit = decimal.decLit;
 pub const decMul = decimal.decMul;
 pub const decNeg = decimal.decNeg;
@@ -2963,7 +2963,7 @@ pub const decRound = decimal.decRound;
 pub const decRoundMode = decimal.decRoundMode;
 pub const decPown = decimal.decPown;
 pub const decSign = decimal.decSign;
-const decSpecText = decimal.decSpecText;
+pub const decSpecText = decimal.decSpecText;
 pub const decSub = decimal.decSub;
 pub const decText = decimal.decText;
 pub const decToFloat = decimal.decToFloat;
@@ -4546,7 +4546,7 @@ pub fn countOne(n: *usize, _: *sgc.Hdr) void {
 /// cells it refers to, and how to give up what it holds and free it. `gc_field` is the
 /// collector's header in `C`; `payload` is the field that holds everything else (all fields
 /// but the count and the header when it is null).
-fn Collected(comptime C: type, comptime gc_field: []const u8, comptime rc_offset: isize, comptime payload: ?[]const u8) type {
+pub fn Collected(comptime C: type, comptime gc_field: []const u8, comptime rc_offset: isize, comptime payload: ?[]const u8) type {
     return struct {
         pub inline fn cellOf(n: *sgc.Hdr) *C {
             return @alignCast(@fieldParentPtr(gc_field, n));
@@ -4595,7 +4595,7 @@ fn Collected(comptime C: type, comptime gc_field: []const u8, comptime rc_offset
             return n == 0;
         }
 
-        const desc: sgc.Desc = .{
+        pub const desc: sgc.Desc = .{
             .rc_offset = rc_offset,
             .trace = trace,
             .release_outside = releaseOutside,
@@ -4722,7 +4722,7 @@ pub fn asyncStateSet(x: Any) void {
 }
 
 /// (given up when the thread ends, and before the program counts what it never freed)
-fn asyncStateRelease() void {
+pub fn asyncStateRelease() void {
     const old = thread.async_state;
     thread.async_state = null;
     drop(old);
@@ -4752,2507 +4752,132 @@ pub const tail_call: std.builtin.CallModifier = if (builtin.zig_backend == .stag
     else => true,
 }) .always_tail else .auto;
 
-// ---------------------------------------------------------------------------------------------
-// Strings
-//
-// A string is what it is on .NET: an immutable sequence of UTF-16 code units, so that its
-// length, its characters and their order are the same here and there. It is a pointer to a
-// header that the units follow. A literal is static data: it is never counted and never
-// freed, and making one costs nothing.
-// ---------------------------------------------------------------------------------------------
-
-pub const Str = extern struct {
-    /// the number of references, or `literal` for a string that is static data
-    rc: u32,
-    len: u32,
-    /// the units there is room for (more than `len` in a string that is appended to)
-    cap: u32,
-
-    pub const literal: u32 = std.math.maxInt(u32);
-
-    /// The UTF-16 code units.
-    pub inline fn units(s: *const Str) []const u16 {
-        const first: [*]const u16 = @ptrCast(@as([*]const Str, @ptrCast(s)) + 1);
-        return first[0..s.len];
-    }
-};
-
-/// F#'s `string`: a pointer to the text, or null as on .NET. (The pointer is not to a
-/// constant: the count behind it changes. A literal is constant data all the same, and is
-/// never written: its count says so.)
-pub const String = ?*Str;
-
-/// The code units of a string. A null string has none.
-pub inline fn unitsOf(s: String) []const u16 {
-    return if (s) |p| p.units() else &.{};
-}
-
-pub fn LiteralCell(comptime n: usize) type {
-    return extern struct { header: Str, units: [n]u16 };
-}
-
-/// A string literal, from UTF-8 text.
-pub inline fn str(comptime utf8: []const u8) String {
-    const static = comptime blk: {
-        // (the conversion is a loop at compile time, and a function with many literals runs it
-        // many times: the compiler's guard against endless loops is not for this)
-        @setEvalBranchQuota(std.math.maxInt(u32));
-        const u = std.unicode.utf8ToUtf16LeStringLiteral(utf8);
-        break :blk LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len, .cap = u.len }, .units = u.* };
-    };
-    return @constCast(&static.header);
-}
-
-/// A string literal that is not well-formed text (F# allows a surrogate on its own).
-pub inline fn strOf(comptime u: []const u16) String {
-    const static = comptime LiteralCell(u.len){ .header = .{ .rc = Str.literal, .len = u.len, .cap = u.len }, .units = u[0..u.len].* };
-    return @constCast(&static.header);
-}
-
-pub fn strWords(len: usize) usize {
-    return @sizeOf(Str) / 4 + (len + 1) / 2;
-}
-
-/// A new string of `len` units, to be filled in by the caller. Its count is one.
-pub fn strNew(len: usize) struct { *Str, []u16 } {
-    const words = allocator.alloc(u32, strWords(len)) catch oom();
-    const s: *Str = @ptrCast(words.ptr);
-    s.* = .{ .rc = 1, .len = @intCast(len), .cap = @intCast(len) };
-    if (track) thread.stats.allocs += 1;
-    const first: [*]u16 = @ptrCast(@as([*]Str, @ptrCast(s)) + 1);
-    return .{ s, first[0..len] };
-}
-
-/// A new string with these units.
-pub fn strFrom(u: []const u16) String {
-    if (u.len == 0) return str("");
-    const s, const out = strNew(u.len);
-    @memcpy(out, u);
-    return s;
-}
-
-pub inline fn strRetain(s: String) void {
-    const p = s orelse return;
-    const rc = @atomicLoad(u32, &p.rc, .monotonic);
-    if (rc == Str.literal) return;
-    if (rc & shared_bit != 0) {
-        _ = @atomicRmw(u32, &p.rc, .Add, 1, .monotonic);
-        return;
-    }
-    p.rc = rc + 1;
-    if (track) thread.stats.dups += 1;
-}
-
-pub inline fn strRelease(s: String) void {
-    const p = s orelse return;
-    const rc = @atomicLoad(u32, &p.rc, .monotonic);
-    if (rc == Str.literal) return;
-    const m = p;
-    if (rc & shared_bit != 0) {
-        if (@atomicRmw(u32, &m.rc, .Sub, 1, .acq_rel) != shared_bit | 1) return;
-        if (track) thread.stats.frees += 1;
-        const words: [*]u32 = @ptrCast(@alignCast(m));
-        allocator.free(words[0..strWords(m.cap)]);
-        return;
-    }
-    if (m.rc != 1) {
-        m.rc -= 1;
-        if (track) thread.stats.decs += 1;
-        return;
-    }
-    if (track) thread.stats.frees += 1;
-    const words: [*]u32 = @ptrCast(@alignCast(m));
-    allocator.free(words[0..strWords(m.cap)]);
-}
-
-/// Text that grows: what the functions below build a string of unknown length in.
-pub const TextBuilder = struct {
-    list: std.ArrayList(u16) = .empty,
-
-    pub fn add(b: *TextBuilder, u: []const u16) void {
-        b.list.appendSlice(allocator, u) catch oom();
-    }
-
-    pub fn addOne(b: *TextBuilder, c: u16) void {
-        b.list.append(allocator, c) catch oom();
-    }
-
-    pub fn addAscii(b: *TextBuilder, text: []const u8) void {
-        for (text) |c| b.addOne(c);
-    }
-
-    pub fn deinit(b: *TextBuilder) void {
-        b.list.deinit(allocator);
-    }
-
-    /// The text as a string; the builder is empty afterwards.
-    pub fn finish(b: *TextBuilder) String {
-        const s = strFrom(b.list.items);
-        b.deinit();
-        b.* = .{};
-        return s;
-    }
-};
-
-// ---- System.Text.Encoding: UTF-8 and UTF-16 (little-endian, .NET's Encoding.Unicode) ----
-
-pub const TextEncoding = enum(u8) {
-    utf8,
-    utf16le,
-    /// (the name .NET prints for it)
-    pub fn fable_show(b: *Shower, x: TextEncoding, depth: i32) *Layout {
-        _ = depth;
-        return b.word(if (x == .utf8) "System.Text.UTF8Encoding" else "System.Text.UnicodeEncoding");
-    }
-};
-
-/// (a code unit, or a pair of them, as a code point; a lone surrogate is U+FFFD, as .NET encodes it)
-fn nextCodePoint(units: []const u16, i: *usize) u21 {
-    const u = units[i.*];
-    i.* += 1;
-    if (u >= 0xD800 and u <= 0xDBFF and i.* < units.len) {
-        const lo = units[i.*];
-        if (lo >= 0xDC00 and lo <= 0xDFFF) {
-            i.* += 1;
-            return 0x10000 + ((@as(u21, u) - 0xD800) << 10) + (lo - 0xDC00);
-        }
-    }
-    if (u >= 0xD800 and u <= 0xDFFF) return 0xFFFD;
-    return u;
-}
-
-fn encodeUnits(enc: TextEncoding, units: []const u16) Array(u8) {
-    var out: std.ArrayList(u8) = .empty;
-    switch (enc) {
-        .utf16le => for (units) |u| {
-            out.append(allocator, @truncate(u)) catch oom();
-            out.append(allocator, @truncate(u >> 8)) catch oom();
-        },
-        .utf8 => {
-            var i: usize = 0;
-            while (i < units.len) {
-                const cp = nextCodePoint(units, &i);
-                var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(cp, &buf) catch 0;
-                out.appendSlice(allocator, buf[0..n]) catch oom();
-            }
-        },
-    }
-    return arrayFrom(Array(u8), out.toOwnedSlice(allocator) catch oom());
-}
-
-fn rangeOf(len: usize, index: i32, count: i32) Raised![2]usize {
-    if (index < 0 or count < 0) return raise(ArgumentOutOfRangeException, str("Non-negative number required."));
-    if (@as(usize, @intCast(index)) + @as(usize, @intCast(count)) > len) return raise(ArgumentOutOfRangeException, str("Index and count must refer to a location within the buffer."));
-    return .{ @intCast(index), @as(usize, @intCast(index)) + @as(usize, @intCast(count)) };
-}
-
-/// `enc.GetBytes(s)`
-pub fn encodingGetBytes(enc: TextEncoding, s: String) Raised!Array(u8) {
-    if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
-    return encodeUnits(enc, unitsOf(s));
-}
-
-/// `enc.GetBytes(chars, index, count)`
-pub fn encodingGetBytesRange(enc: TextEncoding, chars: Array(u16), index: i32, count: i32) Raised!Array(u8) {
-    const r = try rangeOf(chars.items.len, index, count);
-    return encodeUnits(enc, chars.items[r[0]..r[1]]);
-}
-
-/// `enc.GetString(bytes)`: invalid bytes are U+FFFD, as .NET decodes them
-fn decodeBytes(enc: TextEncoding, bytes: []const u8) String {
-    var b: TextBuilder = .{};
-    switch (enc) {
-        .utf16le => {
-            var i: usize = 0;
-            while (i + 1 < bytes.len) : (i += 2) b.addOne(@as(u16, bytes[i]) | (@as(u16, bytes[i + 1]) << 8));
-            if (i < bytes.len) b.addOne(0xFFFD);
-        },
-        .utf8 => {
-            var i: usize = 0;
-            while (i < bytes.len) {
-                const n = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
-                    b.addOne(0xFFFD);
-                    i += 1;
-                    continue;
-                };
-                if (i + n > bytes.len) {
-                    b.addOne(0xFFFD);
-                    i += 1;
-                    continue;
-                }
-                const cp = std.unicode.utf8Decode(bytes[i .. i + n]) catch {
-                    b.addOne(0xFFFD);
-                    i += 1;
-                    continue;
-                };
-                if (cp >= 0x10000) {
-                    const v = cp - 0x10000;
-                    b.addOne(@intCast(0xD800 + (v >> 10)));
-                    b.addOne(@intCast(0xDC00 + (v & 0x3FF)));
-                } else b.addOne(@intCast(cp));
-                i += n;
-            }
-        },
-    }
-    return b.finish();
-}
-
-pub fn encodingGetString(enc: TextEncoding, bytes: Array(u8)) Raised!String {
-    if (arrayIsNull(bytes)) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 'bytes')"));
-    return decodeBytes(enc, bytes.items);
-}
-
-pub fn encodingGetStringRange(enc: TextEncoding, bytes: Array(u8), index: i32, count: i32) Raised!String {
-    const r = try rangeOf(bytes.items.len, index, count);
-    return decodeBytes(enc, bytes.items[r[0]..r[1]]);
-}
-
-/// `enc.GetByteCount(s)`
-pub fn encodingGetByteCount(enc: TextEncoding, s: String) Raised!i32 {
-    const a = try encodingGetBytes(enc, s);
-    defer drop(a);
-    return @intCast(a.items.len);
-}
-
-pub fn strEql(a: String, b: String) bool {
-    if (a == b) return true;
-    const x = a orelse return false;
-    const y = b orelse return false;
-    return std.mem.eql(u16, x.units(), y.units());
-}
-
-/// The order of two strings by their code units: negative, zero or positive, and the same
-/// number as .NET's `String.CompareOrdinal`, which is what F#'s `compare` gives for strings.
-/// A null string comes before every other.
-pub fn strCompare(a: String, b: String) i32 {
-    if (a == null or b == null) return @as(i32, @intFromBool(a != null)) - @as(i32, @intFromBool(b != null));
-    const x = unitsOf(a);
-    const y = unitsOf(b);
-    const x0: i32 = if (x.len != 0) x[0] else 0;
-    const y0: i32 = if (y.len != 0) y[0] else 0;
-    if (x0 != y0) return x0 - y0;
-    for (x[0..@min(x.len, y.len)], y[0..@min(x.len, y.len)]) |c, d| {
-        if (c != d) return @as(i32, c) - @as(i32, d);
-    }
-    return @as(i32, @intCast(x.len)) - @as(i32, @intCast(y.len));
-}
-
-/// F#'s `compare`: negative, zero or positive. Numbers, chars and booleans by value (on a
-/// float, not-a-number comes first); strings by code unit; records and tuples field by field;
-/// unions by case, then by field; an option with None first; lists item by item, the shorter
-/// first when one starts the other; arrays by length, then item by item.
-pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
-    const T = @TypeOf(a);
-    if (comptime hookOf(T, "fable_compare")) return hookType(T).fable_compare.call(.{ a, box(b) });
-    if (T == Obj) {
-        if (a.type.compare) |f| return f(a, b);
-        @panic("fable: At least one object must implement IComparable.");
-    }
-    if (T == String) return strCompare(a, b);
-    if (comptime isBigInt(T)) return bigCompare(a, b);
-    if (comptime isDecimal(T)) return decCompare(a, b);
-    if (T == bool) return @as(i32, @intFromBool(a)) - @as(i32, @intFromBool(b));
-    if (T == void) return 0;
-    if (T == Exn) @compileError("fable: exceptions cannot be compared");
-    if (comptime isIface(T)) {
-        if (ifaceToObjBorrow(a)) |oa| {
-            if (ifaceToObjBorrow(b)) |ob| {
-                if (oa.type.compare) |f| return f(oa, ob);
-            }
-        }
-        @panic("fable: At least one object must implement IComparable.");
-    }
-    if (comptime isFunc(T)) @compileError("fable: function values cannot be compared");
-    switch (@typeInfo(T)) {
-        .int, .float, .comptime_int, .comptime_float => {
-            if (a < b) return -1;
-            if (a > b) return 1;
-            if (a == b) return 0;
-            // (not a number: it comes before every number, and equals itself)
-            if (a == a) return 1;
-            return if (b == b) -1 else 0;
-        },
-        .optional => {
-            const x = a orelse return if (b == null) 0 else -1;
-            const y = b orelse return 1;
-            return compare(x, y);
-        },
-        .pointer => |p| {
-            if (comptime p.size == .slice) {
-                if (a.len != b.len) return if (a.len < b.len) -1 else 1;
-                for (a, b) |x, y| {
-                    const c = compare(x, y);
-                    if (c != 0) return c;
-                }
-                return 0;
-            }
-            // a cell: a reference record, an array, or what a case of a recursive union holds
-            if (a == b) return 0;
-            inline for (@typeInfo(p.child).@"struct".field_names) |name| {
-                if (comptime !isCount(name) and !std.mem.eql(u8, name, "shape")) {
-                    const c = compare(@field(a, name), @field(b, name));
-                    if (c != 0) return c;
-                }
-            }
-            return 0;
-        },
-        .@"struct" => |st| {
-            inline for (st.field_names) |name| {
-                const c = compare(@field(a, name), @field(b, name));
-                if (c != 0) return c;
-            }
-            return 0;
-        },
-        .@"union" => {
-            if (comptime isCollection(T)) return treeCompare(a, b);
-            if (comptime @hasDecl(T, "fable_list")) {
-                var x = a;
-                var y = b;
-                while (true) {
-                    if (x == .Empty) return if (y == .Empty) 0 else -1;
-                    if (y == .Empty) return 1;
-                    if (x.Cons == y.Cons) return 0;
-                    const c = compare(x.Cons.Head, y.Cons.Head);
-                    if (c != 0) return c;
-                    x = x.Cons.Tail;
-                    y = y.Cons.Tail;
-                }
-            }
-            // (along a last field of its own type in a loop: a long chain does not use the stack)
-            var x = a;
-            var y = b;
-            while (true) {
-                const ta = @backingInt(std.meta.activeTag(x));
-                const tb = @backingInt(std.meta.activeTag(y));
-                if (ta != tb) return if (ta < tb) -1 else 1;
-                switch (x) {
-                    inline else => |px, tag| {
-                        const py = @field(y, @tagName(tag));
-                        const P = @TypeOf(px);
-                        const last_self: bool = comptime blk: {
-                            if (!isCellPtr(P)) break :blk false;
-                            const info = @typeInfo(@typeInfo(P).pointer.child).@"struct";
-                            break :blk info.field_types.len > 0 and info.field_types[info.field_types.len - 1] == T;
-                        };
-                        if (comptime !last_self) return compare(px, py);
-                        if (px == py) return 0;
-                        const names = @typeInfo(@typeInfo(P).pointer.child).@"struct".field_names;
-                        inline for (names[0 .. names.len - 1]) |name| {
-                            if (comptime !isCount(name)) {
-                                const c = compare(@field(px, name), @field(py, name));
-                                if (c != 0) return c;
-                            }
-                        }
-                        x = @field(px, names[names.len - 1]);
-                        y = @field(py, names[names.len - 1]);
-                    },
-                }
-            }
-        },
-        else => @compileError("fable: values of type " ++ @typeName(T) ++ " cannot be compared"),
-    }
-}
-
-/// `compare a b` where one of them may be a number that is written out.
-pub inline fn compareOf(a: anytype, b: anytype) i32 {
-    const T = @TypeOf(a, b);
-    return compare(@as(T, a), @as(T, b));
-}
-
-/// `max a b` and `min a b`: a reference of its own to the one that is chosen. (With a
-/// not-a-number among two floats the result is not a number, as on .NET.)
-pub fn maxOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
-    if (comptime @typeInfo(@TypeOf(a)) == .float) {
-        if (a != a) return a;
-        if (b != b) return b;
-    }
-    return dup(if (compare(a, b) < 0) b else a);
-}
-
-/// `Math.Max(a, b)`: as `max`, but of floats +0.0 is greater than -0.0, as IEEE 754 says
-pub fn mathMax(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
-    if (comptime @typeInfo(@TypeOf(a)) == .float) {
-        if (a == 0 and b == 0) return if (std.math.signbit(a)) b else a;
-    }
-    return maxOf(a, b);
-}
-
-/// `Math.Min(a, b)`: of floats -0.0 is less than +0.0
-pub fn mathMin(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
-    if (comptime @typeInfo(@TypeOf(a)) == .float) {
-        if (a == 0 and b == 0) return if (std.math.signbit(a)) a else b;
-    }
-    return minOf(a, b);
-}
-
-pub fn minOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
-    if (comptime @typeInfo(@TypeOf(a)) == .float) {
-        if (a != a) return a;
-        if (b != b) return b;
-    }
-    // (of two equal values, the second, as F#'s `if a < b then a else b` and .NET's decimal.Min)
-    return dup(if (compare(a, b) < 0) a else b);
-}
-
-/// F#'s `hash`: equal values have equal hashes. A number is its own hash, as on .NET; the
-/// hash of anything else is this library's.
-pub fn hash(x: anytype) i32 {
-    const T = @TypeOf(x);
-    if (T == reflect.Type) return @bitCast(@as(u32, @truncate(std.hash.Wyhash.hash(0, x.full_name))));
-    if (comptime byReference(T)) {
-        const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&x));
-        return @bitCast(@as(u32, @truncate(h)));
-    }
-    if (comptime hookOf(T, "fable_hash")) return hookType(T).fable_hash.call(.{x});
-    // (null hashes to 0, as on .NET; an object by its own hash)
-    if (T == Any) return if (x) |o| hash(o) else 0;
-    if (T == Obj) {
-        if (x.type.hash) |f| return f(x);
-    }
-    if (comptime isBigInt(T)) {
-        const t = bigText(x);
-        defer drop(t);
-        return hash(t);
-    }
-    if (T == String) {
-        var h: u32 = 5381;
-        for (unitsOf(x)) |c| h = (h *% 33) ^ c;
-        return @bitCast(h);
-    }
-    if (T == Exn) {
-        if (x.type.hash) |f| return f(x);
-    }
-    if (T == Obj) return objStamp(x);
-    if (T == Exn) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
-    if (comptime isDecimal(T)) return decHash(x);
-    if (comptime isFunc(T)) return @truncate(@as(isize, @bitCast(@intFromPtr(x.env) ^ @intFromPtr(x.code))));
-    if (comptime isIface(T)) {
-        if (ifaceToObjBorrow(x)) |o| return hash(o);
-        return @truncate(@as(isize, @bitCast(@intFromPtr(x.data) ^ @intFromPtr(x.vt))));
-    }
-    switch (@typeInfo(T)) {
-        .void => return 0,
-        .bool => return @intFromBool(x),
-        .int => |info| {
-            if (info.bits <= 32) return if (info.signedness == .signed) @as(i32, @intCast(x)) else @bitCast(@as(u32, @intCast(x)));
-            // (as .NET folds a 64-bit number)
-            const wide: u64 = if (info.signedness == .signed) @bitCast(@as(i64, @intCast(x))) else @as(u64, @intCast(x));
-            return @bitCast(@as(u32, @truncate(wide)) ^ @as(u32, @truncate(wide >> 32)));
-        },
-        .float => {
-            const wide: u64 = @bitCast(@as(f64, if (x == 0) 0 else x));
-            return @bitCast(@as(u32, @truncate(wide)) ^ @as(u32, @truncate(wide >> 32)));
-        },
-        .optional => return if (x) |v| hashWith(1, hash(v)) else 0,
-        .pointer => |p| {
-            var h: i32 = 17;
-            if (comptime p.size != .slice and @hasDecl(p.child, "fable_identity")) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
-            if (comptime p.size == .slice) {
-                for (x) |item| h = hashWith(h, hash(item));
-                return h;
-            }
-            inline for (@typeInfo(p.child).@"struct".field_names) |name| {
-                if (comptime !isCount(name) and !std.mem.eql(u8, name, "shape")) h = hashWith(h, hash(@field(x, name)));
-            }
-            return h;
-        },
-        .@"struct" => |st| {
-            var h: i32 = 17;
-            inline for (st.field_names) |name| h = hashWith(h, hash(@field(x, name)));
-            return h;
-        },
-        .@"union" => {
-            if (comptime isCollection(T)) return treeHash(x);
-            if (comptime @hasDecl(T, "fable_list")) {
-                var h: i32 = 17;
-                var rest = x;
-                while (rest == .Cons) : (rest = rest.Cons.Tail) h = hashWith(h, hash(rest.Cons.Head));
-                return h;
-            }
-            switch (x) {
-                inline else => |payload, tag| return hashWith(@backingInt(tag), hash(payload)),
-            }
-        },
-        else => @compileError("fable: values of type " ++ @typeName(T) ++ " cannot be hashed"),
-    }
-}
-
-pub fn hashWith(h: i32, next: i32) i32 {
-    return (h *% 31) +% next;
-}
-
-// ---- what .NET raises for a string that is null or an argument that is out of range ----
-
-pub fn nullRef() Raised {
-    return raise(NullReferenceException, str("Object reference not set to an instance of an object."));
-}
-
-pub fn argNull(comptime param: []const u8) Raised {
-    return raise(ArgumentNullException, str("Value cannot be null. (Parameter '" ++ param ++ "')"));
-}
-
-// ---- F#'s nullness operators: a value is null only of a type that has null here (a string,
-// `obj`, an option); of any other type it never is ----
-
-pub fn isNullValue(x: anytype) bool {
-    const T = @TypeOf(x);
-    if (comptime @typeInfo(T) == .optional) return x == null;
-    return isNullOf(x);
-}
-
-/// Is the type an array's (a cell of `fable_array`)?
-pub fn isArrayPtr(comptime T: type) bool {
-    return isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array");
-}
-
-/// `nonNull x`, the `NonNull` and `NonNullQuick` patterns
-pub fn nonNullValue(x: anytype) Raised!@TypeOf(x) {
-    if (isNullValue(x)) return nullRef();
-    return dup(x);
-}
-
-/// `nullArgCheck name x`
-pub fn nullArgCheck(name: String, x: anytype) Raised!@TypeOf(x) {
-    if (!isNullValue(x)) return dup(x);
-    const head = strConcat(str("Value cannot be null. (Parameter '"), name);
-    defer drop(head);
-    return raise(ArgumentNullException, strConcat(head, str("')")));
-}
-
-/// `nonNull x` when `x` is a Zig optional wrapping a type whose unwrapped F# type has a non-optional Zig type
-pub fn nonNullUnwrap(x: anytype) Raised!@typeInfo(@TypeOf(x)).optional.child {
-    const inner = x orelse return nullRef();
-    return dup(inner);
-}
-
-/// `nullArgCheck name x` when `x` is a Zig optional wrapping a type whose unwrapped F# type has a non-optional Zig type
-pub fn nullArgCheckUnwrap(name: String, x: anytype) Raised!@typeInfo(@TypeOf(x)).optional.child {
-    if (x) |inner| return dup(inner);
-    const head = strConcat(str("Value cannot be null. (Parameter '"), name);
-    defer drop(head);
-    return raise(ArgumentNullException, strConcat(head, str("')")));
-}
-
-pub fn argRange(comptime param: []const u8, comptime text: []const u8) Raised {
-    throw(ArgumentOutOfRangeException.new(.{ .Message = str(text ++ " (Parameter '" ++ param ++ "')"), .ParamName = str(param) }));
-    return error.Raised;
-}
-
-/// `e` with the name of the parameter it is about (an ArgumentException's `ParamName`)
-pub fn exnWithParam(e: Exn, name: String) Exn {
-    if (e.type.set_param) |f| f(e, name);
-    return dup(e);
-}
-
-/// `e.ParamName`: null when it has none
-pub fn exnParamName(e: Exn) String {
-    if (e.type.param) |f| return f(e);
-    return null;
-}
-
-pub fn argNegative(comptime param: []const u8, value: i32) Raised {
-    return raise(ArgumentOutOfRangeException, format(.{
-        param ++ " ('",                                                                      value,
-        "') must be a non-negative value. (Parameter '" ++ param ++ "')\nActual value was ", value,
-        ".",
-    }));
-}
-
-pub fn argAbove(comptime param: []const u8, value: anytype, limit: i32) Raised {
-    return raise(ArgumentOutOfRangeException, format(.{
-        param ++ " ('",                                        value,
-        "') must be less than or equal to '",                  limit,
-        "'. (Parameter '" ++ param ++ "')\nActual value was ", value,
-        ".",
-    }));
-}
-
-pub const index_range = "Index was out of range. Must be non-negative and less than or equal to the size of the collection.";
-
-/// `s.Length`
-pub inline fn strLen(s: String) Raised!i32 {
-    const p = s orelse return nullRef();
-    return @intCast(p.len);
-}
-
-/// `String.length s`, and `s.Length` of a string that cannot be null.
-pub inline fn strLength(s: String) i32 {
-    return @intCast(unitsOf(s).len);
-}
-
-/// `s.[i]`
-pub inline fn strAt(s: String, i: i32) Raised!u16 {
-    const p = s orelse return nullRef();
-    if (i < 0 or i >= p.len) return raise(IndexOutOfRangeException, str("Index was outside the bounds of the array."));
-    return p.units()[@intCast(i)];
-}
-
-/// `a + b`: a new string, unless one of them is empty. (Null counts as empty, and the result
-/// is never null.)
-pub fn strConcat(a: String, b: String) String {
-    const x = unitsOf(a);
-    const y = unitsOf(b);
-    if (x.len == 0) return if (y.len == 0) str("") else dup(b);
-    if (y.len == 0) return dup(a);
-    const s, const u = strNew(x.len + y.len);
-    @memcpy(u[0..x.len], x);
-    @memcpy(u[x.len..], y);
-    return s;
-}
-
-/// `a + b` where the caller gives `a` up: a string nothing else refers to grows in place, its
-/// room doubling, so that appending in a loop is not quadratic.
-pub fn strAppend(a: String, b: String) String {
-    const p = a orelse return strConcat(a, b);
-    const y = unitsOf(b);
-    if (y.len == 0) return a;
-    if (p.rc != 1 or b == a) {
-        const r = strConcat(a, b);
-        strRelease(a);
-        return r;
-    }
-    const need = @as(usize, p.len) + y.len;
-    var s = p;
-    if (need > p.cap) {
-        const cap = @max(need, @as(usize, p.cap) * 2);
-        const old: [*]u32 = @ptrCast(@alignCast(p));
-        const words = allocator.realloc(old[0..strWords(p.cap)], strWords(cap)) catch oom();
-        s = @ptrCast(words.ptr);
-        s.cap = @intCast(cap);
-    }
-    const first: [*]u16 = @ptrCast(@as([*]Str, @ptrCast(s)) + 1);
-    @memcpy(first[s.len..need], y);
-    s.len = @intCast(need);
-    return s;
-}
-
-/// `s.Equals(other)`
-pub fn strEquals(s: String, other: String) Raised!bool {
-    if (s == null) return nullRef();
-    return strEql(s, other);
-}
-
-pub inline fn strIsNullOrEmpty(s: String) bool {
-    return unitsOf(s).len == 0;
-}
-
-pub fn strIsNullOrWhiteSpace(s: String) bool {
-    for (unitsOf(s)) |c| {
-        if (!unicode.isWhiteSpace(c)) return false;
-    }
-    return true;
-}
-
-/// The part of `s` from `start` that is `n` long. Both are known to be inside the string.
-pub fn strSlice(s: String, start: usize, n: usize) String {
-    const u = unitsOf(s);
-    if (n == 0) return str("");
-    if (n == u.len) return dup(s);
-    return strFrom(u[start..][0..n]);
-}
-
-/// `s.Substring(start)` and `s.Substring(start, length)`
-pub fn strSubstring(s: String, start: i32, length: ?i32) Raised!String {
-    const p = s orelse return nullRef();
-    const total: i32 = @intCast(p.len);
-    if (start < 0) return argNegative("startIndex", start);
-    if (start > total) return argRange("startIndex", "startIndex cannot be larger than length of string.");
-    const n = length orelse total - start;
-    if (n < 0) return argNegative("length", n);
-    if (start > total - n) return argRange("length", "Index and length must refer to a location within the string.");
-    return strSlice(s, @intCast(start), @intCast(n));
-}
-
-/// `s.IndexOf(c)` and `s.IndexOf(c, start)`
-pub fn strIndexOfChar(s: String, c: u16, start: i32) Raised!i32 {
-    const p = s orelse return nullRef();
-    const u = p.units();
-    if (start < 0 or start > u.len) return argRange("startIndex", index_range);
-    const at = std.mem.indexOfScalarPos(u16, u, @intCast(start), c) orelse return -1;
-    return @intCast(at);
-}
-
-/// `s.IndexOf(value)` and `s.IndexOf(value, start)`
-pub fn strIndexOf(s: String, value: String, start: i32) Raised!i32 {
-    const p = s orelse return nullRef();
-    const v = value orelse return argNull("value");
-    const u = p.units();
-    if (start < 0 or start > u.len) return argRange("startIndex", index_range);
-    if (v.len == 0) return start;
-    const at = std.mem.indexOfPos(u16, u, @intCast(start), v.units()) orelse return -1;
-    return @intCast(at);
-}
-
-pub fn strLastIndexOfChar(s: String, c: u16) Raised!i32 {
-    const p = s orelse return nullRef();
-    const at = std.mem.lastIndexOfScalar(u16, p.units(), c) orelse return -1;
-    return @intCast(at);
-}
-
-pub fn strLastIndexOf(s: String, value: String) Raised!i32 {
-    const p = s orelse return nullRef();
-    const v = value orelse return argNull("value");
-    if (v.len == 0) return @intCast(p.len);
-    const at = std.mem.lastIndexOf(u16, p.units(), v.units()) orelse return -1;
-    return @intCast(at);
-}
-
-pub fn strContains(s: String, value: String) Raised!bool {
-    const p = s orelse return nullRef();
-    const v = value orelse return argNull("value");
-    return std.mem.indexOf(u16, p.units(), v.units()) != null;
-}
-
-pub fn strContainsChar(s: String, c: u16) Raised!bool {
-    const p = s orelse return nullRef();
-    return std.mem.indexOfScalar(u16, p.units(), c) != null;
-}
-
-pub fn strStartsWith(s: String, value: String) Raised!bool {
-    const p = s orelse return nullRef();
-    const v = value orelse return argNull("value");
-    return std.mem.startsWith(u16, p.units(), v.units());
-}
-
-pub fn strEndsWith(s: String, value: String) Raised!bool {
-    const p = s orelse return nullRef();
-    const v = value orelse return argNull("value");
-    return std.mem.endsWith(u16, p.units(), v.units());
-}
-
-pub fn strStartsWithChar(s: String, c: u16) Raised!bool {
-    const p = s orelse return nullRef();
-    return p.len != 0 and p.units()[0] == c;
-}
-
-pub fn strEndsWithChar(s: String, c: u16) Raised!bool {
-    const p = s orelse return nullRef();
-    return p.len != 0 and p.units()[p.len - 1] == c;
-}
-
-/// `s.ToUpperInvariant()` (`upper`) and `s.ToLowerInvariant()`: each code unit to the one
-/// .NET maps it to. `ToUpper` and `ToLower` are the same here: there is no current culture.
-pub fn strCase(s: String, comptime upper: bool) Raised!String {
-    const p = s orelse return nullRef();
-    const u = p.units();
-    const change = if (upper) unicode.toUpper else unicode.toLower;
-    for (u, 0..) |c, i| {
-        if (change(c) != c) {
-            const r, const out = strNew(u.len);
-            @memcpy(out[0..i], u[0..i]);
-            for (u[i..], out[i..]) |from, *to| to.* = change(from);
-            return r;
-        }
-    }
-    return dup(s);
-}
-
-/// `s.Trim()`, `s.TrimStart()`, `s.TrimEnd()`: white space, or the one character given.
-pub fn strTrim(s: String, comptime start: bool, comptime end: bool, only: ?u16) Raised!String {
-    const p = s orelse return nullRef();
-    const u = p.units();
-    var from: usize = 0;
-    var to: usize = u.len;
-    if (start) {
-        while (from < to and (if (only) |c| u[from] == c else unicode.isWhiteSpace(u[from]))) from += 1;
-    }
-    if (end) {
-        while (to > from and (if (only) |c| u[to - 1] == c else unicode.isWhiteSpace(u[to - 1]))) to -= 1;
-    }
-    return strSlice(s, from, to - from);
-}
-
-/// `s.Replace(old, new)`
-pub fn strReplace(s: String, old: String, new_: String) Raised!String {
-    const p = s orelse return nullRef();
-    const o = old orelse return argNull("oldValue");
-    if (o.len == 0) return raise(ArgumentException, str("The value cannot be an empty string. (Parameter 'oldValue')"));
-    const u = p.units();
-    const with = unitsOf(new_);
-    var at = std.mem.indexOf(u16, u, o.units()) orelse return dup(s);
-    var b: TextBuilder = .{};
-    var done: usize = 0;
-    while (true) {
-        b.add(u[done..at]);
-        b.add(with);
-        done = at + o.len;
-        at = std.mem.indexOfPos(u16, u, done, o.units()) orelse break;
-    }
-    b.add(u[done..]);
-    return b.finish();
-}
-
-pub fn strReplaceChar(s: String, old: u16, new_: u16) Raised!String {
-    const p = s orelse return nullRef();
-    const u = p.units();
-    const first = std.mem.indexOfScalar(u16, u, old) orelse return dup(s);
-    const r, const out = strNew(u.len);
-    @memcpy(out[0..first], u[0..first]);
-    for (u[first..], out[first..]) |from, *to| to.* = if (from == old) new_ else from;
-    return r;
-}
-
-/// `s.Insert(start, value)`
-pub fn strInsert(s: String, start: i32, value: String) Raised!String {
-    const p = s orelse return nullRef();
-    const v = value orelse return argNull("value");
-    const u = p.units();
-    // (.NET compares the index as an unsigned number, and says so in its message)
-    const index: u32 = @bitCast(start);
-    if (index > u.len) return argAbove("startIndex", index, @intCast(u.len));
-    if (v.len == 0) return dup(s);
-    if (u.len == 0) return dup(value);
-    const r, const out = strNew(u.len + v.len);
-    @memcpy(out[0..index], u[0..index]);
-    @memcpy(out[index..][0..v.len], v.units());
-    @memcpy(out[index + v.len ..], u[index..]);
-    return r;
-}
-
-/// `s.Remove(start)` and `s.Remove(start, count)`
-pub fn strRemove(s: String, start: i32, count: ?i32) Raised!String {
-    const p = s orelse return nullRef();
-    const u = p.units();
-    const total: i32 = @intCast(u.len);
-    if (count) |n| {
-        if (start < 0) return argNegative("startIndex", start);
-        if (n < 0) return argNegative("count", n);
-        if (n > total - start) return argAbove("count", n, total - start);
-        if (n == 0) return dup(s);
-        const from: usize = @intCast(start);
-        const r, const out = strNew(u.len - @as(usize, @intCast(n)));
-        @memcpy(out[0..from], u[0..from]);
-        @memcpy(out[from..], u[from + @as(usize, @intCast(n)) ..]);
-        return if (out.len == 0) blk: {
-            strRelease(r);
-            break :blk str("");
-        } else r;
-    }
-    if (start < 0) return argRange("startIndex", "StartIndex cannot be less than zero.");
-    if (start > total) return argRange("startIndex", "startIndex cannot be larger than length of string.");
-    return strSlice(s, 0, @intCast(start));
-}
-
-/// `s.PadLeft(width, c)` (`left`) and `s.PadRight(width, c)`
-pub fn strPad(s: String, comptime left: bool, width: i32, c: u16) Raised!String {
-    const p = s orelse return nullRef();
-    if (width < 0) return argNegative("totalWidth", width);
-    const u = p.units();
-    const total: usize = @intCast(width);
-    if (total <= u.len) return dup(s);
-    const r, const out = strNew(total);
-    const pad = total - u.len;
-    if (left) {
-        @memset(out[0..pad], c);
-        @memcpy(out[pad..], u);
-    } else {
-        @memcpy(out[0..u.len], u);
-        @memset(out[u.len..], c);
-    }
-    return r;
-}
-
-/// `String(c, count)`
-pub fn strOfChar(c: u16, count: i32) Raised!String {
-    if (count < 0) return argNegative("count", count);
-    if (count == 0) return str("");
-    const r, const out = strNew(@intCast(count));
-    @memset(out, c);
-    return r;
-}
-
-// ---- F#'s `String` module: a null string is an empty one ----
-
-pub fn countNegative(count: i32) Raised {
-    return raise(ArgumentException, format(.{ "The input must be non-negative.\ncount = ", count, " (Parameter 'count')" }));
-}
-
-/// Apply a function value to three values, as `apply2` does to two.
-pub inline fn apply3(comptime R: type, f: anytype, a: anytype, b: anytype, c: anytype) Raised!R {
-    const Code = @typeInfo(@FieldType(@TypeOf(f), "code")).pointer.child;
-    const n = @typeInfo(Code).@"fn".param_types.len;
-    if (comptime n == 4) return f.code(f.env, a, b, c);
-    if (comptime n == 3) {
-        const g = f.code(f.env, a, b) catch |err| {
-            drop(c);
-            return err;
-        };
-        defer drop(g);
-        return g.code(g.env, c);
-    }
-    if (comptime @hasField(@TypeOf(f), "code2")) {
-        if (f.code2) |c2| {
-            const g = c2(f.env, a, b) catch |err| {
-                drop(c);
-                return err;
-            };
-            defer drop(g);
-            return g.code(g.env, c);
-        }
-    }
-    const g = f.code(f.env, a) catch |err| {
-        drop(b);
-        drop(c);
-        return err;
-    };
-    defer drop(g);
-    return apply2(R, g, b, c);
-}
-
-/// Apply a function value to two values: at once if it takes both or exposes `code2`, otherwise
-/// one after the other.
-pub inline fn apply2(comptime R: type, f: anytype, a: anytype, b: anytype) Raised!R {
-    const Code = @typeInfo(@FieldType(@TypeOf(f), "code")).pointer.child;
-    if (comptime @typeInfo(Code).@"fn".param_types.len == 3) return f.code(f.env, a, b);
-    if (comptime @hasField(@TypeOf(f), "code2")) {
-        if (f.code2) |c2| return c2(f.env, a, b);
-    }
-    const g = f.code(f.env, a) catch |err| {
-        drop(b);
-        return err;
-    };
-    defer drop(g);
-    return g.code(g.env, b);
-}
-
-/// `String.replicate count s`
-pub fn strReplicate(count: i32, s: String) Raised!String {
-    if (count < 0) return countNegative(count);
-    const u = unitsOf(s);
-    const n: usize = @intCast(count);
-    if (n == 0 or u.len == 0) return str("");
-    if (n == 1) return dup(s);
-    const r, const out = strNew(u.len * n);
-    for (0..n) |i| @memcpy(out[i * u.len ..][0..u.len], u);
-    return r;
-}
-
-/// `String.concat sep strings`, for a list of strings
-pub fn strJoin(sep: String, strings: List(String)) String {
-    var b: TextBuilder = .{};
-    var rest = strings;
-    var first = true;
-    while (rest == .Cons) : (rest = rest.Cons.Tail) {
-        if (!first) b.add(unitsOf(sep));
-        first = false;
-        b.add(unitsOf(rest.Cons.Head));
-    }
-    return b.finish();
-}
-
-/// `String.init count f`
-pub fn strInit(count: i32, f: anytype) Raised!String {
-    if (count < 0) return countNegative(count);
-    var b: TextBuilder = .{};
-    errdefer b.deinit();
-    var i: i32 = 0;
-    while (i < count) : (i += 1) {
-        const part: String = try f.code(f.env, i);
-        b.add(unitsOf(part));
-        drop(part);
-    }
-    return b.finish();
-}
-
-/// `String.map f s`
-pub fn strMap(f: anytype, s: String) Raised!String {
-    const u = unitsOf(s);
-    if (u.len == 0) return str("");
-    const r, const out = strNew(u.len);
-    errdefer strRelease(r);
-    for (u, out) |c, *to| to.* = try f.code(f.env, c);
-    return r;
-}
-
-/// `String.mapi f s`
-pub fn strMapi(f: anytype, s: String) Raised!String {
-    const u = unitsOf(s);
-    if (u.len == 0) return str("");
-    const r, const out = strNew(u.len);
-    errdefer strRelease(r);
-    for (u, out, 0..) |c, *to, i| to.* = try apply2(u16, f, @as(i32, @intCast(i)), c);
-    return r;
-}
-
-/// `String.iter f s`
-pub fn strIter(f: anytype, s: String) Raised!void {
-    for (unitsOf(s)) |c| try f.code(f.env, c);
-}
-
-/// `String.iteri f s`
-pub fn strIteri(f: anytype, s: String) Raised!void {
-    for (unitsOf(s), 0..) |c, i| try apply2(void, f, @as(i32, @intCast(i)), c);
-}
-
-/// `String.forall f s`
-pub fn strForall(f: anytype, s: String) Raised!bool {
-    for (unitsOf(s)) |c| {
-        if (!try f.code(f.env, c)) return false;
-    }
-    return true;
-}
-
-/// `String.exists f s`
-pub fn strExists(f: anytype, s: String) Raised!bool {
-    for (unitsOf(s)) |c| {
-        if (try f.code(f.env, c)) return true;
-    }
-    return false;
-}
-
-/// `String.filter f s`
-pub fn strFilter(f: anytype, s: String) Raised!String {
-    var b: TextBuilder = .{};
-    errdefer b.deinit();
-    for (unitsOf(s)) |c| {
-        if (try f.code(f.env, c)) b.addOne(c);
-    }
-    return b.finish();
-}
-
-/// `String.collect f s`
-pub fn strCollect(f: anytype, s: String) Raised!String {
-    var b: TextBuilder = .{};
-    errdefer b.deinit();
-    for (unitsOf(s)) |c| {
-        const part: String = try f.code(f.env, c);
-        b.add(unitsOf(part));
-        drop(part);
-    }
-    return b.finish();
-}
-
-/// Comptime type-shape metadata for `%A` and `ToString` when Zig erases F# distinctions
-/// (`option` vs `voption`, tuple vs `struct tuple`, `char` vs `uint16`).
-pub const ShowNode = struct {
-    pub const auto: u16 = 0xFFFF;
-    pub const Kind = enum {
-        auto,
-        u16_num,
-        opt,
-        vopt,
-        tuple,
-        struct_tuple,
-        seq,
-        map,
-        record,
-        @"union",
-    };
-    kind: Kind = .auto,
-    a: u16 = auto,
-    b: u16 = 0,
-};
-
-pub const TypeShape = struct {
-    nodes: []const ShowNode = &.{},
-    refs: []const u16 = &.{},
-};
-
-/// How a value is turned into text: an F# format specifier (`%5d`, `%.2f`, `%s`, ...), or
-/// what `string x` and `$"{x}"` do (kind 'P').
-pub const Spec = struct {
-    kind: u8 = 'P',
-    width: u16 = 0,
-    precision: ?u8 = null,
-    zero: bool = false,
-    left: bool = false,
-    plus: bool = false,
-    space: bool = false,
-    /// a .NET format (`N2`), for a hole of an interpolated string that has one
-    net: []const u8 = "",
-    shape: TypeShape = .{},
-};
-
-pub fn Arg(comptime T: type, comptime spec: Spec) type {
-    return struct {
-        pub const fable_spec = spec;
-        value: T,
-    };
-}
-
-/// A value with its format specifier, as a part of `format`.
-pub inline fn arg(comptime spec: Spec, value: anytype) Arg(@TypeOf(value), spec) {
-    return .{ .value = value };
-}
-
-/// The text of one part: ASCII in `scratch`, or the units of a string.
-const Piece = union(enum) {
-    ascii: []const u8,
-    units: []const u16,
-
-    pub fn len(p: Piece) usize {
-        return switch (p) {
-            .ascii => |a| a.len,
-            .units => |u| u.len,
-        };
-    }
-};
-
-const scratch_len = 640;
-
-/// The decimal digits of a number: 0.d0 d1 d2 ... x 10^point.
-pub const Decimal = struct {
-    /// (a double has at most 309 digits before the point, or 1074 after it)
-    digits: [1100]u8 = undefined,
-    len: usize = 0,
-    point: i32 = 1,
-
-    /// The exact digits of a finite number that is not negative.
-    pub fn exact(x: f64) Decimal {
-        var d: Decimal = .{};
-        if (x == 0) return d;
-        const bits: u64 = @bitCast(x);
-        const biased: i32 = @intCast((bits >> 52) & 0x7FF);
-        var m: u64 = bits & ((1 << 52) - 1);
-        var e: i32 = undefined;
-        if (biased == 0) {
-            e = -1074;
-        } else {
-            m |= 1 << 52;
-            e = biased - 1075;
-        }
-        const zeros: u6 = @intCast(@ctz(m));
-        m >>= zeros;
-        e += zeros;
-
-        var limbs: [36]u32 = @splat(0);
-        if (e >= 0) {
-            // a whole number, m * 2^e: its digits, nine at a time from the last
-            const at: usize = @intCast(@divTrunc(e, 32));
-            const wide: u128 = @as(u128, m) << @intCast(@mod(e, 32));
-            limbs[at] = @truncate(wide);
-            limbs[at + 1] = @truncate(wide >> 32);
-            limbs[at + 2] = @truncate(wide >> 64);
-            var n: usize = at + 3;
-            var end: usize = d.digits.len;
-            while (n > 0) {
-                var carry: u64 = 0;
-                var i = n;
-                while (i > 0) {
-                    i -= 1;
-                    const cur = (carry << 32) | limbs[i];
-                    limbs[i] = @intCast(cur / 1_000_000_000);
-                    carry = cur % 1_000_000_000;
-                }
-                while (n > 0 and limbs[n - 1] == 0) n -= 1;
-                for (0..9) |_| {
-                    end -= 1;
-                    d.digits[end] = @intCast(carry % 10);
-                    carry /= 10;
-                }
-            }
-            while (d.digits[end] == 0) end += 1;
-            d.len = d.digits.len - end;
-            std.mem.copyForwards(u8, d.digits[0..d.len], d.digits[end..]);
-            d.point = @intCast(d.len);
-            return d;
-        }
-
-        // m / 2^shift: the whole part, then one digit of the rest at a time
-        const shift: usize = @intCast(-e);
-        const whole: u64 = if (shift >= 64) 0 else m >> @intCast(shift);
-        const rest: u64 = if (shift >= 64) m else m & ((@as(u64, 1) << @intCast(shift)) - 1);
-        if (whole != 0) {
-            const text = std.fmt.bufPrint(&d.digits, "{d}", .{whole}) catch unreachable;
-            for (d.digits[0..text.len]) |*c| c.* -= '0';
-            d.len = text.len;
-        }
-        d.point = @intCast(d.len);
-        limbs[0] = @truncate(rest);
-        limbs[1] = @truncate(rest >> 32);
-        const top = shift / 32;
-        const bit: u5 = @intCast(shift % 32);
-        for (0..shift) |_| {
-            var carry: u64 = 0;
-            for (limbs[0 .. top + 2]) |*l| {
-                const cur = @as(u64, l.*) * 10 + carry;
-                l.* = @truncate(cur);
-                carry = cur >> 32;
-            }
-            var next: u32 = limbs[top] >> bit;
-            if (bit != 0) {
-                next |= limbs[top + 1] << @intCast(32 - @as(u6, bit));
-                limbs[top] &= (@as(u32, 1) << bit) - 1;
-            } else {
-                limbs[top] = 0;
-            }
-            limbs[top + 1] = 0;
-            if (d.len == 0 and next == 0) {
-                d.point -= 1;
-            } else {
-                d.digits[d.len] = @intCast(next);
-                d.len += 1;
-            }
-        }
-        return d;
-    }
-
-    /// The shortest digits that read back as the same number, of its own type.
-    pub fn shortest(x: anytype) Decimal {
-        var d: Decimal = .{};
-        if (x == 0) return d;
-        var buf: [64]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{e}", .{x}) catch unreachable;
-        const e = std.mem.indexOfScalar(u8, text, 'e').?;
-        for (text[0..e]) |c| {
-            if (c == '.') continue;
-            d.digits[d.len] = c - '0';
-            d.len += 1;
-        }
-        d.point = (std.fmt.parseInt(i32, text[e + 1 ..], 10) catch unreachable) + 1;
-        return d;
-    }
-
-    /// Keep `n` digits, rounding to the nearest and a tie to the even digit, as .NET does.
-    pub fn round(d: *Decimal, n: i32) void {
-        d.roundTo(n, true);
-    }
-
-    /// Keep `n` digits, rounding to the nearest; a tie goes to the even digit, or up.
-    pub fn roundTo(d: *Decimal, n: i32, even: bool) void {
-        if (n >= d.len) return;
-        if (n < 0) {
-            d.len = 0;
-            return;
-        }
-        const keep: usize = @intCast(n);
-        const next = d.digits[keep];
-        var up = next > 5;
-        if (next == 5) {
-            up = !even or (keep > 0 and d.digits[keep - 1] % 2 == 1);
-            for (d.digits[keep + 1 .. d.len]) |c| {
-                if (c != 0) up = true;
-            }
-        }
-        d.len = keep;
-        if (!up) return;
-        var i = keep;
-        while (i > 0) {
-            i -= 1;
-            if (d.digits[i] != 9) {
-                d.digits[i] += 1;
-                return;
-            }
-            d.digits[i] = 0;
-        }
-        // (all nines, or no digit at all: one, a place higher)
-        d.digits[0] = 1;
-        d.len = @max(keep, 1);
-        d.point += 1;
-    }
-
-    pub inline fn digit(d: *const Decimal, i: i32) u8 {
-        return if (i >= 0 and i < d.len) '0' + d.digits[@intCast(i)] else '0';
-    }
-};
-
-pub const Text = struct {
-    buf: []u8,
-    len: usize = 0,
-
-    pub inline fn put(t: *Text, c: u8) void {
-        t.buf[t.len] = c;
-        t.len += 1;
-    }
-
-    /// e+005: the exponent with its sign and at least `width` digits
-    pub fn exponent(t: *Text, letter: u8, exp: i32, width: usize) void {
-        t.put(letter);
-        t.put(if (exp < 0) '-' else '+');
-        var digits: [8]u8 = undefined;
-        const text = std.fmt.bufPrint(&digits, "{d}", .{@abs(exp)}) catch unreachable;
-        for (@min(text.len, width)..width) |_| t.put('0');
-        for (text) |c| t.put(c);
-    }
-
-    /// The digits without the zeros at their end: plainly while the exponent is above -5 and
-    /// below `limit`, as d.ddde+xx otherwise.
-    pub fn general(t: *Text, d: *const Decimal, limit: i32, letter: u8) void {
-        var n: i32 = @intCast(d.len);
-        while (n > 0 and d.digits[@intCast(n - 1)] == 0) n -= 1;
-        const exp = d.point - 1;
-        if (exp > -5 and exp < limit) {
-            if (d.point <= 0) {
-                t.put('0');
-            } else {
-                var i: i32 = 0;
-                while (i < d.point) : (i += 1) t.put(d.digit(i));
-            }
-            if (n > d.point) {
-                t.put('.');
-                var i: i32 = @min(d.point, 0);
-                while (i < 0) : (i += 1) t.put('0');
-                i = @max(d.point, 0);
-                while (i < n) : (i += 1) t.put(d.digit(i));
-            }
-        } else {
-            t.put(d.digit(0));
-            if (n > 1) {
-                t.put('.');
-                var i: i32 = 1;
-                while (i < n) : (i += 1) t.put(d.digit(i));
-            }
-            t.exponent(letter, exp, 2);
-        }
-    }
-};
-
-/// A float as F# and .NET write it. `%f` and `%e` round the exact value of the number; `%g`
-/// keeps six digits; everything else (`string x`, `$"{x}"`, `%O`) is the shortest text that
-/// reads back as the same number.
-fn floatText(comptime spec: Spec, value: anytype, out: []u8) []const u8 {
-    const x: f64 = value;
-    if (std.math.isNan(x)) return "NaN";
-    if (std.math.isInf(x)) return if (x > 0) "Infinity" else "-Infinity";
-    var t: Text = .{ .buf = out };
-    if (std.math.signbit(x)) t.put('-') else if (spec.plus) t.put('+') else if (spec.space) t.put(' ');
-    const precision: i32 = @min(spec.precision orelse 6, 80);
-    switch (spec.kind) {
-        'f', 'F' => {
-            var d = Decimal.exact(@abs(x));
-            d.round(d.point + precision);
-            var i: i32 = @min(d.point, 1) - 1;
-            while (i < d.point) : (i += 1) t.put(d.digit(i));
-            if (precision > 0) {
-                t.put('.');
-                var k: i32 = 0;
-                while (k < precision) : (k += 1) t.put(d.digit(d.point + k));
-            }
-        },
-        'e', 'E' => {
-            var d = Decimal.exact(@abs(x));
-            d.round(precision + 1);
-            t.put(d.digit(0));
-            if (precision > 0) {
-                t.put('.');
-                var k: i32 = 1;
-                while (k <= precision) : (k += 1) t.put(d.digit(k));
-            }
-            t.exponent(spec.kind, d.point - 1, 3);
-        },
-        'g', 'G' => {
-            const letter: u8 = if (spec.kind == 'g') 'e' else 'E';
-            if (precision == 0) {
-                const d = Decimal.shortest(@abs(value));
-                t.general(&d, if (@TypeOf(value) == f32) 9 else 17, letter);
-            } else {
-                var d = Decimal.exact(@abs(x));
-                d.round(precision);
-                t.general(&d, precision, letter);
-            }
-        },
-        else => {
-            const d = Decimal.shortest(@abs(value));
-            t.general(&d, if (@TypeOf(value) == f32) 9 else 17, 'E');
-        },
-    }
-    return out[0..t.len];
-}
-
-pub fn pieceOf(comptime spec: Spec, value: anytype, scratch: *[scratch_len]u8) Piece {
-    const T = @TypeOf(value);
-    if (comptime isDecimal(T)) return .{ .ascii = if (spec.net.len != 0) netText(spec.net, value, scratch) else decSpecText(spec, value, scratch) };
-    if (T == String) {
-        // (only `%O` shows that a string is null)
-        if (value == null and spec.kind == 'O') return .{ .ascii = "<null>" };
-        return .{ .units = unitsOf(value) };
-    }
-    switch (@typeInfo(T)) {
-        .bool => return .{ .ascii = if (spec.kind == 'b')
-            (if (value) "true" else "false")
-        else
-            (if (value) "True" else "False") },
-        .int => |info| {
-            if (spec.net.len != 0) return .{ .ascii = netText(spec.net, value, scratch) };
-            if (spec.kind == 'c') {
-                // (a char: one UTF-16 unit, kept in the scratch space as such)
-                const u: *[1]u16 = @ptrCast(@alignCast(scratch));
-                u[0] = @intCast(value);
-                return .{ .units = u };
-            }
-            const Bits = @Int(.unsigned, info.bits);
-            const sign: []const u8 = if (value >= 0 and spec.plus) "+" else if (value >= 0 and spec.space) " " else "";
-            const text = switch (spec.kind) {
-                'x' => std.fmt.bufPrint(scratch, "{x}", .{@as(Bits, @bitCast(value))}),
-                'X' => std.fmt.bufPrint(scratch, "{X}", .{@as(Bits, @bitCast(value))}),
-                'o' => std.fmt.bufPrint(scratch, "{o}", .{@as(Bits, @bitCast(value))}),
-                'u' => std.fmt.bufPrint(scratch, "{d}", .{@as(Bits, @bitCast(value))}),
-                else => std.fmt.bufPrint(scratch, "{s}{d}", .{ sign, value }),
-            };
-            return .{ .ascii = text catch unreachable };
-        },
-        .comptime_int => return pieceOf(spec, @as(i64, value), scratch),
-        .float => return .{ .ascii = if (spec.net.len != 0) netText(spec.net, value, scratch) else floatText(spec, value, scratch) },
-        .comptime_float => return .{ .ascii = floatText(spec, @as(f64, value), scratch) },
-        else => @compileError("fable: a value of type " ++ @typeName(T) ++ " cannot be formatted yet"),
-    }
-}
-
-pub fn isLiteralText(comptime T: type) bool {
-    const info = @typeInfo(T);
-    if (info != .pointer) return false;
-    if (info.pointer.size == .slice) return info.pointer.child == u8;
-    if (info.pointer.size != .one) return false;
-    const child = @typeInfo(info.pointer.child);
-    return child == .array and child.array.child == u8;
-}
-
-/// Text from parts: literal text (a Zig string literal), strings, and values, bare or with a
-/// format specifier (`fable_rt.arg`). This is `sprintf`, string interpolation and `string x`.
-pub fn format(parts: anytype) String {
-    @setEvalBranchQuota(std.math.maxInt(u32));
-    const names = @typeInfo(@TypeOf(parts)).@"struct".field_names;
-    var pieces: [names.len]Piece = undefined;
-    var pad: [names.len]usize = @splat(0);
-    var scratch: [names.len][scratch_len]u8 align(2) = undefined;
-    // (the text of a `%A` is a string of its own until it is copied into the result)
-    var written: [names.len]String = @splat(null);
-    defer for (written) |text| strRelease(text);
-    var total: usize = 0;
-    inline for (names, 0..) |name, i| {
-        const part = @field(parts, name);
-        const T = @TypeOf(part);
-        if (comptime isBigInt(T)) {
-            written[i] = bigText(part);
-            pieces[i] = .{ .units = unitsOf(written[i]) };
-        } else if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "fable_spec") and isBigInt(@FieldType(T, "value")))) {
-            written[i] = bigText(part.value);
-            pieces[i] = .{ .units = unitsOf(written[i]) };
-            if (T.fable_spec.width > pieces[i].len()) pad[i] = T.fable_spec.width - pieces[i].len();
-        } else if (comptime isLiteralText(T)) {
-            pieces[i] = .{ .units = comptime std.unicode.utf8ToUtf16LeStringLiteral(part) };
-        } else if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "fable_spec"))) {
-            if (comptime T.fable_spec.kind == 'A') {
-                written[i] = anyTextShape(T.fable_spec.shape, part.value);
-                pieces[i] = .{ .units = unitsOf(written[i]) };
-            } else if (comptime T.fable_spec.kind == 'T') {
-                // (`%O` and `{x}` of a value whose type is a type parameter: its `ToString`)
-                written[i] = genericText(part.value) catch blk: {
-                    drop(take());
-                    break :blk str("");
-                };
-                pieces[i] = .{ .units = unitsOf(written[i]) };
-            } else {
-                pieces[i] = pieceOf(T.fable_spec, part.value, &scratch[i]);
-            }
-            if (T.fable_spec.width > pieces[i].len()) pad[i] = T.fable_spec.width - pieces[i].len();
-        } else {
-            pieces[i] = pieceOf(.{}, part, &scratch[i]);
-        }
-        total += pieces[i].len() + pad[i];
-    }
-    const s, const out = strNew(total);
-    var at: usize = 0;
-    inline for (names, 0..) |name, i| {
-        const T = @TypeOf(@field(parts, name));
-        const spec: Spec = if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "fable_spec"))) T.fable_spec else .{};
-        at = writePiece(out, at, pieces[i], pad[i], spec);
-    }
-    return s;
-}
-
-/// Write one part at `at`, padded to its width; returns where the next part starts.
-fn writePiece(out: []u16, start: usize, piece: Piece, pad: usize, spec: Spec) usize {
-    var at = start;
-    if (pad != 0 and !spec.left) {
-        if (spec.zero and piece == .ascii) {
-            // (zeros go between the sign and the digits)
-            const a = piece.ascii;
-            const signed = a.len > 0 and (a[0] == '-' or a[0] == '+' or a[0] == ' ');
-            if (signed) {
-                out[at] = a[0];
-                at += 1;
-            }
-            @memset(out[at..][0..pad], '0');
-            at += pad;
-            for (a[@intFromBool(signed)..]) |c| {
-                out[at] = c;
-                at += 1;
-            }
-            return at;
-        }
-        @memset(out[at..][0..pad], ' ');
-        at += pad;
-    }
-    switch (piece) {
-        .ascii => |a| for (a) |c| {
-            out[at] = c;
-            at += 1;
-        },
-        .units => |u| {
-            @memcpy(out[at..][0..u.len], u);
-            at += u.len;
-        },
-    }
-    if (pad != 0 and spec.left) {
-        @memset(out[at..][0..pad], ' ');
-        at += pad;
-    }
-    return at;
-}
-
-pub fn posixWrite(fd: i32, bytes: []const u8) void {
-    if (builtin.os.tag == .freestanding) return;
-    var done: usize = 0;
-    while (done < bytes.len) {
-        const n = std.posix.system.write(fd, bytes.ptr + done, bytes.len - done);
-        if (n <= 0) return;
-        done += @intCast(n);
-    }
-}
-
-pub fn defaultOut(bytes: []const u8) void {
-    posixWrite(1, bytes);
-}
-
-pub fn defaultErr(bytes: []const u8) void {
-    posixWrite(2, bytes);
-}
-
 /// Where `printf` and `eprintf` send their text, as UTF-8. A program may replace them (a
 /// freestanding one has to: there they do nothing).
 pub var write_out: *const fn (bytes: []const u8) void = defaultOut;
 pub var write_err: *const fn (bytes: []const u8) void = defaultErr;
 
-pub fn writeText(write: *const fn ([]const u8) void, s: String, newline: bool) void {
-    var buf: [512]u8 = undefined;
-    var rest = unitsOf(s);
-    while (rest.len != 0) {
-        // (a pair of surrogates is not split between two chunks)
-        var n = @min(rest.len, buf.len / 3);
-        if (n < rest.len and rest[n - 1] >= 0xD800 and rest[n - 1] < 0xDC00) n -= 1;
-        if (n == 0) n = 1;
-        const len = std.unicode.wtf16LeToWtf8(&buf, rest[0..n]);
-        write(buf[0..len]);
-        rest = rest[n..];
-    }
-    if (newline) write("\n");
-}
-
-/// `printf` / `printfn`: the text of `parts` (see `format`) to standard output.
-pub fn print(parts: anytype, comptime newline: bool) void {
-    const s = format(parts);
-    writeText(write_out, s, newline);
-    drop(s);
-}
-
-/// `eprintf` / `eprintfn`
-pub fn printErr(parts: anytype, comptime newline: bool) void {
-    const s = format(parts);
-    writeText(write_err, s, newline);
-    drop(s);
-}
-
 // ---------------------------------------------------------------------------------------------
-// .NET's standard numeric formats: what `{x:N2}` in an interpolated string asks for
+// (moved to fable_string.zig)
+const fable_string = @import("fable_string.zig");
+pub const Str = fable_string.Str;
+pub const String = fable_string.String;
+pub const unitsOf = fable_string.unitsOf;
+pub const LiteralCell = fable_string.LiteralCell;
+pub const str = fable_string.str;
+pub const strOf = fable_string.strOf;
+pub const strWords = fable_string.strWords;
+pub const strNew = fable_string.strNew;
+pub const strFrom = fable_string.strFrom;
+pub const strRetain = fable_string.strRetain;
+pub const strRelease = fable_string.strRelease;
+pub const TextBuilder = fable_string.TextBuilder;
+pub const TextEncoding = fable_string.TextEncoding;
+pub const encodingGetBytes = fable_string.encodingGetBytes;
+pub const encodingGetBytesRange = fable_string.encodingGetBytesRange;
+pub const encodingGetString = fable_string.encodingGetString;
+pub const encodingGetStringRange = fable_string.encodingGetStringRange;
+pub const encodingGetByteCount = fable_string.encodingGetByteCount;
+pub const strEql = fable_string.strEql;
+pub const strCompare = fable_string.strCompare;
+pub const compare = fable_string.compare;
+pub const compareOf = fable_string.compareOf;
+pub const maxOf = fable_string.maxOf;
+pub const mathMax = fable_string.mathMax;
+pub const mathMin = fable_string.mathMin;
+pub const minOf = fable_string.minOf;
+pub const hash = fable_string.hash;
+pub const hashWith = fable_string.hashWith;
+pub const nullRef = fable_string.nullRef;
+pub const argNull = fable_string.argNull;
+pub const isNullValue = fable_string.isNullValue;
+pub const isArrayPtr = fable_string.isArrayPtr;
+pub const nonNullValue = fable_string.nonNullValue;
+pub const nullArgCheck = fable_string.nullArgCheck;
+pub const nonNullUnwrap = fable_string.nonNullUnwrap;
+pub const nullArgCheckUnwrap = fable_string.nullArgCheckUnwrap;
+pub const argRange = fable_string.argRange;
+pub const exnWithParam = fable_string.exnWithParam;
+pub const exnParamName = fable_string.exnParamName;
+pub const argNegative = fable_string.argNegative;
+pub const argAbove = fable_string.argAbove;
+pub const index_range = fable_string.index_range;
+pub const strLen = fable_string.strLen;
+pub const strLength = fable_string.strLength;
+pub const strAt = fable_string.strAt;
+pub const strConcat = fable_string.strConcat;
+pub const strAppend = fable_string.strAppend;
+pub const strEquals = fable_string.strEquals;
+pub const strIsNullOrEmpty = fable_string.strIsNullOrEmpty;
+pub const strIsNullOrWhiteSpace = fable_string.strIsNullOrWhiteSpace;
+pub const strSlice = fable_string.strSlice;
+pub const strSubstring = fable_string.strSubstring;
+pub const strIndexOfChar = fable_string.strIndexOfChar;
+pub const strIndexOf = fable_string.strIndexOf;
+pub const strLastIndexOfChar = fable_string.strLastIndexOfChar;
+pub const strLastIndexOf = fable_string.strLastIndexOf;
+pub const strContains = fable_string.strContains;
+pub const strContainsChar = fable_string.strContainsChar;
+pub const strStartsWith = fable_string.strStartsWith;
+pub const strEndsWith = fable_string.strEndsWith;
+pub const strStartsWithChar = fable_string.strStartsWithChar;
+pub const strEndsWithChar = fable_string.strEndsWithChar;
+pub const strCase = fable_string.strCase;
+pub const strTrim = fable_string.strTrim;
+pub const strReplace = fable_string.strReplace;
+pub const strReplaceChar = fable_string.strReplaceChar;
+pub const strInsert = fable_string.strInsert;
+pub const strRemove = fable_string.strRemove;
+pub const strPad = fable_string.strPad;
+pub const strOfChar = fable_string.strOfChar;
+pub const countNegative = fable_string.countNegative;
+pub const apply3 = fable_string.apply3;
+pub const apply2 = fable_string.apply2;
+pub const strReplicate = fable_string.strReplicate;
+pub const strJoin = fable_string.strJoin;
+pub const strInit = fable_string.strInit;
+pub const strMap = fable_string.strMap;
+pub const strMapi = fable_string.strMapi;
+pub const strIter = fable_string.strIter;
+pub const strIteri = fable_string.strIteri;
+pub const strForall = fable_string.strForall;
+pub const strExists = fable_string.strExists;
+pub const strFilter = fable_string.strFilter;
+pub const strCollect = fable_string.strCollect;
+pub const ShowNode = fable_string.ShowNode;
+pub const TypeShape = fable_string.TypeShape;
+pub const Spec = fable_string.Spec;
+pub const Arg = fable_string.Arg;
+pub const arg = fable_string.arg;
+pub const scratch_len = fable_string.scratch_len;
+pub const Decimal = fable_string.Decimal;
+pub const Text = fable_string.Text;
+pub const floatText = fable_string.floatText;
+pub const pieceOf = fable_string.pieceOf;
+pub const isLiteralText = fable_string.isLiteralText;
+pub const format = fable_string.format;
+pub const posixWrite = fable_string.posixWrite;
+pub const defaultOut = fable_string.defaultOut;
+pub const defaultErr = fable_string.defaultErr;
+pub const writeText = fable_string.writeText;
+pub const print = fable_string.print;
+pub const printErr = fable_string.printErr;
 // ---------------------------------------------------------------------------------------------
-
-/// The digits before the point, in groups of three if `grouped`.
-fn wholeDigits(t: *Text, d: *const Decimal, comptime grouped: bool) void {
-    const count: i32 = @max(d.point, 1);
-    var i: i32 = 0;
-    while (i < count) : (i += 1) {
-        if (grouped and i != 0 and @mod(count - i, 3) == 0) t.put(',');
-        t.put(d.digit(i + d.point - count));
-    }
-}
-
-pub fn fraction(t: *Text, d: *const Decimal, places: i32) void {
-    if (places <= 0) return;
-    t.put('.');
-    var k: i32 = 0;
-    while (k < places) : (k += 1) t.put(d.digit(d.point + k));
-}
-
-/// A number as .NET's `ToString(format)` writes it in the invariant culture, for the
-/// standard formats: D, X, B, N, F, E, G, R, P and C with an optional precision.
-/// The `n`-th section of a custom format (`positive;negative;zero`), or null.
-fn customSection(fmt: []const u8, n: usize) ?[]const u8 {
-    var start: usize = 0;
-    var k: usize = 0;
-    var i: usize = 0;
-    while (i < fmt.len) : (i += 1) {
-        const c = fmt[i];
-        if (c == '\\') {
-            i += 1;
-        } else if (c == '\'' or c == '"') {
-            i += 1;
-            while (i < fmt.len and fmt[i] != c) i += 1;
-        } else if (c == ';') {
-            if (k == n) return fmt[start..i];
-            k += 1;
-            start = i + 1;
-        }
-    }
-    if (k == n) return fmt[start..];
-    return null;
-}
-
-/// .NET's `FindSection`: the section for a negative number (1) or a zero (2), or the first
-/// when the format has no such section or it is empty.
-fn customFind(fmt: []const u8, n: usize) usize {
-    if (n == 0) return 0;
-    const s = customSection(fmt, n) orelse return 0;
-    return if (s.len == 0) 0 else n;
-}
-
-/// A number in one of .NET's custom formats (`0.00`, `#,##0`, `0%`, `0.0;(0.0);zero`,
-/// `0.00E+0`, quoted text), as .NET's `NumberToStringFormat` writes it: a double keeps 15
-/// significant digits (a float32 7), digits are rounded half away from zero, and digits beyond
-/// the placeholders before the point all go where the first placeholder is.
-fn customText(fmt: []const u8, value: anytype, out: []u8) []const u8 {
-    const T = @TypeOf(value);
-    const is_dec = comptime isDecimal(T);
-    const is_float = comptime !is_dec and @typeInfo(T) == .float;
-    var t: Text = .{ .buf = out };
-    var negative: bool = undefined;
-    var number: Decimal = .{};
-    if (is_dec) {
-        number = decDigits(value);
-        negative = value.m < 0;
-    } else if (is_float) {
-        if (std.math.isNan(value)) return "NaN";
-        if (std.math.isInf(value)) return if (value > 0) "Infinity" else "-Infinity";
-        negative = std.math.signbit(value);
-        number = Decimal.exact(@abs(@as(f64, value)));
-        number.roundTo(if (T == f32) 7 else 15, false);
-    } else {
-        negative = value < 0;
-        if (value != 0) {
-            const text = std.fmt.bufPrint(&number.digits, "{d}", .{@abs(@as(i128, value))}) catch unreachable;
-            for (number.digits[0..text.len]) |*c| c.* -= '0';
-            number.len = text.len;
-            number.point = @intCast(text.len);
-        }
-    }
-    while (number.len > 0 and number.digits[number.len - 1] == 0) number.len -= 1;
-
-    var section: usize = if (number.len == 0) customFind(fmt, 2) else if (negative) customFind(fmt, 1) else 0;
-    while (true) {
-        const sec = customSection(fmt, section).?;
-        // what the section asks for
-        var digit_count: i32 = 0;
-        var decimal_pos: i32 = -1;
-        var first_digit: i32 = std.math.maxInt(i32);
-        var last_digit: i32 = 0;
-        var scientific = false;
-        var thousand_pos: i32 = -1;
-        var thousand_count: i32 = 0;
-        var thousand_seps = false;
-        var scale_adjust: i32 = 0;
-        var i: usize = 0;
-        while (i < sec.len) : (i += 1) {
-            const c = sec[i];
-            switch (c) {
-                '#' => digit_count += 1,
-                '0' => {
-                    if (first_digit == std.math.maxInt(i32)) first_digit = digit_count;
-                    digit_count += 1;
-                    last_digit = digit_count;
-                },
-                '.' => {
-                    if (decimal_pos < 0) decimal_pos = digit_count;
-                },
-                ',' => {
-                    if (digit_count > 0 and decimal_pos < 0) {
-                        if (thousand_pos >= 0) {
-                            if (thousand_pos == digit_count) {
-                                thousand_count += 1;
-                                continue;
-                            }
-                            thousand_seps = true;
-                        }
-                        thousand_pos = digit_count;
-                        thousand_count = 1;
-                    }
-                },
-                '%' => scale_adjust += 2,
-                '\'', '"' => {
-                    i += 1;
-                    while (i < sec.len and sec[i] != c) i += 1;
-                },
-                '\\' => i += 1,
-                'E', 'e' => {
-                    if ((i + 1 < sec.len and sec[i + 1] == '0') or (i + 2 < sec.len and (sec[i + 1] == '+' or sec[i + 1] == '-') and sec[i + 2] == '0')) {
-                        scientific = true;
-                        i += 1;
-                        if (sec[i] == '+' or sec[i] == '-') i += 1;
-                        while (i + 1 < sec.len and sec[i + 1] == '0') i += 1;
-                    }
-                },
-                else => {},
-            }
-        }
-        if (decimal_pos < 0) decimal_pos = digit_count;
-        if (thousand_pos >= 0) {
-            if (thousand_pos == decimal_pos) {
-                scale_adjust -= thousand_count * 3;
-            } else {
-                thousand_seps = true;
-            }
-        }
-
-        var d = number;
-        if (d.len != 0) {
-            d.point += scale_adjust;
-            const pos = if (scientific) digit_count else d.point + digit_count - decimal_pos;
-            d.roundTo(pos, false);
-            while (d.len > 0 and d.digits[d.len - 1] == 0) d.len -= 1;
-            if (d.len == 0) {
-                d.point = 0;
-                if (!is_float) negative = false;
-                const z = customFind(fmt, 2);
-                if (z != section) {
-                    section = z;
-                    continue;
-                }
-            }
-        } else {
-            if (!is_float) negative = false;
-            d.point = 0;
-        }
-
-        const first: i32 = if (first_digit < decimal_pos) decimal_pos - first_digit else 0;
-        const last: i32 = if (last_digit > decimal_pos) decimal_pos - last_digit else 0;
-        var dig_pos: i32 = undefined;
-        var adjust: i32 = undefined;
-        if (scientific) {
-            dig_pos = decimal_pos;
-            adjust = 0;
-        } else {
-            dig_pos = @max(d.point, decimal_pos);
-            adjust = d.point - decimal_pos;
-        }
-        var di: usize = 0;
-        if (negative and section == 0 and d.point != 0) t.put('-');
-        var decimal_written = false;
-        const sep = struct {
-            pub fn at(seps: bool, pos: i32) bool {
-                return seps and pos > 1 and @mod(pos - 1, 3) == 0;
-            }
-        };
-        var exponent_done = false;
-        i = 0;
-        while (i < sec.len) : (i += 1) {
-            const c = sec[i];
-            switch (c) {
-                '#', '0' => {
-                    var ch: u8 = 0;
-                    if (adjust < 0) {
-                        adjust += 1;
-                        ch = if (dig_pos <= first) '0' else 0;
-                    } else {
-                        while (adjust > 0) : (adjust -= 1) {
-                            if (di < d.len) {
-                                t.put('0' + d.digits[di]);
-                                di += 1;
-                            } else t.put('0');
-                            if (sep.at(thousand_seps, dig_pos)) t.put(',');
-                            dig_pos -= 1;
-                        }
-                        if (di < d.len) {
-                            ch = '0' + d.digits[di];
-                            di += 1;
-                        } else {
-                            ch = if (dig_pos > last) '0' else 0;
-                        }
-                    }
-                    if (ch != 0) {
-                        t.put(ch);
-                        if (sep.at(thousand_seps, dig_pos)) t.put(',');
-                    }
-                    dig_pos -= 1;
-                },
-                '.' => {
-                    if (dig_pos == 0 and !decimal_written and (last < 0 or (decimal_pos < digit_count and di < d.len))) {
-                        t.put('.');
-                        decimal_written = true;
-                    }
-                },
-                ',' => {},
-                '\'', '"' => {
-                    i += 1;
-                    while (i < sec.len and sec[i] != c) : (i += 1) t.put(sec[i]);
-                },
-                '\\' => {
-                    i += 1;
-                    if (i < sec.len) t.put(sec[i]);
-                },
-                'E', 'e' => {
-                    var positive_sign = false;
-                    var zeros: u8 = 0;
-                    if (scientific and !exponent_done and i + 1 < sec.len and (sec[i + 1] == '0' or (i + 2 < sec.len and (sec[i + 1] == '+' or sec[i + 1] == '-') and sec[i + 2] == '0'))) {
-                        var j = i + 1;
-                        if (sec[j] == '+') positive_sign = true;
-                        if (sec[j] == '+' or sec[j] == '-') j += 1;
-                        while (j < sec.len and sec[j] == '0') : (j += 1) zeros += 1;
-                        i = j - 1;
-                        const e: i32 = if (d.len == 0) 0 else d.point - decimal_pos;
-                        t.put(c);
-                        if (e < 0) t.put('-') else if (positive_sign) t.put('+');
-                        var buf: [12]u8 = undefined;
-                        const digits = std.fmt.bufPrint(&buf, "{d}", .{@abs(e)}) catch unreachable;
-                        var pad: i32 = @as(i32, @min(zeros, 10)) - @as(i32, @intCast(digits.len));
-                        while (pad > 0) : (pad -= 1) t.put('0');
-                        for (digits) |x| t.put(x);
-                        exponent_done = true;
-                    } else {
-                        t.put(c);
-                    }
-                },
-                else => t.put(c),
-            }
-        }
-        if (negative and section == 0 and d.point == 0 and t.len > 0) {
-            std.mem.copyBackwards(u8, out[1 .. t.len + 1], out[0..t.len]);
-            out[0] = '-';
-            t.len += 1;
-        }
-        return out[0..t.len];
-    }
-}
-
-pub fn isStandardFormat(comptime fmt: []const u8) bool {
-    if (fmt.len == 0 or fmt.len > 3 or !std.ascii.isAlphabetic(fmt[0])) return false;
-    for (fmt[1..]) |c| {
-        if (!std.ascii.isDigit(c)) return false;
-    }
-    return true;
-}
-
-pub fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
-    if (comptime !isStandardFormat(fmt)) return customText(fmt, value, out);
-    const T = @TypeOf(value);
-    const isDec = comptime isDecimal(T);
-    const whole = !isDec and @typeInfo(T) == .int;
-    const letter = fmt[0];
-    const given: ?i32 = comptime if (fmt.len > 1) (std.fmt.parseInt(i32, fmt[1..], 10) catch @compileError("fable: the format " ++ fmt)) else null;
-    var t: Text = .{ .buf = out };
-
-    if (comptime (letter == 'X' or letter == 'x' or letter == 'B' or letter == 'b')) {
-        if (!whole) @compileError("fable: the format " ++ fmt ++ " is for whole numbers");
-        const bits: @Int(.unsigned, @typeInfo(T).int.bits) = @bitCast(value);
-        var raw: [140]u8 = undefined;
-        const text = switch (letter) {
-            'X' => std.fmt.bufPrint(&raw, "{X}", .{bits}),
-            'x' => std.fmt.bufPrint(&raw, "{x}", .{bits}),
-            else => std.fmt.bufPrint(&raw, "{b}", .{bits}),
-        } catch unreachable;
-        var pad: i32 = (given orelse 0) - @as(i32, @intCast(text.len));
-        while (pad > 0) : (pad -= 1) t.put('0');
-        for (text) |c| t.put(c);
-        return out[0..t.len];
-    }
-    // (`G` of a decimal: every digit of its scale)
-    if (isDec and (letter == 'G' or letter == 'g') and given == null) return decAscii(value, out);
-    if (!whole and !isDec) {
-        if (std.math.isNan(value)) return "NaN";
-        if (std.math.isInf(value)) return if (value > 0) "Infinity" else "-Infinity";
-    }
-
-    const negative = if (isDec) value.m < 0 else if (whole) value < 0 else std.math.signbit(value);
-    const shortest = !whole and !isDec and (letter == 'R' or letter == 'r' or ((letter == 'G' or letter == 'g') and (given orelse 0) == 0));
-    var d: Decimal = .{};
-    if (isDec) {
-        d = decDigits(value);
-    } else if (whole) {
-        if (value != 0) {
-            const text = std.fmt.bufPrint(&d.digits, "{d}", .{@abs(@as(i128, value))}) catch unreachable;
-            for (d.digits[0..text.len]) |*c| c.* -= '0';
-            d.len = text.len;
-            d.point = @intCast(text.len);
-        }
-    } else if (shortest) {
-        d = Decimal.shortest(@abs(value));
-    } else {
-        d = Decimal.exact(@abs(@as(f64, value)));
-    }
-    // (a whole number has no exact half to decide: .NET rounds its digits half up)
-    // (and neither does .NET's formatting of a decimal)
-    const even = !whole and !isDec;
-
-    switch (letter) {
-        'D', 'd' => {
-            if (!whole) @compileError("fable: the format " ++ fmt ++ " is for whole numbers");
-            if (negative) t.put('-');
-            const have: i32 = @max(d.point, 1);
-            var pad: i32 = @as(i32, given orelse 0) - have;
-            while (pad > 0) : (pad -= 1) t.put('0');
-            wholeDigits(&t, &d, false);
-        },
-        'N', 'n', 'F', 'f', 'P', 'p', 'C', 'c' => {
-            const places: i32 = @min(given orelse 2, 80);
-            const percent = letter == 'P' or letter == 'p';
-            const currency = letter == 'C' or letter == 'c';
-            if (percent and d.len != 0) d.point += 2;
-            d.roundTo(d.point + places, even);
-            // (a decimal that rounds to zero is written without its sign; a float keeps it)
-            var zero = true;
-            for (d.digits[0..d.len]) |c| {
-                if (c != 0) zero = false;
-            }
-            const signed = negative and !(isDec and zero);
-            if (signed) t.put(if (currency) '(' else '-');
-            if (currency) t.put(0xA4);
-            wholeDigits(&t, &d, !(letter == 'F' or letter == 'f'));
-            fraction(&t, &d, places);
-            if (percent) {
-                t.put(' ');
-                t.put('%');
-            }
-            if (signed and currency) t.put(')');
-        },
-        'E', 'e' => {
-            const places: i32 = @min(given orelse 6, 80);
-            d.roundTo(places + 1, even);
-            if (negative) t.put('-');
-            t.put(d.digit(0));
-            if (places > 0) {
-                t.put('.');
-                var k: i32 = 1;
-                while (k <= places) : (k += 1) t.put(d.digit(k));
-            }
-            t.exponent(letter, d.point - 1, 3);
-        },
-        'G', 'g', 'R', 'r' => {
-            const e: u8 = if (letter == 'g' or letter == 'r') 'e' else 'E';
-            if (negative) t.put('-');
-            const limit: i32 = if (shortest)
-                (if (T == f32) 9 else 17)
-            else if (whole and (letter == 'R' or letter == 'r' or (given orelse 0) == 0))
-                std.math.maxInt(i32)
-            else
-                given.?;
-            if (!shortest) d.roundTo(limit, even);
-            if (d.len == 0) t.put('0') else t.general(&d, limit, e);
-        },
-        else => @compileError("fable: the format " ++ fmt ++ " is not supported"),
-    }
-    return out[0..t.len];
-}
-
+// (moved to fable_netformat.zig)
+const fable_netformat = @import("fable_netformat.zig");
+pub const fraction = fable_netformat.fraction;
+pub const isStandardFormat = fable_netformat.isStandardFormat;
+pub const netText = fable_netformat.netText;
 // ---------------------------------------------------------------------------------------------
-// %A: a value as F# would write it
-//
-// This is the printer of FSharp.Core, rule for rule, so that the text is the same: the value
-// becomes a layout (text, and joints that may or must break), the layout is fitted into lines
-// of 80 characters by breaking the outermost joints first, and the result is written with the
-// indentation the breaks ask for. A list shows its first 100 items; a record that contains
-// itself is cut where it comes round again.
-// ---------------------------------------------------------------------------------------------
-
-const Joint = union(enum) { unbreakable, breakable: i32, broken: i32 };
-
-pub const Layout = struct {
-    /// no space is wanted before this text (`tight_left`) or after it (`tight_right`)
-    tight_left: bool,
-    tight_right: bool,
-    what: union(enum) {
-        leaf: []const u16,
-        node: struct { l: *Layout, r: *Layout, joint: Joint },
-    },
-};
-
-/// Where a value stands decides whether it needs brackets.
-pub const Prec = enum(u8) { bracket_if_tuple_or_not_atomic = 2, bracket_if_tuple = 3, never_bracket = 4 };
-
-const print_width = 80;
-const print_length = 100;
-const print_depth = 100;
-
-pub const Shower = struct {
-    arena: std.mem.Allocator,
-    /// the reference records that are being written, to find one that contains itself
-    path: [print_depth]*const anyopaque = undefined,
-    on_path: usize = 0,
-    /// the breaks that could still be made to gain room: the columns each would save (negative
-    /// once it was made), the innermost last
-    savings: std.ArrayList(i32) = .empty,
-    outer: usize = 0,
-
-    pub fn leaf(b: *Shower, tight_left: bool, text: []const u16, tight_right: bool) *Layout {
-        const l = b.arena.create(Layout) catch oom();
-        l.* = .{ .tight_left = tight_left, .tight_right = tight_right, .what = .{ .leaf = text } };
-        return l;
-    }
-
-    pub fn ascii(b: *Shower, tight_left: bool, text: []const u8, tight_right: bool) *Layout {
-        const u = b.arena.alloc(u16, text.len) catch oom();
-        for (text, u) |c, *to| to.* = c;
-        return b.leaf(tight_left, u, tight_right);
-    }
-
-    pub fn word(b: *Shower, text: []const u8) *Layout {
-        return b.ascii(false, text, false);
-    }
-
-    pub fn join(b: *Shower, l: *Layout, r: *Layout, joint: Joint) *Layout {
-        const n = b.arena.create(Layout) catch oom();
-        n.* = .{ .tight_left = l.tight_left, .tight_right = r.tight_right, .what = .{ .node = .{ .l = l, .r = r, .joint = joint } } };
-        return n;
-    }
-
-    pub fn tight(b: *Shower, l: *Layout, r: *Layout) *Layout {
-        return b.join(l, r, .unbreakable);
-    }
-
-    pub fn bracket(b: *Shower, l: *Layout) *Layout {
-        return b.tight(b.tight(b.ascii(false, "(", true), l), b.ascii(true, ")", false));
-    }
-
-    /// The items with `sep` after each but the last, and a possible break after each `sep`.
-    pub fn separated(b: *Shower, items: []const *Layout, sep: []const u8) *Layout {
-        var all = items[0];
-        for (items[1..]) |item| all = b.join(b.tight(all, b.ascii(true, sep, false)), item, .{ .breakable = 0 });
-        return all;
-    }
-
-    /// `Case`, `Case x` or `Case (x, y)`: a union case, `Some`, `ValueSome`, or an F# exception.
-    pub fn case(b: *Shower, name: []const u8, payload: anytype, prec: Prec, depth: i32) *Layout {
-        return b.caseShape(name, payload, .{}, &.{}, prec, depth);
-    }
-
-    pub fn caseShape(b: *Shower, name: []const u8, payload: anytype, comptime shape: TypeShape, field_refs: []const u16, prec: Prec, depth: i32) *Layout {
-        const P = @TypeOf(payload);
-        if (P == void) return b.word(name);
-        const fields = if (@typeInfo(P) == .pointer) payload else &payload;
-        const names = @typeInfo(@TypeOf(fields.*)).@"struct".field_names;
-        comptime var n = 0;
-        inline for (names) |field| {
-            if (comptime !isCount(field)) n += 1;
-        }
-        if (n == 0) return b.word(name);
-        var items: [n]*Layout = undefined;
-        comptime var i = 0;
-        inline for (names) |field| {
-            if (comptime !isCount(field)) {
-                const child_idx = if (i < field_refs.len) field_refs[i] else ShowNode.auto;
-                items[i] = b.showShape(@field(fields, field), shape, child_idx, if (n == 1) .bracket_if_tuple_or_not_atomic else .bracket_if_tuple, depth - 1);
-                i += 1;
-            }
-        }
-        const args = if (n == 1) items[0] else b.bracket(b.separated(&items, ","));
-        const whole = b.join(b.word(name), args, .{ .breakable = 2 });
-        return if (@backingInt(prec) <= @backingInt(Prec.bracket_if_tuple_or_not_atomic)) b.bracket(whole) else whole;
-    }
-
-    /// A two-dimensional array: `[[a; b]` and every further row on a line of its own, `]`.
-    pub fn array2D(b: *Shower, items: anytype, arr_shape: [2]usize, depth: i32) *Layout {
-        return b.array2DShape(items, arr_shape, .{}, ShowNode.auto, depth);
-    }
-
-    pub fn array2DShape(b: *Shower, items: anytype, arr_shape: [2]usize, comptime shape: TypeShape, child_idx: u16, depth: i32) *Layout {
-        var all: ?*Layout = null;
-        for (0..arr_shape[0]) |i| {
-            var row: std.ArrayList(*Layout) = .empty;
-            for (items[i * arr_shape[1] ..][0..arr_shape[1]]) |item| {
-                if (row.items.len == print_length) {
-                    row.append(b.arena, b.word("...")) catch oom();
-                    break;
-                }
-                row.append(b.arena, b.showShape(item, shape, child_idx, .bracket_if_tuple, depth - 1)) catch oom();
-            }
-            const inner = if (row.items.len == 0) b.word("[]") else b.tight(b.tight(b.ascii(false, "[", true), b.separated(row.items, ";")), b.ascii(true, "]", false));
-            all = if (all) |above| b.join(above, inner, .{ .broken = 0 }) else inner;
-        }
-        const body = all orelse return b.word("[]");
-        return b.tight(b.tight(b.ascii(false, "[", true), body), b.ascii(true, "]", false));
-    }
-
-    /// `{ A = 1` and every further field on a line of its own.
-    pub fn record(b: *Shower, fields: anytype, depth: i32) *Layout {
-        return b.recordShape(fields, .{}, &.{}, depth);
-    }
-
-    pub fn recordShape(b: *Shower, fields: anytype, comptime shape: TypeShape, field_refs: []const u16, depth: i32) *Layout {
-        var all: ?*Layout = null;
-        comptime var fi: usize = 0;
-        inline for (@typeInfo(@TypeOf(fields.*)).@"struct".field_names) |field| {
-            if (comptime !isCount(field)) {
-                const child_idx = if (fi < field_refs.len) field_refs[fi] else ShowNode.auto;
-                fi += 1;
-                const value = b.showShape(@field(fields, field), shape, child_idx, .bracket_if_tuple, depth - 1);
-                const item = b.join(b.tight(b.word(field), b.word("=")), value, .{ .breakable = 1 });
-                all = if (all) |above| b.join(above, item, .{ .broken = 0 }) else item;
-            }
-        }
-        return b.tight(b.tight(b.word("{"), all.?), b.word("}"));
-    }
-
-    pub fn number(b: *Shower, x: anytype) *Layout {
-        const T = @TypeOf(x);
-        var buf: [scratch_len + 4]u8 = undefined;
-        switch (@typeInfo(T)) {
-            .int => |info| {
-                const suffix = switch (T) {
-                    i8 => "y",
-                    u8 => "uy",
-                    c_ushort => "us",
-                    i16 => "s",
-                    i32 => "",
-                    u32 => "u",
-                    i64 => "L",
-                    u64 => "UL",
-                    isize => "n",
-                    usize => "un",
-                    else => if (info.signedness == .signed) "" else "u",
-                };
-                return b.word(std.fmt.bufPrint(&buf, "{d}{s}", .{ x, suffix }) catch unreachable);
-            },
-            .float => {
-                const suffix = if (T == f32) "f" else "";
-                if (std.math.isNan(x)) return b.word("nan" ++ suffix);
-                if (std.math.isInf(x)) return if (x > 0) b.word("infinity" ++ suffix) else b.word("-infinity" ++ suffix);
-                if (T == f32 and x > -2147483648.0 and x < 2147483648.0 and @trunc(x) == x) {
-                    return b.word(std.fmt.bufPrint(&buf, "{d}.0f", .{@as(i32, @intFromFloat(x))}) catch unreachable);
-                }
-                const text = floatText(.{ .kind = 'g', .precision = 10 }, x, buf[0..scratch_len]);
-                var plain = T == f64;
-                for (text) |c| {
-                    if (!(std.ascii.isDigit(c) or c == '-')) plain = false;
-                }
-                const tail = if (plain) ".0" else suffix;
-                var all: [scratch_len + 4]u8 = undefined;
-                return b.word(std.fmt.bufPrint(&all, "{s}{s}", .{ text, tail }) catch unreachable);
-            },
-            else => comptime unreachable,
-        }
-    }
-
-    pub fn char(b: *Shower, c: u16) *Layout {
-        var text: [8]u16 = undefined;
-        var n: usize = 0;
-        text[n] = '\'';
-        n += 1;
-        if (c == '\'' or c == '\\') {
-            text[n] = '\\';
-            text[n + 1] = c;
-            n += 2;
-        } else if (c == 8) {
-            text[n] = '\\';
-            text[n + 1] = 'b';
-            n += 2;
-        } else if (c < 0x20 or (c >= 0x7F and c <= 0x9F)) {
-            text[n] = '\\';
-            text[n + 1] = '0' + c / 100;
-            text[n + 2] = '0' + (c / 10) % 10;
-            text[n + 3] = '0' + c % 10;
-            n += 4;
-        } else {
-            text[n] = c;
-            n += 1;
-        }
-        text[n] = '\'';
-        n += 1;
-        return b.leaf(false, b.arena.dupe(u16, text[0..n]) catch oom(), false);
-    }
-
-    pub fn quoted(b: *Shower, u: []const u16) *Layout {
-        const text = b.arena.alloc(u16, u.len + 2) catch oom();
-        text[0] = '"';
-        @memcpy(text[1..][0..u.len], u);
-        text[u.len + 1] = '"';
-        return b.leaf(false, text, false);
-    }
-
-    /// The layout of a value. A `u16` is taken to be a char unless `node` marks it `.u16_num`.
-    pub fn show(b: *Shower, x: anytype, prec: Prec, depth: i32) *Layout {
-        return b.showShape(x, .{}, ShowNode.auto, prec, depth);
-    }
-
-    pub fn showShape(b: *Shower, x: anytype, comptime shape: TypeShape, node_idx: u16, prec: Prec, depth: i32) *Layout {
-        const T = @TypeOf(x);
-        if (depth <= 0) return b.word("...");
-        if (T == String) return if (x) |p| b.quoted(p.units()) else b.word("null");
-        if (T == reflect.Type) return b.word(x.full_name);
-        if (T == Any) return if (x) |o| b.showShape(o, shape, node_idx, prec, depth) else b.word("null");
-        if (comptime isBigInt(T)) {
-            const d = bigDigits(x);
-            defer allocator.free(d);
-            return b.word(d);
-        }
-        if (comptime isDecimal(T)) {
-            var buf: [41]u8 = undefined;
-            const t = decAscii(x, &buf);
-            buf[t.len] = 'M';
-            const copy = b.arena.dupe(u8, buf[0 .. t.len + 1]) catch oom();
-            return b.word(copy);
-        }
-        if (comptime isCellPtr(T)) {
-            if (isCellNull(x)) return b.word("null");
-        }
-        if (T == Exn) {
-            if (x.type.show) |exn_show_fn| return exn_show_fn(b, x, prec, depth);
-            return b.word(x.type.name);
-        }
-        if (T == Obj) return b.word(x.type.name);
-        if (comptime isIface(T)) {
-            if (ifaceToObjBorrow(x)) |o| return b.word(o.type.name);
-            return b.word("<iface>");
-        }
-        if (comptime isFunc(T)) return b.word("<fun>");
-        const node: ShowNode = if (node_idx < shape.nodes.len) shape.nodes[node_idx] else .{};
-        switch (@typeInfo(T)) {
-            .void => return b.word("()"),
-            .bool => return b.word(if (x) "true" else "false"),
-            .int => return if (T == u16 and node.kind != .u16_num) b.char(x) else b.number(x),
-            .float => return b.number(x),
-            .optional => {
-                const is_vopt = node.kind == .vopt;
-                const child: u16 = if (is_vopt or node.kind == .opt) node.a else ShowNode.auto;
-                if (x) |v| return b.caseShape(if (is_vopt) "ValueSome" else "Some", .{v}, shape, &.{child}, prec, depth);
-                return b.word(if (is_vopt) "ValueNone" else "None");
-            },
-            .pointer => |ptr| {
-                if (comptime @hasDecl(ptr.child, "fable_show_shape")) return ptr.child.fable_show_shape(b, x, shape, node, depth);
-                if (comptime @hasDecl(ptr.child, "fable_identity")) return ptr.child.fable_show(b, x, depth);
-                if (comptime @hasDecl(ptr.child, "fable_array")) {
-                    const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
-                    if (x.shape) |arr_shape| return b.array2DShape(x.items, arr_shape, shape, child, depth);
-                    if (x.items.len == 0) return b.word("[||]");
-                    var items: std.ArrayList(*Layout) = .empty;
-                    for (x.items) |item| {
-                        if (items.items.len == print_length) {
-                            items.append(b.arena, b.word("...")) catch oom();
-                            break;
-                        }
-                        items.append(b.arena, b.showShape(item, shape, child, .bracket_if_tuple, depth - 1)) catch oom();
-                    }
-                    return b.tight(b.tight(b.ascii(false, "[|", true), b.separated(items.items, ";")), b.ascii(true, "|]", false));
-                }
-                // a reference record
-                const addr: *const anyopaque = @ptrCast(x);
-                for (b.path[0..b.on_path]) |seen| {
-                    if (seen == addr) return b.word("...");
-                }
-                if (b.on_path == b.path.len) return b.word("...");
-                b.path[b.on_path] = addr;
-                b.on_path += 1;
-                defer b.on_path -= 1;
-                const field_refs: []const u16 = if (node.kind == .record) shape.refs[node.a..][0..node.b] else &.{};
-                return b.recordShape(x, shape, field_refs, depth);
-            },
-            .@"struct" => |s| {
-                // a sequence (Seq.fs): `seq [a; b; c; d; ...]`, which walks it, as .NET does
-                if (comptime @hasField(T, "fable_seq")) {
-                    const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
-                    var items: [4]*Layout = undefined;
-                    var n: usize = 0;
-                    var more = false;
-                    const walk = x.fable_seq.code(x.fable_seq.env, {}) catch {
-                        drop(take());
-                        return b.word("seq [...]");
-                    };
-                    defer drop(walk);
-                    defer walk.close.code(walk.close.env, {}) catch drop(take());
-                    while (true) {
-                        const next = walk.next.code(walk.next.env, {}) catch {
-                            drop(take());
-                            break;
-                        };
-                        const item = next orelse break;
-                        defer drop(item);
-                        if (n == 4) {
-                            more = true;
-                            break;
-                        }
-                        items[n] = b.showShape(item, shape, child, .bracket_if_tuple, depth - 1);
-                        n += 1;
-                    }
-                    return showSeq(b, items[0..n], more);
-                }
-                if (!s.is_tuple) {
-                    const field_refs: []const u16 = if (node.kind == .record) shape.refs[node.a..][0..node.b] else &.{};
-                    return b.recordShape(&x, shape, field_refs, depth);
-                }
-                const is_struct = node.kind == .struct_tuple;
-                const field_refs: []const u16 = if (is_struct or node.kind == .tuple) shape.refs[node.a..][0..node.b] else &.{};
-                var items: [s.field_names.len]*Layout = undefined;
-                inline for (s.field_names, 0..) |field, i| {
-                    const child_idx = if (i < field_refs.len) field_refs[i] else ShowNode.auto;
-                    items[i] = b.showShape(@field(x, field), shape, child_idx, .bracket_if_tuple, depth - 1);
-                }
-                const tup = b.bracket(b.separated(&items, ","));
-                return if (is_struct) b.tight(b.word("struct"), tup) else tup;
-            },
-            .@"union" => {
-                if (comptime isCollection(T)) {
-                    // `map [(1, "a"); ...]`, `set [1; 2]`: nine entries, then `...`
-                    const name = if (T.fable_collection == .map) "map" else "set";
-                    const k_idx: u16 = if (node.kind == .map or node.kind == .seq) node.a else ShowNode.auto;
-                    const v_idx: u16 = if (node.kind == .map) node.b else ShowNode.auto;
-                    var items: std.ArrayList(*Layout) = .empty;
-                    var w = TreeWalk(T).init(x);
-                    while (w.next()) |n| {
-                        if (items.items.len == 9) {
-                            items.append(b.arena, b.word("...")) catch oom();
-                            break;
-                        }
-                        const item = if (comptime T.fable_collection == .map) blk: {
-                            const pair_items: [2]*Layout = .{
-                                b.showShape(n.key, shape, k_idx, .bracket_if_tuple, depth - 1),
-                                b.showShape(n.value, shape, v_idx, .bracket_if_tuple, depth - 1),
-                            };
-                            break :blk b.bracket(b.separated(&pair_items, ","));
-                        } else b.showShape(n.key, shape, k_idx, .bracket_if_tuple, depth - 1);
-                        items.append(b.arena, item) catch oom();
-                    }
-                    const list = if (items.items.len == 0)
-                        b.word("[]")
-                    else
-                        b.tight(b.tight(b.ascii(false, "[", true), b.separated(items.items, ";")), b.ascii(true, "]", false));
-                    const whole = b.join(b.word(name), list, .{ .breakable = 2 });
-                    return if (@backingInt(prec) <= @backingInt(Prec.bracket_if_tuple_or_not_atomic)) b.bracket(whole) else whole;
-                }
-                if (comptime @hasDecl(T, "fable_list")) {
-                    const child: u16 = if (node.kind == .seq) node.a else ShowNode.auto;
-                    if (x == .Empty) return b.word("[]");
-                    var items: std.ArrayList(*Layout) = .empty;
-                    var rest = x;
-                    while (rest == .Cons) : (rest = rest.Cons.Tail) {
-                        if (items.items.len == print_length) {
-                            items.append(b.arena, b.word("...")) catch oom();
-                            break;
-                        }
-                        items.append(b.arena, b.showShape(rest.Cons.Head, shape, child, .bracket_if_tuple, depth - 1)) catch oom();
-                    }
-                    return b.tight(b.tight(b.ascii(false, "[", true), b.separated(items.items, ";")), b.ascii(true, "]", false));
-                }
-                switch (x) {
-                    inline else => |payload, tag| {
-                        const tag_idx = comptime blk: {
-                            for (@typeInfo(T).@"union".field_names, 0..) |name, idx| {
-                                if (std.mem.eql(u8, name, @tagName(tag))) break :blk idx;
-                            }
-                            unreachable;
-                        };
-                        const field_refs: []const u16 = if (node.kind == .@"union" and tag_idx < node.b) blk: {
-                            const case_idx = shape.refs[node.a + tag_idx];
-                            const cn = if (case_idx < shape.nodes.len) shape.nodes[case_idx] else ShowNode{};
-                            break :blk if (cn.kind == .record) shape.refs[cn.a..][0..cn.b] else &.{};
-                        } else &.{};
-                        return b.caseShape(@tagName(tag), payload, shape, field_refs, prec, depth);
-                    },
-                }
-            },
-            else => @compileError("fable: a value of type " ++ @typeName(T) ++ " cannot be written with %A"),
-        }
-    }
-
-    /// Make the next break that is still open, the outermost first; the columns it saves.
-    pub fn forceBreak(b: *Shower) ?i32 {
-        if (b.outer == b.savings.items.len) return null;
-        const saving = b.savings.items[b.outer];
-        b.savings.items[b.outer] = -saving;
-        b.outer += 1;
-        return saving;
-    }
-
-    /// Fit `layout`, which starts at column `start`, into the width by turning joints that may
-    /// break into breaks. Returns the column after it, and the width of its last line.
-    pub fn fit(b: *Shower, start: i32, layout: *Layout) struct { i32, i32 } {
-        switch (layout.what) {
-            .leaf => |text| {
-                const width: i32 = @intCast(text.len);
-                var pos = start;
-                while (pos + width > print_width) {
-                    pos -= b.forceBreak() orelse break;
-                }
-                return .{ pos + width, width };
-            },
-            .node => |*n| {
-                const mid: i32 = if (n.l.tight_right or n.r.tight_left) 0 else 1;
-                var pos, const left = b.fit(start, n.l);
-                switch (n.joint) {
-                    .unbreakable => {
-                        pos, const right = b.fit(pos + mid, n.r);
-                        return .{ pos, left + mid + right };
-                    },
-                    .broken => |indent| {
-                        pos, const right = b.fit(pos - left + indent, n.r);
-                        return .{ pos, indent + right };
-                    },
-                    .breakable => |indent| {
-                        const saving = left + mid - indent;
-                        if (saving <= 0) {
-                            pos, const right = b.fit(pos + mid, n.r);
-                            return .{ pos, left + mid + right };
-                        }
-                        b.savings.append(b.arena, saving) catch oom();
-                        pos, const right = b.fit(pos + mid, n.r);
-                        const made = b.savings.pop().? < 0;
-                        if (b.outer > b.savings.items.len) b.outer = b.savings.items.len;
-                        if (!made) return .{ pos, left + mid + right };
-                        n.joint = .{ .broken = indent };
-                        return .{ pos, indent + right };
-                    },
-                }
-            },
-        }
-    }
-
-    pub fn write(out: *TextBuilder, column: *i32, layout: *const Layout, tab: i32) void {
-        switch (layout.what) {
-            .leaf => |text| {
-                out.add(text);
-                column.* += @intCast(text.len);
-            },
-            .node => |n| {
-                write(out, column, n.l, tab);
-                switch (n.joint) {
-                    .broken => |indent| {
-                        out.addOne('\n');
-                        var i: i32 = 0;
-                        while (i < tab + indent) : (i += 1) out.addOne(' ');
-                        column.* = tab + indent;
-                        write(out, column, n.r, tab + indent);
-                    },
-                    else => {
-                        if (!(n.l.tight_right or n.r.tight_left)) {
-                            out.addOne(' ');
-                            column.* += 1;
-                        }
-                        write(out, column, n.r, column.*);
-                    },
-                }
-            },
-        }
-    }
-};
-
-pub fn writeObj(out: *TextBuilder, o: Obj) void {
-    if (o.type.to_string) |f| {
-        const t = f(null, o, {}) catch return out.addAscii(o.type.name);
-        defer drop(t);
-        return out.add(unitsOf(t));
-    }
-    out.addAscii(o.type.name);
-}
-
-/// `%A`: the value as F# would write it.
-pub fn anyText(x: anytype) String {
-    return anyTextAt(.{}, ShowNode.auto, x);
-}
-
-pub fn anyTextShape(comptime shape: TypeShape, x: anytype) String {
-    const start: u16 = if (shape.nodes.len != 0) 0 else ShowNode.auto;
-    return anyTextAt(shape, start, x);
-}
-
-fn anyTextAt(comptime shape: TypeShape, node_idx: u16, x: anytype) String {
-    if (@TypeOf(x) == String and x == null) return str("<null>");
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var b: Shower = .{ .arena = arena.allocator() };
-    const layout = b.showShape(x, shape, node_idx, .bracket_if_tuple, print_depth);
-    _ = b.fit(0, layout);
-    var out: TextBuilder = .{};
-    var column: i32 = 0;
-    Shower.write(&out, &column, layout, 0);
-    return out.finish();
-}
-
+// (moved to fable_show.zig)
+pub const fable_show = @import("fable_show.zig");
+pub const Layout = fable_show.Layout;
+pub const Prec = fable_show.Prec;
+pub const Shower = fable_show.Shower;
+pub const writeObj = fable_show.writeObj;
+pub const anyText = fable_show.anyText;
+pub const anyTextShape = fable_show.anyTextShape;
+const anyTextAt = fable_show.anyTextAt;
 // ---------------------------------------------------------------------------------------------
 // .NET's ToString of a value: what `string x`, `{x}`, `Append x` and `String.Join` give
 // ---------------------------------------------------------------------------------------------
@@ -8042,485 +5667,69 @@ pub inline fn captured(comptime Captures: type, env: ?*Env) *const Captures {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Exceptions
-//
-// A function that can raise returns `Raised!T`. `raise` moves the exception into `current` and
-// returns `error.Raised`; every caller on the way gives up what it still owns and returns the
-// error too, until a `with` handler takes the exception out. The exception is always owned in
-// exactly one place.
-//
-// An exception is a reference-counted cell that starts with a header naming its type, so that
-// a file can declare exception types that no other file has to know about.
-// ---------------------------------------------------------------------------------------------
-
-pub const Raised = error{Raised};
-
-pub const ExnType = struct {
-    name: []const u8,
-    destroy: *const fn (Exn) void,
-    /// marks what the exception holds shared (see `markShared`)
-    share: *const fn (Exn) Raised!void,
-    /// the message, for an exception that was made with one
-    message: ?*const fn (Exn) String = null,
-    /// the .NET class this one derives from, if a program can name it
-    parent: ?*const ExnType = null,
-    /// the exception as `%A` writes it (null when the program never formats one: see `exn_show`)
-    show: ?*const fn (*Shower, Exn, Prec, i32) *Layout,
-    /// F#'s `exception` declarations are equal when their fields are (null: only to itself)
-    eql: ?*const fn (Exn, Exn) bool = null,
-    hash: ?*const fn (Exn) i32 = null,
-    /// a .NET exception's `InnerException`
-    set_inner: ?*const fn (Exn, Exn) void = null,
-    inner: ?*const fn (Exn) ?Exn = null,
-    /// an ArgumentException's `ParamName`
-    set_param: ?*const fn (Exn, String) void = null,
-    param: ?*const fn (Exn) String = null,
-};
-
-pub const ExnHeader = struct {
-    @"$rc": u32 = 1,
-    /// the collector's header of this exception, if what it holds can be part of a cycle
-    gc: ?*sgc.Hdr = null,
-    type: *const ExnType,
-    trace_len: u8 = 0,
-    trace_thrown: bool = false,
-    trace_skipped: bool = false,
-    trace_addrs: if (stack_traces) [32]usize else void = undefined,
-};
-
-/// F#'s `exn`.
-pub const Exn = *ExnHeader;
-
-/// An F# `exception` declaration with the given fields.
-pub fn ExnOf(comptime name: []const u8, comptime Payload: type) type {
-    return ExnUnder(name, Payload, null, true);
-}
-
-/// F#'s `MatchFailureException`: the file, line and column of the match, and a fixed message.
-pub const MatchFailureException = ExnUnder("Microsoft.FSharp.Core.MatchFailureException", struct { Data0: String, Data1: i32, Data2: i32 }, null, true);
-
-/// A .NET exception class with a message, derived from `Parent` (or from `System.Exception`).
-fn Class(comptime name: []const u8, comptime Parent: ?type) type {
-    return ExnUnder(name, Described, if (Parent) |P| &P.info else null, false);
-}
-
-pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime parent: ?*const ExnType, comptime sealed: bool) type {
-    return struct {
-        const cyclic = functions_in_cycles and holdsCyclic(Payload);
-        const Whole = struct { header: ExnHeader, hdr: GcHdr(cyclic) = undefined, payload: Payload };
-        const K = Collected(
-            Whole,
-            "hdr",
-            @as(isize, @offsetOf(Whole, "header")) + @as(isize, @offsetOf(ExnHeader, "$rc")) - @as(isize, @offsetOf(Whole, "hdr")),
-            "payload",
-        );
-
-        const is_match_failure = std.mem.eql(u8, name, "Microsoft.FSharp.Core.MatchFailureException");
-
-        pub const info: ExnType = .{
-            .name = name,
-            .destroy = destroy,
-            .share = share,
-            .message = if (Payload == Described) message else if (is_match_failure) matchMessage else if (@hasField(Payload, "fable_message")) classMessage else null,
-            .parent = parent,
-            .show = if (exn_show) show else null,
-            // (an object of a class compares by reference, as on .NET)
-            .eql = if (Payload == Described or @hasField(Payload, "fable_message")) null else payloadEql,
-            .hash = if (Payload == Described or @hasField(Payload, "fable_message")) null else payloadHash,
-            .set_inner = setInner,
-            .inner = innerOf,
-            .set_param = setParam,
-            .param = paramOf,
-        };
-
-        /// (a class deriving from System.Exception: the message its base constructor was given)
-        pub fn classMessage(e: Exn) String {
-            return dup(of(e).fable_message);
-        }
-
-        pub fn matchMessage(_: Exn) String {
-            return str("The match cases were incomplete");
-        }
-
-        pub fn payloadEql(a: Exn, b: Exn) bool {
-            return eql(of(a).*, of(b).*);
-        }
-
-        pub fn payloadHash(e: Exn) i32 {
-            return hash(of(e).*);
-        }
-
-        pub fn show(b: *Shower, e: Exn, prec: Prec, depth: i32) *Layout {
-            if (comptime is_match_failure) return b.case("MatchFailureException", of(e), prec, depth);
-            if (Payload != Described) return b.case(name, of(e), prec, depth);
-            // a .NET exception: its class and its message (and the exception inside, as
-            // .NET's `ToString` writes it)
-            var t: TextBuilder = .{};
-            exnText(&t, e);
-            const s = t.finish();
-            defer drop(s);
-            return b.leaf(false, b.arena.dupe(u16, unitsOf(s)) catch oom(), false);
-        }
-
-        pub fn setInner(e: Exn, within: Exn) void {
-            if (Payload == Described) {
-                const p: *Payload = @constCast(of(e));
-                if (p.InnerException) |old| drop(old);
-                p.InnerException = dup(within);
-            }
-        }
-
-        pub fn setParam(e: Exn, param_name: String) void {
-            if (Payload == Described) {
-                const p: *Payload = @constCast(of(e));
-                drop(p.ParamName);
-                p.ParamName = dup(param_name);
-            }
-        }
-
-        pub fn paramOf(e: Exn) String {
-            return if (Payload == Described) dup(of(e).ParamName) else null;
-        }
-
-        pub fn innerOf(e: Exn) ?Exn {
-            return if (Payload == Described) of(e).InnerException else null;
-        }
-
-        pub fn message(e: Exn) String {
-            return dup(of(e).Message);
-        }
-
-        pub fn new(payload: Payload) Exn {
-            if (comptime cyclic) gcTick();
-            const c = allocator.create(Whole) catch oom();
-            c.* = .{ .header = .{ .type = &info }, .payload = payload };
-            if (comptime cyclic) {
-                c.hdr = thread.collector.hdr(&K.desc, K.isLeaf(c));
-                c.header.gc = &c.hdr;
-            }
-            if (track) thread.stats.allocs += 1;
-            return &c.header;
-        }
-
-        /// Is `e` an exception of this type, or of a class that derives from it?
-        pub inline fn is(e: Exn) bool {
-            if (sealed) return e.type == &info;
-            var t: ?*const ExnType = e.type;
-            while (t) |class| : (t = class.parent) {
-                if (class == &info) return true;
-            }
-            return false;
-        }
-
-        /// The fields of an exception of this type.
-        pub inline fn of(e: Exn) *const Payload {
-            const c: *Whole = @alignCast(@fieldParentPtr("header", e));
-            return &c.payload;
-        }
-
-        pub fn destroy(e: Exn) void {
-            const c: *Whole = @alignCast(@fieldParentPtr("header", e));
-            drop(c.payload);
-            free(c);
-        }
-
-        pub fn share(e: Exn) Raised!void {
-            const c: *Whole = @alignCast(@fieldParentPtr("header", e));
-            try markShared(c.payload);
-        }
-    };
-}
-
-/// The exception in flight is `thread.current`.
-pub noinline fn throw(e: Exn) void {
-    std.debug.assert(thread.current == null);
-    if (stack_traces and !e.trace_thrown) {
-        e.trace_thrown = true;
-        var st = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &e.trace_addrs);
-        if (st.return_addresses.len == 0) {
-            st = std.debug.captureCurrentStackTrace(.{}, &e.trace_addrs);
-        }
-        e.trace_len = @intCast(st.return_addresses.len);
-        e.trace_skipped = st.skipped != .none;
-    }
-    thread.current = e;
-}
-
-pub fn take() Exn {
-    const e = thread.current.?;
-    thread.current = null;
-    return e;
-}
-
-/// Can a call with a result of this type have raised?
-pub fn isRaised(comptime T: type) bool {
-    return @typeInfo(T) == .error_union;
-}
-
-/// The result type of a function that raises only if one of the functions of other files it
-/// calls does. (A file is compiled without knowing whether they do; Zig knows.)
-pub fn MayRaise(comptime T: type, comptime callees: anytype) type {
-    inline for (callees) |callee| {
-        if (isRaised(@typeInfo(@TypeOf(callee)).@"fn".return_type.?)) return Raised!T;
-    }
-    return T;
-}
-
-/// What a .NET exception class holds: its message.
-pub const Described = struct { Message: String, InnerException: ?Exn = null, ParamName: String = null };
-
-/// What `failwith` raises: .NET's `System.Exception` with a message. (Every exception is a
-/// `System.Exception`, so a test for that class is not a test at all; this is the test for
-/// exactly this class, which is what the `Failure` pattern is.)
-pub const Failure = ExnUnder("System.Exception", Described, null, true);
-
-/// The .NET exception classes that a program can raise and handle by name, each under the
-/// class it derives from on .NET.
-pub const SystemException = Class("System.SystemException", null);
-pub const ArgumentException = Class("System.ArgumentException", SystemException);
-pub const ArgumentNullException = Class("System.ArgumentNullException", ArgumentException);
-pub const ArgumentOutOfRangeException = Class("System.ArgumentOutOfRangeException", ArgumentException);
-pub const ArithmeticException = Class("System.ArithmeticException", SystemException);
-pub const DivideByZeroException = Class("System.DivideByZeroException", ArithmeticException);
-pub const OverflowException = Class("System.OverflowException", ArithmeticException);
-pub const InvalidOperationException = Class("System.InvalidOperationException", SystemException);
-pub const ThreadStateException = Class("System.Threading.ThreadStateException", SystemException);
-pub const NotSupportedException = Class("System.NotSupportedException", SystemException);
-pub const NotImplementedException = Class("System.NotImplementedException", SystemException);
-pub const IndexOutOfRangeException = Class("System.IndexOutOfRangeException", SystemException);
-pub const NullReferenceException = Class("System.NullReferenceException", SystemException);
-pub const FormatException = Class("System.FormatException", SystemException);
-pub const KeyNotFoundException = Class("System.Collections.Generic.KeyNotFoundException", SystemException);
-pub const AggregateException = Class("System.AggregateException", null);
-pub const InvalidCastException = Class("System.InvalidCastException", SystemException);
-pub const TimeoutException = Class("System.TimeoutException", SystemException);
-pub const UriFormatException = Class("System.UriFormatException", FormatException);
-pub const IOException = Class("System.IO.IOException", SystemException);
-pub const FileNotFoundException = Class("System.IO.FileNotFoundException", IOException);
-pub const DirectoryNotFoundException = Class("System.IO.DirectoryNotFoundException", IOException);
-pub const UnauthorizedAccessException = Class("System.UnauthorizedAccessException", SystemException);
-pub const ObjectDisposedException = Class("System.ObjectDisposedException", InvalidOperationException);
-pub const OperationCanceledException = Class("System.OperationCanceledException", SystemException);
-pub const TaskCanceledException = Class("System.Threading.Tasks.TaskCanceledException", OperationCanceledException);
-pub const ApplicationException = Class("System.ApplicationException", null);
-pub const OutOfMemoryException = Class("System.OutOfMemoryException", SystemException);
-pub const NotFiniteNumberException = Class("System.NotFiniteNumberException", ArithmeticException);
-pub const RankException = Class("System.RankException", SystemException);
-pub const ArrayTypeMismatchException = Class("System.ArrayTypeMismatchException", SystemException);
-
-/// Raise an exception of a .NET class with a message.
-pub fn raise(comptime C: type, message: String) Raised {
-    throw(C.new(.{ .Message = message }));
-    return error.Raised;
-}
-
-/// `a / b` for whole numbers: as .NET, a division by zero raises, and so does the smallest
-/// number of 32 or 64 bits divided by -1 (its result does not fit).
-pub fn div(comptime T: type, a: T, b: T) Raised!T {
-    if (b == 0) return raise(DivideByZeroException, str("Attempted to divide by zero."));
-    const info = @typeInfo(T).int;
-    if (info.signedness == .signed and b == -1) {
-        if (info.bits >= 32 and a == std.math.minInt(T)) {
-            return raise(OverflowException, str("Arithmetic operation resulted in an overflow."));
-        }
-        return 0 -% a;
-    }
-    return @divTrunc(a, b);
-}
-
-/// `a % b` for whole numbers, with the sign of `a`.
-pub fn rem(comptime T: type, a: T, b: T) Raised!T {
-    if (b == 0) return raise(DivideByZeroException, str("Attempted to divide by zero."));
-    const info = @typeInfo(T).int;
-    if (info.signedness == .signed and b == -1) {
-        if (info.bits >= 32 and a == std.math.minInt(T)) {
-            return raise(OverflowException, str("Arithmetic operation resulted in an overflow."));
-        }
-        return 0;
-    }
-    return @rem(a, b);
-}
-
-/// `e.Message`: the message an exception was made with; for an F# exception, the exception
-/// as `%A` writes it.
-/// `Exception(message, inner)`: the new exception, with `inner` inside it.
-pub fn exnWithInner(e: Exn, inner_exn: Exn) Exn {
-    if (e.type.set_inner) |f| f(e, inner_exn);
-    return dup(e);
-}
-
-/// `e.InnerException`, which is null for most exceptions.
-pub fn exnInner(e: Exn) Raised!Exn {
-    if (e.type.inner) |f| {
-        if (f(e)) |i| return dup(i);
-    }
-    return nullRef();
-}
-
-/// `box e.InnerException`: null when there is none, as on .NET
-pub fn exnInnerBoxed(e: Exn) Any {
-    if (e.type.inner) |f| {
-        if (f(e)) |i| return box(i);
-    }
-    return null;
-}
-
-/// `isNull e.InnerException`
-pub fn exnHasNoInner(e: Exn) bool {
-    if (e.type.inner) |f| return f(e) == null;
-    return true;
-}
-
-/// `e.ToString()` without the stack trace: its class, its message, and the exceptions inside.
-fn exnText(t: *TextBuilder, e: Exn) void {
-    t.addAscii(e.type.name);
-    t.addAscii(": ");
-    const m = exnMessage(e);
-    defer drop(m);
-    t.add(unitsOf(m));
-    if (e.type.inner) |f| {
-        if (f(e)) |i| {
-            t.addAscii("\n ---> ");
-            exnText(t, i);
-            t.addAscii("\n   --- End of inner exception stack trace ---");
-        }
-    }
-}
-
-/// `e.ToString()`: .NET's class name and message (its stack trace's frames are left out)
-pub fn exnToString(e: Exn) Raised!String {
-    const m = exnMessage(e);
-    defer drop(m);
-    var b: TextBuilder = .{};
-    b.addAscii(e.type.name);
-    if (unitsOf(m).len > 0) {
-        b.addAscii(": ");
-        b.add(unitsOf(m));
-    }
-    return b.finish();
-}
-
-pub fn exnMessage(e: Exn) String {
-    if (e.type.message) |message| return message(e);
-    if (comptime exn_show) return anyText(e);
-    return str(e.type.name);
-}
-
-/// `e.StackTrace`: null until the exception is thrown, then the captured frames.
-pub fn exnStackTrace(e: Exn) String {
-    // (with no capture there are no frames to write, and the field that holds them is void)
-    return if (comptime stack_traces) traceText(e) else null;
-}
-
-fn traceText(e: Exn) String {
-    if (!e.trace_thrown) return null;
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const st: std.debug.StackTrace = .{
-        .return_addresses = e.trace_addrs[0..e.trace_len],
-        .skipped = if (e.trace_skipped) .unknown else .none,
-    };
-    std.debug.writeStackTrace(&st, .{ .writer = &aw.writer, .mode = .no_color }) catch {};
-    const utf8 = aw.written();
-    if (utf8.len == 0) return str("");
-    var b: TextBuilder = .{};
-    var i: usize = 0;
-    while (i < utf8.len) {
-        const n = std.unicode.utf8ByteSequenceLength(utf8[i]) catch {
-            b.addOne(utf8[i]);
-            i += 1;
-            continue;
-        };
-        if (i + n > utf8.len) {
-            b.addOne(utf8[i]);
-            i += 1;
-            continue;
-        }
-        const cp = std.unicode.utf8Decode(utf8[i .. i + n]) catch {
-            b.addOne(utf8[i]);
-            i += 1;
-            continue;
-        };
-        if (cp <= 0xFFFF) {
-            b.addOne(@intCast(cp));
-        } else {
-            const s = cp - 0x10000;
-            b.addOne(@intCast(0xD800 + (s >> 10)));
-            b.addOne(@intCast(0xDC00 + (s & 0x3FF)));
-        }
-        i += n;
-    }
-    return b.finish();
-}
-
-/// The module values of a file with tests, before the first test of it runs.
-pub fn testInit(init: anytype) !void {
-    const r = init();
-    if (comptime isRaised(@TypeOf(r))) {
-        r catch {
-            uncaught();
-            return error.TestFailed;
-        };
-    }
-}
-
-/// A test that `zig test` runs (an F# function marked `[<Fact>]`): it fails if it raises,
-/// and the exception is written as an unhandled one would be.
-/// A cell the runtime keeps for as long as the thread (a cache: the null array of a type, a
-/// shared Random) is not counted as alive, so that what a program or a test leaves alive is
-/// what it made; `recount` puts it back just before the runtime gives it up.
-pub inline fn uncount() void {
-    if (track) thread.stats.frees += 1;
-}
-
-pub inline fn recount() void {
-    if (track) thread.stats.frees -= 1;
-}
-
-/// Before a test: what is alive (once cycles that died are freed), to compare after it.
-pub fn testLiveBefore() i64 {
-    _ = collect();
-    return live();
-}
-
-/// After a test: every cell it made is freed (what it left waiting has run; cycles that died are
-/// freed first). Only in builds that count cells.
-pub fn testNoLeak(before: i64) !void {
-    if (!track) return;
-    asyncStateRelease();
-    _ = collect();
-    const now = live();
-    if (now != before) {
-        std.debug.print("fable: the test left {d} cell(s) alive\n", .{now - before});
-        return error.TestLeaked;
-    }
-}
-
-pub fn testCase(f: anytype) !void {
-    const n = @typeInfo(@TypeOf(f)).@"fn".param_types.len;
-    const r = if (n == 0) f() else f({});
-    if (comptime isRaised(@TypeOf(r))) {
-        if (r) |v| {
-            drop(v);
-        } else |_| {
-            uncaught();
-            return error.TestFailed;
-        }
-    } else drop(r);
-}
-
-/// The program's entry point let an exception escape: say which, and give it up.
-pub fn uncaught() void {
-    const e = take();
-    const text = exnMessage(e);
-    write_err("Unhandled exception. ");
-    write_err(e.type.name);
-    write_err(": ");
-    writeText(write_err, text, true);
-    drop(text);
-    drop(e);
-}
-
+// (moved to fable_exn.zig)
+const fable_exn = @import("fable_exn.zig");
+pub const Raised = fable_exn.Raised;
+pub const ExnType = fable_exn.ExnType;
+pub const ExnHeader = fable_exn.ExnHeader;
+pub const Exn = fable_exn.Exn;
+pub const ExnOf = fable_exn.ExnOf;
+pub const MatchFailureException = fable_exn.MatchFailureException;
+pub const ExnUnder = fable_exn.ExnUnder;
+pub const throw = fable_exn.throw;
+pub const take = fable_exn.take;
+pub const isRaised = fable_exn.isRaised;
+pub const MayRaise = fable_exn.MayRaise;
+pub const Described = fable_exn.Described;
+pub const Failure = fable_exn.Failure;
+pub const SystemException = fable_exn.SystemException;
+pub const ArgumentException = fable_exn.ArgumentException;
+pub const ArgumentNullException = fable_exn.ArgumentNullException;
+pub const ArgumentOutOfRangeException = fable_exn.ArgumentOutOfRangeException;
+pub const ArithmeticException = fable_exn.ArithmeticException;
+pub const DivideByZeroException = fable_exn.DivideByZeroException;
+pub const OverflowException = fable_exn.OverflowException;
+pub const InvalidOperationException = fable_exn.InvalidOperationException;
+pub const ThreadStateException = fable_exn.ThreadStateException;
+pub const NotSupportedException = fable_exn.NotSupportedException;
+pub const NotImplementedException = fable_exn.NotImplementedException;
+pub const IndexOutOfRangeException = fable_exn.IndexOutOfRangeException;
+pub const NullReferenceException = fable_exn.NullReferenceException;
+pub const FormatException = fable_exn.FormatException;
+pub const KeyNotFoundException = fable_exn.KeyNotFoundException;
+pub const AggregateException = fable_exn.AggregateException;
+pub const InvalidCastException = fable_exn.InvalidCastException;
+pub const TimeoutException = fable_exn.TimeoutException;
+pub const UriFormatException = fable_exn.UriFormatException;
+pub const IOException = fable_exn.IOException;
+pub const FileNotFoundException = fable_exn.FileNotFoundException;
+pub const DirectoryNotFoundException = fable_exn.DirectoryNotFoundException;
+pub const UnauthorizedAccessException = fable_exn.UnauthorizedAccessException;
+pub const ObjectDisposedException = fable_exn.ObjectDisposedException;
+pub const OperationCanceledException = fable_exn.OperationCanceledException;
+pub const TaskCanceledException = fable_exn.TaskCanceledException;
+pub const ApplicationException = fable_exn.ApplicationException;
+pub const OutOfMemoryException = fable_exn.OutOfMemoryException;
+pub const NotFiniteNumberException = fable_exn.NotFiniteNumberException;
+pub const RankException = fable_exn.RankException;
+pub const ArrayTypeMismatchException = fable_exn.ArrayTypeMismatchException;
+pub const raise = fable_exn.raise;
+pub const div = fable_exn.div;
+pub const rem = fable_exn.rem;
+pub const exnWithInner = fable_exn.exnWithInner;
+pub const exnInner = fable_exn.exnInner;
+pub const exnInnerBoxed = fable_exn.exnInnerBoxed;
+pub const exnHasNoInner = fable_exn.exnHasNoInner;
+pub const exnToString = fable_exn.exnToString;
+pub const exnMessage = fable_exn.exnMessage;
+pub const exnStackTrace = fable_exn.exnStackTrace;
+pub const testInit = fable_exn.testInit;
+pub const uncount = fable_exn.uncount;
+pub const recount = fable_exn.recount;
+pub const testLiveBefore = fable_exn.testLiveBefore;
+pub const testNoLeak = fable_exn.testNoLeak;
+pub const testCase = fable_exn.testCase;
+pub const uncaught = fable_exn.uncaught;
 // ---------------------------------------------------------------------------------------------
 // Calls between files
 //
@@ -8758,202 +5967,65 @@ pub fn leaked() bool {
 // ---------------------------------------------------------------------------------------------
 // Numbers
 // ---------------------------------------------------------------------------------------------
-// Numbers: what F#'s operators and System.Math do, raising what they raise on .NET
-// ---------------------------------------------------------------------------------------------
-
-pub fn overflow() Raised {
-    return raise(OverflowException, str("Arithmetic operation resulted in an overflow."));
-}
-
-/// `a + b` under `open Checked`
-pub fn checkedAdd(a: anytype, b: @TypeOf(a)) Raised!@TypeOf(a) {
-    const r = @addWithOverflow(a, b);
-    if (r[1] != 0) return overflow();
-    return r[0];
-}
-
-pub fn checkedSub(a: anytype, b: @TypeOf(a)) Raised!@TypeOf(a) {
-    const r = @subWithOverflow(a, b);
-    if (r[1] != 0) return overflow();
-    return r[0];
-}
-
-pub fn checkedMul(a: anytype, b: @TypeOf(a)) Raised!@TypeOf(a) {
-    const r = @mulWithOverflow(a, b);
-    if (r[1] != 0) return overflow();
-    return r[0];
-}
-
-pub fn checkedNeg(a: anytype) Raised!@TypeOf(a) {
-    return checkedSub(@as(@TypeOf(a), 0), a);
-}
-
-/// `int x` under `open Checked`: a value that does not fit raises.
-pub fn checkedConv(comptime To: type, x: anytype) Raised!To {
-    switch (@typeInfo(@TypeOf(x))) {
-        .int, .comptime_int => {
-            if (x < std.math.minInt(To) or x > std.math.maxInt(To)) return overflow();
-            return @intCast(x);
-        },
-        .float, .comptime_float => {
-            const t = @trunc(x);
-            if (t != t or t < @as(f64, @floatFromInt(std.math.minInt(To))) or t > @as(f64, @floatFromInt(std.math.maxInt(To)))) return overflow();
-            return @intFromFloat(t);
-        },
-        else => @compileError("checkedConv: " ++ @typeName(@TypeOf(x))),
-    }
-}
-
-/// `abs x`: the smallest whole number has no absolute value, and .NET raises for it.
-pub fn absOf(x: anytype) Raised!@TypeOf(x) {
-    const T = @TypeOf(x);
-    if (comptime @typeInfo(T) == .int and @typeInfo(T).int.signedness == .signed) {
-        if (x == std.math.minInt(T)) return raise(OverflowException, str("Negating the minimum value of a twos complement number is invalid."));
-    }
-    return if (comptime @typeInfo(T) == .float) @abs(x) else if (x < 0) -x else x;
-}
-
-/// `sign x`: -1, 0 or 1; not a number has no sign.
-pub fn signOf(x: anytype) Raised!i32 {
-    if (comptime @typeInfo(@TypeOf(x)) == .float) {
-        if (x != x) return raise(ArithmeticException, str("Function does not accept floating point Not-a-Number values."));
-    }
-    return if (x < 0) -1 else if (x > 0) 1 else 0;
-}
-
-/// `pown x n`: by squaring, wrapping for whole numbers; a negative power of a whole number
-/// raises nothing on .NET and is 0 unless x is 1 or -1 (F# divides 1 by the power).
-pub fn pown(x: anytype, n: i32) @TypeOf(x) {
-    const T = @TypeOf(x);
-    if (n < 0) {
-        if (comptime @typeInfo(T) == .float) return 1 / pown(x, -%n);
-        return if (x == 1) 1 else if (x == -1 and @rem(n, 2) != 0) -1 else if (x == -1) 1 else 0;
-    }
-    var result: T = 1;
-    var base = x;
-    var e: u32 = @intCast(n);
-    while (e != 0) : (e >>= 1) {
-        if (e & 1 != 0) result = if (comptime @typeInfo(T) == .float) result * base else result *% base;
-        base = if (comptime @typeInfo(T) == .float) base * base else base *% base;
-    }
-    return result;
-}
-
-/// `round x`: to the nearest, a tie to the even number, as .NET.
-pub fn roundEven(x: anytype) @TypeOf(x) {
-    const r = @round(x);
-    if (@abs(x - @trunc(x)) == 0.5) return 2 * @round(x / 2);
-    return r;
-}
-
-/// `Math.Round(x, digits)`
-/// `Math.Round(x, mode)`: the mode checked first, whatever the value (.NET's)
-pub fn roundModeOnly(x: anytype, mode: i32) Raised!@TypeOf(x) {
-    if (mode < 0 or mode > 4) return raise(ArgumentException, format(.{ "The value '", mode, "' is not valid for this usage of the type MidpointRounding. (Parameter 'mode')" }));
-    return roundMode(x, 0, mode);
-}
-
-pub fn roundTo(x: anytype, digits: i32) Raised!@TypeOf(x) {
-    return roundMode(x, digits, 0);
-}
-
-/// `Math.Round(x, digits, mode)` with .NET's MidpointRounding (see `decRoundMode`)
-pub fn roundMode(x: anytype, digits: i32, mode: i32) Raised!@TypeOf(x) {
-    const T = @TypeOf(x);
-    // (.NET's: 15 digits of a double, 6 of a float32; a value with no fraction to round, or not
-    // finite, is given back before the mode is looked at)
-    const max_digits: i32 = if (T == f32) 6 else 15;
-    if (digits < 0 or digits > max_digits) return raise(ArgumentOutOfRangeException, format(.{ "Rounding digits must be between 0 and ", max_digits, ", inclusive. (Parameter 'digits')" }));
-    const limit: T = if (T == f32) 1e8 else 1e16;
-    if (!std.math.isFinite(x) or @abs(x) >= limit) return x;
-    if (mode < 0 or mode > 4) return raise(ArgumentException, format(.{ "The value '", mode, "' is not valid for this usage of the type MidpointRounding. (Parameter 'mode')" }));
-    const scale = std.math.pow(T, 10, @floatFromInt(digits));
-    const y = x * scale;
-    const r = switch (mode) {
-        0 => roundEven(y),
-        1 => @round(y),
-        2 => @trunc(y),
-        3 => @floor(y),
-        else => @ceil(y),
-    };
-    return r / scale;
-}
-
-/// `Math.MaxMagnitude(x, y)` and `MinMagnitude`: by absolute value (NaN wins; of equal
-/// magnitudes, the larger value, or for MinMagnitude the smaller), as .NET
-pub fn maxMagnitude(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
-    const ax = @abs(x);
-    const ay = @abs(y);
-    if (ax > ay or std.math.isNan(ax)) return x;
-    if (ax == ay) return if (std.math.signbit(x)) y else x;
-    return y;
-}
-
-pub fn minMagnitude(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
-    const ax = @abs(x);
-    const ay = @abs(y);
-    if (ax < ay or std.math.isNan(ax)) return x;
-    if (ax == ay) return if (std.math.signbit(x)) x else y;
-    return y;
-}
-
-/// `Math.Log(x, b)`
-pub fn logBase(x: f64, b: f64) f64 {
-    return @log(x) / @log(b);
-}
-
-/// `Math.Clamp(x, lo, hi)`
-pub fn clamp(x: anytype, lo: @TypeOf(x), hi: @TypeOf(x)) Raised!@TypeOf(x) {
-    if (compare(lo, hi) > 0) return raise(ArgumentException, format(.{ "'", lo, "' cannot be greater than ", hi, "." }));
-    return if (compare(x, lo) < 0) lo else if (compare(x, hi) > 0) hi else x;
-}
-
-/// The name .NET gives a whole-number type in an overflow message.
-pub const convert = @import("fable_convert.zig");
-pub const arrayAverage = convert.arrayAverage;
-pub const arrayAverageBy = convert.arrayAverageBy;
-pub const arrayCopyRange = convert.arrayCopyRange;
-pub const arrayIndexOf = convert.arrayIndexOf;
-pub const arraySetSlice = convert.arraySetSlice;
-pub const arraySum = convert.arraySum;
-pub const arraySumBy = convert.arraySumBy;
-pub const arraySumDec = convert.arraySumDec;
-pub const badFormat = convert.badFormat;
-pub const base64Of = convert.base64Of;
-pub const base64Parse = convert.base64Parse;
-pub const bitGetBytes = convert.bitGetBytes;
-pub const bitTo = convert.bitTo;
-pub const bitToString = convert.bitToString;
-pub const conv = convert.conv;
-pub const convFloatToInt = convert.convFloatToInt;
-pub const convParse = convert.convParse;
-pub const convParseBase = convert.convParseBase;
-pub const convToStringBase = convert.convToStringBase;
-pub const hexOf = convert.hexOf;
-pub const hexParse = convert.hexParse;
-pub const listAverage = convert.listAverage;
-pub const listAverageBy = convert.listAverageBy;
-pub const listSum = convert.listSum;
-pub const listSumBy = convert.listSumBy;
-pub const listSumDec = convert.listSumDec;
-pub const netIntName = convert.netIntName;
-pub const parseBool = convert.parseBool;
-pub const parseFloat = convert.parseFloat;
-pub const parseHex = convert.parseHex;
-pub const parseInt = convert.parseInt;
-pub const parseIntFs = convert.parseIntFs;
-const parseWhole = convert.parseWhole;
-pub const trimmed = convert.trimmed;
-pub const numberText = convert.numberText;
-pub const parseFloatFs = convert.parseFloatFs;
-pub const tryParseAny = convert.tryParseAny;
-pub const tryParseFloat = convert.tryParseFloat;
-pub const tryParseInt = convert.tryParseInt;
-test {
-    _ = convert;
-}
-
-// ---------------------------------------------------------------------------------------------
+// (moved to fable_math.zig)
+const fable_math = @import("fable_math.zig");
+pub const overflow = fable_math.overflow;
+pub const checkedAdd = fable_math.checkedAdd;
+pub const checkedSub = fable_math.checkedSub;
+pub const checkedMul = fable_math.checkedMul;
+pub const checkedNeg = fable_math.checkedNeg;
+pub const checkedConv = fable_math.checkedConv;
+pub const absOf = fable_math.absOf;
+pub const signOf = fable_math.signOf;
+pub const pown = fable_math.pown;
+pub const roundEven = fable_math.roundEven;
+pub const roundModeOnly = fable_math.roundModeOnly;
+pub const roundTo = fable_math.roundTo;
+pub const roundMode = fable_math.roundMode;
+pub const maxMagnitude = fable_math.maxMagnitude;
+pub const minMagnitude = fable_math.minMagnitude;
+pub const logBase = fable_math.logBase;
+pub const clamp = fable_math.clamp;
+pub const convert = fable_math.convert;
+pub const arrayAverage = fable_math.arrayAverage;
+pub const arrayAverageBy = fable_math.arrayAverageBy;
+pub const arrayCopyRange = fable_math.arrayCopyRange;
+pub const arrayIndexOf = fable_math.arrayIndexOf;
+pub const arraySetSlice = fable_math.arraySetSlice;
+pub const arraySum = fable_math.arraySum;
+pub const arraySumBy = fable_math.arraySumBy;
+pub const arraySumDec = fable_math.arraySumDec;
+pub const badFormat = fable_math.badFormat;
+pub const base64Of = fable_math.base64Of;
+pub const base64Parse = fable_math.base64Parse;
+pub const bitGetBytes = fable_math.bitGetBytes;
+pub const bitTo = fable_math.bitTo;
+pub const bitToString = fable_math.bitToString;
+pub const conv = fable_math.conv;
+pub const convFloatToInt = fable_math.convFloatToInt;
+pub const convParse = fable_math.convParse;
+pub const convParseBase = fable_math.convParseBase;
+pub const convToStringBase = fable_math.convToStringBase;
+pub const hexOf = fable_math.hexOf;
+pub const hexParse = fable_math.hexParse;
+pub const listAverage = fable_math.listAverage;
+pub const listAverageBy = fable_math.listAverageBy;
+pub const listSum = fable_math.listSum;
+pub const listSumBy = fable_math.listSumBy;
+pub const listSumDec = fable_math.listSumDec;
+pub const netIntName = fable_math.netIntName;
+pub const parseBool = fable_math.parseBool;
+pub const parseFloat = fable_math.parseFloat;
+pub const parseHex = fable_math.parseHex;
+pub const parseInt = fable_math.parseInt;
+pub const parseIntFs = fable_math.parseIntFs;
+const parseWhole = fable_math.parseWhole;
+pub const trimmed = fable_math.trimmed;
+pub const numberText = fable_math.numberText;
+pub const parseFloatFs = fable_math.parseFloatFs;
+pub const tryParseAny = fable_math.tryParseAny;
+pub const tryParseFloat = fable_math.tryParseFloat;
+pub const tryParseInt = fable_math.tryParseInt;
 // Tests (`zig test fable_rt.zig`)
 // ---------------------------------------------------------------------------------------------
 
