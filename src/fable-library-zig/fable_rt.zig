@@ -2256,6 +2256,10 @@ pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type
         free_count: i32 = 0,
         /// what F#'s `dict` and `readOnlyDict` make: changing it raises
         read_only: bool = false,
+        /// made by .NET's constructor without a comparer: array keys are compared by reference, as
+        /// .NET's `EqualityComparer<T[]>.Default` does (F#'s `dict`, `distinct` and the like
+        /// compare them by their items)
+        by_ref: bool = false,
         /// an IEqualityComparer's members, when one was given: they hash and compare the keys
         cmp_eq: ?Func(*const fn (?*Env, K, K) Raised!bool) = null,
         cmp_hash: ?Func(*const fn (?*Env, K) Raised!i32) = null,
@@ -2377,6 +2381,7 @@ pub fn htEmptyLike(d: anytype) @TypeOf(d) {
     if (shared) lockEnter(@intFromPtr(d));
     defer if (shared) lockExit(@intFromPtr(d));
     const e = htNew(@TypeOf(d));
+    e.by_ref = d.by_ref;
     if (d.cmp_eq != null and d.cmp_hash != null) htInitComparers(e, d.cmp_eq.?, d.cmp_hash.?);
     return e;
 }
@@ -2386,12 +2391,49 @@ fn comparerFailed() noreturn {
     @panic("fable: an IEqualityComparer raised an exception (not supported inside a dictionary or set)");
 }
 
+/// Is a key of type `K` an array, which .NET's default comparer compares by reference?
+fn isArrayKey(comptime K: type) bool {
+    const P = switch (@typeInfo(K)) {
+        .optional => |o| o.child,
+        else => K,
+    };
+    const info = @typeInfo(P);
+    return info == .pointer and info.pointer.size == .one and @typeInfo(info.pointer.child) == .@"struct" and @hasDecl(info.pointer.child, "fable_array");
+}
+
+fn keyAddress(key: anytype) usize {
+    return if (comptime @typeInfo(@TypeOf(key)) == .optional)
+        (if (key) |k| @intFromPtr(k) else 0)
+    else
+        @intFromPtr(key);
+}
+
+/// `HashSet<T>()` and `Dictionary<K, V>()` of .NET: array keys by reference
+pub fn htByRef(d: anytype) @TypeOf(d) {
+    d.by_ref = true;
+    return d;
+}
+
+/// (the library's `distinct` and the like: keys compared by what they hold, as F# does)
+pub fn htStructural(d: anytype) void {
+    d.by_ref = false;
+}
+
 fn htHash(d: anytype, key: KeyOf(@TypeOf(d))) i32 {
+    if (comptime isArrayKey(KeyOf(@TypeOf(d)))) {
+        if (d.by_ref and d.cmp_hash == null) {
+            const a: u64 = keyAddress(key);
+            return @bitCast(@as(u32, @truncate(a ^ (a >> 32))));
+        }
+    }
     const f = d.cmp_hash orelse return hash(key);
     return f.code(f.env, dup(key)) catch comparerFailed();
 }
 
 fn htEql(d: anytype, a: KeyOf(@TypeOf(d)), b: KeyOf(@TypeOf(d))) bool {
+    if (comptime isArrayKey(KeyOf(@TypeOf(d)))) {
+        if (d.by_ref and d.cmp_eq == null) return keyAddress(a) == keyAddress(b);
+    }
     const f = d.cmp_eq orelse return eql(a, b);
     return f.code(f.env, dup(a), dup(b)) catch comparerFailed();
 }
@@ -2507,6 +2549,8 @@ pub fn dictSet(d: anytype, key: KeyOf(@TypeOf(d)), value: ValueOf(@TypeOf(d))) R
 /// earlier one
 pub fn dictOfList(comptime D: type, pairs: anytype, comptime read_only: bool) D {
     const d = htNew(D);
+    // (`Dictionary(other)` is .NET's: its array keys by reference; `dict` is F#'s)
+    d.by_ref = !read_only;
     var rest = pairs;
     while (rest == .Cons) : (rest = rest.Cons.Tail) {
         var displaced: ?ValueOf(D) = null;
@@ -2698,6 +2742,8 @@ pub fn setAdd(h: anytype, x: KeyOf(@TypeOf(h))) bool {
 /// `HashSet xs` of a list
 pub fn setOfList(comptime H: type, xs: List(KeyOf(H))) H {
     const h = htNew(H);
+    // (`HashSet(items)` is .NET's: its array items by reference)
+    h.by_ref = true;
     var rest = xs;
     while (rest == .Cons) : (rest = rest.Cons.Tail) {
         var displaced: ?ValueOf(H) = null;

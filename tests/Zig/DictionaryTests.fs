@@ -11,6 +11,15 @@ type MyRefType(i: int) =
 
 type MyRecord = { a: int }
 
+type CountingDictionary() =
+    inherit Dictionary<string, int>()
+
+    member this.Increment(key: string) =
+        this.[key] <- (if this.ContainsKey key then this.[key] else 0) + 1
+
+type ArrayKeyDictionary() =
+    inherit Dictionary<int[], int>()
+
 type R = { i: int; s: string }
 
 [<Fact>]
@@ -416,3 +425,50 @@ let ``test conversion from array works with duplicates`` () =
     |> equal 2
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Dictionary subclasses work`` () =
+    let dic = CountingDictionary()
+    dic.Increment "a"
+    dic.Increment "a"
+    dic.Increment "b"
+    dic.["a"] |> equal 2
+    dic.Count |> equal 2
+    dic.ContainsKey "b" |> equal true
+    dic.Remove "b" |> equal true
+    dic |> Seq.map (fun kv -> kv.Key, kv.Value) |> List.ofSeq |> equal [ "a", 2 ]
+
+[<Fact>]
+let ``test Dictionary compares array keys by reference`` () =
+    // See #5165
+    let key = [| 1 |]
+    let dic = Dictionary<int[], int>()
+    dic.[key] <- 1
+    dic.[[| 1 |]] <- 2
+    dic.Count |> equal 2
+    dic.ContainsKey key |> equal true
+    dic.ContainsKey [| 1 |] |> equal false
+    dic.[key] |> equal 1
+    let copy = Dictionary<int[], int>(dic)
+    copy.Count |> equal 2
+    copy.ContainsKey key |> equal true
+    copy.ContainsKey [| 1 |] |> equal false
+
+[<Fact>]
+let ``test Dictionary subclasses compare array keys by reference`` () =
+    let key = [| 1 |]
+    let dic = ArrayKeyDictionary()
+    dic.[key] <- 1
+    dic.ContainsKey key |> equal true
+    dic.ContainsKey [| 1 |] |> equal false
+
+[<Fact>]
+let ``test Dictionary compares ResizeArray keys by reference`` () =
+    let key = ResizeArray [ 1 ]
+    let dic = Dictionary<ResizeArray<int>, int>()
+    dic.[key] <- 1
+    dic.[ResizeArray [ 1 ]] <- 2
+    dic.Count |> equal 2
+    dic.ContainsKey key |> equal true
+    dic.ContainsKey(ResizeArray [ 1 ]) |> equal false
+

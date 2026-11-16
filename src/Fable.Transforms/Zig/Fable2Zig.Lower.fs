@@ -13,6 +13,12 @@ open Fable.Transforms.Zig.LowerHelpers
 
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
+    // (a value of a class deriving from `Dictionary` or `HashSet` with members only, as the
+    // object of a call or what is cast: the collection it is, under the collection's type)
+    | Fable.Call(callee, ({ ThisArg = Some x } as info), t, r) when (collectionBase ctx.Com x.Type).IsSome ->
+        lw ctx (asCollectionBase ctx x (fun x -> Fable.Call(callee, { info with ThisArg = Some x }, t, r)))
+    | Fable.TypeCast(x, target) when (collectionBase ctx.Com x.Type).IsSome ->
+        lw ctx (asCollectionBase ctx x (fun x -> Fable.TypeCast(x, target)))
     // (a unit that does something, the one argument of a call (`box (ignore (f ()))`): it is done,
     // then the call made of `()`)
     | Fable.Call(callee,
@@ -6191,6 +6197,17 @@ and itemOf (x: Expr) : Ty =
     | TEnt(_, [ item ]) -> item
     | _ -> fail None "internal: not a collection"
 
+/// `x`, of a class deriving from a collection with members only, as a value of the collection's
+/// type given to `k`
+and asCollectionBase (ctx: Ctx) (x: Fable.Expr) (k: Fable.Expr -> Fable.Expr) : Fable.Expr =
+    let baseType = (collectionBase ctx.Com x.Type).Value
+
+    match x with
+    | Fable.IdentExpr id -> k (Fable.IdentExpr { id with Type = baseType })
+    | _ ->
+        let tmp = AST.makeTypedIdent baseType "collection"
+        Fable.Let(tmp, x, k (Fable.IdentExpr tmp))
+
 /// What a `for ... in` loop walks, lowered: a list (of a list, a set, or a map's entries) or
 /// a string. None for a source that is walked some other way.
 and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
@@ -8788,6 +8805,45 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                                 $"the Zig target does not support this kind of member of an exception class yet (%s{c.Name}.%s{m.Name})"
                     with ZigError(msg, r) ->
                         report r msg
+                // a class deriving from `Dictionary` or `HashSet` with members only: its
+                // constructor makes the collection, by the base constructor
+                | Some ent when
+                    (collectionBase
+                        com
+                        (Fable.DeclaredType(
+                            c.Entity,
+                            ent.GenericParameters
+                            |> List.map (fun g -> Fable.GenericParam(g.Name, false, []))
+                        )))
+                        .IsSome
+                    ->
+                    let collectionType =
+                        (collectionBase
+                            com
+                            (Fable.DeclaredType(
+                                c.Entity,
+                                ent.GenericParameters
+                                |> List.map (fun g -> Fable.GenericParam(g.Name, false, []))
+                            )))
+                            .Value
+
+                    match c.Constructor, c.BaseCall with
+                    | Some ctor, Some(Fable.Call(callee, info, _, r)) ->
+                        // (Fable types the base constructor's call as unit: it makes the collection)
+                        let baseCall = Fable.Call(callee, info, collectionType, r)
+
+                        let body =
+                            match ctor.Body with
+                            | Fable.Value(Fable.UnitConstant, _) -> baseCall
+                            | body -> Fable.Sequential [ body; baseCall ]
+
+                        attached.Add { ctor with Body = body }
+                    | _ -> report None $"the Zig target needs a primary constructor of %s{c.Name}"
+
+                    for m in c.AttachedMembers do
+                        report
+                            m.Body.Range
+                            $"the Zig target does not support this kind of member of a collection's subclass yet (%s{c.Name}.%s{m.Name})"
                 | Some ent when
                     not (ent.IsFSharpExceptionDeclaration || ent.IsFSharpModule)
                     && (try

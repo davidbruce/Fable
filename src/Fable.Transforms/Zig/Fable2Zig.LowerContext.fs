@@ -1395,6 +1395,50 @@ let isClassEntity (ent: Fable.Entity) =
         || ent.IsValueType
     )
 
+/// A class of the program that derives from .NET's `Dictionary` or `HashSet` and adds only
+/// members (no fields, no overrides): the collection it is, here, as its base type with the
+/// class's type arguments put in
+let collectionBase (com: Compiler) (t: Fable.Type) : Fable.Type option =
+    match t with
+    | Fable.DeclaredType(entRef, genArgs) ->
+        match entRef.Path with
+        | Fable.SourcePath _ ->
+            match com.TryGetEntity entRef with
+            | Some ent when isClassEntity ent ->
+                match ent.BaseType with
+                | Some bt when
+                    (bt.Entity.FullName = "System.Collections.Generic.Dictionary`2"
+                     || bt.Entity.FullName = "System.Collections.Generic.HashSet`1")
+                    && ent.FSharpFields |> List.forall (fun f -> f.IsStatic)
+                    && not (
+                        ent.MembersFunctionsAndValues
+                        |> Seq.exists (fun m -> m.IsOverrideOrExplicitInterfaceImplementation)
+                    )
+                    ->
+                    let subst =
+                        List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) genArgs
+                        |> Map.ofList
+
+                    let rec put (t: Fable.Type) =
+                        match t with
+                        | Fable.GenericParam(name, _, _) when subst.ContainsKey name -> subst[name]
+                        | Fable.Array(item, kind) -> Fable.Array(put item, kind)
+                        | Fable.List item -> Fable.List(put item)
+                        | Fable.Option(item, isStruct) -> Fable.Option(put item, isStruct)
+                        | Fable.Tuple(items, isStruct) -> Fable.Tuple(List.map put items, isStruct)
+                        | Fable.DeclaredType(e, args) -> Fable.DeclaredType(e, List.map put args)
+                        | Fable.LambdaType(a, b) -> Fable.LambdaType(put a, put b)
+                        | other -> other
+
+                    if ent.GenericParameters.Length = genArgs.Length then
+                        Some(Fable.DeclaredType(bt.Entity, List.map put bt.GenericArgs))
+                    else
+                        None
+                | _ -> None
+            | _ -> None
+        | _ -> None
+    | _ -> None
+
 /// A class that derives from `System.Exception` (`inherit exn(message)`): an exception here,
 /// whose payload is its message and its fields
 let isExceptionClass (ent: Fable.Entity) =

@@ -17,6 +17,8 @@ let rec unwrapNullness (t: Fable.Type) : Fable.Type =
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
     | Fable.Unit -> tVoid
+    // (a class deriving from `Dictionary` or `HashSet` with members only: the collection)
+    | Fable.DeclaredType _ when (collectionBase ctx.Com t).IsSome -> mapType ctx r (collectionBase ctx.Com t).Value
     | Fable.Boolean -> tBool
     | Fable.Char -> TPrim "u16"
     | Fable.Number(kind, _) ->
@@ -595,7 +597,20 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
                 match ctx.Com.TryGetEntity entRef with
                 // (a struct is a value, not an object; a class deriving from System.Exception is
                 // an exception)
-                | Some ent when isClassEntity ent && not ent.IsValueType && not (isExceptionClass ent) -> Some ent
+                | Some ent when
+                    isClassEntity ent
+                    && not ent.IsValueType
+                    && not (isExceptionClass ent)
+                    && (collectionBase
+                            ctx.Com
+                            (Fable.DeclaredType(
+                                entRef,
+                                ent.GenericParameters
+                                |> List.map (fun g -> Fable.GenericParam(g.Name, false, []))
+                            )))
+                        .IsNone
+                    ->
+                    Some ent
                 | _ -> None
             | _ -> None
 

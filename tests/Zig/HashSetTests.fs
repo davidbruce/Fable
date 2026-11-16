@@ -26,6 +26,15 @@ let inline hashSet l =
         xs.Add x |> ignore
     xs
 
+type ArrayHashSet() =
+    inherit HashSet<int[]>()
+
+type NameSet() =
+    inherit HashSet<string>()
+
+    member this.AddAll(names: string list) =
+        names |> List.filter this.Add |> List.length
+
 [<ReferenceEquality>]
 type RefEqRecord = { a: int; b: int }
 
@@ -469,3 +478,44 @@ let ``test HashSet works with union items`` () =
     xs.Count |> equal 1
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test HashSet subclasses work`` () =
+    let names = NameSet()
+    names.AddAll [ "a"; "b"; "a" ] |> equal 2
+    names.Count |> equal 2
+    names.Contains "b" |> equal true
+    names.Remove "b" |> equal true
+    names |> List.ofSeq |> equal [ "a" ]
+
+[<Fact>]
+let ``test HashSet compares arrays by reference`` () =
+    // See #5165
+    let item = [| 1 |]
+    let xs = HashSet<int[]>()
+    xs.Add item |> equal true
+    xs.Add item |> equal false
+    xs.Add [| 1 |] |> equal true
+    xs.Count |> equal 2
+    xs.Contains item |> equal true
+    xs.Contains [| 1 |] |> equal false
+    HashSet<int[]>([ [| 1 |]; [| 1 |] ]).Count |> equal 2
+
+[<Fact>]
+let ``test HashSet subclasses compare arrays by reference`` () =
+    let item = [| 1 |]
+    let xs = ArrayHashSet()
+    xs.Add item |> equal true
+    xs.Contains item |> equal true
+    xs.Contains [| 1 |] |> equal false
+
+[<Fact>]
+let ``test HashSet compares ResizeArrays by reference`` () =
+    let item = ResizeArray [ 1 ]
+    let xs = HashSet<ResizeArray<int>>()
+    xs.Add item |> equal true
+    xs.Add(ResizeArray [ 1 ]) |> equal true
+    xs.Count |> equal 2
+    xs.Contains item |> equal true
+    xs.Contains(ResizeArray [ 1 ]) |> equal false
+

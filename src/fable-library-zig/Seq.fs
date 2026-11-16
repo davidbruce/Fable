@@ -809,10 +809,16 @@ let sortDescending<'T when 'T: comparison> (source: SeqOf<'T>) : SeqOf<'T> =
 let sortWith<'T> (comparer: 'T -> 'T -> int) (source: SeqOf<'T>) : SeqOf<'T> =
     delay (fun () -> ofList (List.sortWith comparer (toList source)))
 
+/// (a set of F#'s: its arrays compared by their items, where .NET's `HashSet()` compares them by
+/// reference)
+[<Fable.Core.Emit("fable_rt.htStructural($0)")>]
+let private structural (_set: System.Collections.Generic.HashSet<'T>) : unit = Fable.Core.Util.nativeOnly
+
 let distinct<'T when 'T: equality> (source: SeqOf<'T>) : SeqOf<'T> =
     make (fun () ->
         let w = walk source
         let seen = System.Collections.Generic.HashSet<'T>()
+        structural seen
 
         let rec next () =
             match w.next () with
@@ -1133,6 +1139,7 @@ let distinctBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (source: S
     make (fun () ->
         let w = walk source
         let seen = System.Collections.Generic.HashSet<'Key>()
+        structural seen
 
         let rec next () =
             match w.next () with
@@ -1149,7 +1156,12 @@ let distinctBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (source: S
 let except<'T when 'T: equality> (itemsToExclude: SeqOf<'T>) (source: SeqOf<'T>) : SeqOf<'T> =
     make (fun () ->
         let w = walk source
-        let seen = System.Collections.Generic.HashSet<'T>(toList itemsToExclude)
+        let seen = System.Collections.Generic.HashSet<'T>()
+        structural seen
+
+        for x in toList itemsToExclude do
+            seen.Add x |> ignore
+
 
         let rec next () =
             match w.next () with

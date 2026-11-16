@@ -569,8 +569,9 @@ let call
     | ("System.Collections.Generic.Dictionary`2.KeyCollection" | "System.Collections.Generic.Dictionary`2.ValueCollection" | "System.Collections.Generic.ICollection`1"),
       "get_Count",
       [ xs ] -> pure' "fable_rt.listCount($0)" [ xs ] tI32
+    // (.NET's default comparer: array keys by reference)
     | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"), ".ctor", [] ->
-        pure' "fable_rt.htNew($R)" [] (mapType ctx r t)
+        pure' "fable_rt.htByRef(fable_rt.htNew($R))" [] (mapType ctx r t)
     // (with an IEqualityComparer, after a capacity or not: its Equals and GetHashCode hash and
     // compare the keys)
     | ("System.Collections.Generic.Dictionary`2" | "System.Collections.Generic.HashSet`1"),
@@ -607,7 +608,7 @@ let call
         pure' "fable_rt.setOfList($R, $0)" [ xs ] (mapType ctx r t)
     // (a capacity: nothing to do here)
     | "System.Collections.Generic.HashSet`1", ".ctor", [ n ] when isInt n ->
-        bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.htNew($R)" [] (mapType ctx r t))
+        bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.htByRef(fable_rt.htNew($R))" [] (mapType ctx r t))
     | "System.Collections.Generic.HashSet`1", ".ctor", [ _ ] -> libraryCall ctx r "HashSet" "ofSeq" info args t
     // (items and an IEqualityComparer: the library's HashSet.ofSeqWith)
     | "System.Collections.Generic.HashSet`1", ".ctor", [ xs; cmp ] when not (isInt xs) ->
