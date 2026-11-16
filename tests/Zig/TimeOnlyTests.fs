@@ -343,3 +343,19 @@ let ``test TimeOnly.Add* accept fractional values and are tick-precise`` () =
 // ---- ported from tests/Js/Main (2026-11-16, remaining) ----
 
 // ---- ported from tests/Js/Main (2026-11-16, last) ----
+
+// ---- ported from tests/Js/Main (2026-11-16, final) ----
+
+[<Fact>]
+let ``test FromTimeSpan works`` () =
+    let t1 = TimeOnly.FromTimeSpan (TimeSpan.FromHours 2.)
+    let t2 = TimeOnly.FromTimeSpan (TimeSpan (23, 59, 59))
+
+    t1.Hour |> equal 2
+    t2.Hour |> equal 23
+    t2.Minute |> equal 59
+    t2.Second |> equal 59
+
+    throwsAnyError (fun () -> TimeOnly.FromTimeSpan (TimeSpan.FromHours 24.))
+    throwsAnyError (fun () -> TimeOnly.FromTimeSpan (TimeSpan.FromHours -1.))
+

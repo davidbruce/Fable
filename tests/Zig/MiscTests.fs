@@ -317,6 +317,9 @@ module StyleBuilderHelper =
 module Mutable =
     let mutable prop = 10
 
+    let private add3 a b c = a + b + c
+    let mutable mutAdd3 = add3
+
 module Same =
     let a = 5
     module Same =
@@ -1936,6 +1939,9 @@ let ``test GetType of exceptions`` () =
 
 
 
+
+
+
 let (>>*) (f: string -> unit) () (x: string) = f x
 
 type RecordWithMutableFn = { mutable MutableFn: string -> unit }
@@ -1986,6 +1992,11 @@ let buildRecordWithMutableFnWithWhile (xs: RecordWithMutableFn list) =
     items
 
 let docCommentWithCommentEnd (c: char) = string c
+
+let mutable private fn: int -> int = id
+let mutable private forLoopModuleBound = 3
+let mutable forLoopPublicArray = [| 1; 2; 3 |]
+let mutable private forLoopPrivateArray = [| 1; 2; 3 |]
 
 let rec private forLoopBoundTailCall (n: int) acc =
     if n = 0 then
@@ -2414,4 +2425,68 @@ let ``test Stopwatch.Restart works`` () =
         sw.ElapsedMilliseconds < 50L |> equal true
     }
     |> Async.RunSynchronously
+
+
+// ---- ported from tests/Js/Main (2026-11-16, final) ----
+
+[<Fact>]
+let ``test for bound reading a ref cell, a field or a module mutable is evaluated once`` () =
+    let r = ref 2
+    let mutable a = 0
+    for _ = 0 to r.Value do
+        r.Value <- 7
+        a <- a + 1
+    equal 3 a
+    ForLoopBound().FieldBoundIterations() |> equal 4
+    ForLoopBound().PropertyBoundIterations() |> equal 4
+    forLoopModuleBound <- 3
+    let mutable b = 0
+    for _ = 0 to forLoopModuleBound do
+        forLoopModuleBound <- 1
+        b <- b + 1
+    equal 4 b
+
+[<Fact>]
+let ``test for bound reading the length of a mutable array minus one is evaluated each iteration`` () =
+    let mutable a = [| 1; 2; 3 |]
+    let mutable n = 0
+    for _ = 0 to a.Length - 1 do
+        a <- [| 1; 2; 3; 4; 5; 6 |]
+        n <- n + 1
+    equal 6 n
+    forLoopPublicArray <- [| 1; 2; 3 |]
+    let mutable m = 0
+    for _ = 0 to forLoopPublicArray.Length - 1 do
+        forLoopPublicArray <- [| 1; 2; 3; 4; 5; 6 |]
+        m <- m + 1
+    equal 6 m
+    forLoopPrivateArray <- [| 1; 2; 3 |]
+    let mutable p = 0
+    for _ = 0 to forLoopPrivateArray.Length - 1 do
+        forLoopPrivateArray <- [| 1; 2; 3; 4; 5; 6 |]
+        p <- p + 1
+    equal 6 p
+    MiscTestsHelper.forLoopCrossFileArray <- [| 1; 2; 3 |]
+    let mutable q = 0
+    for _ = 0 to MiscTestsHelper.forLoopCrossFileArray.Length - 1 do
+        MiscTestsHelper.forLoopCrossFileArray <- [| 1; 2; 3; 4; 5; 6 |]
+        q <- q + 1
+    equal 6 q
+    MiscTestsHelper.forLoopCrossFileCalls <- 0
+    let mutable r = 0
+    for _ = 0 to (MiscTestsHelper.forLoopCrossFileMakeArray ()).Length - 1 do
+        r <- r + 1
+    equal 3 r
+    equal 1 MiscTestsHelper.forLoopCrossFileCalls
+
+[<Fact>]
+let ``test Mutable alias to multi-arg function applies arguments correctly`` () =
+    Mutable.mutAdd3 1 2 3 |> equal 6
+
+[<Fact>]
+let ``test References captured by >> are eagerly evaluated`` () =
+    // See #2851
+    let times2 x = x * 2
+    fn <- fn >> times2
+    fn 5 |> equal 10
 

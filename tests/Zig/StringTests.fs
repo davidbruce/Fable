@@ -29,6 +29,9 @@ let containsInOrder (substrings: string list) (str: string) =
       lastIndex <- i
       success)
 
+
+type MyUnion = Bar of int * int | Foo1 of float | Foo3 | Foo4 of MyUnion
+
 [<Fact>]
 let ``test F# nameof works`` () =
     M.f 12 |> equal "x"
@@ -1296,6 +1299,7 @@ type B() =
 type Test(i: int) =
       override _.ToString() = string(i + i)
 
+let [<Literal>] aLiteral = "foo"
 let notALiteral = "foo"
 
 
@@ -2083,3 +2087,24 @@ let ``test Printf works with generic argument`` () =
     let f3 = f2 2
     f3 2 |> equal "foo 2 2 2"
 #endif
+[<Fact>]
+let ``test String literal addition is optimized`` () =
+    "bar" + aLiteral |> equal "barfoo"
+    "bar" + notALiteral |> equal "barfoo"
+
+[<Fact>]
+let ``test Unions with sprintf %A`` () =
+    Bar(1,5) |> sprintf "%A" |> equal "Bar (1, 5)"
+    Foo1 4.5 |> sprintf "%A" |> equal "Foo1 4.5"
+    Foo4 Foo3 |> sprintf "%A" |> equal "Foo4 Foo3"
+    Foo4(Foo1 4.5) |> sprintf "%A" |> equal "Foo4 (Foo1 4.5)"
+    Foo3 |> sprintf "%A" |> equal "Foo3"
+
+[<Fact>]
+let ``test Unions with string operator`` () =
+    Bar(1,5) |> string |> equal "Bar (1, 5)"
+    Foo1 4.5 |> string |> equal "Foo1 4.5"
+    Foo4 Foo3 |> string |> equal "Foo4 Foo3"
+    Foo4(Foo1 4.5) |>string |> equal "Foo4 (Foo1 4.5)"
+    Foo3 |> string |> equal "Foo3"
+

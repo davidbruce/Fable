@@ -3952,6 +3952,60 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             let step = bindArgs ctx [ c ] (fun xs -> EIf(xs.Head, bIr, stop, tVoid))
             ELet(go, ELit("true", tBool), EWhile(EVar go, step))
 
+    // (`for i = 0 to arr.Length - 1` of a mutable array: .NET reads the bound again at each
+    // iteration, so a loop that assigns the array runs to its new length)
+    | Fable.ForLoop(id,
+                    start,
+                    (Fable.Operation(Fable.Binary(BinaryMinus,
+                                                  Fable.Call(Fable.Import(getLen, _, _), lenInfo, _, _),
+                                                  Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 1, _), _)),
+                                     _,
+                                     _,
+                                     _) as limit),
+                    body,
+                    true,
+                    r) when
+        getLen.Selector = "get_Length"
+        && (
+            match lenInfo.ThisArg with
+            | Some(Fable.IdentExpr a) ->
+                a.IsMutable
+                && (
+                    match a.Type with
+                    | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> true
+                    | _ -> false
+                )
+            | Some(Fable.Import({ Kind = Fable.MemberImport memberRef }, _, _)) ->
+                match ctx.Com.TryGetMember memberRef with
+                | Some m -> m.IsValue && m.IsMutable
+                | None -> false
+            | _ -> false
+        )
+        ->
+        let i = { AST.makeTypedIdent id.Type (tempName ctx "i") with IsMutable = true }
+
+        let one =
+            Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32 1, Fable.NumberInfo.Empty), None)
+
+        let cond =
+            Fable.Operation(Fable.Binary(BinaryLessOrEqual, Fable.IdentExpr i, limit), [], Fable.Boolean, r)
+
+        let step =
+            Fable.Set(
+                Fable.IdentExpr i,
+                Fable.ValueSet,
+                id.Type,
+                Fable.Operation(Fable.Binary(BinaryPlus, Fable.IdentExpr i, one), [], id.Type, r),
+                r
+            )
+
+        lw
+            ctx
+            (Fable.Let(
+                i,
+                start,
+                Fable.WhileLoop(cond, Fable.Let(id, Fable.IdentExpr i, Fable.Sequential [ body; step ]), r)
+            ))
     | Fable.ForLoop(id, start, limit, body, isUp, _) ->
         let startNonNeg = isKnownNonNegExpr ctx start
         let startIr = lw ctx start
