@@ -2211,3 +2211,101 @@ let ``test Async.StartImmediateAsTask works`` () =
         equal 42 result
     }
     |> Async.RunSynchronously
+
+let private loopLog = ResizeArray<string>()
+
+let private loggedSource =
+    seq {
+        try
+            for i in 1..5 do
+                yield i
+        finally
+            loopLog.Add "finally"
+    }
+
+[<Fact>]
+let ``test Loops in async work as on .NET, with or without awaits in their body`` () =
+    let message (r: Choice<unit, exn>) =
+        match r with
+        | Choice2Of2 e -> e.Message
+        | Choice1Of2() -> "ok"
+
+    async {
+        for i in 1..3 do
+            if i = 2 then
+                failwith "boom"
+    }
+    |> Async.Catch
+    |> Async.RunSynchronously
+    |> message
+    |> equal "boom"
+
+    // (an endless sequence, walked as the loop goes)
+    async {
+        for x in Seq.initInfinite id do
+            if x = 5 then
+                failwith "stop"
+    }
+    |> Async.Catch
+    |> Async.RunSynchronously
+    |> message
+    |> equal "stop"
+
+    // (a sequence's finally runs when the loop is left early, with or without do!)
+    loopLog.Clear()
+
+    async {
+        for x in loggedSource do
+            do! Async.Sleep 0
+
+            if x = 3 then
+                failwith "early"
+    }
+    |> Async.Catch
+    |> Async.RunSynchronously
+    |> message
+    |> equal "early"
+
+    List.ofSeq loopLog |> equal [ "finally" ]
+    loopLog.Clear()
+
+    async {
+        for x in loggedSource do
+            if x = 2 then
+                failwith "sync early"
+    }
+    |> Async.Catch
+    |> Async.RunSynchronously
+    |> message
+    |> equal "sync early"
+
+    List.ofSeq loopLog |> equal [ "finally" ]
+
+    let cts = new System.Threading.CancellationTokenSource()
+    cts.Cancel()
+    let mutable n = 0
+
+    (try
+        Async.RunSynchronously(
+            async {
+                for i in 1..10 do
+                    n <- n + i
+            },
+            cancellationToken = cts.Token
+        )
+
+        "ran"
+     with :? System.OperationCanceledException ->
+         "cancelled")
+    |> equal "cancelled"
+
+    n |> equal 0
+    let mutable k = 0
+
+    async {
+        while k < 10 do
+            k <- k + 1
+    }
+    |> Async.RunSynchronously
+
+    k |> equal 10

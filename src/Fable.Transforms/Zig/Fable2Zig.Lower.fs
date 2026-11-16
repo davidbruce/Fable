@@ -5604,6 +5604,52 @@ and dotnetCall
         libraryCall ctx r "Async" "parallelAllMax" info info.Args t
     | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Reduce" ->
         dotnetCall ctx r "Microsoft.FSharp.Collections.ArrayModule" "Reduce" info t
+    // (`for x in s do` and `while c do` in `async { }` whose body completes at once, no `let!` or
+    // `do!` in it: one loop of the library's, not a computation made and run for each item)
+    | "Microsoft.FSharp.Control.FSharpAsyncBuilder", "For" when
+        (match info.Args with
+         | [ _; Fable.Lambda(_, body, _) ] -> (syncAsyncBody body).IsSome
+         | _ -> false)
+        ->
+        match info.Args with
+        | [ source; Fable.Lambda(arg, body, name) ] ->
+            let lambda = Fable.Lambda(arg, (syncAsyncBody body).Value, name)
+
+            libraryCall
+                ctx
+                r
+                "Async"
+                "builderForSync"
+                { info with
+                    ThisArg = None
+                    MemberRef = None
+                }
+                [ source; lambda ]
+                t
+        | _ -> fail r "internal: an async for"
+    | "Microsoft.FSharp.Control.FSharpAsyncBuilder", "While" when
+        (match info.Args with
+         | [ guard; AsyncBuilderCall("Delay", { Args = [ Fable.Lambda(_, body, _) ] }) ] ->
+             not (usesAsyncBuilder guard) && (syncAsyncBody body).IsSome
+         | _ -> false)
+        ->
+        match info.Args with
+        | [ guard; AsyncBuilderCall("Delay", { Args = [ Fable.Lambda(arg, body, name) ] }) ] ->
+            let lambda = Fable.Lambda(arg, (syncAsyncBody body).Value, name)
+
+            libraryCall
+                ctx
+                r
+                "Async"
+                "builderWhileSync"
+                { info with
+                    ThisArg = None
+                    MemberRef = None
+                    GenericArgs = []
+                }
+                [ guard; lambda ]
+                t
+        | _ -> fail r "internal: an async while"
     // (a member of a .NET collection, StringBuilder or Random whose object may be null: checked
     // first, as .NET does. Not where it is known not to be: an object made there, or a variable
     // bound to one. The object is a variable or a field of one, read again by the call)

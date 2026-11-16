@@ -531,19 +531,90 @@ let builderWhile (guard: unit -> bool) (computation: AsyncOf<unit>) : AsyncOf<un
 
     loop ()
 
+/// `for x in s do` in `async { }`: the sequence walked as the loop goes (not first made a list:
+/// a long or endless one works, as on .NET), its enumerator disposed on each way out, as
+/// FSharp.Core's `Using(s.GetEnumerator(), ...)` does; cancellation looked at before each item
 let builderFor<'T> (sequence: SeqOf<'T>) (body: 'T -> AsyncOf<unit>) : AsyncOf<unit> =
-    let rec loop (rest: 'T list) : AsyncOf<unit> =
-        make (fun k ->
-            if isCancelled k then
+    make (fun k ->
+        let e = Seq.getEnumerator sequence
+
+        let rec loop () : AsyncOf<unit> =
+            make (fun k ->
+                if isCancelled k then
+                    k.cancel (canceled ())
+                else
+                    let moved =
+                        try
+                            Ok(e.MoveNext())
+                        with ex ->
+                            Error ex
+
+                    match moved with
+                    | Ok true ->
+                        let x = e.Current
+                        startMade (fun () -> body x) (withOk k (fun () -> bounce (fun () -> start (loop ()) k)))
+                    | Ok false -> k.ok ()
+                    | Error ex -> k.fail ex
+            )
+
+        start (builderTryFinally (loop ()) (fun () -> e.Dispose())) k
+    )
+
+/// `for x in s do` in `async { }` whose body completes at once (no `let!`, `do!`: the compiler
+/// gives the body without its `async.Zero()`): one loop, no computation made per item.
+/// Cancellation is looked at before each item, as .NET's does; an exception of the body or of
+/// the sequence is the computation's; the enumerator is disposed on each way out.
+let builderForSync<'T> (sequence: SeqOf<'T>) (body: 'T -> unit) : AsyncOf<unit> =
+    make (fun k ->
+        let mutable cancelled = false
+        let mutable failed: exn option = None
+
+        try
+            let e = Seq.getEnumerator sequence
+
+            try
+                while not cancelled && e.MoveNext() do
+                    if isCancelled k then
+                        cancelled <- true
+                    else
+                        body e.Current
+            finally
+                e.Dispose()
+        with ex ->
+            failed <- Some ex
+
+        match failed with
+        | Some ex -> k.fail ex
+        | None ->
+            if cancelled then
                 k.cancel (canceled ())
             else
-                match rest with
-                | x :: tail ->
-                    startMade (fun () -> body x) (withOk k (fun () -> bounce (fun () -> start (loop tail) k)))
-                | [] -> k.ok ()
-        )
+                k.ok ()
+    )
 
-    make (fun k -> start (loop (Seq.toList sequence)) k)
+/// `while guard do` in `async { }` whose body completes at once (see builderForSync)
+let builderWhileSync (guard: unit -> bool) (body: unit -> unit) : AsyncOf<unit> =
+    make (fun k ->
+        let mutable cancelled = false
+        let mutable failed: exn option = None
+
+        try
+            while not cancelled && guard () do
+                if isCancelled k then
+                    cancelled <- true
+                else
+                    body ()
+        with ex ->
+            failed <- Some ex
+
+        match failed with
+        | Some ex -> k.fail ex
+        | None ->
+            if cancelled then
+                k.cancel (canceled ())
+            else
+                k.ok ()
+    )
 
 // ---- the Async module ----
 

@@ -2146,6 +2146,45 @@ let neverNullIn (ctx: Ctx) (e: Fable.Expr) : bool =
     | Fable.IdentExpr i -> ctx.NonNull.Contains i.Name
     | _ -> neverNull e
 
+/// A call of a member of the async builder (`async.Zero()`, `async.Bind(...)`): its name and call
+let (|AsyncBuilderCall|_|) (e: Fable.Expr) =
+    match e with
+    | Fable.Call(Fable.Import(imp, _, _), info, _, _) when
+        imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Control.FSharpAsyncBuilder"
+        ->
+        Some(imp.Selector, info)
+    | _ -> None
+
+/// Does `e` use the async builder anywhere (a `let!`, `do!`, `return`, a nested loop of it)?
+let usesAsyncBuilder (e: Fable.Expr) =
+    e
+    |> AST.deepExists (
+        function
+        | AsyncBuilderCall _ -> true
+        | _ -> false
+    )
+
+/// The body of a loop in `async { }` that completes at once: each of its ends is `async.Zero()`
+/// and nothing else in it is async (no `let!`, `do!`). The body with unit for its Zero.
+let rec syncAsyncBody (e: Fable.Expr) : Fable.Expr option =
+    match e with
+    | AsyncBuilderCall("Zero", _) -> Some(Fable.Value(Fable.UnitConstant, None))
+    | Fable.Sequential stmts ->
+        let init = List.take (stmts.Length - 1) stmts
+
+        if init |> List.exists usesAsyncBuilder then
+            None
+        else
+            syncAsyncBody (List.last stmts)
+            |> Option.map (fun last -> Fable.Sequential(init @ [ last ]))
+    | Fable.Let(id, value, body) when not (usesAsyncBuilder value) ->
+        syncAsyncBody body |> Option.map (fun b -> Fable.Let(id, value, b))
+    | Fable.IfThenElse(guard, a, b, r) when not (usesAsyncBuilder guard) ->
+        match syncAsyncBody a, syncAsyncBody b with
+        | Some a, Some b -> Some(Fable.IfThenElse(guard, a, b, r))
+        | _ -> None
+    | _ -> None
+
 /// .NET's classes that are counted cells here with a null cell of their type (fable_rt's
 /// `fable_null_cell`): their members raise NullReferenceException on it
 let nullCellEntity (fullName: string) : bool =
