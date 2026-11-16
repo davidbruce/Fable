@@ -490,35 +490,35 @@ let ``test MailboxProcessor Post and PostAndReply work across multiple OS thread
     let finalTotal = mb.PostAndReply(fun ch -> GetAndStop ch)
     finalTotal |> equal 300
 
-#if FABLE_COMPILER_ZIG // (the Zig target refuses what .NET allows here: see fable_weak.zig)
+type WeakNode = { mutable Next: WeakNode option; Name: string }
+
 [<Fact>]
-let ``test A weak reference to a value shared between threads is refused, and the other way round`` () =
+let ``test Weak references work with values shared between threads`` () =
+    // (shared first, then a weak reference)
     let gate = obj ()
     let t = Thread(fun () -> lock gate (fun () -> ()))
     t.Start()
     t.Join()
-
-    let first =
-        try
-            System.WeakReference<obj>(gate) |> ignore
-            "none"
-        with :? System.NotSupportedException ->
-            "NotSupported"
-
-    first |> equal "NotSupported"
-
+    let w1 = System.WeakReference<obj>(gate)
+    let mutable x = null
+    (w1.TryGetTarget(&x) && obj.ReferenceEquals(x, gate)) |> equal true
+    // (a weak reference, then shared)
     let o = obj ()
-    let w = System.WeakReference<obj>(o)
-
-    let second =
-        try
-            let t2 = Thread(fun () -> lock o (fun () -> ()))
-            t2.Start()
-            t2.Join()
-            "none"
-        with :? System.NotSupportedException ->
-            "NotSupported"
-
-    second |> equal "NotSupported"
-    w |> ignore
-#endif
+    let w2 = System.WeakReference<obj>(o)
+    let t2 = Thread(fun () -> lock o (fun () -> ()))
+    t2.Start()
+    t2.Join()
+    (w2.TryGetTarget(&x) && obj.ReferenceEquals(x, o)) |> equal true
+    // (a weak reference used by another thread)
+    let n = { Next = None; Name = "a" }
+    let w3 = System.WeakReference<WeakNode>(n)
+    let mutable seen = ""
+    let t3 =
+        Thread(fun () ->
+            let mutable m = Unchecked.defaultof<WeakNode>
+            if w3.TryGetTarget(&m) then
+                seen <- m.Name
+        )
+    t3.Start()
+    t3.Join()
+    seen |> equal n.Name

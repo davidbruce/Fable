@@ -72,7 +72,7 @@ let private transformFileHere (com: Compiler) (file: Fable.File) : ZigFile =
 
     {
         Imports =
-            state.Imports
+            Seq.append state.Imports state.UserImports
             |> Seq.map (fun kv -> kv.Value, kv.Key)
             |> Seq.sortBy fst
             |> List.ofSeq

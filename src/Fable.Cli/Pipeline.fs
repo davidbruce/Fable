@@ -604,8 +604,13 @@ module Zig =
                 let dirOf (file: string) =
                     Path.normalizeFullPath (IO.Path.GetDirectoryName(file))
 
-                // (the library itself is compiled with `.` as its directory)
-                let sameDir = IO.Path.GetDirectoryName(path) = "." || dirOf sourcePath = dirOf path
+                // (the library itself is compiled with `.` as its directory; a package, `std`,
+                // has none)
+                let sameDir =
+                    IO.Path.GetDirectoryName(path) = "."
+                    || (IO.Path.GetDirectoryName(path) <> "" && dirOf sourcePath = dirOf path)
+
+                let original = path
 
                 let path =
                     // (a file of the runtime library that uses another: they stay side by side)
@@ -613,6 +618,35 @@ module Zig =
                         "./" + IO.Path.GetFileName(path)
                     else
                         Imports.getImportPath pathResolver sourcePath targetPath projDir cliArgs.OutDir path
+
+                // (a Zig file of the program's, `[<Import(..., "./native.zig")>]`: Zig imports only
+                // files under the module's root, so it is copied to where its path from the output
+                // points, beside the Zig of the F# files)
+                if
+                    original.EndsWith(".zig", StringComparison.Ordinal)
+                    && (original.StartsWith(".", StringComparison.Ordinal)
+                        || IO.Path.IsPathRooted original)
+                    && not (original.Replace('\\', '/').Contains "fable-library-zig")
+                then
+                    let from =
+                        if IO.Path.IsPathRooted original then
+                            original
+                        else
+                            IO.Path.Combine(IO.Path.GetDirectoryName(sourcePath), original)
+                        |> Path.normalizeFullPath
+
+                    let target =
+                        IO.Path.Combine(IO.Path.GetDirectoryName(targetPath), path)
+                        |> Path.normalizeFullPath
+
+                    if
+                        from <> target
+                        && IO.File.Exists from
+                        && (not (IO.File.Exists target)
+                            || IO.File.GetLastWriteTimeUtc from > IO.File.GetLastWriteTimeUtc target)
+                    then
+                        IO.Directory.CreateDirectory(IO.Path.GetDirectoryName target) |> ignore
+                        IO.File.Copy(from, target, true)
 
                 if
                     path.EndsWith(".fs", StringComparison.Ordinal)

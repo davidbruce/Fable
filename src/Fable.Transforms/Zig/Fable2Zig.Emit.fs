@@ -983,7 +983,9 @@ let emitUnpack (em: Em) (ind: string) (u: Unpack) =
             if isManaged v.Ty then
                 L $"    _ = %s{dupCode (vname em v)};"
 
-        L $"    fable_rt.release(%s{cell});"
+        // (a shared cell may lose its last reference here, another thread having dropped its
+        // own since `isUnique` was asked: then it is freed, with the fields just dup'ed)
+        L $"    fable_rt.drop(%s{cell});"
         L "}"
     elif not u.Drops.IsEmpty then
         L $"// `%s{x}` is dead: [%s{moves}] move out, the rest is dropped"
@@ -2355,6 +2357,9 @@ let emitFile (state: FileState) : string =
         rootNames.Add(topIdent fn.Name) |> ignore
 
     for alias in state.Imports.Values do
+        rootNames.Add alias |> ignore
+
+    for alias in state.UserImports.Values do
         rootNames.Add alias |> ignore
 
     for e in state.LocalEnts do

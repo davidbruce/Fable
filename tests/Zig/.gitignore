@@ -3,3 +3,4 @@ fable_modules/
 bin/
 obj/
 .zig-cache/
+!native/*.zig

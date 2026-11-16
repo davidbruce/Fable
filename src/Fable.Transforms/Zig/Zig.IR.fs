@@ -744,6 +744,10 @@ type FileState() =
     member val ObjInfos = Dictionary<string, obj>()
     /// imports of other files: path -> local alias
     member val Imports = Dictionary<string, string>()
+    /// imports the program declares (`[<Import>]`, `[<ImportMember>]`, `[<ImportAll>]`): Zig
+    /// files and packages written by hand, path -> local alias (none of the module values,
+    /// `$init` and `$cycles` an F# file's Zig has)
+    member val UserImports = Dictionary<string, string>()
     /// the generated code calls the hand-written runtime (`fable_rt.zig`)
     member val UsesRuntime = false with get, set
     /// what the file's code does that lets a function value be part of a cycle (see

@@ -13,6 +13,22 @@ open Fable.Transforms.Zig.LowerHelpers
 
 let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
+    // ---- what the program imports from Zig (`[<Import("add", "./native.zig")>]`,
+    // `[<ImportMember>]`, `[<ImportAll("std")>]`): used as it is. A function is called directly,
+    // its arguments borrowed for the call (what it keeps, it dup's); what it returns is owned ----
+    | Fable.Call(Fable.Import({ Kind = Fable.UserImport _ } as imp, _, _), info, t, r) ->
+        lw ctx (userImportCall ctx imp info t r)
+    | Fable.CurriedApply(Fable.Import({ Kind = Fable.UserImport _ } as imp, _, _), args, t, r) ->
+        lw ctx (userImportCall ctx imp (Fable.CallInfo.Create(args = args)) t r)
+    // (a value whose type F# gives where it is used: `let answer: int = nativeOnly`)
+    | Fable.TypeCast(Fable.Import({ Kind = Fable.UserImport _ } as imp, Fable.Any, _), t) when t <> Fable.Any ->
+        lw ctx (Fable.Import(imp, t, None))
+    | Fable.Import({ Kind = Fable.UserImport _ } as imp, t, r) ->
+        match t with
+        | Fable.LambdaType _
+        | Fable.DelegateType _ ->
+            fail r "the Zig target cannot use an imported function as a value yet: call it, or wrap it in a lambda"
+        | _ -> EEmit(userImportTarget ctx imp, [], mapType ctx r t)
     // (a value of a class deriving from `Dictionary` or `HashSet` with members only, as the
     // object of a call or what is cast: the collection it is, under the collection's type)
     | Fable.Call(callee, ({ ThisArg = Some x } as info), t, r) when (collectionBase ctx.Com x.Type).IsSome ->
@@ -2049,14 +2065,12 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
     | Fable.Emit(info, t, r) ->
         let ty = mapType ctx r t
 
-        if info.CallInfo.ThisArg.IsSome then
-            fail r "the Zig target does not support Emit on instance members yet"
-
         if info.Macro.Contains "fable_rt." then
             ctx.State.UsesRuntime <- true
 
+        // (an instance member: the object is `$0`, the arguments follow, as in the other targets)
         let args =
-            info.CallInfo.Args
+            (Option.toList info.CallInfo.ThisArg @ info.CallInfo.Args)
             |> List.filter (fun a -> not (isUnit a.Type))
             |> List.map (lw ctx)
 

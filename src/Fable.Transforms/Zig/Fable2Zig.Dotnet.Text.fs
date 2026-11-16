@@ -119,6 +119,27 @@ let call
         )
         ->
         rt "fable_rt.printfFormatText($0)" [ f ] tStr
+    // (`sprintf fmt a b`, `printfn fmt a b` and the like of a format given as a value: a chain of
+    // function values for the printer type F# took from where it is used; see
+    // fable_rt.printfFormatFn)
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators",
+      ("PrintFormatToString" | "PrintFormat" | "PrintFormatLine" | "PrintFormatToError" | "PrintFormatLineToError" | "PrintFormatToStringThenFail"),
+      [ f ] when
+        (match f.Type with
+         | Fable.DeclaredType(e, _) ->
+             e.FullName.StartsWith("Microsoft.FSharp.Core.PrintfFormat", System.StringComparison.Ordinal)
+         | _ -> false)
+        ->
+        let sink =
+            match name with
+            | "PrintFormatToString" -> "text"
+            | "PrintFormat" -> "out"
+            | "PrintFormatLine" -> "out_line"
+            | "PrintFormatToError" -> "err"
+            | "PrintFormatLineToError" -> "err_line"
+            | _ -> "fail"
+
+        rt $"fable_rt.printfFormatFn($R, .%s{sink}, $0)" [ f ] (mapType ctx r t)
     // `s.Normalize()` and `s.IsNormalized()`: Unicode's forms (fable_normalize.zig); FormC unless
     // one is given
     | "System.String", "Normalize", [ s ] -> rt "fable_rt.strNormalize($0, 1)" [ s ] tStr

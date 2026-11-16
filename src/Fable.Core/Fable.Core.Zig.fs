@@ -63,6 +63,13 @@ module Collector =
     [<Emit("fable_rt.collectorSet(.check_factor, $0)")>]
     let setCheckFactor (times: int) : unit = ()
 
+/// Are `a` and `b` the same cell: one object of a reference type, a list's first cell, a
+/// function's environment? Immutable records and unions are values in the Zig target, where
+/// `obj.ReferenceEquals` of them is refused: for one of them this is false. A shortcut before
+/// structural equality (`sameCell a b || a = b`), as `obj.ReferenceEquals` is under .NET.
+[<Emit("fable_rt.sameCell($0, $1)")>]
+let sameCell (a: 'T) (b: 'T) : bool = obj.ReferenceEquals(a, b)
+
 /// What the runtime did, for programs and tests that want to see it. The runtime counts in
 /// Debug and ReleaseSafe builds only.
 [<RequireQualifiedAccess>]

@@ -1178,7 +1178,7 @@ open Fable.Core
 let unicodeCategory: char -> string = nativeOnly
 #endif
 
-#if !FABLE_COMPILER_ZIG // (not supported by the Zig target yet: comparison by a culture, params of obj, FormattableString, PrintfFormat.Value, a function whose result type F# leaves open, imports)
+#if !FABLE_COMPILER_ZIG // (uses the Python import above, unicodedata)
 [<Fact>]
 let ``test unicode categories`` () =
     let chars = [
@@ -1276,11 +1276,9 @@ let ``test %A and ToString for voption, struct tuple, uint16, and functions`` ()
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
-#if !FABLE_COMPILER_ZIG // (a format known only when the program runs, given its values: printf whose type F# takes from each use)
 let spr fmt =
     let fmt = Printf.StringFormat<_>(fmt)
     sprintf fmt
-#endif
 
 
 
@@ -2070,7 +2068,6 @@ let ``test Can use backslash is interpolated strings`` () =
 2
 """
 
-#if !FABLE_COMPILER_ZIG // (a format known only when the program runs, given its values: printf whose type F# takes from each use)
 [<Fact>]
 let ``test Printf works with generic argument`` () =
     spr "bar %s" "a" |> equal "bar a"
@@ -2082,7 +2079,6 @@ let ``test Printf works with generic argument`` () =
     let f2 = f1 2
     let f3 = f2 2
     f3 2 |> equal "foo 2 2 2"
-#endif
 [<Fact>]
 let ``test String literal addition is optimized`` () =
     "bar" + aLiteral |> equal "barfoo"
@@ -2104,3 +2100,14 @@ let ``test Unions with string operator`` () =
     Foo4(Foo1 4.5) |>string |> equal "Foo4 (Foo1 4.5)"
     Foo3 |> string |> equal "Foo3"
 
+
+[<Fact>]
+let ``test Printf of a format given as a value takes flags and checks its values`` () =
+    let fail fmt = failwithf (Printf.StringFormat<_>(fmt))
+    spr "[%+d|% d|%05d|%-6.1f|%x|%X|%o|%c|%O|%08.3f]" 5 5 -42 2.25 255 255 8 'q' (Some 1) -3.14159
+    |> equal "[+5| 5|-0042|2.2   |ff|FF|10|q|Some(1)|-003.142]"
+    spr "%s and %A" null (Some "x") |> equal " and Some \"x\""
+    spr "%O|%O|%i%%" null [ 1; 2 ] 50 |> equal "<null>|[1; 2]|50%"
+    (try fail "bad %d" 7 with ex -> ex.Message) |> equal "bad 7"
+    (try spr "%d" "x" with ex -> ex.GetType().Name) |> equal "Exception"
+    (try spr "%d" 1 2 with ex -> ex.GetType().Name) |> equal "InvalidCastException"

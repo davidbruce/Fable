@@ -265,7 +265,7 @@ pub fn markShared(x: anytype) Raised!void {
         for (x) |item| try markShared(item);
         return;
     }
-    if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_weak")) return notShareable("a weak reference");
+    // (a weak reference: shared with its target and its handle, see fable_on_share in fable_weak.zig)
     switch (@typeInfo(T)) {
         .pointer => try shareCells(T, x),
         .optional => if (x) |v| try markShared(v),
@@ -625,8 +625,9 @@ fn notShareable(what: []const u8) Raised {
 fn markCell(c: anytype) Raised!bool {
     // (shared already: other threads may be changing the count; until then, no other has it)
     if (isShared(c)) return false;
-    // (a weak reference to it is this thread's: another thread that freed it would not empty it)
-    if (thread.weak.contains(@intFromPtr(c))) return notShareable("a value that a weak reference points to");
+    // (weak references point at it: their handle moves to the table of shared cells, which a
+    // thread that frees it empties)
+    if (thread.weak.count() != 0) weak_refs.shareWeakHandle(@intFromPtr(c));
     // (a cell the collector follows leaves it when it is shared, unless it is part of a
     // structure of cells already, where its count is the collector's business)
     // (a cell the collector follows leaves it when it is shared, unless it is part of a
@@ -649,6 +650,7 @@ fn shareCells(comptime T: type, x: T) Raised!void {
         switch (@typeInfo(T)) {
             .pointer => {
                 if (!try markCell(cur)) return;
+                if (comptime @hasDecl(@typeInfo(T).pointer.child, "fable_on_share")) try @typeInfo(T).pointer.child.fable_on_share(cur);
                 inline for (@typeInfo(@typeInfo(T).pointer.child).@"struct".field_names) |name| {
                     if (comptime isCount(name)) continue;
                     const F = @TypeOf(@field(cur, name));
@@ -734,8 +736,12 @@ pub fn movedOut(_: void, h: *sgc.Hdr) void {
 
 pub inline fn free(c: anytype) void {
     if (track) thread.stats.frees += 1;
-    // (a cell that weak references point at: they see it is gone)
+    // (a cell that weak references point at: they see it is gone. A shared cell's are in the
+    // table of all threads)
     if (thread.weak.count() != 0) weakGone(@intFromPtr(c));
+    if (comptime @hasField(@TypeOf(c.*), "$rc")) {
+        if (isShared(c) and weak_refs.shared_count.load(.monotonic) != 0) weak_refs.sharedWeakGone(@intFromPtr(c));
+    }
     // (a cell whose identity hash was taken: the next cell made here gets a new one)
     if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(c));
     // (the blocks a cell holds besides itself: an array's items, a dictionary's entries)
@@ -3864,6 +3870,29 @@ pub fn physicalHash(x: anytype) i32 {
     return hash(x);
 }
 
+/// `Fable.Core.Zig.sameCell a b`: are both the same cell (one reference type's object, a
+/// list's first cell, a function's environment)? A value (a number, a struct, a record or a union
+/// kept as a value) is never the same cell as anything: false, as .NET's ReferenceEquals of two
+/// boxings. For a shortcut before structural equality (`sameCell a b || a = b`).
+pub fn sameCell(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
+    if (comptime isCellPtr(T)) return a == b;
+    if (T == String) return a == b;
+    if (T == Any) return a == b;
+    if (comptime isFunc(T)) return a.env != null and a.env == b.env and a.code == b.code;
+    if (comptime isIface(T)) return a.data == b.data;
+    if (comptime isListType(T)) return switch (a) {
+        .Cons => |c| switch (b) {
+            .Cons => |d| c == d,
+            else => false,
+        },
+        // (the empty list is one value, as on .NET)
+        else => b != .Cons,
+    };
+    if (comptime @typeInfo(T) == .optional and isCellPtr(@typeInfo(T).optional.child)) return a == b;
+    return false;
+}
+
 /// A whole-number format (`B`, `X`, `D`) given to a float or a decimal: .NET's FormatException
 pub fn formatSpecifierInvalid(comptime T: type) Raised!T {
     return raise(FormatException, str("Format specifier was invalid."));
@@ -4149,6 +4178,211 @@ fn floatHole(letter: u8, precision: ?u8, x: f64) String {
             inline else => |q| format(.{arg(.{ .kind = k, .precision = q }, x)}),
         },
         else => unreachable,
+    };
+}
+
+// ---- printf of a format known only when the program runs, given its values (`sprintf fmt a b`
+// with `fmt: StringFormat<'T>` made from a string). F# takes the printer type ('T, here
+// `int -> string -> string`) from where the format is used, so Zig knows it: a chain of
+// function values made for it, each holding the values given so far (as they are, not boxed),
+// the last turning them into text. Each hole is checked against its value's type as the
+// program runs, as .NET does (with .NET's classes of exception, not its messages, which are
+// FSharp.Core's internals). ----
+
+/// What is done with the text: given back (sprintf), written (printf, printfn, eprintf,
+/// eprintfn) or raised (failwithf)
+pub const PrintfSink = enum { text, out, out_line, err, err_line, fail };
+
+/// `sprintf fmt` (or another of PrintfSink) of a format given as a value: a function value of
+/// type `F` that takes the format's values one by one, or the result where it takes none
+pub fn printfFormatFn(comptime F: type, comptime sink: PrintfSink, f: PrintfFormat) Raised!F {
+    return printfStage(F, sink, f, .{});
+}
+
+/// (`args`: the values so far, owned; `f` borrowed)
+fn printfStage(comptime F: type, comptime sink: PrintfSink, f: PrintfFormat, args: anytype) Raised!F {
+    if (comptime isFunc(F)) {
+        const Caps = struct { fmt: PrintfFormat, args: @TypeOf(args) };
+        const S = PrintfStageCode(F, sink, Caps);
+        const caps: Caps = .{ .fmt = dup(f), .args = args };
+        if (comptime @hasField(F, "code2")) return closure2(F, Caps, caps, S.code, S.code2);
+        return closure(F, Caps, caps, S.code);
+    }
+    return printfFinish(F, sink, f, args);
+}
+
+fn PrintfStageCode(comptime F: type, comptime sink: PrintfSink, comptime Caps: type) type {
+    const Code = @typeInfo(@FieldType(F, "code")).pointer.child;
+    const Fn = @typeInfo(Code).@"fn";
+    const A = Fn.param_types[1].?;
+    const R = Unraised(Fn.return_type.?);
+    return struct {
+        fn code(env: ?*Env, a: A) Raised!R {
+            const c = captured(Caps, env);
+            return printfStage(R, sink, c.fmt, dup(c.args) ++ .{a});
+        }
+
+        const Fn2 = if (@hasField(F, "code2")) @typeInfo(@typeInfo(Code2Of(@FieldType(F, "code"))).pointer.child).@"fn" else Fn;
+        const B = if (@hasField(F, "code2")) Fn2.param_types[2].? else void;
+
+        fn code2(env: ?*Env, a: A, b: B) Fn2.return_type.? {
+            const g = code(env, a) catch |e| {
+                drop(b);
+                return e;
+            };
+            defer drop(g);
+            return g.code(g.env, b);
+        }
+    };
+}
+
+fn printfFinish(comptime R: type, comptime sink: PrintfSink, f: PrintfFormat, args: anytype) Raised!R {
+    defer drop(args);
+    const text = try printfTyped(f, args);
+    switch (sink) {
+        .text => return text,
+        .fail => return raise(Failure, text),
+        else => {
+            defer drop(text);
+            switch (sink) {
+                .out => print(.{text}, false),
+                .out_line => print(.{text}, true),
+                .err => printErr(.{text}, false),
+                .err_line => printErr(.{text}, true),
+                else => unreachable,
+            }
+            return if (R == void) {} else @compileError("fable: printf of a format given as a value gives unit");
+        },
+    }
+}
+
+const PrintfHole = struct { letter: u8, width: usize = 0, precision: ?u8 = null, left: bool = false, zero: bool = false, plus: bool = false, space: bool = false };
+
+/// The text of the format with its holes filled by `args` in order
+fn printfTyped(f: PrintfFormat, args: anytype) Raised!String {
+    const n = @typeInfo(@TypeOf(args)).@"struct".field_names.len;
+    const units = unitsOf(f[0]);
+    var b: TextBuilder = .{};
+    errdefer drop(b.finish());
+    var i: usize = 0;
+    var hole: usize = 0;
+    while (i < units.len) {
+        if (units[i] != '%') {
+            b.add(units[i .. i + 1]);
+            i += 1;
+            continue;
+        }
+        if (i + 1 < units.len and units[i + 1] == '%') {
+            b.addAscii("%");
+            i += 2;
+            continue;
+        }
+        var h: PrintfHole = .{ .letter = 0 };
+        var j = i + 1;
+        while (j < units.len) : (j += 1) {
+            switch (units[j]) {
+                '-' => h.left = true,
+                '0' => h.zero = true,
+                '+' => h.plus = true,
+                ' ' => h.space = true,
+                else => break,
+            }
+        }
+        while (j < units.len and units[j] >= '0' and units[j] <= '9') : (j += 1) h.width = h.width *| 10 +| @as(usize, units[j] - '0');
+        if (j < units.len and units[j] == '.') {
+            j += 1;
+            var p: u8 = 0;
+            while (j < units.len and units[j] >= '0' and units[j] <= '9') : (j += 1) p = p *| 10 +| @as(u8, @intCast(units[j] - '0'));
+            h.precision = p;
+        }
+        if (j >= units.len or units[j] > 0x7f) return raise(ArgumentException, str("Bad format specifier"));
+        h.letter = @intCast(units[j]);
+        j += 1;
+        if (hole >= n) return raise(Failure, str("The format takes more values than it was given."));
+        var text: String = null;
+        inline for (0..n) |k| {
+            if (k == hole) text = try printfHoleText(h, args[k]);
+        }
+        defer drop(text);
+        printfPad(&b, h, unitsOf(text));
+        hole += 1;
+        i = j;
+    }
+    if (hole != n) return raise(InvalidCastException, str("The format takes fewer values than it was given."));
+    return b.finish();
+}
+
+/// `text` with the hole's width: spaces before (or after, `-`), or zeros after the sign (`0`)
+fn printfPad(b: *TextBuilder, h: PrintfHole, text: []const u16) void {
+    const pad = if (h.width > text.len) h.width - text.len else 0;
+    if (pad == 0) return b.add(text);
+    if (h.left) {
+        b.add(text);
+        for (0..pad) |_| b.addAscii(" ");
+        return;
+    }
+    const numeric = switch (h.letter) {
+        'd', 'i', 'u', 'x', 'X', 'o', 'B', 'f', 'F', 'e', 'E', 'g', 'G', 'M' => true,
+        else => false,
+    };
+    if (h.zero and numeric) {
+        const signed = text.len > 0 and (text[0] == '-' or text[0] == '+' or text[0] == ' ');
+        if (signed) b.add(text[0..1]);
+        for (0..pad) |_| b.addAscii("0");
+        return b.add(if (signed) text[1..] else text);
+    }
+    for (0..pad) |_| b.addAscii(" ");
+    b.add(text);
+}
+
+/// Does a hole of this letter take a value of type T (as F# checks a format it knows)?
+fn printfTakes(comptime letter: u8, comptime T: type) bool {
+    return switch (letter) {
+        'd', 'i', 'u', 'x', 'X', 'o', 'B' => @typeInfo(T) == .int or T == BigInt,
+        'f', 'F', 'e', 'E', 'g', 'G' => @typeInfo(T) == .float or T == NetDecimal,
+        'M' => T == NetDecimal,
+        // (a string, or an object F# typed from `null`: its ToString, "" of null)
+        's' => T == String or T == Any,
+        'c' => T == u16,
+        'b' => T == bool,
+        'A', 'O' => true,
+        else => false,
+    };
+}
+
+fn printfHoleText(h: PrintfHole, v: anytype) Raised!String {
+    const T = @TypeOf(v);
+    switch (h.letter) {
+        inline 'd', 'i', 'u', 'x', 'X', 'o', 'B', 'f', 'F', 'e', 'E', 'g', 'G', 'M', 's', 'c', 'b', 'A', 'O' => |k| {
+            if (comptime !printfTakes(k, T)) return raise(Failure, str("The format's type of value does not match the value given."));
+            if (comptime k == 'O' or (k == 's' and T == Any)) return printfToString(k, v);
+            if (comptime k == 'A' or k == 's' or k == 'c' or k == 'b') return format(.{arg(.{ .kind = k }, v)});
+            return switch (@as(u2, @intFromBool(h.plus)) * 2 + @intFromBool(h.space)) {
+                inline else => |sign| printfNumber(k, sign >> 1 == 1, sign & 1 == 1, h.precision, v),
+            };
+        },
+        else => return raise(ArgumentException, str("Bad format specifier")),
+    }
+}
+
+/// `%O` (and `%s` of an object): .NET's ToString of the value; null as `<null>` (`%s`: nothing)
+fn printfToString(comptime k: u8, v: anytype) Raised!String {
+    const T = @TypeOf(v);
+    if (T == Any or T == Obj or comptime isIface(T)) {
+        if (comptime T == Any) {
+            if (v == null) return str(if (k == 'O') "<null>" else "");
+        }
+        return genericText(v);
+    }
+    var b: TextBuilder = .{};
+    writeNet(&b, v);
+    return b.finish();
+}
+
+fn printfNumber(comptime k: u8, comptime plus: bool, comptime space: bool, precision: ?u8, v: anytype) String {
+    const p = precision orelse return format(.{arg(.{ .kind = k, .plus = plus, .space = space }, v)});
+    return switch (@as(u4, @intCast(@min(p, 15)))) {
+        inline else => |q| format(.{arg(.{ .kind = k, .plus = plus, .space = space, .precision = q }, v)}),
     };
 }
 

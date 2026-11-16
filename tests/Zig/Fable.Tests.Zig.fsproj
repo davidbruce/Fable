@@ -94,5 +94,6 @@
     <Compile Include="EnvironmentTests.fs" />
     <Compile Include="ListCollectorTests.fs" />
     <Compile Include="ConditionalWeakTableTests.fs" />
+    <Compile Include="InteropTests.fs" />
   </ItemGroup>
 </Project>

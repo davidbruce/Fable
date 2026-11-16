@@ -879,6 +879,61 @@ and importAlias (ctx: Ctx) (path: string) =
         ctx.State.Imports[path] <- alias
         alias
 
+/// The alias of a Zig file or package the program imports (`[<Import>]`): `@import` of it, as
+/// written (a package: `std`; a file: its path, which the CLI copies under the output)
+and userImportAlias (ctx: Ctx) (path: string) =
+    match ctx.State.UserImports.TryGetValue path with
+    | true, alias -> alias
+    | _ ->
+        let fileName = System.IO.Path.GetFileNameWithoutExtension(path)
+
+        let baseName =
+            "z_"
+            + System.Text.RegularExpressions.Regex.Replace(fileName, "[^A-Za-z0-9_]", "_")
+
+        let mutable alias = baseName
+        let mutable i = 1
+
+        while ctx.State.UserImports.ContainsValue alias
+              || ctx.State.Imports.ContainsValue alias do
+            alias <- $"%s{baseName}_%d{i}"
+            i <- i + 1
+
+        ctx.State.UserImports[path] <- alias
+        alias
+
+/// What an imported name is in Zig: the alias of its file (`[<ImportAll>]`), or a declaration of
+/// it (quoted where it is not a plain identifier)
+and userImportTarget (ctx: Ctx) (imp: Fable.ImportInfo) =
+    let alias = userImportAlias ctx imp.Path
+
+    match imp.Selector with
+    | "*"
+    | "default"
+    | "" -> alias
+    // (a name, or a Zig expression of the file's declarations: `math.maxInt(i32)`)
+    | sel when System.Text.RegularExpressions.Regex.IsMatch(sel, "^[A-Za-z_]") -> alias + "." + sel
+    | sel -> alias + ".@\"" + sel + "\""
+
+/// A call of an imported Zig function: an Emit of it with its arguments (not those of unit)
+and userImportCall (ctx: Ctx) (imp: Fable.ImportInfo) (info: Fable.CallInfo) (t: Fable.Type) r : Fable.Expr =
+    let n =
+        (Option.toList info.ThisArg @ info.Args)
+        |> List.filter (fun a -> a.Type <> Fable.Unit)
+        |> List.length
+
+    let holes = List.init n (fun i -> $"$%d{i}") |> String.concat ", "
+
+    Fable.Emit(
+        {
+            Macro = $"%s{userImportTarget ctx imp}(%s{holes})"
+            IsStatement = false
+            CallInfo = info
+        },
+        t,
+        r
+    )
+
 /// F#'s `seq`: the record of the library's Seq.fs, around the function that starts a walk.
 and seqEnt (ctx: Ctx) : Ent =
     match ctx.State.Ents.TryGetValue "$seq" with

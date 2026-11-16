@@ -1215,3 +1215,28 @@ let ``test LanguagePrimitives.PhysicalHash with arrays works`` () =
     (LanguagePrimitives.PhysicalHash [|1;2|], LanguagePrimitives.PhysicalHash [|1;2|]) ||> notEqual
     (LanguagePrimitives.PhysicalHash [|2;1|], LanguagePrimitives.PhysicalHash [|1;2|]) ||> notEqual
 
+
+type SameCellRecord = { A: int }
+
+[<Fact>]
+let ``test Fable.Core.Zig.sameCell tells cells apart`` () =
+    let xs = [ 1; 2 ]
+    let ys = xs
+    Fable.Core.Zig.sameCell xs ys |> equal true
+    Fable.Core.Zig.sameCell xs (List.map id xs) |> equal false
+    let r = ref 1
+    Fable.Core.Zig.sameCell r r |> equal true
+    Fable.Core.Zig.sameCell r (ref 1) |> equal false
+    let f = fun (x: int) -> x + r.Value
+    Fable.Core.Zig.sameCell f f |> equal true
+    let o = obj ()
+    Fable.Core.Zig.sameCell o o |> equal true
+    Fable.Core.Zig.sameCell o (obj ()) |> equal false
+    let a = { A = 1 }
+#if FABLE_COMPILER_ZIG
+    // (an immutable record is a value here: never the same cell)
+    Fable.Core.Zig.sameCell a a |> equal false
+#else
+    Fable.Core.Zig.sameCell a a |> equal true
+#endif
+    (Fable.Core.Zig.sameCell a { A = 1 } || a = { A = 1 }) |> equal true

@@ -33,35 +33,60 @@ stopping the program. From F#:
 
 - `Fable.Core.Zig.Collector`: `collect ()`, `step budget`, `pause ()`/`resume ()`, tuning.
 - `Fable.Core.Zig.Counters`: what the runtime did (cells made, freed, live).
-- `WeakReference<'T>`: handles that are cleared when the target is freed.
+- `WeakReference<'T>`: handles that are cleared when the target is freed, also for values
+  shared between threads (to break the back edges of a cyclic shared structure).
+- `Fable.Core.Zig.sameCell a b`: whether two values are the same cell, a shortcut before
+  structural equality (`obj.ReferenceEquals` under .NET).
 - `[<StackArena(bytes)>]` on a function: what it allocates comes from its stack.
 - `IResource<'T>` / `ISharedResource<'T>`: values whose `Destroy` (and `Dup`) the runtime calls,
   for handles of things outside the program.
 
 Under .NET these do nothing (or what .NET does), so the same program runs on both.
 
+Threads are real threads: `Thread`, `Async.Parallel`, `Async.StartChild`, `MailboxProcessor`,
+`Task.Run` and the like. A value is marked shared when it reaches another thread, and from then
+on its count changes atomically; the rest of the program pays one test of a bit.
+
+## Calling Zig
+
+```fsharp
+[<Import("add", "./native.zig")>]           // a declaration of a Zig file of yours
+let add: int -> int -> int = nativeOnly
+
+[<ImportMember("./native.zig")>]            // the same, named after the F# function
+let greet (name: string) : string = nativeOnly
+
+[<Import("math.maxInt(i32)", "std")>]       // a package, and a Zig expression of it
+let maxInt: int = nativeOnly
+
+type System.String with
+    [<Emit("@as(i32, @intCast(fable_rt.unitsOf($0).len))")>]   // `$0` is the object
+    member s.Units : int = nativeOnly
+```
+
+A call is direct. Its arguments are borrowed for the call (Zig code that keeps one calls
+`fable_rt.dup` on it) and what it returns belongs to the caller. F#'s `int`, `float`, `bool` and
+the like are Zig's `i32`, `f64`, `bool`; a `string` is `fable_rt.String` (UTF-16, as on .NET:
+`fable_rt.unitsOf`, `fable_rt.str`). A `.zig` file next to your `.fs` files is copied to the
+output with them, as Zig imports only files under the root of the program.
+
 ## What differs from .NET
 
 Programs print and compute what they do on .NET; where the target cannot do that yet it refuses
 to compile, rather than doing something else. The known exceptions:
 
-- One thread: values cannot be shared between threads yet. `async` and `task` run on the
-  calling thread; `Async.Sleep` and `Task.Delay` do not wait, `Async.Parallel` runs in turn.
-- A weak reference sees its target gone at the target's last use, not at a later collection.
-- A loop over a `Dictionary` walks a snapshot of it.
-- `try ... finally` and `use` inside `seq { }` run their finalizer when the sequence is walked to
-  its end or raises, not yet when a walk is left early (`Seq.head`, `Seq.take`, ...).
-- `%A` of a type that contains a `voption`, a struct tuple or a function is refused.
-- Comparison by a culture (`String.Compare` without `StringComparison.Ordinal`) is refused;
-  `StackTrace` is not supported.
 - Immutable records, unions and tuples are values, not objects: `obj.ReferenceEquals` and
   `PhysicalEquality` of them are refused (`[<ReferenceEquality>]` gives a type's values an
-  identity). An exception thrown by a type's own `Equals`, `GetHashCode` or `CompareTo` while
-  `=`, `hash` or `compare` runs it stops the program.
-- `Array.zeroCreate` of a reference record gives records of default fields, where .NET gives
-  nulls.
-- Not yet supported: reflection, generic classes in class hierarchies, arrays of more than two
-  dimensions, `Regex`, dates and times.
+  identity; `sameCell` is false for them).
+- A weak reference sees its target gone at the target's last use, not at a later collection.
+- A cycle through values shared between threads is not collected (as in Koka): break it with a
+  weak reference.
+- A loop over a `Dictionary` walks a snapshot of it.
+- The current culture is the invariant culture.
+- `Length` of a null array is 0, and a field of a null record is the field's null, where .NET
+  raises NullReferenceException.
+- An exception thrown by a type's own `Equals`, `GetHashCode` or `CompareTo` while `=`, `hash`
+  or `compare` runs it stops the program.
 
 ## Developing
 

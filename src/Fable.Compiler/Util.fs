@@ -683,6 +683,7 @@ module Imports =
                     importPath.EndsWith(".fs", StringComparison.Ordinal)
                     || importPath.EndsWith(".fsx", StringComparison.Ordinal)
                     || importPath.EndsWith(".rs", StringComparison.Ordinal)
+                    || importPath.EndsWith(".zig", StringComparison.Ordinal)
                 then
                     getTargetRelativePath pathResolver importPath targetDir projDir outDir
                 else
