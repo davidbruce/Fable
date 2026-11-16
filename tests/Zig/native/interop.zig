@@ -1,4 +1,5 @@
 //! Hand-written Zig that InteropTests.fs imports (`[<Import>]`, `[<ImportMember>]`).
+const std = @import("std");
 const fable_rt = @import("../fable_modules/fable-library-zig/fable_rt.zig");
 
 pub fn add(a: i32, b: i32) i32 {
@@ -89,4 +90,49 @@ export fn fable_test_vadd(a: CVec2, b: CVec2) CVec2 {
 
 export fn fable_test_area(r: CRect) f32 {
     return if (r.solid) r.width * r.height + r.pos.x else 0;
+}
+
+/// For InteropTests.fs's byrefs, bools, wide strings and callbacks
+export fn fable_test_scale(v: *CVec2, k: f32) void {
+    v.x *= k;
+    v.y *= k;
+}
+
+export fn fable_test_bool4(b: i32) i32 {
+    return if (b != 0) 7 else 3;
+}
+
+export fn fable_test_bool1(b: bool) bool {
+    return !b;
+}
+
+export fn fable_test_is_positive(x: i32) i32 {
+    return @intFromBool(x > 0);
+}
+
+export fn fable_test_wlen(s: [*:0]const u16) i32 {
+    return @intCast(std.mem.len(s));
+}
+
+export fn fable_test_whello() [*:0]const u16 {
+    return std.unicode.utf8ToUtf16LeStringLiteral("h\u{e9}llo");
+}
+
+export fn fable_test_out_flag(x: i32, flag: *i32) void {
+    flag.* = @intFromBool(x > 10);
+}
+
+var stored_callback: ?*const fn (i32) callconv(.c) i32 = null;
+
+export fn fable_test_register(cb: *const fn (i32) callconv(.c) i32) void {
+    stored_callback = cb;
+}
+
+export fn fable_test_fire(x: i32) i32 {
+    return stored_callback.?(x);
+}
+
+export fn fable_test_each_name(cb: *const fn (?[*:0]const u8, i32) callconv(.c) void) void {
+    cb("one", 1);
+    cb("two", 2);
 }

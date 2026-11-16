@@ -217,4 +217,72 @@ let ``test Structs are given to C and back by value`` () =
     area { r with solid = false } |> equal 0.0f
     vaddC { x = 1.0f; y = 1.0f } { x = 2.0f; y = 2.0f } |> equal { x = 3.0f; y = 3.0f }
     areaC r |> equal 13.0f
+
+type IntFn = delegate of int -> int
+type NameFn = delegate of string * int -> unit
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_scale")>]
+extern void scaleInPlace(Vec2& v, float32 k)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_bool4")>]
+extern int bool4(bool b)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_bool1")>]
+extern [<return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.I1)>] bool bool1(
+    [<System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.I1)>] bool b
+)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_is_positive")>]
+extern bool isPositive(int x)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_wlen", CharSet = System.Runtime.InteropServices.CharSet.Unicode)>]
+extern int wideLength(string s)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_wlen")>]
+extern int wideLength2([<System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPWStr)>] string s)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_whello")>]
+extern [<return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPWStr)>] string wideHello()
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_out_flag")>]
+extern void outFlag(int x, [<System.Runtime.InteropServices.Out>] bool& flag)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_register")>]
+extern void registerCallback(IntFn cb)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_fire")>]
+extern int fireCallback(int x)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_each_name")>]
+extern void eachName(NameFn cb)
+
+/// (kept alive while C may call it, as on .NET)
+let private tripled = IntFn(fun x -> x * 3)
+
+[<Fact>]
+let ``test Byrefs, MarshalAs and callbacks cross to C as on .NET`` () =
+    let mutable v = { x = 1.0f; y = 2.0f }
+    scaleInPlace (&v, 3.0f)
+    v |> equal { x = 3.0f; y = 6.0f }
+    bool4 true |> equal 7
+    bool4 false |> equal 3
+    bool1 true |> equal false
+    isPositive 5 |> equal true
+    isPositive -5 |> equal false
+    wideLength "héllo" |> equal 5
+    wideLength2 "ab" |> equal 2
+    wideHello () |> equal "héllo"
+    let mutable flag = false
+    outFlag (42, &flag)
+    flag |> equal true
+    outFlag (1, &flag)
+    flag |> equal false
+    // (a callback C keeps and calls later)
+    registerCallback tripled
+    fireCallback 5 |> equal 15
+    fireCallback 7 |> equal 21
+    // (one called while the call runs, with C strings)
+    let seen = ResizeArray<string>()
+    eachName (NameFn(fun name n -> seen.Add(sprintf "%s=%d" name n)))
+    List.ofSeq seen |> equal [ "one=1"; "two=2" ]
 #endif

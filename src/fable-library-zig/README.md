@@ -107,10 +107,21 @@ extern Vector2 Vector2Add(Vector2 v1, Vector2 v2)   // given and given back by v
 let twice (x: int) : int = x * 2             // exported to C under that name
 ```
 
-What a C function takes and gives: numbers, `bool` (one byte, C's `bool`; .NET's default is a
-4-byte `BOOL`), strings (UTF-8; one given back is copied, C keeps it), arrays (a pointer to the
-items) and structs of numbers, bools and such structs, by value. Not yet: `out`/`ref`
-parameters, callbacks, `[<MarshalAs>]`.
+What a C function takes and gives, as .NET marshals it: numbers; `bool` as a 4-byte `BOOL`, or
+C's 1-byte `bool` under `[<MarshalAs(UnmanagedType.I1)>]`; strings as UTF-8, or UTF-16 under
+`[<MarshalAs(UnmanagedType.LPWStr)>]` or `CharSet = CharSet.Unicode` (one given back is copied,
+C keeps it); arrays (a pointer to the items); structs of numbers, bools and such structs, by
+value; `out`/`ref` (`int&`, `Vector2&`, `[<Out>] bool&`); and delegates, as C callbacks:
+
+```fsharp
+type Compare = delegate of byref<int> * byref<int> -> int
+
+[<DllImport("libc")>]
+extern void qsort(int[] items, unativeint count, unativeint size, Compare compare)
+```
+
+A callback that C keeps to call later needs its delegate kept alive meanwhile, as on .NET; an
+exception that leaves a callback ends the program, as on .NET.
 
 A C header becomes a module the build translates (Zig has no `@cImport`), imported with
 `c:`, whose calls are given C's values as `extern` ones are:

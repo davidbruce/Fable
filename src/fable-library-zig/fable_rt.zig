@@ -4562,13 +4562,87 @@ const CString = struct {
     }
 };
 
-/// What C is given for a value of type T
-fn CArg(comptime T: type) type {
-    if (T == String) return ?[*:0]const u8;
+/// How a value crosses to C (`[<MarshalAs>]`, DllImport's `CharSet`; the compiler gives one for
+/// each parameter and for the result): `.plain` as it is; a bool as a 4-byte `BOOL` (`.bool4`,
+/// .NET's default) or C's 1-byte `bool` (`.bool1`, `UnmanagedType.I1`/`U1`); a string as UTF-8
+/// (`.utf8`, the default) or UTF-16 (`.utf16`, `LPWStr`, `CharSet.Unicode`)
+pub const CKind = enum { plain, bool4, bool1, utf8, utf16 };
+
+/// What C is given for a value of type T, crossing as `kind`
+fn CArg(comptime T: type, comptime kind: CKind) type {
+    if (T == String) return if (kind == .utf16) ?[*:0]const u16 else ?[*:0]const u8;
+    if (T == bool) return if (kind == .bool1) bool else i32;
     if (comptime isArrayPtr(T)) return [*]@typeInfo(@FieldType(@typeInfo(T).pointer.child, "items")).pointer.child;
     if (comptime isPlainStruct(T)) return CStruct(T);
-    if (comptime isManaged(T)) @compileError("fable: a [<DllImport>] function takes and gives numbers, bools, strings, arrays and structs of numbers and bools (by value); not " ++ @typeName(T));
+    if (comptime isFunc(T)) return CallbackFn(T);
+    if (comptime isByref(T)) {
+        const V = @typeInfo(T).pointer.child;
+        if (V == bool) return if (kind == .bool1) *bool else *i32;
+        if (comptime isPlainStruct(V)) return *CStruct(V);
+        if (comptime @typeInfo(V) == .int or @typeInfo(V) == .float) return T;
+        @compileError("fable: a [<DllImport>] function's byref (out, ref) parameter is of a number, a bool or a struct of them; not " ++ @typeName(V));
+    }
+    if (comptime isManaged(T)) @compileError("fable: a [<DllImport>] function takes and gives numbers, bools, strings, arrays, delegates, byrefs and structs of numbers and bools (by value); not " ++ @typeName(T));
     return T;
+}
+
+/// (a byref: `*T` of a value, not a counted cell)
+fn isByref(comptime T: type) bool {
+    const info = @typeInfo(T);
+    return info == .pointer and info.pointer.size == .one and !isCellPtr(T) and @typeInfo(info.pointer.child) != .@"fn" and @typeInfo(info.pointer.child) != .@"opaque";
+}
+
+/// What a byref's value is copied into for the call (and back after): a C struct, a `BOOL`
+fn CTemp(comptime T: type, comptime kind: CKind) type {
+    if (!isByref(T)) return void;
+    const V = @typeInfo(T).pointer.child;
+    if (V == bool) return if (kind == .bool1) void else i32;
+    if (isPlainStruct(V)) return CStruct(V);
+    return void;
+}
+
+/// A string given to C as UTF-16 for one call
+const CWString = struct {
+    small: [128]u16 = undefined,
+    big: ?[]u16 = null,
+
+    fn init(c: *CWString, s: String) [*:0]const u16 {
+        const units = unitsOf(s);
+        const buf: []u16 = if (units.len + 1 <= c.small.len) &c.small else blk: {
+            const b = allocator.alloc(u16, units.len + 1) catch oom();
+            c.big = b;
+            break :blk b;
+        };
+        @memcpy(buf[0..units.len], units);
+        buf[units.len] = 0;
+        return @ptrCast(buf.ptr);
+    }
+
+    fn deinit(c: *CWString) void {
+        if (c.big) |b| allocator.free(b);
+    }
+};
+
+/// A result of C as F#'s `R`
+fn fromC(comptime R: type, comptime kind: CKind, r: anytype) R {
+    if (R == String) {
+        if (kind == .utf16) {
+            const p: ?[*:0]const u16 = r;
+            return if (p) |q| strFrom(std.mem.span(q)) else null;
+        }
+        const p: ?[*:0]const u8 = r;
+        return if (p) |q| io.fromUtf8(std.mem.span(q)) else null;
+    }
+    if (R == bool) return if (kind == .bool1) r else r != 0;
+    if (comptime isPlainStruct(R)) return fromCStruct(R, r);
+    return r;
+}
+
+/// An F# value as C's (a callback's result)
+fn toC(comptime T: type, comptime kind: CKind, x: T) CArg(T, kind) {
+    if (T == bool) return if (kind == .bool1) x else @intFromBool(x);
+    if (comptime isPlainStruct(T)) return toCStruct(CStruct(T), x);
+    return x;
 }
 
 // ---- structs given to C by value: an F# struct of numbers, bools and such structs (a
@@ -4638,39 +4712,191 @@ fn CFn(comptime P: []const type, comptime R: type) type {
     };
 }
 
-/// `f args` of `[<DllImport>] extern R f(...)`: the C function `name`
-pub fn callC(comptime R: type, comptime name: []const u8, args: anytype) R {
+// ---- callbacks: a delegate given to C is a function of C's calling convention made for it
+// (one for each callback parameter of each C function), which turns C's arguments into F#'s,
+// calls the delegate and gives its result back as C's. The delegate it calls: the one given to
+// the call that is running on this thread (`qsort`'s comparison), or else the one given last
+// (a callback C keeps and calls later, from any thread). As on .NET, the program keeps that
+// delegate alive while C may call it (no reference is taken here, as .NET's thunk does not keep
+// the delegate alive either); an exception that leaves it ends the program, as on .NET. ----
+
+fn Callback(comptime name: []const u8, comptime index: usize, comptime F: type) type {
+    _ = name;
+    _ = index;
+    const Code = @typeInfo(@FieldType(F, "code")).pointer.child;
+    const Fn = @typeInfo(Code).@"fn";
+    const P = Fn.param_types[1..];
+    const RR = Fn.return_type.?;
+    const R = if (isRaised(RR)) Unraised(RR) else RR;
+    const CR = CArg(R, .plain);
+    return struct {
+        threadlocal var current: ?F = null;
+        var latest: ?F = null;
+        var guard = std.atomic.Value(u32).init(0);
+
+        fn setLatest(f: F) void {
+            while (guard.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+            latest = f;
+            guard.store(0, .release);
+        }
+
+        fn delegate() F {
+            if (current) |f| return f;
+            while (guard.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+            const f = latest;
+            guard.store(0, .release);
+            return f orelse @panic("fable: a C callback was called with no delegate given for it");
+        }
+
+        fn invoke(c_args: anytype) CR {
+            const f = delegate();
+            var f_args: std.meta.ArgsTuple(Code) = undefined;
+            f_args[0] = f.env;
+            inline for (P, 0..) |A, i| {
+                const a = c_args[i];
+                f_args[i + 1] = if (A.? == String) strFromCStr(a) else fromC(A.?, .plain, a);
+            }
+            const result = @call(.auto, f.code, f_args);
+            const value = if (comptime isRaised(RR)) result catch {
+                uncaught();
+                std.process.abort();
+            } else result;
+            return toC(R, .plain, value);
+        }
+
+        const C = blk: {
+            var ps: [P.len]type = undefined;
+            for (P, 0..) |A, i| ps[i] = if (A.? == String) ?[*:0]const u8 else CArg(A.?, .plain);
+            break :blk ps;
+        };
+
+        const code = switch (P.len) {
+            0 => struct {
+                fn f() callconv(.c) CR {
+                    return invoke(.{});
+                }
+            }.f,
+            1 => struct {
+                fn f(a: C[0]) callconv(.c) CR {
+                    return invoke(.{a});
+                }
+            }.f,
+            2 => struct {
+                fn f(a: C[0], b: C[1]) callconv(.c) CR {
+                    return invoke(.{ a, b });
+                }
+            }.f,
+            3 => struct {
+                fn f(a: C[0], b: C[1], c: C[2]) callconv(.c) CR {
+                    return invoke(.{ a, b, c });
+                }
+            }.f,
+            4 => struct {
+                fn f(a: C[0], b: C[1], c: C[2], d: C[3]) callconv(.c) CR {
+                    return invoke(.{ a, b, c, d });
+                }
+            }.f,
+            5 => struct {
+                fn f(a: C[0], b: C[1], c: C[2], d: C[3], e: C[4]) callconv(.c) CR {
+                    return invoke(.{ a, b, c, d, e });
+                }
+            }.f,
+            else => @compileError("fable: a callback of more than five arguments"),
+        };
+    };
+}
+
+/// The C type of a callback for a delegate of type F
+fn CallbackFn(comptime F: type) type {
+    const Code = @typeInfo(@FieldType(F, "code")).pointer.child;
+    const Fn = @typeInfo(Code).@"fn";
+    const P = Fn.param_types[1..];
+    const RR = Fn.return_type.?;
+    const R = if (isRaised(RR)) Unraised(RR) else RR;
+    var ps: [P.len]type = undefined;
+    for (P, 0..) |A, i| ps[i] = if (A.? == String) ?[*:0]const u8 else CArg(A.?, .plain);
+    return CFn(&ps, CArg(R, .plain));
+}
+
+/// `f args` of `[<DllImport>] extern R f(...)`: the C function `name`, each argument crossing as
+/// its kind in `kinds`, the result as `ret`
+pub fn callC(comptime R: type, comptime name: []const u8, comptime kinds: anytype, comptime ret: CKind, args: anytype) R {
     const fields = @typeInfo(@TypeOf(args)).@"struct".field_types;
     const n = fields.len;
     const params = comptime blk: {
         var ps: [n]type = undefined;
-        for (fields, 0..) |F, i| ps[i] = CArg(F);
+        for (fields, 0..) |F, i| ps[i] = CArg(F, kinds[i]);
         break :blk ps;
     };
+    const temp_types = comptime blk: {
+        var ts: [n]type = undefined;
+        for (fields, 0..) |F, i| ts[i] = CTemp(F, kinds[i]);
+        break :blk ts;
+    };
     var c_args: @Tuple(&params) = undefined;
+    var temps: @Tuple(&temp_types) = undefined;
     var strings: [n]CString = undefined;
+    var wide: [n]CWString = undefined;
     inline for (0..n) |i| {
         const F = fields[i];
+        const kind: CKind = kinds[i];
         if (F == String) {
-            strings[i] = .{};
-            c_args[i] = if (args[i] == null) null else strings[i].init(args[i]);
+            if (kind == .utf16) {
+                wide[i] = .{};
+                c_args[i] = if (args[i] == null) null else wide[i].init(args[i]);
+            } else {
+                strings[i] = .{};
+                c_args[i] = if (args[i] == null) null else strings[i].init(args[i]);
+            }
         } else if (comptime isArrayPtr(F)) {
             c_args[i] = args[i].items.ptr;
         } else if (comptime isPlainStruct(F)) {
             c_args[i] = toCStruct(CStruct(F), args[i]);
+        } else if (comptime isFunc(F)) {
+            const Cb = Callback(name, i, F);
+            Cb.setLatest(args[i]);
+            c_args[i] = &Cb.code;
+        } else if (comptime temp_types[i] != void) {
+            const V = @typeInfo(F).pointer.child;
+            temps[i] = if (V == bool) @intFromBool(args[i].*) else toCStruct(temp_types[i], args[i].*);
+            c_args[i] = &temps[i];
+        } else if (F == bool) {
+            c_args[i] = if (kind == .bool1) args[i] else @intFromBool(args[i]);
         } else {
             c_args[i] = args[i];
         }
     }
-    defer inline for (0..n) |i| {
-        if (fields[i] == String) strings[i].deinit();
+    // (the delegates of this call, for callbacks that come while it runs on this thread)
+    const saved_types = comptime blk: {
+        var ts: [n]type = undefined;
+        for (fields, 0..) |F, i| ts[i] = if (isFunc(F)) ?F else void;
+        break :blk ts;
     };
-    const CR = comptime if (R == String) ?[*:0]const u8 else if (isPlainStruct(R)) CStruct(R) else CArg(R);
+    var saved: @Tuple(&saved_types) = undefined;
+    inline for (0..n) |i| {
+        if (comptime isFunc(fields[i])) {
+            const Cb = Callback(name, i, fields[i]);
+            saved[i] = Cb.current;
+            Cb.current = args[i];
+        }
+    }
+    defer inline for (0..n) |i| {
+        if (fields[i] == String) {
+            if (kinds[i] == .utf16) wide[i].deinit() else strings[i].deinit();
+        }
+        if (comptime isFunc(fields[i])) Callback(name, i, fields[i]).current = saved[i];
+    };
+    const CR = comptime if (R == String) (if (ret == .utf16) ?[*:0]const u16 else ?[*:0]const u8) else CArg(R, ret);
     const f = @extern(CFn(&params, CR), .{ .name = name });
     const r = @call(.auto, f, c_args);
-    if (R == String) return if (r) |p| io.fromUtf8(std.mem.span(p)) else null;
-    if (comptime isPlainStruct(R)) return fromCStruct(R, r);
-    return r;
+    // (what C wrote into the byrefs' copies, back into them)
+    inline for (0..n) |i| {
+        if (comptime temp_types[i] != void) {
+            const V = @typeInfo(fields[i]).pointer.child;
+            args[i].* = if (V == bool) temps[i] != 0 else fromCStruct(V, temps[i]);
+        }
+    }
+    return fromC(R, ret, r);
 }
 
 /// `f args` of a C function imported with `[<Import("f", "c:module")>]` (a module of C's

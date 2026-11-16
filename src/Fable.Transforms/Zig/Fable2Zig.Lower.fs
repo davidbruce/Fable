@@ -2158,10 +2158,22 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             else
 
                 // (an instance member: the object is `$0`, the arguments follow, as in the other targets)
+                // (a C function's byref parameter, `out`/`ref`: its address, not the value read
+                // through it, as a call of an F# function that takes a byref gives)
+                let isCCall =
+                    info.Macro.StartsWith("fable_rt.callC(", System.StringComparison.Ordinal)
+
                 let args =
                     (Option.toList info.CallInfo.ThisArg @ info.CallInfo.Args)
                     |> List.filter (fun a -> not (isUnit a.Type))
-                    |> List.map (lw ctx)
+                    |> List.map (fun a ->
+                        let ir = lw ctx a
+
+                        match a.Type with
+                        | Fable.DeclaredType(ent, _) when isCCall && ent.FullName = "Microsoft.FSharp.Core.byref`2" ->
+                            defaultArg (tryAddress ir) ir
+                        | _ -> ir
+                    )
 
                 // (`[<Emit("try f($0)")>]`: a call that may raise, whose exception goes on as F#'s does)
                 if info.Macro.StartsWith("try ", System.StringComparison.Ordinal) then
@@ -8914,12 +8926,90 @@ let externBody (com: Compiler) (m: Fable.MemberDecl) : Fable.Expr =
         |> Option.orElse (info |> Option.map (fun i -> i.CompiledName))
         |> Option.defaultValue m.Name
 
+    // How each value crosses (fable_rt.CKind): `[<MarshalAs>]` of a parameter or the result,
+    // else by its type: a bool as .NET's 4-byte `BOOL`, a string as UTF-8, or UTF-16 under
+    // DllImport's `CharSet = CharSet.Unicode`
+    let dllImport =
+        info
+        |> Option.bind (fun i ->
+            i.Attributes
+            |> Seq.tryFind (fun a -> a.Entity.FullName = "System.Runtime.InteropServices.DllImportAttribute")
+        )
+
+    let unicode =
+        match dllImport with
+        | Some(:? Fable.Transforms.FSharp2Fable.FsAtt as a) ->
+            a.NamedArguments
+            |> List.exists (fun (n, v) -> n = "CharSet" && v <> null && System.Convert.ToInt32 v = 3)
+        | _ -> false
+
+    let marshalAs (atts: Fable.Attribute seq) =
+        atts
+        |> Seq.tryPick (fun a ->
+            if a.Entity.FullName = "System.Runtime.InteropServices.MarshalAsAttribute" then
+                match a.ConstructorArgs with
+                | v :: _ when v <> null ->
+                    match System.Convert.ToInt32 v with
+                    | 2 -> Some "bool4" // UnmanagedType.Bool
+                    | 3
+                    | 4 -> Some "bool1" // I1, U1
+                    | 20
+                    | 22
+                    | 48 -> Some "utf8" // LPStr, LPTStr, LPUTF8Str
+                    | 21 -> Some "utf16" // LPWStr
+                    | _ -> None
+                | _ -> None
+            else
+                None
+        )
+
+    let rec kindOf (t: Fable.Type) (atts: Fable.Attribute seq) =
+        match marshalAs atts with
+        | Some k -> k
+        | None ->
+            match t with
+            | Fable.String ->
+                if unicode then
+                    "utf16"
+                else
+                    "utf8"
+            | Fable.Boolean -> "bool4"
+            | Fable.DeclaredType(e, v :: _) when e.FullName = "Microsoft.FSharp.Core.byref`2" -> kindOf v []
+            | _ -> "plain"
+
     let args = m.Args |> List.filter (fun a -> a.Type <> Fable.Unit)
+
+    let parameters =
+        info
+        |> Option.map (fun i -> i.CurriedParameterGroups |> List.concat)
+        |> Option.defaultValue []
+
+    let kinds =
+        args
+        |> List.mapi (fun i a ->
+            let atts =
+                if parameters.Length = args.Length then
+                    parameters.[i].Attributes
+                else
+                    Seq.empty
+
+            "." + kindOf a.Type atts
+        )
+        |> String.concat ", "
+
+    let retKind =
+        "."
+        + kindOf
+            m.Body.Type
+            (info
+             |> Option.map (fun i -> i.ReturnParameter.Attributes)
+             |> Option.defaultValue Seq.empty)
+
     let holes = args |> List.mapi (fun i _ -> $"$%d{i}") |> String.concat ", "
 
     Fable.Emit(
         {
-            Macro = $"fable_rt.callC($R, \"%s{name}\", .{{ %s{holes} }})"
+            Macro = $"fable_rt.callC($R, \"%s{name}\", .{{ %s{kinds} }}, %s{retKind}, .{{ %s{holes} }})"
             IsStatement = false
             CallInfo = Fable.CallInfo.Create(args = (args |> List.map Fable.IdentExpr))
         },
