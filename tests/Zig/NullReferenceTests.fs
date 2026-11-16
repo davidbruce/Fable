@@ -116,3 +116,34 @@ let ``test Null interface value works and raises NullReferenceException on call`
             true
 
     raised |> equal true
+
+type WithCollectionFields() =
+    [<DefaultValue>]
+    val mutable Dict: System.Collections.Generic.Dictionary<string, int>
+
+    [<DefaultValue>]
+    val mutable Items: ResizeArray<int>
+
+[<Fact>]
+let ``test .NET collections can be null`` () =
+    let nre f =
+        try
+            f ()
+            false
+        with :? System.NullReferenceException ->
+            true
+
+    let x = WithCollectionFields()
+    isNull x.Dict |> equal true
+    isNull x.Items |> equal true
+    nre (fun () -> x.Items.Add 1) |> equal true
+    nre (fun () -> x.Dict.Count |> ignore) |> equal true
+    nre (fun () -> for _ in x.Items do ()) |> equal true
+    x.Items <- ResizeArray [ 1 ]
+    x.Items.Add 2
+    x.Items.Count |> equal 2
+    let items = Array.zeroCreate<ResizeArray<int>> 1
+    isNull items.[0] |> equal true
+    nre (fun () -> items.[0].Add 1) |> equal true
+    let sb: System.Text.StringBuilder = Unchecked.defaultof<_>
+    nre (fun () -> sb.Append "x" |> ignore) |> equal true

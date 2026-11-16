@@ -446,3 +446,11 @@ let ``test Map ICollection.CopyTo works`` () =
     coll.CopyTo(ys, 0)
     ys = (xs |> Array.map KeyValuePair) |> equal true
 
+
+[<Fact>]
+let ``test Map.Keys and Map.Values work`` () =
+    let m = Map [ 2, "b"; 1, "a" ]
+    m.Keys |> Seq.toList |> equal [ 1; 2 ]
+    m.Values |> Seq.toList |> equal [ "a"; "b" ]
+    m.Keys.Count |> equal 2
+    m.Values.Contains "b" |> equal true

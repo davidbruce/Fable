@@ -540,6 +540,9 @@ let libraryFunction (entity: string) (name: string) : (string * string) option =
         | "Change" -> Some("Map", "member" + name)
         | "get_Count" -> Some("Map", "memberCount")
         | "get_IsEmpty" -> Some("Map", "memberIsEmpty")
+        // (`m.Keys` and `m.Values`: lists here, as ICollection is)
+        | "get_Keys" -> Some("Map", "keys")
+        | "get_Values" -> Some("Map", "values")
         // `Map [ (k, v); ... ]`
         | ".ctor" -> Some("Map", "ofList")
         | _ -> None
@@ -2143,6 +2146,54 @@ let neverNullIn (ctx: Ctx) (e: Fable.Expr) : bool =
     | Fable.IdentExpr i -> ctx.NonNull.Contains i.Name
     | _ -> neverNull e
 
+/// .NET's classes that are counted cells here with a null cell of their type (fable_rt's
+/// `fable_null_cell`): their members raise NullReferenceException on it
+let nullCellEntity (fullName: string) : bool =
+    match fullName with
+    | "System.Collections.Generic.Dictionary`2"
+    | "System.Collections.Generic.List`1"
+    | "System.Collections.Generic.HashSet`1"
+    | "System.Text.StringBuilder"
+    | "System.Random" -> true
+    | _ -> false
+
+/// `a.[i]` of an array, as F# compiles it (`GetArray a i`)
+let (|ArrayItemRead|_|) (e: Fable.Expr) =
+    match e with
+    | Fable.Call(Fable.Import({
+                                  Selector = "GetArray"
+                                  Path = path
+                              },
+                              _,
+                              _),
+                 { Args = [ a; i ] },
+                 _,
+                 _) when
+        path.EndsWith("Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", System.StringComparison.Ordinal)
+        ->
+        Some(a, i)
+    | _ -> None
+
+/// Is `e` the object of a member of a .NET collection that may be its type's null cell (see
+/// `nullCellEntity`), and read without effects, so that a check may read it again? A variable
+/// not known to hold an object made there, or a field or an item of one.
+let rec mayBeNullCell (ctx: Ctx) (e: Fable.Expr) : bool =
+    let rec plainRead (x: Fable.Expr) =
+        match x with
+        | Fable.IdentExpr _ -> true
+        | Fable.TypeCast(y, _)
+        | Fable.Get(y, Fable.FieldGet _, _, _) -> plainRead y
+        | Fable.Get(y, Fable.ExprGet(Fable.IdentExpr _ | Fable.Value _), _, _) -> plainRead y
+        | ArrayItemRead(y, (Fable.IdentExpr _ | Fable.Value _)) -> plainRead y
+        | _ -> false
+
+    match e with
+    | Fable.TypeCast(x, _) -> mayBeNullCell ctx x
+    | Fable.IdentExpr i -> not (ctx.NonNull.Contains i.Name)
+    | Fable.Get(_, (Fable.FieldGet _ | Fable.ExprGet _), _, _)
+    | ArrayItemRead _ -> plainRead e
+    | _ -> false
+
 /// Has this type a default value here (what .NET's is: zero, false, null of a string, None)?
 let rec hasDefault (ctx: Ctx) (t: Fable.Type) : bool =
     match t with
@@ -2156,6 +2207,10 @@ let rec hasDefault (ctx: Ctx) (t: Fable.Type) : bool =
     | Fable.Option _
     | Fable.Nullable _ -> true
     | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> true
+    // (.NET's mutable collections, StringBuilder and Random: the null cell of their type, which
+    // their members check for, see `nullCellEntity`)
+    | Fable.Array(_, Fable.ResizeArray) -> true
+    | Fable.DeclaredType(entRef, _) when nullCellEntity entRef.FullName -> true
     // (a function: one that raises NullReferenceException, see fable_rt.nullOf)
     | Fable.LambdaType _
     | Fable.DelegateType _ -> true

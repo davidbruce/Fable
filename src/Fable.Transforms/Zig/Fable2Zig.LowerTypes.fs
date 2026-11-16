@@ -1083,7 +1083,12 @@ and walkEnt (ctx: Ctx) : Ent =
                 TypeParams = [ "T" ]
                 Cases =
                     [
-                        "", [ "next", TFn([ tVoid ], TOpt(TGen "T")); "close", TFn([ tVoid ], tVoid) ]
+                        "",
+                        [
+                            "next", TFn([ tVoid ], TOpt(TGen "T"))
+                            "close", TFn([ tVoid ], tVoid)
+                            "reset", tBool
+                        ]
                     ]
                 MutableFields = []
                 Managed = true

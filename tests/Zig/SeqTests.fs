@@ -1571,3 +1571,29 @@ let ``test Seq.transpose groups the items of jagged sequences by index`` () =
     Seq.transpose [[1; 2]; [3]] |> Seq.map Seq.toList |> Seq.toList |> equal [[1; 3]; [2]]
     Seq.transpose [| [|1|]; [|2; 3|] |] |> Seq.map Seq.toList |> Seq.toList |> equal [[1; 2]; [3]]
 
+
+[<Fact>]
+let ``test IEnumerator.Reset works where .NET allows it`` () =
+    let afterReset (s: seq<'T>) =
+        let e = s.GetEnumerator()
+        e.MoveNext() |> ignore
+        try
+            e.Reset()
+            if e.MoveNext() then Some e.Current else None
+        with :? System.NotSupportedException -> None
+    afterReset [| 1; 2 |] |> equal (Some 1)
+    afterReset [ 1; 2 ] |> equal (Some 1)
+    afterReset (ResizeArray [ 1; 2 ]) |> equal (Some 1)
+    afterReset (seq { 1..2 }) |> equal (Some 1)
+    afterReset (seq { 'a'..'b' }) |> equal (Some 'a')
+    afterReset (Seq.sortWith compare [ 2; 1 ]) |> equal (Some 1)
+    afterReset (Seq.delay (fun () -> [ 1; 2 ] :> seq<int>)) |> equal (Some 1)
+    afterReset (seq { yield 1; yield 2 }) |> equal None
+    afterReset (Seq.ofArray [| 1; 2 |]) |> equal None
+    afterReset (Seq.map id [ 1; 2 ]) |> equal None
+    afterReset (Seq.init 2 id) |> equal None
+    let e = ([| 1; 2 |] :> System.Array).GetEnumerator()
+    e.MoveNext() |> ignore
+    e.Reset()
+    e.MoveNext() |> equal true
+    e.Current |> equal (box 1)

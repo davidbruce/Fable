@@ -2356,7 +2356,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         match x.Type with
         | Fable.Array(_, Fable.MutableArray)
         | Fable.Array(_, Fable.ImmutableArray) ->
-            bindArgs ctx [ lw ctx x ] (fun xs -> ECall(libraryTarget ctx "Seq" "ofArray", [ itemTy ], xs, seqTy))
+            bindArgs ctx [ lw ctx x ] (fun xs -> ECall(libraryTarget ctx "Seq" "ofCollection", [ itemTy ], xs, seqTy))
         // (an object of the program's that implements `IEnumerable<'T>`: what its
         // `GetEnumerator` gives)
         | Fable.DeclaredType({ Path = Fable.SourcePath _ }, _) when
@@ -2426,7 +2426,7 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                     bindArgs
                         ctx
                         [ ERt("fable_rt.strToChars($0)", xs, chars) ]
-                        (fun cs -> ECall(libraryTarget ctx "Seq" "ofArray", [ itemTy ], cs, seqTy))
+                        (fun cs -> ECall(libraryTarget ctx "Seq" "ofCollection", [ itemTy ], cs, seqTy))
                 )
         | _ ->
             match forInSource ctx x with
@@ -5501,6 +5501,47 @@ and dotnetCall
         libraryCall ctx r "Async" "parallelAllMax" info info.Args t
     | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Reduce" ->
         dotnetCall ctx r "Microsoft.FSharp.Collections.ArrayModule" "Reduce" info t
+    // (a member of a .NET collection, StringBuilder or Random whose object may be null: checked
+    // first, as .NET does. Not where it is known not to be: an object made there, or a variable
+    // bound to one. The object is a variable or a field of one, read again by the call)
+    | _ when
+        nullCellEntity entity
+        && not (List.contains "cellChecked" info.Tags)
+        && (
+            match info.ThisArg with
+            | Some this -> mayBeNullCell ctx this
+            | None -> false
+        )
+        ->
+        match info.ThisArg.Value with
+        | Uncast(Fable.IdentExpr _) ->
+            ctx.State.UsesRuntime <- true
+
+            ESeq(
+                ERt("fable_rt.checkCellNonNull($0)", [ lw ctx info.ThisArg.Value ], tVoid),
+                dotnetCall ctx r entity name { info with Tags = "cellChecked" :: info.Tags } t
+            )
+        // (a field or an item: read once, into a variable that is checked)
+        | this ->
+            let v = AST.makeTypedIdent this.Type (tempName ctx "cell")
+
+            let call =
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = name
+                            Path = Replacements.DotnetPrefix + entity
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    { info with ThisArg = Some(Fable.IdentExpr v) },
+                    t,
+                    r
+                )
+
+            lw ctx (Fable.Let(v, this, call))
     | _ ->
 
         let isNumber (ty: Ty) = intBits ty > 0 || isFloatTy ty
@@ -6487,6 +6528,14 @@ and asCollectionBase (ctx: Ctx) (x: Fable.Expr) (k: Fable.Expr -> Fable.Expr) : 
 
 /// What a `for ... in` loop walks, lowered: a list (of a list, a set, or a map's entries) or
 /// a string. None for a source that is walked some other way.
+/// `e`, after a check that `x` (lowered to `ir`), a .NET collection, is not null where it may be
+and cellChecked (ctx: Ctx) (x: Fable.Expr) (ir: Expr) (e: Expr) : Expr =
+    if mayBeNullCell ctx x then
+        ctx.State.UsesRuntime <- true
+        ESeq(ERt("fable_rt.checkCellNonNull($0)", [ ir ], tVoid), e)
+    else
+        e
+
 and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
     let (Uncast inner) = source
 
@@ -6556,7 +6605,10 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
             bindArgs
                 ctx
                 [ lw ctx inner ]
-                (fun xs -> EEmit("fable_rt.raToList($0)", xs, TEnt(listEnt ctx.State, [ itemOf xs.Head ]))),
+                (fun xs ->
+                    cellChecked ctx inner xs.Head
+                    <| EEmit("fable_rt.raToList($0)", xs, TEnt(listEnt ctx.State, [ itemOf xs.Head ]))
+                ),
             "list"
         )
     | Fable.DeclaredType(ent, [ k; v ]) when isDictionaryName ent.FullName ->
@@ -6566,7 +6618,10 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
             bindArgs
                 ctx
                 [ lw ctx inner ]
-                (fun xs -> EEmit("fable_rt.dictToList($0)", xs, TEnt(listEnt ctx.State, [ pairTy ]))),
+                (fun xs ->
+                    cellChecked ctx inner xs.Head
+                    <| EEmit("fable_rt.dictToList($0)", xs, TEnt(listEnt ctx.State, [ pairTy ]))
+                ),
             "list"
         )
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.HashSet`1" ->
@@ -6574,7 +6629,10 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
             bindArgs
                 ctx
                 [ lw ctx inner ]
-                (fun xs -> EEmit("fable_rt.setToList($0)", xs, TEnt(listEnt ctx.State, [ mapType ctx None item ]))),
+                (fun xs ->
+                    cellChecked ctx inner xs.Head
+                    <| EEmit("fable_rt.setToList($0)", xs, TEnt(listEnt ctx.State, [ mapType ctx None item ]))
+                ),
             "list"
         )
     | Fable.DeclaredType(ent, [ item ]) when

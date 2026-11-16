@@ -1965,6 +1965,7 @@ pub fn ResizeArray(comptime T: type) type {
     return *struct {
         const Self = @This();
         pub const fable_identity = {};
+        pub const fable_null_cell = {};
         pub const fable_resize_array = T;
         pub const fable_cyclic = holdsCyclic(T);
         @"$rc": u32 = 1,
@@ -2253,6 +2254,7 @@ pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type
     return *struct {
         const Self = @This();
         pub const fable_identity = {};
+        pub const fable_null_cell = {};
         pub const fable_cyclic = functions_in_cycles or holdsCyclic(K) or holdsCyclic(V);
         pub const Entry = struct { hash: i32, next: i32, kv: ?struct { key: K, value: V } };
         @"$rc": u32 = 1,
@@ -3756,6 +3758,12 @@ pub inline fn checkNonNull(x: anytype) Raised!void {
     if (x == null) return nullRef();
 }
 
+/// Raise NullReferenceException when a .NET collection (a cell with `fable_null_cell`) is the
+/// null cell of its type: before a member is called on it
+pub inline fn checkCellNonNull(x: anytype) Raised!void {
+    if (isCellNull(x)) return nullRef();
+}
+
 /// `o :?> C` of a class: null stays null
 pub fn anyToClass(o: Any, ty: *const ObjType) Raised!Any {
     return objCast(o, ty);
@@ -4183,6 +4191,9 @@ fn hasNullDepth(comptime T: type, comptime depth: u8) bool {
     if (isIface(T)) return false;
     if (isCellPtr(T)) {
         const C = @typeInfo(T).pointer.child;
+        // (.NET's mutable collections, StringBuilder and Random: a null cell, empty, which a
+        // member call checks for, see checkCellNonNull)
+        if (@hasDecl(C, "fable_null_cell")) return true;
         if (@hasDecl(C, "fable_identity") or @hasDecl(C, "fable_object")) return false;
         const st = @typeInfo(C).@"struct";
         for (st.field_names, st.field_types) |name, F| {
@@ -4291,6 +4302,14 @@ fn CellNull(comptime P: type) type {
 /// cell's own type, which reads the cell back, sees it as a null cell)
 fn fillNullCell(comptime P: type, c: P) void {
     const C = @typeInfo(P).pointer.child;
+    if (comptime @hasDecl(C, "fable_null_cell")) {
+        // (its fields' own defaults: an empty collection, never changed, as members check)
+        const gc = if (comptime @hasField(C, "$gc")) c.@"$gc" else {};
+        c.* = .{};
+        if (comptime @hasField(C, "$gc")) c.@"$gc" = gc;
+        c.@"$rc" = arrays.null_count;
+        return;
+    }
     c.@"$rc" = arrays.null_count;
     const st = @typeInfo(C).@"struct";
     inline for (st.field_names, st.field_types) |name, F| {

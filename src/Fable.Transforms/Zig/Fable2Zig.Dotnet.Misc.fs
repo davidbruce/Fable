@@ -193,35 +193,21 @@ let call
                 [ Fable.Any ]
             )
 
-        dotnetCall
+        let items =
+            Fable.TypeCast(Fable.TypeCast(a, Fable.Array(Fable.Any, Fable.MutableArray)), objSeq)
+
+        libraryCall
             ctx
             r
-            "System.Collections.Generic.IEnumerable`1"
-            "GetEnumerator"
+            "Seq"
+            "getEnumerator"
             { info with
-                ThisArg =
-                    Some(
-                        Fable.Call(
-                            Fable.Import(
-                                {
-                                    Selector = "OfArray"
-                                    Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Collections.SeqModule"
-                                    Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
-                                },
-                                Fable.Any,
-                                None
-                            ),
-                            Fable.CallInfo.Create(
-                                args = [ Fable.TypeCast(a, Fable.Array(Fable.Any, Fable.MutableArray)) ],
-                                genArgs = [ Fable.Any ]
-                            ),
-                            objSeq,
-                            r
-                        )
-                    )
-                Args = []
+                ThisArg = None
                 GenericArgs = [ Fable.Any ]
+                SignatureArgTypes = []
+                MemberRef = None
             }
+            [ items ]
             t
     // (the non-generic IEnumerable is a sequence of objects here)
     | "System.Collections.IEnumerable", "GetEnumerator", _ ->

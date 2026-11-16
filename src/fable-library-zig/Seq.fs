@@ -4,11 +4,14 @@
 /// this `SeqOf`; the runtime knows it by its field, to write it with `%A` (`seq [1; 2; ...]`).
 module Fable.Library.Zig.Seq
 
-/// A walk: `next` gives the next item, and `close` runs any cleanup if stopped early.
+/// A walk: `next` gives the next item, and `close` runs any cleanup if stopped early. `reset`:
+/// whether `IEnumerator.Reset()` may start it again, as .NET's enumerators of lists, arrays,
+/// collections and ranges do (those of sequence expressions and of the Seq functions raise).
 type Walk<'T> =
     {
         next: unit -> 'T option
         close: unit -> unit
+        reset: bool
     }
 
 type SeqOf<'T> = { fable_seq: unit -> Walk<'T> }
@@ -21,15 +24,29 @@ let private walker (next: unit -> 'T option) : Walk<'T> =
     {
         next = next
         close = noop
+        reset = false
     }
 
 let private walkerClose (next: unit -> 'T option) (close: unit -> unit) : Walk<'T> =
     {
         next = next
         close = close
+        reset = false
+    }
+
+/// (a walk that `Reset()` may start again)
+let private resettableWalker (next: unit -> 'T option) : Walk<'T> =
+    {
+        next = next
+        close = noop
+        reset = true
     }
 
 let private walk (source: SeqOf<'T>) : Walk<'T> = source.fable_seq ()
+
+/// `source`, whose walks `Reset()` may start again
+let private resettable (source: SeqOf<'T>) : SeqOf<'T> =
+    { fable_seq = fun () -> { walk source with reset = true } }
 
 let private walking (source: SeqOf<'T>) (useWalk: Walk<'T> -> 'R) : 'R =
     let w = walk source
@@ -85,7 +102,7 @@ let ofList<'T> (source: 'T list) : SeqOf<'T> =
     make (fun () ->
         let mutable rest = source
 
-        walker
+        resettableWalker
         <| fun () ->
             match rest with
             | x :: tail ->
@@ -99,6 +116,21 @@ let ofArray<'T> (source: 'T[]) : SeqOf<'T> =
         let mutable i = 0
 
         walker
+        <| fun () ->
+            if i < source.Length then
+                i <- i + 1
+                Some source.[i - 1]
+            else
+                None
+    )
+
+/// An array (or a string's chars) given where a sequence is expected: unlike `Seq.ofArray`'s, its
+/// enumerator resets, as .NET's of an array
+let ofCollection<'T> (source: 'T[]) : SeqOf<'T> =
+    make (fun () ->
+        let mutable i = 0
+
+        resettableWalker
         <| fun () ->
             if i < source.Length then
                 i <- i + 1
@@ -911,7 +943,7 @@ let rangeInt (start: int) (step: int) (stop: int) : SeqOf<int> =
             else
                 start < stop
 
-        walker
+        resettableWalker
         <| fun () ->
             if ended then
                 None
@@ -939,7 +971,7 @@ let rangeInt64 (start: int64) (step: int64) (stop: int64) : SeqOf<int64> =
             else
                 start < stop
 
-        walker
+        resettableWalker
         <| fun () ->
             if ended then
                 None
@@ -962,7 +994,7 @@ let rangeUInt64 (start: uint64) (step: uint64) (stop: uint64) : SeqOf<uint64> =
         let mutable next = start
         let mutable ended = start > stop
 
-        walker
+        resettableWalker
         <| fun () ->
             if ended then
                 None
@@ -986,7 +1018,7 @@ let private rangeOf (zero: 'T) (start: 'T) (step: 'T) (stop: 'T) (add: 'T -> 'T 
     make (fun () ->
         let mutable next = start
 
-        walker
+        resettableWalker
         <| fun () ->
             let x = next
 
@@ -1002,7 +1034,7 @@ let rangeDecimal (start: decimal) (step: decimal) (stop: decimal) : SeqOf<decima
 let rangeBigInt (start: bigint) (step: bigint) (stop: bigint) : SeqOf<bigint> = rangeOf 0I start step stop (+)
 
 let rangeChar (start: char) (stop: char) : SeqOf<char> =
-    map char (rangeInt (int start) 1 (int stop))
+    resettable (map char (rangeInt (int start) 1 (int stop)))
 
 let rangeFloat (start: float) (step: float) (stop: float) : SeqOf<float> =
     if step = 0.0 then
@@ -1011,7 +1043,7 @@ let rangeFloat (start: float) (step: float) (stop: float) : SeqOf<float> =
     make (fun () ->
         let mutable i = 0
 
-        walker
+        resettableWalker
         <| fun () ->
             let x = start + float i * step
 
@@ -1708,8 +1740,7 @@ let enumerateFromFunctions<'E, 'T> (create: unit -> 'E) (moveNext: 'E -> bool) (
     )
 
 /// `(s :> IEnumerable<'T>).GetEnumerator()`: an enumerator over a walk of the sequence.
-/// (`Reset` starts a new walk: what .NET's enumerators of arrays, lists and collections do; one of
-/// a sequence expression raises NotSupportedException on .NET, here it walks the sequence again)
+/// (`Reset` starts a new walk where the walk allows it, see Walk; otherwise NotSupportedException)
 let getEnumerator<'T> (source: SeqOf<'T>) : System.Collections.Generic.IEnumerator<'T> =
     let mutable w = walk source
     let mutable current: 'T option = None
@@ -1729,6 +1760,9 @@ let getEnumerator<'T> (source: SeqOf<'T>) : System.Collections.Generic.IEnumerat
               current.IsSome
 
           member _.Reset() =
+              if not w.reset then
+                  raise (System.NotSupportedException("Reset is not supported on this enumerator."))
+
               w.close ()
               w <- walk source
               current <- None

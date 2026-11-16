@@ -360,7 +360,6 @@ type TypeWithParameterizedUnitMeasureTest_Test =
 // -------------------------------------------------------------
 
 // Tested ported from https://github.com/fable-compiler/Fable/pull/1336/files
-#if !FABLE_COMPILER_ZIG // (a [<DefaultValue>] field of a .NET collection type (Dictionary): .NET collections are not null in the Zig target yet)
 type TypeWithDefaultValueTest() =
     [<DefaultValue>]
     val mutable IntValue: int
@@ -370,7 +369,6 @@ type TypeWithDefaultValueTest() =
 
     [<DefaultValue>]
     val mutable ObjValue: System.Collections.Generic.Dictionary<string, string>
-#endif
 
 type ClassWithDefaultValueInstanceFields =
     val X: int

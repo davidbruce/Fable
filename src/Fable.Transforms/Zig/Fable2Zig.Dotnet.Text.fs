@@ -775,7 +775,12 @@ let call
         | Fable.DelegateType _
         | Fable.List _
         | Fable.Tuple _
-        | Fable.AnonymousRecordType _ ->
+        | Fable.AnonymousRecordType _
+        // (.NET's mutable collections, StringBuilder and Random: the null cell of the type)
+        | Fable.Array(_, Fable.ResizeArray) ->
+            ctx.State.UsesRuntime <- true
+            EEmit("fable_rt.nullOf($R)", [], mapType ctx r t)
+        | Fable.DeclaredType(entRef, _) when nullCellEntity entRef.FullName ->
             ctx.State.UsesRuntime <- true
             EEmit("fable_rt.nullOf($R)", [], mapType ctx r t)
         | _ -> fail r "the Zig target has no default value of this type (%A); .NET's is null" t

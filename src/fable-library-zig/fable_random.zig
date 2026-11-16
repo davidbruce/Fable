@@ -30,6 +30,7 @@ pub const mbig: i32 = std.math.maxInt(i32);
 
 pub const Random = *struct {
     pub const fable_identity = {};
+    pub const fable_null_cell = {};
     @"$rc": u32 = 1,
     seed: [56]i32 = @splat(0),
     inext: usize = 0,
@@ -164,6 +165,7 @@ pub fn randomNextBytes(r: Random, buffer: Array(u8)) void {
 
 pub const StringBuilder = *struct {
     pub const fable_identity = {};
+    pub const fable_null_cell = {};
     @"$rc": u32 = 1,
     units: std.ArrayList(u16) = .empty,
 
