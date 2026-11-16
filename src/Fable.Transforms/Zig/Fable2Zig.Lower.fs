@@ -5115,10 +5115,11 @@ and dotnetCall
         && info.Args.Length = 1
         ->
         lw ctx info.Args.Head
-    // (`Comparer<'T>.Default.Compare(a, b)`: F#'s comparison; `Default` is the only comparer of
-    // this type here)
-    | "System.Collections.Generic.Comparer`1", "Compare" when info.Args.Length = 2 ->
-        dotnetCall ctx r "Microsoft.FSharp.Core.Operators" "Compare" { info with ThisArg = None } t
+    // (`c.Compare(a, b)` of a `Comparer<'T>`: an IComparer here, `Default` or one of `Create`)
+    | "System.Collections.Generic.Comparer`1", "Compare" when info.Args.Length = 2 && info.ThisArg.IsSome ->
+        libraryCall ctx r "Array" "comparerCompare" info (info.ThisArg.Value :: info.Args) t
+    | "System.Collections.Generic.Comparer`1", "Create" when info.Args.Length = 1 ->
+        libraryCall ctx r "Array" "comparerOfDelegate" info info.Args t
     // (a format provider given to a number's, a date's or Convert's member: the culture is the
     // invariant one here, as without it; see `isCulture`)
     | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single" | "System.Decimal" | "System.Numerics.BigInteger" | "System.Convert" | "System.DateTime" | "System.DateTimeOffset" | "System.TimeSpan" | "System.DateOnly" | "System.TimeOnly"),

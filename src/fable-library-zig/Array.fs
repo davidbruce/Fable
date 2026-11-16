@@ -1101,6 +1101,15 @@ let comparerOfFunction (f: 'T -> 'T -> int) : System.Collections.Generic.ICompar
         member _.Compare(a, b) = f a b
     }
 
+/// `Comparer<'T>.Create(comparison)`: an IComparer of the delegate
+let comparerOfDelegate (f: System.Comparison<'T>) : System.Collections.Generic.IComparer<'T> =
+    { new System.Collections.Generic.IComparer<'T> with
+        member _.Compare(a, b) = f.Invoke(a, b)
+    }
+
+/// `c.Compare(a, b)` of a `Comparer<'T>` (an IComparer here: `Default` or one made by `Create`)
+let comparerCompare (c: System.Collections.Generic.IComparer<'T>) (a: 'T) (b: 'T) : int = c.Compare(a, b)
+
 /// `ComparisonIdentity.Structural`: F#'s comparison
 let structuralComparer<'T when 'T: comparison> () : System.Collections.Generic.IComparer<'T> =
     { new System.Collections.Generic.IComparer<'T> with

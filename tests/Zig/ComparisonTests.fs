@@ -1186,3 +1186,16 @@ let ``test EqualityComparer.Equals works`` () =
 let ``test EqualityComparer.GetHashCode works`` () =
     genericHash 1 |> equal ((1).GetHashCode())
     genericHash "1" |> equal ("1".GetHashCode())
+[<Fact>]
+let ``test Comparer.Compare works`` () =
+    genericCompare 1 1 |> equal 0
+    genericCompare 1 2 |> equal -1
+    genericCompare 2 1 |> equal 1
+
+[<Fact>]
+let ``test Comparer.Create works`` () =
+    let cmp = Comparer<'T>.Create(fun x y -> -(compare x y))
+    cmp.Compare(1, 1) |> equal 0
+    cmp.Compare(1, 2) |> equal 1
+    cmp.Compare(2, 1) |> equal -1
+
