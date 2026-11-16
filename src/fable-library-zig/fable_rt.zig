@@ -291,6 +291,20 @@ pub fn markShared(x: anytype) Raised!void {
 // cells then point to shared ones, never the other way. Nothing is taken back while weak
 // references to shared values exist (one could take a reference meanwhile). ----
 
+/// (a cell of this thread's `[<StackArena>]`: its memory is that function's stack)
+inline fn inThreadArena(c: anytype) bool {
+    if (thread.arena == null) return false;
+    const bytes: [*]u8 = @ptrCast(c);
+    return arenaOwning(bytes[0..@sizeOf(@TypeOf(c.*))]) != null;
+}
+
+/// Can this cell, counted once, be taken out of sharing (its shared bit cleared)? Not while a
+/// weak reference to a shared value exists anywhere (its TryGetTarget could take a reference
+/// meanwhile, and the cell's free would not look for it); a cell that is not shared, yes.
+inline fn unshareable(c: anytype) bool {
+    return !isShared(c) or weak_refs.shared_count.load(.acquire) == 0;
+}
+
 /// The region of `x` that only the receiver holds made its own again
 pub fn adoptShared(x: anytype) void {
     if (weak_refs.shared_count.load(.acquire) != 0) return;
@@ -324,6 +338,7 @@ fn adoptRegion(x: anytype) void {
             while (true) {
                 if (!countedOnce(cur)) return;
                 cur.@"$rc" = 1;
+                if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(cur));
                 var next: ?T = null;
                 inline for (@typeInfo(C).@"struct".field_names) |name| {
                     if (comptime isCount(name)) continue;
@@ -392,7 +407,11 @@ pub fn Iso(comptime T: type) type {
 
         /// (the moved structures join this thread's collector)
         fn settle(c: *Self) void {
-            if (c.moved_ends.len != 0 and !thread.collector_ready) collectorSetup();
+            // (cells the collector follows, in a structure or not, are this thread's now: its
+            // collector is made if it was not)
+            if (comptime holdsCyclic(T)) {
+                if (!thread.collector_ready) collectorSetup();
+            }
             var start: usize = 0;
             for (c.moved_ends) |end| {
                 thread.collector.moveIn(c.moved[start..end]);
@@ -439,7 +458,7 @@ fn isolated(x: anytype) bool {
             if (comptime hasGc(C) or @hasDecl(C, "fable_weak") or @hasDecl(C, "fable_object") or @hasDecl(C, "fable_iso")) return false;
             var cur = x;
             while (true) {
-                if (!countedOnce(cur)) return false;
+                if (!countedOnce(cur) or !unshareable(cur) or inThreadArena(cur)) return false;
                 if (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(cur))) return false;
                 var next: ?T = null;
                 inline for (@typeInfo(C).@"struct".field_names) |name| {
@@ -465,7 +484,7 @@ fn isolated(x: anytype) bool {
                         if (comptime isCellPtr(P)) {
                             const C = @typeInfo(P).pointer.child;
                             if (comptime hasGc(C)) return false;
-                            if (!countedOnce(p)) return false;
+                            if (!countedOnce(p) or !unshareable(p) or inThreadArena(p)) return false;
                             if (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(p))) return false;
                             inline for (@typeInfo(C).@"struct".field_names) |name| {
                                 if (comptime isCount(name)) continue;
@@ -524,10 +543,76 @@ pub fn isoSend(comptime T: type) type {
         pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
 
         pub fn call(x: T) Iso(T) {
-            if (isolated(x)) adoptRegion(x) else shareStored(x);
+            transferOrShare(x);
             return isoBox(T, x);
         }
     };
+}
+
+/// What crosses with a message: the cells and strings it alone holds (counted once, not shared,
+/// not in a `[<StackArena>]`, no weak reference of this thread's to them, none the collector
+/// follows) go as they are, plain; at what is shared already the walk stops (the message's cells
+/// may point at it); anything else is marked shared, with all it reaches (shared never points
+/// at unshared). A unique envelope around a shared part keeps its plain counts.
+fn transferOrShare(x: anytype) void {
+    const T = @TypeOf(x);
+    if (comptime !isManaged(T)) return;
+    if (comptime isFunc(T) or isIface(T) or T == Obj or T == Exn or T == Any) return shareStored(x);
+    if (T == String) {
+        const p = x orelse return;
+        const rc = @atomicLoad(u32, &p.rc, .monotonic);
+        if (rc == Str.literal or rc & shared_bit != 0 or rc == 1) return;
+        return shareStored(x);
+    }
+    if (comptime isSlice(T)) {
+        for (x) |item| transferOrShare(item);
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            const C = ptr.child;
+            if (comptime hasGc(C) or @hasDecl(C, "fable_weak") or @hasDecl(C, "fable_object") or @hasDecl(C, "fable_iso")) return shareStored(x);
+            var cur = x;
+            while (true) {
+                if (isShared(cur)) return;
+                if (cur.@"$rc" != 1 or inThreadArena(cur) or (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(cur)))) return shareStored(cur);
+                if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(cur));
+                var next: ?T = null;
+                inline for (@typeInfo(C).@"struct".field_names) |name| {
+                    if (comptime isCount(name)) continue;
+                    const F = @TypeOf(@field(cur, name));
+                    if (F == T) next = @field(cur, name) else if (F == ?T) next = @field(cur, name) else transferOrShare(@field(cur, name));
+                }
+                cur = next orelse return;
+            }
+        },
+        .optional => if (x) |v| transferOrShare(v),
+        .@"struct" => |st| inline for (st.field_names) |name| transferOrShare(@field(x, name)),
+        .@"union" => {
+            var cur = x;
+            while (true) {
+                var next: ?T = null;
+                switch (cur) {
+                    inline else => |p| {
+                        const P = @TypeOf(p);
+                        if (comptime isCellPtr(P)) {
+                            const C = @typeInfo(P).pointer.child;
+                            if (comptime hasGc(C)) return shareStored(cur);
+                            if (isShared(p)) return;
+                            if (p.@"$rc" != 1 or inThreadArena(p) or (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(p)))) return shareStored(cur);
+                            if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(p));
+                            inline for (@typeInfo(C).@"struct".field_names) |name| {
+                                if (comptime isCount(name)) continue;
+                                if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else transferOrShare(@field(p, name));
+                            }
+                        } else transferOrShare(p);
+                    },
+                }
+                cur = next orelse return;
+            }
+        },
+        else => {},
+    }
 }
 
 /// A message boxed by the thread that holds it (a mailbox of one thread, or a message put back)
@@ -586,17 +671,24 @@ const Region = struct {
         return false;
     }
 
+    /// (what is shared between threads already is left as it is: the value's cells may point at
+    /// it, its counts are atomic; a function, an object, an exception or an interface is shared
+    /// first, so that it is one of those)
     fn visit(r: *Region, x: anytype) void {
         if (!r.ok) return;
         const T = @TypeOf(x);
         if (comptime !isManaged(T)) return;
         if (comptime isFunc(T) or isIface(T) or T == Obj or T == Exn or T == Any) {
-            r.ok = false;
+            markShared(x) catch {
+                drop(take());
+                r.ok = false;
+            };
             return;
         }
         if (T == String) {
             const p = x orelse return;
-            if (@atomicLoad(u32, &p.rc, .acquire) == Str.literal) return;
+            const rc = @atomicLoad(u32, &p.rc, .acquire);
+            if (rc == Str.literal or rc & shared_bit != 0) return;
             _ = r.reach(@intFromPtr(p), &p.rc, null);
             return;
         }
@@ -613,7 +705,8 @@ const Region = struct {
                 }
                 var cur = x;
                 while (r.ok) {
-                    if (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(cur))) {
+                    if (isShared(cur)) return;
+                    if (inThreadArena(cur) or (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(cur)))) {
                         r.ok = false;
                         return;
                     }
@@ -637,6 +730,11 @@ const Region = struct {
                         inline else => |p| {
                             const P = @TypeOf(p);
                             if (comptime isCellPtr(P)) {
+                                if (isShared(p)) return;
+                                if (inThreadArena(p) or (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(p)))) {
+                                    r.ok = false;
+                                    return;
+                                }
                                 if (r.reach(@intFromPtr(p), &p.@"$rc", gcOf(p))) return;
                                 inline for (@typeInfo(@typeInfo(P).pointer.child).@"struct".field_names) |name| {
                                     if (comptime isCount(name)) continue;
@@ -655,33 +753,23 @@ const Region = struct {
     /// Is every cell counted exactly as often as the value refers to it, and every structure of
     /// the collector it reaches reached whole and free to move?
     fn closed(r: *Region) bool {
-        var per_structure: std.AutoHashMapUnmanaged(usize, usize) = .empty;
+        const Seen = struct { reached: usize, members: usize };
+        var per_structure: std.AutoHashMapUnmanaged(usize, Seen) = .empty;
         defer per_structure.deinit(bookkeeping());
         var it = r.cells.iterator();
         while (it.next()) |e| {
             const reached = e.value_ptr.*;
-            if (@atomicLoad(u32, reached.rc, .acquire) & ~shared_bit != reached.seen) return false;
+            if (@atomicLoad(u32, reached.rc, .acquire) != reached.seen) return false;
             const h = reached.hdr orelse continue;
             if (!thread.collector.canMove(h)) return false;
             if (h.st == 0) continue;
             const s = thread.collector.structureOf(h);
             const n = per_structure.getOrPut(bookkeeping(), s.key) catch oom();
-            if (!n.found_existing) n.value_ptr.* = 0;
-            n.value_ptr.* += 1;
+            if (!n.found_existing) n.value_ptr.* = .{ .reached = 0, .members = s.members };
+            n.value_ptr.reached += 1;
         }
-        var ps = per_structure.iterator();
-        while (ps.next()) |e| {
-            // (any member of the structure, to ask how many it has)
-            var cells = r.cells.iterator();
-            while (cells.next()) |c| {
-                const h = c.value_ptr.hdr orelse continue;
-                if (h.st == 0) continue;
-                const s = thread.collector.structureOf(h);
-                if (s.key != e.key_ptr.*) continue;
-                if (s.members != e.value_ptr.*) return false;
-                break;
-            }
-        }
+        var ps = per_structure.valueIterator();
+        while (ps.next()) |n| if (n.reached != n.members) return false;
         return true;
     }
 
@@ -742,7 +830,13 @@ pub fn shareStored(value: anytype) void {
     markShared(value) catch {
         const e = take();
         defer drop(e);
-        @panic("fable: a value the cycle collector follows was stored into a value shared between threads");
+        // (why it cannot be shared: a value the cycle collector follows inside a structure, or one
+        // made in a `[<StackArena>]`)
+        const msg = exnMessage(e);
+        defer drop(msg);
+        write_err("fable: a value that cannot be shared between threads reached another thread: ");
+        writeText(write_err, msg, true);
+        @panic("fable: a value that cannot be shared between threads reached another thread");
     };
 }
 

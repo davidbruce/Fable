@@ -692,3 +692,64 @@ let ``test Iso moves cycles and shared parts between threads`` () =
     t.Start()
     t.Join()
     mb.PostAndReply RingTotal |> equal 4800
+
+[<Fact>]
+let ``test An Iso of a value the collector follows can be dropped on a fresh thread`` () =
+    // (a cell that can be part of a cycle, in none: its new thread's collector is made for it)
+    let iso = Fable.Core.Zig.Iso.pack { Next = None; V = 1 }
+    let seen = ref 0
+
+    let t =
+        Thread(fun () ->
+            let node = Fable.Core.Zig.Iso.unpack iso
+            seen.Value <- node.V
+        )
+
+    t.Start()
+    t.Join()
+    seen.Value |> equal 1
+
+[<Fact>]
+let ``test An Iso may hold what is shared already, as a reply function`` () =
+    let total = ref 0
+    let reply = fun (x: int) -> lock total (fun () -> total.Value <- total.Value + x)
+    let t0 = Thread(fun () -> reply 0)
+    t0.Start()
+    t0.Join()
+    let iso = Fable.Core.Zig.Iso.pack ([ 1; 2; 3 ], reply)
+
+    let t =
+        Thread(fun () ->
+            let (xs, answer) = Fable.Core.Zig.Iso.unpack iso
+            answer (List.sum xs)
+        )
+
+    t.Start()
+    t.Join()
+    total.Value |> equal 6
+
+#if FABLE_COMPILER_ZIG
+[<Fable.Core.Zig.StackArena(65536)>]
+let private packFromArena () : bool =
+    try
+        Fable.Core.Zig.Iso.pack [ 1; 2; 3 ] |> ignore
+        false
+    with :? System.InvalidOperationException ->
+        true
+
+[<Fact>]
+let ``test Iso.pack refuses what was made in a stack arena`` () = packFromArena () |> equal true
+
+[<Fact>]
+let ``test A shared cell in an Iso keeps its weak references`` () =
+    let gate = obj ()
+    let t0 = Thread(fun () -> lock gate (fun () -> ()))
+    t0.Start()
+    t0.Join()
+    let w = System.WeakReference<obj>(gate)
+    let iso = Fable.Core.Zig.Iso.pack ([ 1 ], gate)
+    let (xs, g) = Fable.Core.Zig.Iso.unpack iso
+    let mutable target = null
+    (w.TryGetTarget(&target) && obj.ReferenceEquals(target, g)) |> equal true
+    List.sum xs |> equal 1
+#endif

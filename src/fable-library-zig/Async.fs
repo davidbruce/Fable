@@ -1230,6 +1230,13 @@ let private queueItem (q: MessageQueue<'Msg>) (i: int) : 'Msg =
     | Some box -> peekBox box
     | None -> failwith "a message queue's slot is empty"
 
+/// The `i`th message, left in the queue, of a mailbox shared between threads: marked shared first
+/// (what Scan's function keeps of it may outlive its staying in the queue)
+let private queueItemShared (q: MessageQueue<'Msg>) (i: int) : 'Msg =
+    let msg = queueItem q i
+    shareValue msg
+    msg
+
 let private queueBox (q: MessageQueue<'Msg>) (i: int) : Fable.Core.Zig.Iso<'Msg> =
     match q.items.[q.head + i] with
     | Some box -> box
@@ -1259,7 +1266,9 @@ type MailboxOf<'Msg> =
     {
         body: MailboxOf<'Msg> -> AsyncOf<unit>
         queue: MessageQueue<'Msg>
-        mutable waiting: ('Msg -> unit) option
+        /// (the Receive that waits: given the message in its box, which it opens only when it takes
+        /// it, so that one put back by a timeout that won is put back boxed)
+        mutable waiting: (Fable.Core.Zig.Iso<'Msg> -> unit) option
         mutable started: bool
         mutable begun: bool
         mutable running: bool
@@ -1318,7 +1327,7 @@ let private beginMailboxBody<'Msg> (mb: MailboxOf<'Msg>) : unit =
 
 type private PostAction<'Msg> =
     | BeginBody of int
-    | Resume of ('Msg -> unit) * int
+    | Resume of (Fable.Core.Zig.Iso<'Msg> -> unit) * int
     | Queued
 
 let private runMailboxTurn<'Msg> (mb: MailboxOf<'Msg>) (turn: int) (action: unit -> unit) : unit =
@@ -1412,13 +1421,14 @@ let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
 
         match action with
         | BeginBody turn -> runMailboxTurn mb turn (fun () -> beginMailboxBody mb)
-        | Resume(resume, turn) -> runMailboxTurn mb turn (fun () -> resume (unbox' box))
+        | Resume(resume, turn) -> runMailboxTurn mb turn (fun () -> resume box)
         | Queued -> ()
     else
         match mb.waiting with
         | Some resume ->
             mb.waiting <- None
-            schedule 0 (fun () -> resume msg) |> ignore
+            let box = holdBox msg
+            schedule 0 (fun () -> resume box) |> ignore
         | None -> queueAdd mb.queue msg
 
 let mailboxQueueLength<'Msg> (mb: MailboxOf<'Msg>) : int =
@@ -1482,7 +1492,7 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
                                     )
 
                             mb.waiting <-
-                                Some(fun msg ->
+                                Some(fun box ->
                                     let won, timerOpt, regOpt =
                                         lock
                                             mb
@@ -1491,7 +1501,7 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
                                                     done' <- true
                                                     true, timer, registration
                                                 else
-                                                    queueAdd mb.queue msg
+                                                    queueAddBox mb.queue box
                                                     false, None, None
                                             )
 
@@ -1504,6 +1514,8 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
                                         | Some d -> d.Dispose()
                                         | None -> ()
 
+                                        let msg = unbox' box
+                                        adoptShared msg
                                         k.ok (Some msg)
                                 )
 
@@ -1567,7 +1579,7 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
             let mutable registration: System.IDisposable option = None
 
             mb.waiting <-
-                Some(fun msg ->
+                Some(fun box ->
                     if not done' then
                         done' <- true
 
@@ -1579,9 +1591,9 @@ let mailboxTryReceive<'Msg> (mb: MailboxOf<'Msg>) (timeout: int option) : AsyncO
                         | Some d -> d.Dispose()
                         | None -> ()
 
-                        k.ok (Some msg)
+                        k.ok (Some(unbox' box))
                     else
-                        queueAdd mb.queue msg
+                        queueAddBox mb.queue box
                 )
 
             if not done' then
@@ -1626,7 +1638,7 @@ let mailboxScan<'Msg, 'T> (mb: MailboxOf<'Msg>) (f: 'Msg -> AsyncOf<'T> option) 
                             let mutable i = 0
 
                             while res.IsNone && i < queueCount mb.queue do
-                                match f (queueItem mb.queue i) with
+                                match f (queueItemShared mb.queue i) with
                                 | Some c ->
                                     queueRemoveAt mb.queue i |> ignore
                                     res <- Some c
@@ -1636,8 +1648,8 @@ let mailboxScan<'Msg, 'T> (mb: MailboxOf<'Msg>) (f: 'Msg -> AsyncOf<'T> option) 
                                 mb.running <- false
 
                                 mb.waiting <-
-                                    Some(fun msg ->
-                                        lock mb (fun () -> queueAdd mb.queue msg)
+                                    Some(fun box ->
+                                        lock mb (fun () -> queueAddBox mb.queue box)
                                         start (look ()) k
                                     )
 
@@ -1662,8 +1674,8 @@ let mailboxScan<'Msg, 'T> (mb: MailboxOf<'Msg>) (f: 'Msg -> AsyncOf<'T> option) 
                 | Some c -> start c k
                 | None ->
                     mb.waiting <-
-                        Some(fun msg ->
-                            queueAdd mb.queue msg
+                        Some(fun box ->
+                            queueAddBox mb.queue box
                             start (look ()) k
                         )
         )

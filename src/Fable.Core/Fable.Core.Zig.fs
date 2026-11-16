@@ -75,7 +75,7 @@ let sameCell (a: 'T) (b: 'T) : bool = obj.ReferenceEquals(a, b)
 /// captured by a thread, it moves by one pointer, its value never marked shared; `Iso.unpack`
 /// gives the value, once, to the thread that unpacks it. Under .NET it holds the value.
 [<Sealed>]
-type Iso<'T>(value: 'T) =
+type Iso<'T> internal (value: 'T) =
     let gate = obj ()
     let mutable held = Some value
 
@@ -94,8 +94,11 @@ type Iso<'T>(value: 'T) =
 [<RequireQualifiedAccess>]
 module Iso =
     /// Take `value` into an Iso. In the Zig target the value must be isolated: the caller gives
-    /// it up (no later use), nothing else refers to any part of it, and it holds no function,
-    /// object, or value of a type that can be part of a cycle (InvalidOperationException if not).
+    /// it up (no later use), and each part of it that is not shared between threads already is
+    /// referred to only from inside it (InvalidOperationException if not). It may hold cycles (a
+    /// structure of the cycle collector moves to the thread that unpacks it) and parts shared
+    /// already, as a reply channel (they stay shared); not something made in a
+    /// `[<StackArena>]`. Under .NET nothing is checked.
     [<Emit("$iso_pack($0)")>]
     let pack (value: 'T) : Iso<'T> = Iso<'T>(value)
 
