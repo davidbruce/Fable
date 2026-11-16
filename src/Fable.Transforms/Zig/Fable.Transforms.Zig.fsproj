@@ -2,6 +2,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <Compile Include="Zig.IR.fs" />
+    <Compile Include="Fable2Zig.LowerContext.fs" />
+    <Compile Include="Fable2Zig.LowerTypes.fs" />
+    <Compile Include="Fable2Zig.LowerHelpers.fs" />
     <Compile Include="Fable2Zig.Lower.fs" />
     <Compile Include="Fable2Zig.Dotnet.Helpers.fs" />
     <Compile Include="Fable2Zig.Dotnet.Async.fs" />

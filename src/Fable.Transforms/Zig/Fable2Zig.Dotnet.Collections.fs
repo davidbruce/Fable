@@ -7,6 +7,9 @@ open Fable
 open Fable.AST
 open Fable.Transforms
 open Fable.Transforms.Zig.IR
+open Fable.Transforms.Zig.LowerContext
+open Fable.Transforms.Zig.LowerTypes
+open Fable.Transforms.Zig.LowerHelpers
 open Fable.Transforms.Zig.Lower
 open Fable.Transforms.Zig.DotnetHelpers
 
@@ -250,13 +253,13 @@ let call
             | Fable.Array(item, _) -> item
             | _ -> t
 
-        if Fable.Transforms.Zig.Lower.isArrayIndexInBounds ctx a i then
+        if Fable.Transforms.Zig.LowerHelpers.isArrayIndexInBounds ctx a i then
             pure' "fable_rt.arrayItemAt($0, @as(usize, @intCast($1)))" [ a; i ] (mapType ctx r itemTy)
         else
             rt "fable_rt.arrayGet($0, $1)" [ a; i ] (mapType ctx r itemTy)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "SetArray", [ a; i; x ]
     | "Microsoft.FSharp.Collections.ArrayModule", "Set", [ a; i; x ] ->
-        if Fable.Transforms.Zig.Lower.isArrayIndexInBounds ctx a i then
+        if Fable.Transforms.Zig.LowerHelpers.isArrayIndexInBounds ctx a i then
             pure' "fable_rt.arraySetAt($0, @as(usize, @intCast($1)), $2)" [ a; i; x ] tVoid
         else
             rt "fable_rt.arraySet($0, $1, $2)" [ a; i; x ] tVoid

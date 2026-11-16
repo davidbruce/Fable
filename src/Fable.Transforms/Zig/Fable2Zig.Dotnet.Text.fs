@@ -7,6 +7,9 @@ open Fable
 open Fable.AST
 open Fable.Transforms
 open Fable.Transforms.Zig.IR
+open Fable.Transforms.Zig.LowerContext
+open Fable.Transforms.Zig.LowerTypes
+open Fable.Transforms.Zig.LowerHelpers
 open Fable.Transforms.Zig.Lower
 open Fable.Transforms.Zig.DotnetHelpers
 
@@ -759,7 +762,7 @@ let call
     // (`for i in 0 .. s.Length - 1` or guarded `while i < s.Length`: in range, and not null)
     | "System.String", "get_Chars", [ s; i ]
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "GetString", [ s; i ] when
-        Fable.Transforms.Zig.Lower.isArrayIndexInBounds ctx s i
+        Fable.Transforms.Zig.LowerHelpers.isArrayIndexInBounds ctx s i
         ->
         pure' "$0.?.units()[@as(usize, @intCast($1))]" [ s; i ] tChar
     | "System.String", "get_Chars", [ s; i ]

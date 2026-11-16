@@ -16,7 +16,7 @@ type ZigFile =
 
 let private transformFileHere (com: Compiler) (file: Fable.File) : ZigFile =
     // (the .NET members by domain, which come after the lowering, given to it)
-    Lower.domainCalls <-
+    Fable.Transforms.Zig.LowerContext.domainCalls <-
         function
         | "async" -> DotnetAsync.call
         | "collections" -> DotnetCollections.call

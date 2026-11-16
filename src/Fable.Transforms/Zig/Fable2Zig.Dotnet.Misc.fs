@@ -8,6 +8,9 @@ open Fable
 open Fable.AST
 open Fable.Transforms
 open Fable.Transforms.Zig.IR
+open Fable.Transforms.Zig.LowerContext
+open Fable.Transforms.Zig.LowerTypes
+open Fable.Transforms.Zig.LowerHelpers
 open Fable.Transforms.Zig.Lower
 open Fable.Transforms.Zig.DotnetHelpers
 
@@ -1049,9 +1052,9 @@ let call
                 | _ -> None
 
             let known =
-                match Fable.Transforms.Zig.Lower.staticTypeOf ctx def, items with
+                match Fable.Transforms.Zig.LowerHelpers.staticTypeOf ctx def, items with
                 | Some(Fable.DeclaredType(ent, gs)), Some ts when gs.Length = ts.Length ->
-                    let ks = ts |> List.map (Fable.Transforms.Zig.Lower.staticTypeOf ctx)
+                    let ks = ts |> List.map (Fable.Transforms.Zig.LowerHelpers.staticTypeOf ctx)
 
                     if ks |> List.forall Option.isSome then
                         Some(Fable.DeclaredType(ent, ks |> List.map Option.get))
@@ -1338,14 +1341,14 @@ let call
          | [ Fable.Value(Fable.NewArray(Fable.ArrayValues [], _, _), _) ] -> true
          | _ -> false)
         && (
-            match Fable.Transforms.Zig.Lower.staticTypeOf ctx t0 with
+            match Fable.Transforms.Zig.LowerHelpers.staticTypeOf ctx t0 with
             | Some(Fable.Number _ | Fable.Char | Fable.Boolean | Fable.Any) -> true
             | _ -> false
         )
         ->
         ctx.State.UsesRuntime <- true
 
-        match Fable.Transforms.Zig.Lower.staticTypeOf ctx t0 with
+        match Fable.Transforms.Zig.LowerHelpers.staticTypeOf ctx t0 with
         | Some Fable.Any -> pure' "fable_rt.objectNew()" [] tAny
         | Some ty -> EEmit($"fable_rt.box(fable_rt.defaultOf(%s{zigType (mapType ctx r ty)}))", [], tAny)
         | None -> failwith "unreachable"
