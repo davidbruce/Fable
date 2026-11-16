@@ -218,6 +218,16 @@ let call
                 )
 
         rt "fable_rt.strFormatObjs($0, $1)" [ pattern; objs ] tStr
+    // (the values as an array known only when the program runs: `String.Format(fmt, args)`)
+    | "System.String", "Format", ((Fable.Value(Fable.StringConstant _, _)) as pattern) :: [ Uncast arr ] when
+        (match arr with
+         | Fable.Value(Fable.NewArray(Fable.ArrayValues _, _, _), _) -> false
+         | _ ->
+             match arr.Type with
+             | Fable.Array(Fable.Any, _) -> true
+             | _ -> false)
+        ->
+        rt "fable_rt.strFormatObjs($0, $1)" [ pattern; arr ] tStr
     | "System.String", "Format", (Fable.Value(Fable.StringConstant fmt, _)) :: values ->
         compositeFormat ctx r fmt values t
     // (a culture changes nothing here: formatting is the invariant culture's)
@@ -872,6 +882,28 @@ let call
     | "Microsoft.FSharp.Core.StringModule", "Exists", [ f; s ] -> rt "fable_rt.strExists($0, $1)" [ f; s ] tBool
     | "Microsoft.FSharp.Core.StringModule", "Filter", [ f; s ] -> rt "fable_rt.strFilter($0, $1)" [ f; s ] tStr
     | "Microsoft.FSharp.Core.StringModule", "Collect", [ f; s ] -> rt "fable_rt.strCollect($0, $1)" [ f; s ] tStr
+    // (`String.Concat(a, b, c)` of objects: the text of each, a null one as nothing)
+    | "System.String", "Concat", parts when
+        parts.Length >= 2
+        && parts |> List.exists (fun x -> unwrapNullness x.Type <> Fable.String)
+        && parts
+           |> List.forall (fun x ->
+               match x.Type with
+               | Fable.Array _ -> false
+               | _ -> true
+           )
+        ->
+        let holes =
+            parts
+            |> List.mapi (fun i x ->
+                if unwrapNullness x.Type = Fable.String then
+                    $"$%d{i}"
+                else
+                    $"fable_rt.arg(.{{ .kind = 'T' }}, $%d{i})"
+            )
+            |> String.concat ", "
+
+        pure' $"fable_rt.format(.{{ %s{holes} }})" parts tStr
     | "System.String", "Concat", parts when
         not parts.IsEmpty
         && parts |> List.forall (fun x -> unwrapNullness x.Type = Fable.String)

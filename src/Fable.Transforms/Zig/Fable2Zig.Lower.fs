@@ -4628,6 +4628,11 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                     // (a value whose type is a type parameter: its `ToString`, known when the
                     // Zig is compiled)
                     | ('P' | 'O' | 's'), Fable.GenericParam _ -> 'T'
+                    // (an object, an array, an exception, an object of a class, an interface: its
+                    // own `ToString`, as .NET writes it; null as the empty text)
+                    | ('P' | 'O' | 's'), (Fable.Any | Fable.Array _ | Fable.DeclaredType _ | Fable.Nullable _) -> 'T'
+                    // (`%A` of an object of a class: its `ToString`, as F# writes it)
+                    | 'A', Fable.DeclaredType(entRef, _) when (objInfo ctx r entRef).IsSome -> 'T'
                     | 'A', _ -> 'A'
                     | _, (Fable.String | Fable.Char | Fable.Boolean | Fable.Number _) ->
                         fail r "the Zig target does not support the format %%%c for this type of value yet" letter

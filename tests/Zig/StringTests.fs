@@ -1277,6 +1277,9 @@ let ``test %A and ToString for voption, struct tuple, uint16, and functions`` ()
 
 // ---- ported from tests/Js/Main (2026-11-16) ----
 
+
+
+
 type B() =
       let mutable a = 5
       override x.ToString() =
@@ -1925,4 +1928,46 @@ let ``test String.LastIndexOf with OrdinalIgnoreCase StringComparison`` () =
 let ``test String.LastIndexOf with index and OrdinalIgnoreCase StringComparison`` () =
     "ABCDBC".LastIndexOf("b", 3, StringComparison.OrdinalIgnoreCase) |> equal 1
     "ABCDBC".LastIndexOf("b", 3, StringComparison.Ordinal) |> equal -1
+
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test sprintf "%O" with overloaded string works`` () =
+    let o = Test(5)
+    sprintf "%O" o |> equal "10"
+
+[<Fact>]
+let ``test sprintf "%A" with overloaded string works`` () =
+    let o = Test(5)
+    (sprintf "%A" o).Replace("\"", "") |> equal "10"
+
+[<Fact>]
+let ``test %O in interpolated strings works recursively`` () =
+    // See #3078
+    let b = B()
+    $"b=(%O{b})" |> equal "b=(a=6)"
+    $"%O{b}%O{b}" |> equal "a=7a=8"
+
+[<Fact>]
+let ``test String.Format should fail if there are less arguments than placeholders`` () =
+    // See #2768
+    throwsAnyError <| fun () -> String.Format ("Hello {0}", args = Array.empty)
+
+[<Fact>]
+let ``test String.Format treats null arguments as empty`` () =
+    // See #5162
+    let n: string = null
+    let o: obj = null
+    String.Format("a{0}b", n) |> equal "ab"
+    String.Format("a{0}b", o) |> equal "ab"
+    String.Format("[{0,3}]", n) |> equal "[   ]"
+
+[<Fact>]
+let ``test System.String.Concat treats null arguments as empty`` () =
+    // See #5167
+    String.Concat("a", (null: string), "b") |> equal "ab"
+    String.Concat((null: string), "b") |> equal "b"
+    String.Concat([| "a"; null; "b" |]) |> equal "ab"
+    String.Concat(box "a", null, box 1) |> equal "a1"
 
