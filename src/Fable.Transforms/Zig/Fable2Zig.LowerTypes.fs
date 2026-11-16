@@ -208,6 +208,12 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         || ent.FullName = "System.Text.UnicodeEncoding"
         ->
         TPrim "fable_rt.TextEncoding"
+    // (a format of printf given as a value: its text and what an interpolated string captured)
+    | Fable.DeclaredType(ent, _) when
+        ent.FullName = "Microsoft.FSharp.Core.PrintfFormat`4"
+        || ent.FullName = "Microsoft.FSharp.Core.PrintfFormat`5"
+        ->
+        TTuple [ tStr; mapType ctx r (Fable.Array(Fable.Any, Fable.MutableArray)) ]
     // (`IList<'T>`, as an array is seen through it: the array; `System.Array`: an array of objects)
     | Fable.DeclaredType(ent, [ item ]) when
         ent.FullName = "System.Collections.Generic.IList`1"

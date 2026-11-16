@@ -225,6 +225,10 @@ let (|PrintfCall|_|) (e: Fable.Expr) : (string * string * Fable.Expr list) optio
     | _ -> None
 
 /// `kprintf cont fmt args` as `cont (sprintf fmt args)`.
+/// (for the names of the values of a printf that is used as a function)
+let internal printfValues =
+    new System.Threading.ThreadLocal<int ref>(fun () -> ref 0)
+
 let kprintf
     (imp: Fable.ImportInfo)
     (info: Fable.CallInfo)
@@ -254,15 +258,64 @@ let kprintf
             r
         )
 
-    let text =
-        if args.IsEmpty then
-            toString
-        else
-            Fable.CurriedApply(toString, args, Fable.String, r)
+    // (how many values the format takes: none more for an interpolated string, which has them)
+    let needed =
+        match toString with
+        | PrintfCall(_, fmt, []) ->
+            parseFormat r fmt
+            |> List.filter (
+                function
+                | Spec _ -> true
+                | Text _ -> false
+            )
+            |> List.length
+        | _ -> args.Length
 
-    match cont with
-    | Some cont -> Fable.CurriedApply(cont, [ text ], t, r)
-    | None -> text
+    // (the types a function type takes, the first `n` of them, and what is left)
+    let rec peel (n: int) (t: Fable.Type) =
+        match t with
+        | Fable.LambdaType(a, rest) when n > 0 ->
+            let ps, ret = peel (n - 1) rest
+            a :: ps, ret
+        | _ -> [], t
+
+    // (the values of the format, the text given to the continuation, and what is left of the
+    // values for what the continuation gives: `ksprintf append "%d" 42 "x"` is
+    // `append (sprintf "%d" 42) "x"`)
+    let finish (values: Fable.Expr list) (extra: Fable.Expr list) (t: Fable.Type) =
+        let text =
+            if values.IsEmpty then
+                toString
+            else
+                Fable.CurriedApply(toString, values, Fable.String, r)
+
+        match cont with
+        | Some cont when extra.IsEmpty -> Fable.CurriedApply(cont, [ text ], t, r)
+        | Some cont ->
+            let contRet =
+                match cont.Type with
+                | Fable.LambdaType(_, ret) -> ret
+                | _ -> Fable.Any
+
+            Fable.CurriedApply(Fable.CurriedApply(cont, [ text ], contRet, r), extra, t, r)
+        | None when extra.IsEmpty -> text
+        | None -> Fable.CurriedApply(text, extra, t, r)
+
+    if args.Length >= needed then
+        let values, extra = List.splitAt needed args
+        finish values extra t
+    else
+        // (fewer values than the format takes: the function of the others)
+        let missing, ret = peel (needed - args.Length) t
+        let n = printfValues.Value.Value + 1
+        printfValues.Value.Value <- n
+
+        let names =
+            missing |> List.mapi (fun i ty -> AST.makeTypedIdent ty $"kfmt%d{n}_%d{i}")
+
+        let body = finish (args @ (names |> List.map Fable.IdentExpr)) [] ret
+
+        List.foldBack (fun (name: Fable.Ident) body -> Fable.Lambda(name, body, None)) names body
 
 /// `Printf.bprintf sb fmt a b` and `Printf.kbprintf cont sb fmt a b`: the text appended to the
 /// StringBuilder, then the continuation called
@@ -355,10 +408,6 @@ let isCulture (x: Fable.Expr) =
         e.FullName = "System.Globalization.CultureInfo"
         || e.FullName = "System.IFormatProvider"
     | _ -> false
-
-/// (for the names of the values of a printf that is used as a function)
-let internal printfValues =
-    new System.Threading.ThreadLocal<int ref>(fun () -> ref 0)
 
 /// A printf that has not been given all the values its format takes: the printf, and the
 /// values it has.

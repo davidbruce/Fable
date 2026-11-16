@@ -93,6 +93,24 @@ let call
                   _)) :: rest when path.EndsWith("System.Console", System.StringComparison.Ordinal) ->
         console (which = "get_Error") (name = "WriteLine") rest
     // ---- StringBuilder ----
+    // (a format of printf given as a value, `f $"x %d{x}"` with `f (fmt: StringFormat<_>)`)
+    | ("Microsoft.FSharp.Core.PrintfFormat`4" | "Microsoft.FSharp.Core.PrintfFormat`5"), ".ctor", [ text ] ->
+        pure' "fable_rt.printfFormatNew($0, {})" [ text ] (mapType ctx r t)
+    | ("Microsoft.FSharp.Core.PrintfFormat`4" | "Microsoft.FSharp.Core.PrintfFormat`5"), ".ctor", text :: captures :: _ ->
+        pure' "fable_rt.printfFormatNew($0, $1)" [ text; captures ] (mapType ctx r t)
+    | ("Microsoft.FSharp.Core.PrintfFormat`4" | "Microsoft.FSharp.Core.PrintfFormat`5"), "get_Value", f :: _ ->
+        pure' "fable_rt.printfFormatValue($0)" [ f ] tStr
+    // (`sprintf fmt` of a format given as a value that takes no more values)
+    | "Microsoft.FSharp.Core.ExtraTopLevelOperators", "PrintFormatToString", [ f ] when
+        t = Fable.String
+        && (
+            match f.Type with
+            | Fable.DeclaredType(e, _) ->
+                e.FullName.StartsWith("Microsoft.FSharp.Core.PrintfFormat", System.StringComparison.Ordinal)
+            | _ -> false
+        )
+        ->
+        rt "fable_rt.printfFormatText($0)" [ f ] tStr
     | "System.Text.StringBuilder", ".ctor", [] -> pure' "fable_rt.sbNew(null)" [] (mapType ctx r t)
     // (a capacity, or a string and a capacity: the capacity is only a hint)
     | "System.Text.StringBuilder", ".ctor", [ n ] when isInt n ->

@@ -3852,6 +3852,108 @@ pub fn asSame(comptime T: type, x: anytype) T {
     @compileError("fable: a value of type " ++ @typeName(@TypeOf(x)) ++ " is used as a " ++ @typeName(T));
 }
 
+/// A format of printf given as a value (`Printf.StringFormat<string>`): its text and the values
+/// an interpolated string captured
+/// (a tuple, which the compiler counts and frees as it does any: see LowerTypes)
+pub const PrintfFormat = @Tuple(&.{ String, Array(Any) });
+
+/// `PrintfFormat(text)` and `PrintfFormat(text, captures, types)`
+pub fn printfFormatNew(value: String, captures: anytype) PrintfFormat {
+    const A = Array(Any);
+    const C = @TypeOf(captures);
+    const held: A = if (C == void)
+        arrayFrom(A, arrayItems(A, 0))
+    else if (comptime @typeInfo(C) == .optional)
+        (if (captures) |a| dup(a) else arrayFrom(A, arrayItems(A, 0)))
+    else
+        dup(captures);
+    return .{ dup(value), held };
+}
+
+/// `fmt.Value`
+pub fn printfFormatValue(f: PrintfFormat) String {
+    return dup(f[0]);
+}
+
+/// `sprintf fmt` of a format given as a value, which takes no more values: its text with each
+/// hole the value the interpolated string captured for it. (Widths and flags are not applied to
+/// the values here; a precision of a float is.)
+pub fn printfFormatText(f: PrintfFormat) Raised!String {
+    const units = unitsOf(f[0]);
+    const values: []const Any = f[1].items;
+    var b: TextBuilder = .{};
+    var i: usize = 0;
+    var hole: usize = 0;
+    while (i < units.len) {
+        const c = units[i];
+        if (c != '%') {
+            b.add(units[i .. i + 1]);
+            i += 1;
+            continue;
+        }
+        if (i + 1 < units.len and units[i + 1] == '%') {
+            b.addAscii("%");
+            i += 2;
+            continue;
+        }
+        // (flags, a width, a precision, then the letter)
+        var j = i + 1;
+        var precision: ?u8 = null;
+        while (j < units.len and !std.ascii.isAlphabetic(@truncate(units[j]))) : (j += 1) {
+            if (units[j] == '.') {
+                var p: u8 = 0;
+                j += 1;
+                while (j < units.len and units[j] >= '0' and units[j] <= '9') : (j += 1) p = p *| 10 +| @as(u8, @intCast(units[j] - '0'));
+                precision = p;
+                j -= 1;
+            }
+        }
+        if (j >= units.len) return raise(FormatException, str("The format is missing its type of value."));
+        const letter: u8 = @truncate(units[j]);
+        j += 1;
+        // (an interpolated hole: the spec is followed by `%P()`, or is `%P()` itself)
+        if (letter == 'P' and j + 1 < units.len and units[j] == '(' and units[j + 1] == ')') {
+            j += 2;
+        } else if (j + 3 < units.len and units[j] == '%' and units[j + 1] == 'P' and units[j + 2] == '(' and units[j + 3] == ')') {
+            j += 4;
+        }
+        if (hole >= values.len) return raise(FormatException, str("The format takes more values than it was given."));
+        const v = values[hole];
+        hole += 1;
+        const text = try formatHole(letter, precision, v);
+        defer drop(text);
+        b.add(unitsOf(text));
+        i = j;
+    }
+    return b.finish();
+}
+
+fn formatHole(letter: u8, precision: ?u8, v: Any) Raised!String {
+    switch (letter) {
+        'f', 'F', 'e', 'E', 'g', 'G' => {
+            if (tryUnbox(?f64, v)) |x| return floatHole(letter, precision, x);
+            if (tryUnbox(?f32, v)) |x| return floatHole(letter, precision, @as(f64, x));
+        },
+        'b' => if (tryUnbox(?bool, v)) |x| return if (x) str("true") else str("false"),
+        // (`%A`, `%O`, `%d`, `%s` and the others of a boxed value: its ToString)
+        else => {},
+    }
+    return anyToString(v, true);
+}
+
+fn floatHole(letter: u8, precision: ?u8, x: f64) String {
+    const p = precision orelse return switch (letter) {
+        inline 'f', 'F', 'e', 'E', 'g', 'G' => |k| format(.{arg(.{ .kind = k }, x)}),
+        else => unreachable,
+    };
+    return switch (letter) {
+        inline 'f', 'F', 'e', 'E', 'g', 'G' => |k| switch (@as(u4, @intCast(@min(p, 15)))) {
+            inline else => |q| format(.{arg(.{ .kind = k, .precision = q }, x)}),
+        },
+        else => unreachable,
+    };
+}
+
 /// .NET's `default(T)` of a type that has one here (numbers, chars, bools, strings, options,
 /// tuples of them)
 pub fn defaultOf(comptime T: type) T {

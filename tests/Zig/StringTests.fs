@@ -1987,3 +1987,19 @@ let ``test bprintf works`` () =
     Printf.bprintf sb "Hello"
     Printf.bprintf sb " %s!" "world"
     sb.ToString() |> equal "Hello world!"
+[<Fact>]
+let ``test ksprintf curries correctly`` () =
+    let append (a: string) b = a + b
+    let step1 = Printf.ksprintf append "%d"
+    let step2 = step1 42
+    let result = step2 "The answer is: "
+    result |> equal "42The answer is: "
+
+[<Fact>]
+let ``test input of interpolated print format can be retrieved`` () =
+    // See #3969
+    let f (fmt: Printf.StringFormat<string>) = fmt.Value, sprintf fmt
+    let x, s = 42, "z"
+    f $"wow %d{x}" |> equal ("wow %d%P()", "wow 42")
+    f $"a %d{x} b %s{s} c {x + 1}" |> equal ("a %d%P() b %s%P() c %P()", "a 42 b z c 43")
+
