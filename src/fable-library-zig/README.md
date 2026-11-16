@@ -97,9 +97,20 @@ C functions are called the .NET way, and work on both:
 [<DllImport("libc", EntryPoint = "strlen")>]
 extern unativeint cStrlen(string s)          // a string is given as UTF-8 ended by a zero
 
+[<Struct>]
+type Vector2 = { x: float32; y: float32 }   // a struct of numbers and bools: C's layout
+
+[<DllImport("raylib")>]
+extern Vector2 Vector2Add(Vector2 v1, Vector2 v2)   // given and given back by value
+
 [<UnmanagedCallersOnly(EntryPoint = "app_twice")>]
 let twice (x: int) : int = x * 2             // exported to C under that name
 ```
+
+What a C function takes and gives: numbers, `bool` (one byte, C's `bool`; .NET's default is a
+4-byte `BOOL`), strings (UTF-8; one given back is copied, C keeps it), arrays (a pointer to the
+items) and structs of numbers, bools and such structs, by value. Not yet: `out`/`ref`
+parameters, callbacks, `[<MarshalAs>]`.
 
 A C header becomes a module the build translates (Zig has no `@cImport`), imported with
 `c:`, whose calls are given C's values as `extern` ones are:

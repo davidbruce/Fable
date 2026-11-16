@@ -165,4 +165,56 @@ let ``test Zig code can call F# functions`` () =
     let s = "ab"
     callTwiceText s |> equal "abab"
     s |> equal "ab"
+
+[<Struct>]
+type Vec2 = { x: float32; y: float32 }
+
+[<Struct; System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)>]
+type Vector2 =
+    val x: float32
+    val y: float32
+    new(x, y) = { x = x; y = y }
+
+[<Struct>]
+type Rect =
+    {
+        pos: Vec2
+        width: float32
+        height: float32
+        solid: bool
+    }
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_vadd")>]
+extern Vec2 vaddRecord(Vec2 a, Vec2 b)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_vadd")>]
+extern Vector2 vaddFields(Vector2 a, Vector2 b)
+
+[<System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fable_test_area")>]
+extern float32 area(Rect r)
+
+[<Import("fable_test_vadd", "c:./native/cvec.zig")>]
+let vaddC (a: Vec2) (b: Vec2) : Vec2 = nativeOnly
+
+[<Import("fable_test_area", "c:./native/cvec.zig")>]
+let areaC (r: Rect) : float32 = nativeOnly
+
+[<Fact>]
+let ``test Structs are given to C and back by value`` () =
+    vaddRecord ({ x = 1.0f; y = 2.0f }, { x = 3.0f; y = 4.0f }) |> equal { x = 4.0f; y = 6.0f }
+    let v = vaddFields (Vector2(1.5f, 2.5f), Vector2(0.5f, 0.5f))
+    (v.x, v.y) |> equal (2.0f, 3.0f)
+
+    let r =
+        {
+            pos = { x = 1.0f; y = 0.0f }
+            width = 3.0f
+            height = 4.0f
+            solid = true
+        }
+
+    area r |> equal 13.0f
+    area { r with solid = false } |> equal 0.0f
+    vaddC { x = 1.0f; y = 1.0f } { x = 2.0f; y = 2.0f } |> equal { x = 3.0f; y = 3.0f }
+    areaC r |> equal 13.0f
 #endif

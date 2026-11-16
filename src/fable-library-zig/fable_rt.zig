@@ -4566,7 +4566,63 @@ const CString = struct {
 fn CArg(comptime T: type) type {
     if (T == String) return ?[*:0]const u8;
     if (comptime isArrayPtr(T)) return [*]@typeInfo(@FieldType(@typeInfo(T).pointer.child, "items")).pointer.child;
+    if (comptime isPlainStruct(T)) return CStruct(T);
+    if (comptime isManaged(T)) @compileError("fable: a [<DllImport>] function takes and gives numbers, bools, strings, arrays and structs of numbers and bools (by value); not " ++ @typeName(T));
     return T;
+}
+
+// ---- structs given to C by value: an F# struct of numbers, bools and such structs (a
+// `[<Struct>]` record, or a struct of `val` fields) is copied, field by field, into a struct of
+// the same fields laid out as C lays them out (an `extern struct`), and back for a result ----
+
+/// Is T a struct of numbers, bools and such structs (no tuple, nothing counted)?
+fn isPlainStruct(comptime T: type) bool {
+    return comptime blk: {
+        const info = @typeInfo(T);
+        if (info != .@"struct") break :blk false;
+        if (info.@"struct".is_tuple or isManaged(T)) break :blk false;
+        if (info.@"struct".layout == .@"packed") break :blk false;
+        for (info.@"struct".field_types) |F| {
+            switch (@typeInfo(F)) {
+                .int, .float, .bool => {},
+                .@"struct" => if (!isPlainStruct(F)) break :blk false,
+                else => break :blk false,
+            }
+        }
+        break :blk info.@"struct".field_names.len != 0;
+    };
+}
+
+/// The C layout of a plain struct (see above)
+fn CStruct(comptime T: type) type {
+    const st = @typeInfo(T).@"struct";
+    if (st.layout == .@"extern") return T;
+    var types: [st.field_names.len]type = undefined;
+    for (st.field_types, 0..) |F, i| types[i] = if (@typeInfo(F) == .@"struct") CStruct(F) else F;
+    return @Struct(.@"extern", null, st.field_names, &types, &@splat(.{}));
+}
+
+/// `x` as the struct `C` (a C struct of the same field names: `CStruct(T)`, or one of a header)
+fn toCStruct(comptime C: type, x: anytype) C {
+    var c: C = undefined;
+    inline for (@typeInfo(C).@"struct".field_names) |name| {
+        if (!@hasField(@TypeOf(x), name)) @compileError("fable: the C struct " ++ @typeName(C) ++ " has a field `" ++ name ++ "` that " ++ @typeName(@TypeOf(x)) ++ " has not");
+        const F = @FieldType(C, name);
+        const v = @field(x, name);
+        @field(c, name) = if (@typeInfo(F) == .@"struct") toCStruct(F, v) else if (@typeInfo(F) == .float and @TypeOf(v) != F) @floatCast(v) else if (@typeInfo(F) == .int and @TypeOf(v) != F) @intCast(v) else v;
+    }
+    return c;
+}
+
+/// A C struct `c` as the F# struct T
+fn fromCStruct(comptime T: type, c: anytype) T {
+    var x: T = undefined;
+    inline for (@typeInfo(T).@"struct".field_names) |name| {
+        const F = @FieldType(T, name);
+        const v = @field(c, name);
+        @field(x, name) = if (@typeInfo(F) == .@"struct") fromCStruct(F, v) else if (@typeInfo(F) == .float and @TypeOf(v) != F) @floatCast(v) else if (@typeInfo(F) == .int and @TypeOf(v) != F) @intCast(v) else v;
+    }
+    return x;
 }
 
 fn CFn(comptime P: []const type, comptime R: type) type {
@@ -4600,6 +4656,8 @@ pub fn callC(comptime R: type, comptime name: []const u8, args: anytype) R {
             c_args[i] = if (args[i] == null) null else strings[i].init(args[i]);
         } else if (comptime isArrayPtr(F)) {
             c_args[i] = args[i].items.ptr;
+        } else if (comptime isPlainStruct(F)) {
+            c_args[i] = toCStruct(CStruct(F), args[i]);
         } else {
             c_args[i] = args[i];
         }
@@ -4607,10 +4665,11 @@ pub fn callC(comptime R: type, comptime name: []const u8, args: anytype) R {
     defer inline for (0..n) |i| {
         if (fields[i] == String) strings[i].deinit();
     };
-    const CR = if (R == String) ?[*:0]const u8 else R;
+    const CR = comptime if (R == String) ?[*:0]const u8 else if (isPlainStruct(R)) CStruct(R) else CArg(R);
     const f = @extern(CFn(&params, CR), .{ .name = name });
     const r = @call(.auto, f, c_args);
     if (R == String) return if (r) |p| io.fromUtf8(std.mem.span(p)) else null;
+    if (comptime isPlainStruct(R)) return fromCStruct(R, r);
     return r;
 }
 
@@ -4640,6 +4699,8 @@ pub fn cCall(comptime R: type, f: anytype, args: anytype) R {
             c_args[i] = @intCast(args[i]);
         } else if (comptime @typeInfo(F) == .float and @typeInfo(params[i]) == .float) {
             c_args[i] = @floatCast(args[i]);
+        } else if (comptime isPlainStruct(F) and @typeInfo(params[i]) == .@"struct") {
+            c_args[i] = toCStruct(params[i], args[i]);
         } else {
             c_args[i] = args[i];
         }
@@ -4654,6 +4715,7 @@ pub fn cCall(comptime R: type, f: anytype, args: anytype) R {
         return if (p) |q| io.fromUtf8(std.mem.span(q)) else null;
     }
     if (comptime T == R) return r;
+    if (comptime isPlainStruct(R) and @typeInfo(T) == .@"struct") return fromCStruct(R, r);
     if (comptime @typeInfo(T) == .int and @typeInfo(R) == .int) return @intCast(r);
     if (comptime @typeInfo(T) == .float and @typeInfo(R) == .float) return @floatCast(r);
     if (comptime @typeInfo(T) == .bool and @typeInfo(R) == .bool) return r;

@@ -78,3 +78,15 @@ pub fn call_twice_text(s: fable_rt.String) fable_rt.String {
     const app = @import("../InteropTests.zig");
     return fable_rt.callFSharp(app, "twiceText", .{s}) catch fable_rt.str("raised");
 }
+
+/// C functions that take and give structs by value (InteropTests.fs: DllImport and `c:`)
+const CVec2 = extern struct { x: f32, y: f32 };
+const CRect = extern struct { pos: CVec2, width: f32, height: f32, solid: bool };
+
+export fn fable_test_vadd(a: CVec2, b: CVec2) CVec2 {
+    return .{ .x = a.x + b.x, .y = a.y + b.y };
+}
+
+export fn fable_test_area(r: CRect) f32 {
+    return if (r.solid) r.width * r.height + r.pos.x else 0;
+}
