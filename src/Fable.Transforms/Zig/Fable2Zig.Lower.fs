@@ -10503,829 +10503,878 @@ and dotnetCall
     (t: Fable.Type)
     : Expr
     =
-    let isNumber (ty: Ty) = intBits ty > 0 || isFloatTy ty
-
-    // (the object of a property or method comes first)
-    let args =
-        match info.ThisArg with
-        | Some this -> this :: info.Args
-        | None -> info.Args
-
-    let contents (cell: Expr) =
-        match typeOf cell with
-        | TEnt(_, [ elem ]) -> EGet(cell, PField "contents", elem)
-        | _ -> fail r "internal: not a ref cell"
-
-    /// a call into the runtime library that can raise
-    let rt (macro: string) (xs: Fable.Expr list) (ty: Ty) : Expr =
+    // (other names of structural hashing, equality and comparison, and of values with a unit of
+    // measure: what `hash`, `=`, `compare` and the value are)
+    match entity, name with
+    | ("Microsoft.FSharp.Core.Operators.Unchecked" | "Microsoft.FSharp.Core.LanguagePrimitives"),
+      ("Hash" | "GenericHash" | "GenericLimitedHash" | "GenericHashWithComparer") when not info.Args.IsEmpty ->
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators" "Hash" { info with Args = [ List.last info.Args ] } t
+    | ("Microsoft.FSharp.Core.Operators.Unchecked" | "Microsoft.FSharp.Core.LanguagePrimitives"),
+      ("Equals" | "GenericEquality" | "GenericEqualityER" | "GenericEqualityWithComparer") when info.Args.Length >= 2 ->
+        let n = info.Args.Length
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators" "op_Equality" { info with Args = info.Args.[n - 2 ..] } t
+    | ("Microsoft.FSharp.Core.Operators.Unchecked" | "Microsoft.FSharp.Core.LanguagePrimitives"),
+      ("Compare" | "GenericComparison" | "GenericComparisonWithComparer") when info.Args.Length >= 2 ->
+        let n = info.Args.Length
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators" "Compare" { info with Args = info.Args.[n - 2 ..] } t
+    | "Microsoft.FSharp.Core.LanguagePrimitives", "PhysicalHash" when info.Args.Length = 1 ->
         ctx.State.UsesRuntime <- true
-        bindArgs ctx (xs |> List.map (lw ctx)) (fun irs -> ERt(macro, irs, ty))
-
-    /// a call into the runtime library that cannot
-    let pure' (macro: string) (xs: Fable.Expr list) (ty: Ty) : Expr =
-        ctx.State.UsesRuntime <- true
-        bindArgs ctx (xs |> List.map (lw ctx)) (fun irs -> EEmit(macro, irs, ty))
-
-    let tChar = TPrim "u16"
-    let tF64 = TPrim "f64"
-
-    // (the Zig name of a number type)
-    let zigTypeName (ty: Ty) =
-        match ty with
-        | TPrim name -> name
-        | _ -> fail r "internal: not a number type"
-
-    // (an enum's value is not a number argument: `IndexOf(c, StringComparison.Ordinal)`)
-    let isInt (x: Fable.Expr) =
-        match x.Type with
-        | Fable.Number(Int32, Fable.NumberInfo.IsEnum _) -> false
-        | Fable.Number(Int32, _) -> true
-        | _ -> false
-
-    let tBig = TPrim "fable_rt.BigInt"
-    let tDec = TPrim "fable_rt.NetDecimal"
-
-    let isDec (x: Fable.Expr) =
-        match x.Type with
-        | Fable.Number(Decimal, _) -> true
-        | _ -> false
-
-    let decLit (m: string) (scale: int) =
-        ctx.State.UsesRuntime <- true
-        ELit($"fable_rt.decLit(%s{m}, %d{scale})", tDec)
-
-    let isBig (x: Fable.Expr) =
-        match x.Type with
-        | Fable.Number(BigInt, _) -> true
-        | _ -> false
-
-    match entity, name, args with
-    // ref cells: `ref x`, `!r` and `r.Value`, `r := x` and `r.Value <- x`, `incr`, `decr`
-    | "Microsoft.FSharp.Core.Operators", "Ref", [ x ] ->
-        bindArgsIn true ctx [ lw ctx x ] (fun xs -> ECon(TEnt(refEnt ctx.State, [ typeOf xs.Head ]), "", xs, None))
-    | "Microsoft.FSharp.Core.Operators", "op_Dereference", [ cell ]
-    | "Microsoft.FSharp.Core.FSharpRef`1", ("get_Value" | "get_contents"), cell :: _ ->
-        bindArgs ctx [ lw ctx cell ] (fun xs -> contents xs.Head)
-    | "Microsoft.FSharp.Core.Operators", "op_ColonEquals", [ cell; value ]
-    | "Microsoft.FSharp.Core.FSharpRef`1", ("set_Value" | "set_contents"), [ cell; value ] ->
-        bindArgs ctx [ lw ctx cell; lw ctx value ] (fun xs -> EStore(contents xs[0], xs[1]))
-    | "Microsoft.FSharp.Core.Operators", ("Increment" | "Decrement"), [ cell ] ->
-        let op =
-            if name = "Increment" then
-                "add"
-            else
-                "sub"
-
-        bindArgs
-            ctx
-            [ lw ctx cell ]
-            (fun xs -> EStore(contents xs.Head, EPrim(op, [ contents xs.Head; ELit("1", tI32) ], tI32)))
-    // lists: what does not need a loop is a test or a field
-    | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
-      ("get_IsEmpty" | "IsEmpty"),
-      x :: _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ETest(xs.Head, "Empty", typeOf xs.Head))
-    // (`xs.Head` and `xs.Tail` of an empty list raise, as on .NET)
-    | "Microsoft.FSharp.Collections.FSharpList`1", ("get_Head" | "get_Tail"), x :: _ ->
-        let field =
-            if name = "get_Head" then
-                "Head"
-            else
-                "Tail"
-
-        let ty = mapType ctx r t
-
-        bindArgs
-            ctx
-            [ lw ctx x ]
-            (fun xs ->
-                let empty = ELit(stringLiteral "The input list was empty.", tStr)
-
-                EIf(
-                    ETest(xs.Head, "Empty", typeOf xs.Head),
-                    raiseDotnet ctx r "System.InvalidOperationException" empty t,
-                    EGet(xs.Head, PCase("Cons", field), ty),
-                    ty
-                )
-            )
-    // structural equality of records, unions, tuples and options: plain values, compared
-    // field by field
-    | "Microsoft.FSharp.Core.Operators", "op_Equality", [ a; b ] ->
-        bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("eql", xs, tBool))
-    | "Microsoft.FSharp.Core.Operators", "op_Inequality", [ a; b ] ->
-        bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("not", [ EPrim("eql", xs, tBool) ], tBool))
-    // ---- numbers that are not numbers ----
-    | "Microsoft.FSharp.Core.Operators", "NaN", [] -> ELit("std.math.nan(f64)", TPrim "f64")
-    | "Microsoft.FSharp.Core.Operators", "NaNSingle", [] -> ELit("std.math.nan(f32)", TPrim "f32")
-    | "Microsoft.FSharp.Core.Operators", "Infinity", [] -> ELit("std.math.inf(f64)", TPrim "f64")
-    | "Microsoft.FSharp.Core.Operators", "InfinitySingle", [] -> ELit("std.math.inf(f32)", TPrim "f32")
-    // `box x :? int`: a test of what an `obj` holds
-    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
-        info.GenericArgs.Length = 1
-        && (unwrapNullness x.Type = Fable.Any
-            || (isInterfaceType ctx.Com x.Type && isFatIfaceTy (mapType ctx r x.Type))
-            || isInterfaceType ctx.Com (unwrapNullness info.GenericArgs.Head))
+        bindArgs ctx [ lw ctx info.Args.Head ] (fun xs -> EEmit("fable_rt.physicalHash($0)", xs, tI32))
+    | "Microsoft.FSharp.Core.LanguagePrimitives", m when
+        m.EndsWith("WithMeasure", System.StringComparison.Ordinal)
+        && info.Args.Length = 1
         ->
-        lw ctx (Fable.Test(x, Fable.TypeTest info.GenericArgs.Head, r))
-    // `x :? T` where Fable keeps it a call: of an exception class, or of a class of objects
-    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
-        (match info.GenericArgs with
-         | [ g ] ->
-             match unwrapNullness g with
-             | Fable.DeclaredType(cls, _) -> (tryExnEnt ctx r cls).IsSome || (objInfo ctx r cls).IsSome
-             | _ -> false
-         | _ -> false)
-        ->
-        match unwrapNullness info.GenericArgs.Head with
-        | Fable.DeclaredType(cls, _) when (tryExnEnt ctx r cls).IsSome ->
-            let ent = (tryExnEnt ctx r cls).Value
-            bindArgs ctx [ lw ctx x ] (fun xs -> EExnTest(xs.Head, ent))
-        | Fable.DeclaredType(cls, gs) ->
-            let o = (objInfo ctx r cls).Value
-            let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
-            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.objIs($0, %s{typeRef})", xs, tBool))
-        | _ -> fail r "internal: a type test"
-    // `x :?> Circle`: an object of that class, or InvalidCastException
-    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ Uncast x ] when
-        (objOfType ctx r t).IsSome && (objOfType ctx r x.Type).IsSome
-        ->
-        let o = (objOfType ctx r t).Value
-        let source = (objOfType ctx r x.Type).Value
+        lw ctx info.Args.Head
+    // (`Comparer<'T>.Default.Compare(a, b)`: F#'s comparison; `Default` is the only comparer of
+    // this type here)
+    | "System.Collections.Generic.Comparer`1", "Compare" when info.Args.Length = 2 ->
+        dotnetCall ctx r "Microsoft.FSharp.Core.Operators" "Compare" { info with ThisArg = None } t
+    | "Microsoft.FSharp.Control.FSharpAsync", "Parallel" when info.Args.Length = 2 ->
+        libraryCall ctx r "Async" "parallelAllMax" info info.Args t
+    | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Reduce" ->
+        dotnetCall ctx r "Microsoft.FSharp.Collections.ArrayModule" "Reduce" info t
+    | _ ->
 
-        if ancestors source |> List.exists (fun k -> k.FullName = o.FullName) then
-            lw ctx x
-        else
-            rt $"fable_rt.objCast($0, %s{objTypeRef o (objArgs ctx r t)})" [ x ] tAny
-    // (a cast that changes nothing here: an exception of a known class is an `exn`)
-    | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ x ] when
-        mapType ctx r x.Type = mapType ctx r t
-        && unwrapNullness x.Type <> Fable.Any
-        && (not (isFatIfaceTy (mapType ctx r x.Type))
-            || unwrapNullness x.Type = unwrapNullness t)
-        ->
-        lw ctx x
-    // ---- ranges: `a .. b`, `a .. step .. b` ----
-    | "Microsoft.FSharp.Core.Operators", ("op_Range" | "op_RangeStep"), _ ->
-        let lo, step, hi =
-            match args with
-            | [ a; b ] -> a, None, b
-            | [ a; s; b ] -> a, Some s, b
-            | _ -> fail r "internal: a range"
+        let isNumber (ty: Ty) = intBits ty > 0 || isFloatTy ty
 
-        let one (lit: string) =
-            match step with
-            | Some s -> lw ctx s
-            | None -> ELit(lit, mapType ctx r lo.Type)
+        // (the object of a property or method comes first)
+        let args =
+            match info.ThisArg with
+            | Some this -> this :: info.Args
+            | None -> info.Args
 
-        let fn, irs =
-            match lo.Type with
-            | Fable.Number(Int32, _) -> "rangeInt", [ lw ctx lo; one "1"; lw ctx hi ]
-            | Fable.Number(Int64, _) -> "rangeInt64", [ lw ctx lo; one "1"; lw ctx hi ]
-            | Fable.Number(UInt64, _) -> "rangeUInt64", [ lw ctx lo; one "1"; lw ctx hi ]
-            | Fable.Number(Decimal, _) -> "rangeDecimal", [ lw ctx lo; one "fable_rt.decLit(1, 0)"; lw ctx hi ]
-            | Fable.Number(BigInt, _) ->
-                "rangeBigInt",
-                [
-                    lw ctx lo
-                    (match step with
-                     | Some s -> lw ctx s
-                     | None -> EEmit("fable_rt.bigOf(@as(i32, 1))", [], mapType ctx r lo.Type))
-                    lw ctx hi
-                ]
-            | Fable.Number(Float64, _) -> "rangeFloat", [ lw ctx lo; one "1.0"; lw ctx hi ]
-            | Fable.Char when step.IsNone -> "rangeChar", [ lw ctx lo; lw ctx hi ]
-            | other -> fail r "the Zig target does not support a range of this type yet (%A)" other
+        let contents (cell: Expr) =
+            match typeOf cell with
+            | TEnt(_, [ elem ]) -> EGet(cell, PField "contents", elem)
+            | _ -> fail r "internal: not a ref cell"
 
-        bindArgs ctx irs (fun xs -> ECall(libraryTarget ctx "Seq" fn, [], xs, mapType ctx r t))
-    | "Microsoft.FSharp.Collections.SeqModule", ("Sum" | "Average" | "SumBy" | "AverageBy"), _ ->
-        let item =
-            match t with
-            | _ when name.EndsWith "By" -> t
-            | _ -> t
+        /// a call into the runtime library that can raise
+        let rt (macro: string) (xs: Fable.Expr list) (ty: Ty) : Expr =
+            ctx.State.UsesRuntime <- true
+            bindArgs ctx (xs |> List.map (lw ctx)) (fun irs -> ERt(macro, irs, ty))
 
-        let seqArg = List.last args
+        /// a call into the runtime library that cannot
+        let pure' (macro: string) (xs: Fable.Expr list) (ty: Ty) : Expr =
+            ctx.State.UsesRuntime <- true
+            bindArgs ctx (xs |> List.map (lw ctx)) (fun irs -> EEmit(macro, irs, ty))
 
-        let listIr =
-            match seqArg with
-            | Fable.TypeCast(inner, _) when (listItem inner.Type).IsSome -> lw ctx inner
-            | _ ->
-                let itemTy =
-                    match seqArg.Type with
-                    | Fable.DeclaredType(_, [ i ]) -> mapType ctx r i
-                    | _ -> mapType ctx r item
+        let tChar = TPrim "u16"
+        let tF64 = TPrim "f64"
 
-                bindArgs
-                    ctx
-                    [ lw ctx seqArg ]
-                    (fun xs ->
-                        ECall(libraryTarget ctx "Seq" "toList", [ itemTy ], xs, TEnt(listEnt ctx.State, [ itemTy ]))
-                    )
+        // (the Zig name of a number type)
+        let zigTypeName (ty: Ty) =
+            match ty with
+            | TPrim name -> name
+            | _ -> fail r "internal: not a number type"
 
-        let ty = mapType ctx r t
+        // (an enum's value is not a number argument: `IndexOf(c, StringComparison.Ordinal)`)
+        let isInt (x: Fable.Expr) =
+            match x.Type with
+            | Fable.Number(Int32, Fable.NumberInfo.IsEnum _) -> false
+            | Fable.Number(Int32, _) -> true
+            | _ -> false
 
-        match name, args with
-        | "Sum", [ _ ] when ty = TPrim "fable_rt.NetDecimal" ->
-            bindArgs ctx [ listIr ] (fun xs -> ERt("fable_rt.listSumDec($0)", xs, ty))
-        | "Sum", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.listSum($0)", xs, ty))
-        | "Average", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> ERt("fable_rt.listAverage($0)", xs, ty))
-        | "SumBy", [ f; _ ] ->
-            bindArgs ctx [ lw ctx f; listIr ] (fun xs -> ERt($"fable_rt.listSumBy(%s{zigTypeName ty}, $0, $1)", xs, ty))
-        | "AverageBy", [ f; _ ] ->
+        let tBig = TPrim "fable_rt.BigInt"
+        let tDec = TPrim "fable_rt.NetDecimal"
+
+        let isDec (x: Fable.Expr) =
+            match x.Type with
+            | Fable.Number(Decimal, _) -> true
+            | _ -> false
+
+        let decLit (m: string) (scale: int) =
+            ctx.State.UsesRuntime <- true
+            ELit($"fable_rt.decLit(%s{m}, %d{scale})", tDec)
+
+        let isBig (x: Fable.Expr) =
+            match x.Type with
+            | Fable.Number(BigInt, _) -> true
+            | _ -> false
+
+        match entity, name, args with
+        // ref cells: `ref x`, `!r` and `r.Value`, `r := x` and `r.Value <- x`, `incr`, `decr`
+        | "Microsoft.FSharp.Core.Operators", "Ref", [ x ] ->
+            bindArgsIn true ctx [ lw ctx x ] (fun xs -> ECon(TEnt(refEnt ctx.State, [ typeOf xs.Head ]), "", xs, None))
+        | "Microsoft.FSharp.Core.Operators", "op_Dereference", [ cell ]
+        | "Microsoft.FSharp.Core.FSharpRef`1", ("get_Value" | "get_contents"), cell :: _ ->
+            bindArgs ctx [ lw ctx cell ] (fun xs -> contents xs.Head)
+        | "Microsoft.FSharp.Core.Operators", "op_ColonEquals", [ cell; value ]
+        | "Microsoft.FSharp.Core.FSharpRef`1", ("set_Value" | "set_contents"), [ cell; value ] ->
+            bindArgs ctx [ lw ctx cell; lw ctx value ] (fun xs -> EStore(contents xs[0], xs[1]))
+        | "Microsoft.FSharp.Core.Operators", ("Increment" | "Decrement"), [ cell ] ->
+            let op =
+                if name = "Increment" then
+                    "add"
+                else
+                    "sub"
+
             bindArgs
                 ctx
-                [ lw ctx f; listIr ]
-                (fun xs -> ERt($"fable_rt.listAverageBy(%s{zigTypeName ty}, $0, $1)", xs, ty))
-        | _ -> fail r "internal: a sum"
+                [ lw ctx cell ]
+                (fun xs -> EStore(contents xs.Head, EPrim(op, [ contents xs.Head; ELit("1", tI32) ], tI32)))
+        // lists: what does not need a loop is a test or a field
+        | ("Microsoft.FSharp.Collections.FSharpList`1" | "Microsoft.FSharp.Collections.ListModule"),
+          ("get_IsEmpty" | "IsEmpty"),
+          x :: _ -> bindArgs ctx [ lw ctx x ] (fun xs -> ETest(xs.Head, "Empty", typeOf xs.Head))
+        // (`xs.Head` and `xs.Tail` of an empty list raise, as on .NET)
+        | "Microsoft.FSharp.Collections.FSharpList`1", ("get_Head" | "get_Tail"), x :: _ ->
+            let field =
+                if name = "get_Head" then
+                    "Head"
+                else
+                    "Tail"
 
-    // .NET's members by domain: tasks and async (Fable2Zig.Dotnet.Async.fs)
-    | DomainCall "async" ctx r info t lowered -> lowered
-    // ---- the entry of a map ----
-    // (an entry is a pair here: making one is making the pair, and `KeyValue(k, v)` is the pair)
-    | "System.Collections.Generic.KeyValuePair`2", ".ctor", [ k; v ] ->
-        lw ctx (Fable.Value(Fable.NewTuple([ k; v ], false), r))
-    | "Microsoft.FSharp.Core.Operators", "KeyValuePattern", [ kv ] -> lw ctx kv
-    | "System.Collections.Generic.KeyValuePair`2", ("get_Key" | "get_Value"), [ kv ] ->
-        bindArgs
-            ctx
-            [ lw ctx kv ]
-            (fun xs ->
-                EGet(
-                    xs.Head,
-                    PItem(
-                        if name = "get_Key" then
-                            0
-                        else
-                            1
-                    ),
-                    mapType ctx r t
+            let ty = mapType ctx r t
+
+            bindArgs
+                ctx
+                [ lw ctx x ]
+                (fun xs ->
+                    let empty = ELit(stringLiteral "The input list was empty.", tStr)
+
+                    EIf(
+                        ETest(xs.Head, "Empty", typeOf xs.Head),
+                        raiseDotnet ctx r "System.InvalidOperationException" empty t,
+                        EGet(xs.Head, PCase("Cons", field), ty),
+                        ty
+                    )
                 )
-            )
-    // ---- the item of this round of a `for ... in` loop ----
-    | _, "get_Current", [ Fable.IdentExpr e ] when ctx.Enumerators.ContainsKey e.Name -> EVar ctx.Enumerators[e.Name]
+        // structural equality of records, unions, tuples and options: plain values, compared
+        // field by field
+        | "Microsoft.FSharp.Core.Operators", "op_Equality", [ a; b ] ->
+            bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("eql", xs, tBool))
+        | "Microsoft.FSharp.Core.Operators", "op_Inequality", [ a; b ] ->
+            bindArgs ctx [ lw ctx a; lw ctx b ] (fun xs -> EPrim("not", [ EPrim("eql", xs, tBool) ], tBool))
+        // ---- numbers that are not numbers ----
+        | "Microsoft.FSharp.Core.Operators", "NaN", [] -> ELit("std.math.nan(f64)", TPrim "f64")
+        | "Microsoft.FSharp.Core.Operators", "NaNSingle", [] -> ELit("std.math.nan(f32)", TPrim "f32")
+        | "Microsoft.FSharp.Core.Operators", "Infinity", [] -> ELit("std.math.inf(f64)", TPrim "f64")
+        | "Microsoft.FSharp.Core.Operators", "InfinitySingle", [] -> ELit("std.math.inf(f32)", TPrim "f32")
+        // `box x :? int`: a test of what an `obj` holds
+        | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
+            info.GenericArgs.Length = 1
+            && (unwrapNullness x.Type = Fable.Any
+                || (isInterfaceType ctx.Com x.Type && isFatIfaceTy (mapType ctx r x.Type))
+                || isInterfaceType ctx.Com (unwrapNullness info.GenericArgs.Head))
+            ->
+            lw ctx (Fable.Test(x, Fable.TypeTest info.GenericArgs.Head, r))
+        // `x :? T` where Fable keeps it a call: of an exception class, or of a class of objects
+        | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "TypeTestGeneric", [ x ] when
+            (match info.GenericArgs with
+             | [ g ] ->
+                 match unwrapNullness g with
+                 | Fable.DeclaredType(cls, _) -> (tryExnEnt ctx r cls).IsSome || (objInfo ctx r cls).IsSome
+                 | _ -> false
+             | _ -> false)
+            ->
+            match unwrapNullness info.GenericArgs.Head with
+            | Fable.DeclaredType(cls, _) when (tryExnEnt ctx r cls).IsSome ->
+                let ent = (tryExnEnt ctx r cls).Value
+                bindArgs ctx [ lw ctx x ] (fun xs -> EExnTest(xs.Head, ent))
+            | Fable.DeclaredType(cls, gs) ->
+                let o = (objInfo ctx r cls).Value
+                let typeRef = objTypeRef o (gs |> List.map (mapTypeArg ctx r))
+                bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.objIs($0, %s{typeRef})", xs, tBool))
+            | _ -> fail r "internal: a type test"
+        // `x :?> Circle`: an object of that class, or InvalidCastException
+        | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ Uncast x ] when
+            (objOfType ctx r t).IsSome && (objOfType ctx r x.Type).IsSome
+            ->
+            let o = (objOfType ctx r t).Value
+            let source = (objOfType ctx r x.Type).Value
 
-    // .NET's members by domain: arrays, 2D arrays, .NET's mutable collections, lazy, spans, weak references (Fable2Zig.Dotnet.Collections.fs)
-    | DomainCall "collections" ctx r info t lowered -> lowered
-    // .NET's members by domain: StringBuilder, Split, Join, Format, chars and strings (Fable2Zig.Dotnet.Text.fs)
-    | DomainCall "text" ctx r info t lowered -> lowered
-    // ---- comparison of what is not a number: by `compare` ----
-    | "Microsoft.FSharp.Core.Operators", "Max", [ a; b ] ->
-        pure' "fable_rt.maxOf(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
-    | "Microsoft.FSharp.Core.Operators", "Min", [ a; b ] ->
-        pure' "fable_rt.minOf(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
-    | "Microsoft.FSharp.Core.Operators", "Hash", [ x ] ->
-        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.hash(%s{typedArg ctx r x 0})", xs, tI32))
-    | "Microsoft.FSharp.Core.Operators",
-      ("op_LessThan" | "op_GreaterThan" | "op_LessThanOrEqual" | "op_GreaterThanOrEqual" | "Compare"),
-      [ a; b ] ->
-        let op =
-            match name with
-            | "op_LessThan" -> Some "lt"
-            | "op_GreaterThan" -> Some "gt"
-            | "op_LessThanOrEqual" -> Some "le"
-            | "op_GreaterThanOrEqual" -> Some "ge"
-            | _ -> None
+            if ancestors source |> List.exists (fun k -> k.FullName = o.FullName) then
+                lw ctx x
+            else
+                rt $"fable_rt.objCast($0, %s{objTypeRef o (objArgs ctx r t)})" [ x ] tAny
+        // (a cast that changes nothing here: an exception of a known class is an `exn`)
+        | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", ("UnboxFast" | "UnboxGeneric"), [ x ] when
+            mapType ctx r x.Type = mapType ctx r t
+            && unwrapNullness x.Type <> Fable.Any
+            && (not (isFatIfaceTy (mapType ctx r x.Type))
+                || unwrapNullness x.Type = unwrapNullness t)
+            ->
+            lw ctx x
+        // ---- ranges: `a .. b`, `a .. step .. b` ----
+        | "Microsoft.FSharp.Core.Operators", ("op_Range" | "op_RangeStep"), _ ->
+            let lo, step, hi =
+                match args with
+                | [ a; b ] -> a, None, b
+                | [ a; s; b ] -> a, Some s, b
+                | _ -> fail r "internal: a range"
 
-        bindArgs
-            ctx
-            [ lw ctx a; lw ctx b ]
-            (fun xs ->
-                let order = EEmit("fable_rt.compareOf($0, $1)", xs, tI32)
+            let one (lit: string) =
+                match step with
+                | Some s -> lw ctx s
+                | None -> ELit(lit, mapType ctx r lo.Type)
 
-                match op with
-                | Some op -> EPrim(op, [ order; ELit("0", tI32) ], tBool)
-                | None -> order
-            )
-    // ---- failures ----
-    | "Microsoft.FSharp.Core.Operators", "FailWith", [ msg ] -> raiseDotnet ctx r "System.Exception" (lw ctx msg) t
-    | "Microsoft.FSharp.Core.Operators", "InvalidOp", [ msg ] ->
-        raiseDotnet ctx r "System.InvalidOperationException" (lw ctx msg) t
-    | "Microsoft.FSharp.Core.Operators", "InvalidArg", [ arg; msg ] ->
-        raiseArgument ctx r "System.ArgumentException" (lw ctx msg) arg t
-    | "Microsoft.FSharp.Core.Operators", "NullArg", [ arg ] ->
-        let message = ELit(stringLiteral "Value cannot be null.", tStr)
-        raiseArgument ctx r "System.ArgumentNullException" message arg t
-    // `System.Exception("...")` and the other classes: a new exception with that message
-    // `Exception(message, inner)`: the exception, with the one inside it
-    | cls, ".ctor", [ message; inner ] when
-        dotnetExceptions.ContainsKey cls
-        && message.Type = Fable.String
-        && (
-            match inner.Type with
-            | Fable.DeclaredType(e, _) -> e.FullName = "System.Exception" || dotnetExceptions.ContainsKey e.FullName
-            | _ -> false
-        )
-        ->
-        bindArgsIn
-            true
-            ctx
-            [ lw ctx message ]
-            (fun xs ->
-                let outer = EExnNew(dotnetExnEnt ctx cls, xs)
-                bindArgs ctx [ outer; lw ctx inner ] (fun ys -> EEmit("fable_rt.exnWithInner($0, $1)", ys, tExn))
-            )
-    | cls, ".ctor", args when
-        dotnetExceptions.ContainsKey cls
-        && args |> List.forall (fun a -> a.Type = Fable.String)
-        ->
-        let message =
-            match cls, args with
-            | "System.ObjectDisposedException", [ objectName ] ->
+            let fn, irs =
+                match lo.Type with
+                | Fable.Number(Int32, _) -> "rangeInt", [ lw ctx lo; one "1"; lw ctx hi ]
+                | Fable.Number(Int64, _) -> "rangeInt64", [ lw ctx lo; one "1"; lw ctx hi ]
+                | Fable.Number(UInt64, _) -> "rangeUInt64", [ lw ctx lo; one "1"; lw ctx hi ]
+                | Fable.Number(Decimal, _) -> "rangeDecimal", [ lw ctx lo; one "fable_rt.decLit(1, 0)"; lw ctx hi ]
+                | Fable.Number(BigInt, _) ->
+                    "rangeBigInt",
+                    [
+                        lw ctx lo
+                        (match step with
+                         | Some s -> lw ctx s
+                         | None -> EEmit("fable_rt.bigOf(@as(i32, 1))", [], mapType ctx r lo.Type))
+                        lw ctx hi
+                    ]
+                | Fable.Number(Float64, _) -> "rangeFloat", [ lw ctx lo; one "1.0"; lw ctx hi ]
+                | Fable.Char when step.IsNone -> "rangeChar", [ lw ctx lo; lw ctx hi ]
+                | other -> fail r "the Zig target does not support a range of this type yet (%A)" other
+
+            bindArgs ctx irs (fun xs -> ECall(libraryTarget ctx "Seq" fn, [], xs, mapType ctx r t))
+        | "Microsoft.FSharp.Collections.SeqModule", ("Sum" | "Average" | "SumBy" | "AverageBy"), _ ->
+            let item =
+                match t with
+                | _ when name.EndsWith "By" -> t
+                | _ -> t
+
+            let seqArg = List.last args
+
+            let listIr =
+                match seqArg with
+                | Fable.TypeCast(inner, _) when (listItem inner.Type).IsSome -> lw ctx inner
+                | _ ->
+                    let itemTy =
+                        match seqArg.Type with
+                        | Fable.DeclaredType(_, [ i ]) -> mapType ctx r i
+                        | _ -> mapType ctx r item
+
+                    bindArgs
+                        ctx
+                        [ lw ctx seqArg ]
+                        (fun xs ->
+                            ECall(
+                                libraryTarget ctx "Seq" "toList",
+                                [ itemTy ],
+                                xs,
+                                TEnt(listEnt ctx.State, [ itemTy ])
+                            )
+                        )
+
+            let ty = mapType ctx r t
+
+            match name, args with
+            | "Sum", [ _ ] when ty = TPrim "fable_rt.NetDecimal" ->
+                bindArgs ctx [ listIr ] (fun xs -> ERt("fable_rt.listSumDec($0)", xs, ty))
+            | "Sum", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.listSum($0)", xs, ty))
+            | "Average", [ _ ] -> bindArgs ctx [ listIr ] (fun xs -> ERt("fable_rt.listAverage($0)", xs, ty))
+            | "SumBy", [ f; _ ] ->
                 bindArgs
                     ctx
-                    [ lw ctx objectName ]
-                    (fun xs ->
-                        EEmit(
-                            "fable_rt.format(.{ \"Cannot access a disposed object.\\nObject name: '\", $0, \"'.\" })",
-                            xs,
-                            tStr
-                        )
+                    [ lw ctx f; listIr ]
+                    (fun xs -> ERt($"fable_rt.listSumBy(%s{zigTypeName ty}, $0, $1)", xs, ty))
+            | "AverageBy", [ f; _ ] ->
+                bindArgs
+                    ctx
+                    [ lw ctx f; listIr ]
+                    (fun xs -> ERt($"fable_rt.listAverageBy(%s{zigTypeName ty}, $0, $1)", xs, ty))
+            | _ -> fail r "internal: a sum"
+
+        // .NET's members by domain: tasks and async (Fable2Zig.Dotnet.Async.fs)
+        | DomainCall "async" ctx r info t lowered -> lowered
+        // ---- the entry of a map ----
+        // (an entry is a pair here: making one is making the pair, and `KeyValue(k, v)` is the pair)
+        | "System.Collections.Generic.KeyValuePair`2", ".ctor", [ k; v ] ->
+            lw ctx (Fable.Value(Fable.NewTuple([ k; v ], false), r))
+        | "Microsoft.FSharp.Core.Operators", "KeyValuePattern", [ kv ] -> lw ctx kv
+        | "System.Collections.Generic.KeyValuePair`2", ("get_Key" | "get_Value"), [ kv ] ->
+            bindArgs
+                ctx
+                [ lw ctx kv ]
+                (fun xs ->
+                    EGet(
+                        xs.Head,
+                        PItem(
+                            if name = "get_Key" then
+                                0
+                            else
+                                1
+                        ),
+                        mapType ctx r t
                     )
-            | _, [] when defaultExnMessages.ContainsKey cls -> ELit(stringLiteral defaultExnMessages[cls], tStr)
-            | "System.ArgumentNullException", [ parameter ] ->
-                withParameter ctx (ELit(stringLiteral "Value cannot be null.", tStr)) parameter
-            | "System.ArgumentOutOfRangeException", [ parameter ] ->
-                let text = "Specified argument was out of the range of valid values."
-                withParameter ctx (ELit(stringLiteral text, tStr)) parameter
-            | ("System.ArgumentNullException" | "System.ArgumentOutOfRangeException"), [ parameter; message ] ->
-                withParameter ctx (lw ctx message) parameter
-            | "System.ArgumentException", [ message; parameter ] -> withParameter ctx (lw ctx message) parameter
-            | _, [ message ] -> lw ctx message
-            | _ -> fail r "the Zig target does not support this way of making a %s yet" cls
+                )
+        // ---- the item of this round of a `for ... in` loop ----
+        | _, "get_Current", [ Fable.IdentExpr e ] when ctx.Enumerators.ContainsKey e.Name ->
+            EVar ctx.Enumerators[e.Name]
 
-        // (the parameter an ArgumentException is about, its `ParamName`)
-        let parameter =
-            match cls, args with
-            | ("System.ArgumentNullException" | "System.ArgumentOutOfRangeException"), parameter :: _ -> Some parameter
-            | "System.ArgumentException", [ _; parameter ] -> Some parameter
-            | _ -> None
+        // .NET's members by domain: arrays, 2D arrays, .NET's mutable collections, lazy, spans, weak references (Fable2Zig.Dotnet.Collections.fs)
+        | DomainCall "collections" ctx r info t lowered -> lowered
+        // .NET's members by domain: StringBuilder, Split, Join, Format, chars and strings (Fable2Zig.Dotnet.Text.fs)
+        | DomainCall "text" ctx r info t lowered -> lowered
+        // ---- comparison of what is not a number: by `compare` ----
+        | "Microsoft.FSharp.Core.Operators", "Max", [ a; b ] ->
+            pure' "fable_rt.maxOf(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
+        | "Microsoft.FSharp.Core.Operators", "Min", [ a; b ] ->
+            pure' "fable_rt.minOf(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
+        | "Microsoft.FSharp.Core.Operators", "Hash", [ x ] ->
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit($"fable_rt.hash(%s{typedArg ctx r x 0})", xs, tI32))
+        | "Microsoft.FSharp.Core.Operators",
+          ("op_LessThan" | "op_GreaterThan" | "op_LessThanOrEqual" | "op_GreaterThanOrEqual" | "Compare"),
+          [ a; b ] ->
+            let op =
+                match name with
+                | "op_LessThan" -> Some "lt"
+                | "op_GreaterThan" -> Some "gt"
+                | "op_LessThanOrEqual" -> Some "le"
+                | "op_GreaterThanOrEqual" -> Some "ge"
+                | _ -> None
 
-        match parameter with
-        | Some p ->
+            bindArgs
+                ctx
+                [ lw ctx a; lw ctx b ]
+                (fun xs ->
+                    let order = EEmit("fable_rt.compareOf($0, $1)", xs, tI32)
+
+                    match op with
+                    | Some op -> EPrim(op, [ order; ELit("0", tI32) ], tBool)
+                    | None -> order
+                )
+        // ---- failures ----
+        | "Microsoft.FSharp.Core.Operators", "FailWith", [ msg ] -> raiseDotnet ctx r "System.Exception" (lw ctx msg) t
+        | "Microsoft.FSharp.Core.Operators", "InvalidOp", [ msg ] ->
+            raiseDotnet ctx r "System.InvalidOperationException" (lw ctx msg) t
+        | "Microsoft.FSharp.Core.Operators", "InvalidArg", [ arg; msg ] ->
+            raiseArgument ctx r "System.ArgumentException" (lw ctx msg) arg t
+        | "Microsoft.FSharp.Core.Operators", "NullArg", [ arg ] ->
+            let message = ELit(stringLiteral "Value cannot be null.", tStr)
+            raiseArgument ctx r "System.ArgumentNullException" message arg t
+        // `System.Exception("...")` and the other classes: a new exception with that message
+        // `Exception(message, inner)`: the exception, with the one inside it
+        | cls, ".ctor", [ message; inner ] when
+            dotnetExceptions.ContainsKey cls
+            && message.Type = Fable.String
+            && (
+                match inner.Type with
+                | Fable.DeclaredType(e, _) -> e.FullName = "System.Exception" || dotnetExceptions.ContainsKey e.FullName
+                | _ -> false
+            )
+            ->
             bindArgsIn
                 true
                 ctx
-                [ message; lw ctx p ]
-                (fun xs -> withParamName ctx (EExnNew(dotnetExnEnt ctx cls, [ xs.Head ])) xs.[1] id)
-        | None -> bindArgsIn true ctx [ message ] (fun xs -> EExnNew(dotnetExnEnt ctx cls, xs))
-    // `ArgumentException(message, parameter, inner)`
-    | "System.ArgumentException", ".ctor", [ message; parameter; inner ] when
-        message.Type = Fable.String && parameter.Type = Fable.String
-        ->
-        bindArgsIn
-            true
-            ctx
-            [ withParameter ctx (lw ctx message) parameter; lw ctx parameter; lw ctx inner ]
-            (fun xs ->
-                let made = EExnNew(dotnetExnEnt ctx "System.ArgumentException", [ xs.Head ])
+                [ lw ctx message ]
+                (fun xs ->
+                    let outer = EExnNew(dotnetExnEnt ctx cls, xs)
+                    bindArgs ctx [ outer; lw ctx inner ] (fun ys -> EEmit("fable_rt.exnWithInner($0, $1)", ys, tExn))
+                )
+        | cls, ".ctor", args when
+            dotnetExceptions.ContainsKey cls
+            && args |> List.forall (fun a -> a.Type = Fable.String)
+            ->
+            let message =
+                match cls, args with
+                | "System.ObjectDisposedException", [ objectName ] ->
+                    bindArgs
+                        ctx
+                        [ lw ctx objectName ]
+                        (fun xs ->
+                            EEmit(
+                                "fable_rt.format(.{ \"Cannot access a disposed object.\\nObject name: '\", $0, \"'.\" })",
+                                xs,
+                                tStr
+                            )
+                        )
+                | _, [] when defaultExnMessages.ContainsKey cls -> ELit(stringLiteral defaultExnMessages[cls], tStr)
+                | "System.ArgumentNullException", [ parameter ] ->
+                    withParameter ctx (ELit(stringLiteral "Value cannot be null.", tStr)) parameter
+                | "System.ArgumentOutOfRangeException", [ parameter ] ->
+                    let text = "Specified argument was out of the range of valid values."
+                    withParameter ctx (ELit(stringLiteral text, tStr)) parameter
+                | ("System.ArgumentNullException" | "System.ArgumentOutOfRangeException"), [ parameter; message ] ->
+                    withParameter ctx (lw ctx message) parameter
+                | "System.ArgumentException", [ message; parameter ] -> withParameter ctx (lw ctx message) parameter
+                | _, [ message ] -> lw ctx message
+                | _ -> fail r "the Zig target does not support this way of making a %s yet" cls
 
-                withParamName
+            // (the parameter an ArgumentException is about, its `ParamName`)
+            let parameter =
+                match cls, args with
+                | ("System.ArgumentNullException" | "System.ArgumentOutOfRangeException"), parameter :: _ ->
+                    Some parameter
+                | "System.ArgumentException", [ _; parameter ] -> Some parameter
+                | _ -> None
+
+            match parameter with
+            | Some p ->
+                bindArgsIn
+                    true
                     ctx
-                    made
-                    xs.[1]
-                    (fun named ->
-                        bindArgs ctx [ named; xs.[2] ] (fun ys -> EEmit("fable_rt.exnWithInner($0, $1)", ys, tExn))
+                    [ message; lw ctx p ]
+                    (fun xs -> withParamName ctx (EExnNew(dotnetExnEnt ctx cls, [ xs.Head ])) xs.[1] id)
+            | None -> bindArgsIn true ctx [ message ] (fun xs -> EExnNew(dotnetExnEnt ctx cls, xs))
+        // `ArgumentException(message, parameter, inner)`
+        | "System.ArgumentException", ".ctor", [ message; parameter; inner ] when
+            message.Type = Fable.String && parameter.Type = Fable.String
+            ->
+            bindArgsIn
+                true
+                ctx
+                [ withParameter ctx (lw ctx message) parameter; lw ctx parameter; lw ctx inner ]
+                (fun xs ->
+                    let made = EExnNew(dotnetExnEnt ctx "System.ArgumentException", [ xs.Head ])
+
+                    withParamName
+                        ctx
+                        made
+                        xs.[1]
+                        (fun named ->
+                            bindArgs
+                                ctx
+                                [ named; xs.[2] ]
+                                (fun ys -> EEmit("fable_rt.exnWithInner($0, $1)", ys, tExn))
+                        )
+                )
+        | ("System.ArgumentException" | "System.ArgumentNullException" | "System.ArgumentOutOfRangeException"),
+          "get_ParamName",
+          [ x ] -> bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnParamName($0)", xs, tStr))
+        // `Failure msg` in a pattern: the message, if the exception is a failure
+        | "Microsoft.FSharp.Core.Operators", "FailurePattern", [ x ] ->
+            let failure = failureEnt ctx
+
+            bindArgs
+                ctx
+                [ lw ctx x ]
+                (fun xs ->
+                    EIf(
+                        EExnTest(xs.Head, failure),
+                        ECon(TOpt tStr, "Some", [ EExnGet(xs.Head, failure, "Message", tStr) ], None),
+                        ECon(TOpt tStr, "None", [], None),
+                        TOpt tStr
                     )
-            )
-    | ("System.ArgumentException" | "System.ArgumentNullException" | "System.ArgumentOutOfRangeException"),
-      "get_ParamName",
-      [ x ] -> bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnParamName($0)", xs, tStr))
-    // `Failure msg` in a pattern: the message, if the exception is a failure
-    | "Microsoft.FSharp.Core.Operators", "FailurePattern", [ x ] ->
-        let failure = failureEnt ctx
-
-        bindArgs
-            ctx
-            [ lw ctx x ]
-            (fun xs ->
-                EIf(
-                    EExnTest(xs.Head, failure),
-                    ECon(TOpt tStr, "Some", [ EExnGet(xs.Head, failure, "Message", tStr) ], None),
-                    ECon(TOpt tStr, "None", [], None),
-                    TOpt tStr
                 )
-            )
-    | "Microsoft.FSharp.Collections.FSharpList`1", "get_Empty", _ -> ECon(mapType ctx r t, "Empty", [], None)
-    | entity, "get_InnerException", [ x ] when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
-        rt "fable_rt.exnInner($0)" [ x ] tExn
-    | "Microsoft.FSharp.Core.Operators", "IsNull", [ Fable.Call(Fable.Import(imp, _, _), inner, _, _) ] when
-        imp.Selector = "get_InnerException"
-        ->
-        pure' "fable_rt.exnHasNoInner($0)" [ inner.ThisArg.Value ] tBool
-    | entity, "get_Message", x :: _ when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
-        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnMessage($0)", xs, tStr))
-    | entity, "get_StackTrace", x :: _ when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
-        ctx.State.UsesStackTrace <- true
+        | "Microsoft.FSharp.Collections.FSharpList`1", "get_Empty", _ -> ECon(mapType ctx r t, "Empty", [], None)
+        | entity, "get_InnerException", [ x ] when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
+            rt "fable_rt.exnInner($0)" [ x ] tExn
+        | "Microsoft.FSharp.Core.Operators", "IsNull", [ Fable.Call(Fable.Import(imp, _, _), inner, _, _) ] when
+            imp.Selector = "get_InnerException"
+            ->
+            pure' "fable_rt.exnHasNoInner($0)" [ inner.ThisArg.Value ] tBool
+        | entity, "get_Message", x :: _ when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnMessage($0)", xs, tStr))
+        | entity, "get_StackTrace", x :: _ when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
+            ctx.State.UsesStackTrace <- true
 
-        bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnStackTrace($0)", xs, tStr))
-    | "Microsoft.FSharp.Core.Operators", "Raise", [ x ] ->
-        bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx r t))
-    | "Microsoft.FSharp.Core.Operators", "Reraise", _ ->
-        match ctx.CaughtExn with
-        | Some exV -> ERaise(EVar exV, mapType ctx r t)
-        | None -> fail r "`reraise ()` is only possible inside a `with` handler"
-    | "Microsoft.FSharp.Core.Operators", "Ignore", [ x ] -> lwStmt ctx x
-    | "Microsoft.FSharp.Core.Operators", "Identity", [ x ] -> lw ctx x
-    | "Microsoft.FSharp.Core.Operators", "Fst", [ x ] ->
-        bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 0, mapType ctx r t))
-    | "Microsoft.FSharp.Core.Operators", "Snd", [ x ] ->
-        bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 1, mapType ctx r t))
-    // .NET's members by domain: decimal, bigint, checked arithmetic (Fable2Zig.Dotnet.Numbers.fs)
-    | DomainCall "numbers" ctx r info t lowered -> lowered
-    // .NET's members by domain, in Fable2Zig.Dotnet.fs (enums, Convert and BitConverter,
-    // Random, Nullable, Stack and Queue, tuples): here, in their place among the cases
-    | DomainCall "misc" ctx r info t lowered -> lowered
-    // ---- obj ----
-    | "Microsoft.FSharp.Core.Operators", "Box", [ x ] when unwrapNullness x.Type <> Fable.Any -> boxed ctx x
-    | "Microsoft.FSharp.Core.Operators", "Box", [ x ] -> lw ctx x
-    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
-      ("Unbox" | "UnboxGeneric" | "UnboxFast"),
-      [ Uncast x ] when unwrapNullness x.Type = Fable.Any && unwrapNullness t <> Fable.Any -> unboxed ctx r x t
-    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
-      ("Unbox" | "UnboxGeneric" | "UnboxFast"),
-      [ Uncast x ] when
-        isInterfaceType ctx.Com x.Type
-        && isFatIfaceTy (mapType ctx r x.Type)
-        && unwrapNullness t <> Fable.Any
-        ->
-        ifaceDowncast ctx r x t
-    // `obj.ReferenceEquals(a, b)` and `PhysicalEquality a b`: the same cell (what F# boxes for
-    // the call is looked through: a record is not copied by it on .NET)
-    | ("System.Object" | "Microsoft.FSharp.Core.LanguagePrimitives"),
-      ("ReferenceEquals" | "PhysicalEquality"),
-      [ Uncast a; Uncast b ] ->
-        let a, b =
-            if a.Type = b.Type then
-                a, b
-            else
-                Fable.TypeCast(a, Fable.Any), Fable.TypeCast(b, Fable.Any)
-
-        // (numbers, chars and bools are boxed one by one for the call: never the same object)
-        match a.Type, b.Type with
-        | (Fable.Number _ | Fable.Char | Fable.Boolean), _
-        | _, (Fable.Number _ | Fable.Char | Fable.Boolean) ->
-            lw ctx (Fable.Sequential [ a; b; Fable.Value(Fable.BoolConstant false, r) ])
-        | _ ->
-
-            // (a record, a union or a tuple that is a value here has no identity to compare)
-            match mapType ctx r a.Type with
-            | TEnt(e, _) when e.Kind = KRecord || e.Kind = KValueUnion ->
-                fail
-                    r
-                    "the Zig target keeps %s as a value, which has no identity: ReferenceEquals and PhysicalEquality cannot be answered as on .NET (mark the type [<ReferenceEquality>] to give its values one)"
-                    e.Ref.FullName
-            | TTuple _ ->
-                fail
-                    r
-                    "the Zig target keeps tuples as values, which have no identity: ReferenceEquals cannot be answered as on .NET"
-            | _ -> pure' "fable_rt.refEql($0, $1)" [ a; b ] tBool
-    // `x.Equals(o)`: by the type's `Equals`, through an object
-    | "System.Object", "Equals", [ a; b ] ->
-        let asObj (x: Fable.Expr) =
-            match x with
-            | Uncast inner when unwrapNullness inner.Type <> Fable.Any -> Fable.TypeCast(inner, Fable.Any)
-            | _ -> x
-
-        pure' "fable_rt.eql($0, $1)" [ asObj a; asObj b ] tBool
-    | ("System.Object" | "System.String" | "System.Boolean" | "System.Char" | "System.SByte" | "System.Byte" | "System.Int16" | "System.UInt16" | "System.Int32" | "System.UInt32" | "System.Int64" | "System.UInt64" | "System.Single" | "System.Double" | "System.Decimal" | "System.Numerics.BigInteger"),
-      "GetHashCode",
-      [ x ] -> pure' "fable_rt.hash($0)" [ x ] tI32
-    | "System.Collections.Generic.EqualityComparer`1", "Equals", [ _; a; b ] ->
-        pure' "fable_rt.eql($0, $1)" [ a; b ] tBool
-    | "System.Collections.Generic.EqualityComparer`1", "GetHashCode", [ _; x ] -> pure' "fable_rt.hash($0)" [ x ] tI32
-    | "System.Collections.Generic.EqualityComparer`1", "get_Default", [] -> EUnit
-    // ---- numbers ----
-    | "System.MathF", _, _ -> dotnetCall ctx r "System.Math" name info t
-    | ("System.Double" | "System.Single"),
-      ("IsNaN" | "IsInfinity" | "IsPositiveInfinity" | "IsNegativeInfinity" | "IsFinite"),
-      [ x ] ->
-        let f =
-            match name with
-            | "IsNaN" -> "isNan"
-            | "IsInfinity" -> "isInf"
-            | "IsPositiveInfinity" -> "isPositiveInf"
-            | "IsNegativeInfinity" -> "isNegativeInf"
-            | _ -> "isFinite"
-
-        pure' $"std.math.%s{f}($0)" [ x ] tBool
-    // `Math.DivRem(a, b)`: `struct (a / b, a % b)`; with `&rem`, the remainder goes there
-    | ("System.Math" | "System.Numerics.BigInteger"), "DivRem", a :: b :: rest ->
-        let n = divRemTemps.Value.Value
-        divRemTemps.Value.Value <- n + 1
-        let ai = AST.makeTypedIdent a.Type $"divRemA%d{n}"
-        let bi = AST.makeTypedIdent b.Type $"divRemB%d{n}"
-
-        let op k =
-            if isBig a then
-                // (bigint's operators are calls)
-                let selector =
-                    if k = BinaryDivide then
-                        "op_Division"
-                    else
-                        "op_Modulus"
-
-                Fable.Call(
-                    Fable.Import(
-                        {
-                            Selector = selector
-                            Path = Replacements.DotnetPrefix + "System.Numerics.BigInteger"
-                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create())
-                        },
-                        Fable.Any,
-                        None
-                    ),
-                    { info with
-                        Args = [ Fable.IdentExpr ai; Fable.IdentExpr bi ]
-                        ThisArg = None
-                    },
-                    a.Type,
-                    r
-                )
-            else
-                Fable.Operation(Fable.Binary(k, Fable.IdentExpr ai, Fable.IdentExpr bi), [], a.Type, r)
-
-        let body =
-            match rest, t with
-            | [ Fable.Operation(Fable.Unary(UnaryAddressOf, (Fable.IdentExpr _ as out)), _, _, _) ], _ ->
-                Fable.Sequential [ Fable.Set(out, Fable.ValueSet, a.Type, op BinaryModulus, r); op BinaryDivide ]
-            | [], Fable.Tuple(_, isStruct) ->
-                Fable.Value(Fable.NewTuple([ op BinaryDivide; op BinaryModulus ], isStruct), r)
-            | _ -> fail r "the Zig target does not support this DivRem yet"
-
-        lw ctx (Fable.Let(ai, a, Fable.Let(bi, b, body)))
-    | ("Microsoft.FSharp.Core.Operators" | "System.Numerics.BigInteger"),
-      ("op_BitwiseAnd" | "op_BitwiseOr" | "op_ExclusiveOr" | "op_LeftShift" | "op_RightShift"),
-      [ a; b ] when isBig a ->
-        let f =
-            match name with
-            | "op_BitwiseAnd" -> "bigAnd"
-            | "op_BitwiseOr" -> "bigOr"
-            | "op_ExclusiveOr" -> "bigXor"
-            | "op_LeftShift" -> "bigShl"
-            | _ -> "bigShr"
-
-        pure' $"fable_rt.%s{f}($0, $1)" [ a; b ] tBig
-    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Abs", [ x ] ->
-        rt "fable_rt.absOf(@as($R, $0))" [ x ] (mapType ctx r x.Type)
-    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Sign", [ x ] ->
-        rt $"fable_rt.signOf(%s{typedArg ctx r x 0})" [ x ] tI32
-    | "Microsoft.FSharp.Core.Operators", "PowInteger", [ x; n ] ->
-        pure' "fable_rt.pown(@as($R, $0), $1)" [ x; n ] (mapType ctx r x.Type)
-    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), ("op_Exponentiation" | "Pow"), [ x; y ] ->
-        pure' "std.math.pow($R, $0, $1)" [ x; y ] (mapType ctx r x.Type)
-    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Round", [ x ] ->
-        pure' "fable_rt.roundEven(@as($R, $0))" [ x ] (mapType ctx r x.Type)
-    | "System.Math", "Round", [ x; digits ] when isInt digits -> pure' "fable_rt.roundTo($0, $1)" [ x; digits ] tF64
-    | "System.Math", "Log", [ x; b ] -> pure' "fable_rt.logBase($0, $1)" [ x; b ] tF64
-    | "System.Math", "Clamp", [ x; lo; hi ] ->
-        rt "fable_rt.clamp(@as($R, $0), $1, $2)" [ x; lo; hi ] (mapType ctx r x.Type)
-    | "System.Math", ("Max" | "Min"), [ a; b ] ->
-        let f =
-            if name = "Max" then
-                "mathMax"
-            else
-                "mathMin"
-
-        pure' $"fable_rt.%s{f}(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
-    | "System.Math", "get_PI", [] -> ELit("std.math.pi", tF64)
-    | "System.Math", "get_E", [] -> ELit("std.math.e", tF64)
-    | ("Microsoft.FSharp.Core.Operators" | "System.Math"),
-      ("Sqrt" | "Sin" | "Cos" | "Tan" | "Exp" | "Log" | "Log10" | "Floor" | "Ceiling" | "Truncate" | "Asin" | "Acos" | "Atan" | "Sinh" | "Cosh" | "Tanh" | "Log2"),
-      [ x ] ->
-        let zig =
-            match name with
-            | "Sqrt" -> "@sqrt($0)"
-            | "Sin" -> "@sin($0)"
-            | "Cos" -> "@cos($0)"
-            | "Tan" -> "@tan($0)"
-            | "Exp" -> "@exp($0)"
-            | "Log" -> "@log($0)"
-            | "Log10" -> "@log10($0)"
-            | "Log2" -> "@log2($0)"
-            | "Floor" -> "@floor($0)"
-            | "Ceiling" -> "@ceil($0)"
-            | "Truncate" -> "@trunc($0)"
-            | "Asin" -> "std.math.asin($0)"
-            | "Acos" -> "std.math.acos($0)"
-            | "Atan" -> "std.math.atan($0)"
-            | "Sinh" -> "std.math.sinh($0)"
-            | "Cosh" -> "std.math.cosh($0)"
-            | _ -> "std.math.tanh($0)"
-
-        pure' (zig.Replace("$0", "@as($R, $0)")) [ x ] (mapType ctx r x.Type)
-    | ("Microsoft.FSharp.Core.Operators" | "System.Math"), ("Atan2" | "Atan2"), [ y; x ] ->
-        pure' "std.math.atan2(@as(f64, $0), @as(f64, $1))" [ y; x ] tF64
-    // `char "a"` and `Char.Parse "a"`: a string of exactly one char
-    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), "ToChar", [ x ]
-    | "System.Char", "Parse", [ x ] when unwrapNullness x.Type = Fable.String ->
-        rt "fable_rt.strToChar($0)" [ x ] (TPrim "u16")
-    // text to numbers: F#'s conversions read `0x`, `0o`, `0b` and `_`; .NET's `Parse` does not
-    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when
-        name.StartsWith("To", System.StringComparison.Ordinal)
-        && unwrapNullness x.Type = Fable.String
-        ->
-        let ty = mapType ctx r t
-
-        if isFloatTy ty then
-            rt "fable_rt.parseFloat($R, $0)" [ x ] ty
-        elif intBits ty > 0 then
-            rt "fable_rt.parseIntFs($R, $0)" [ x ] ty
-        elif t = Fable.Boolean then
-            rt "fable_rt.parseBool($0)" [ x ] ty
-        else
-            fail r "the Zig target does not support %s.%s of a string yet" entity name
-    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64"),
-      "Parse",
-      [ x ] -> rt "fable_rt.parseInt($R, $0)" [ x ] (mapType ctx r t)
-    | ("System.Double" | "System.Single"), "Parse", [ x ] -> rt "fable_rt.parseFloat($R, $0)" [ x ] (mapType ctx r t)
-    | "System.Boolean", "Parse", [ x ] -> rt "fable_rt.parseBool($0)" [ x ] tBool
-    // (`Int32.Parse(s, provider)`: the invariant culture's, as without one)
-    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single"),
-      "Parse",
-      [ x; provider ] when
-        (match unwrapNullness provider.Type with
-         | Fable.DeclaredType(e, _) ->
-             e.FullName = "System.IFormatProvider"
-             || e.FullName = "System.Globalization.CultureInfo"
-         | _ -> false)
-        ->
-        dotnetCall ctx r entity name { info with Args = [ x ] } t
-    // `TryParse(s, &v)`: what F# gives is `(ok, v)`, with `v` an out-variable of its own; or
-    // `TryParse` given as a function, whose `v` is a ref cell (`f(s, r)`). On failure `v` is the
-    // type's default, as on .NET.
-    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single" | "System.Decimal" | "System.Boolean" | "System.Numerics.BigInteger"),
-      "TryParse",
-      [ x; out ] when
-        (match out with
-         | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr o), _, _, _) -> ctx.Vars.ContainsKey o.Name
-         // (`&r.contents` of a ref cell)
-         | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.Get(cell, Fable.FieldGet info, _, _)), _, _, _) ->
-             info.Name = "contents"
-             && (
-                 match cell.Type with
-                 | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
-                 | _ -> false
-             )
-         | _ ->
-             match out.Type with
-             | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
-             | _ -> false)
-        ->
-        let valueType =
-            match out with
-            | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr o), _, _, _) -> unByref o.Type
-            | Fable.Operation(Fable.Unary(UnaryAddressOf, (Fable.Get _ as place)), _, _, _) -> place.Type
-            | _ ->
-                match out.Type with
-                | Fable.DeclaredType(_, [ v ]) -> v
-                | _ -> fail r "internal: TryParse"
-
-        let ty = mapType ctx r valueType
-        let tmp = AST.makeTypedIdent (Fable.Option(valueType, false)) "parsed"
-
-        let parsed =
-            Fable.Emit(
-                {
-                    Macro = $"fable_rt.tryParseAny(%s{zigTypeName ty}, $0)"
-                    IsStatement = false
-                    CallInfo = Fable.CallInfo.Create(args = [ x ])
-                },
-                Fable.Option(valueType, false),
-                r
-            )
-
-        let orDefault =
-            Fable.Emit(
-                {
-                    Macro = $"fable_rt.orDefault(%s{zigTypeName ty}, $0)"
-                    IsStatement = false
-                    CallInfo = Fable.CallInfo.Create(args = [ Fable.IdentExpr tmp ])
-                },
-                valueType,
-                r
-            )
-
-        let store =
-            match out with
-            | Fable.Operation(Fable.Unary(UnaryAddressOf, (Fable.IdentExpr _ as v)), _, _, _) ->
-                Fable.Set(v, Fable.ValueSet, valueType, orDefault, r)
-            | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.Get(cell, _, _, _)), _, _, _) ->
-                Fable.Set(cell, Fable.FieldSet "contents", valueType, orDefault, r)
-            | refCell -> Fable.Set(refCell, Fable.FieldSet "contents", valueType, orDefault, r)
-
-        let isSome = Fable.Test(Fable.IdentExpr tmp, Fable.OptionTest true, r)
-
-        lw ctx (Fable.Let(tmp, parsed, Fable.Sequential [ store; isSome ]))
-    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64"),
-      "Parse",
-      [ s; Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32(512 | 515), _), _) ] ->
-        rt "fable_rt.parseHex($R, $0)" [ s ] (mapType ctx r t)
-    // sums and averages: the runtime adds with `+` of the item type
-    | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] when mapType ctx r t = TPrim "fable_rt.NetDecimal" ->
-        rt "fable_rt.listSumDec($0)" [ xs ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] -> pure' "fable_rt.listSum($0)" [ xs ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ListModule", "SumBy", [ f; xs ] ->
-        trySpecListHof
-            ctx
-            r
-            name
-            args
-            t
-            (function
-            | [ f'; xs' ] -> rt "fable_rt.listSumBy($R, $0, $1)" [ f'; xs' ] (mapType ctx r t)
-            | _ -> rt "fable_rt.listSumBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
-            )
-        |> Option.defaultWith (fun () -> rt "fable_rt.listSumBy($R, $0, $1)" [ f; xs ] (mapType ctx r t))
-    | "Microsoft.FSharp.Collections.ListModule", "Average", [ xs ] ->
-        rt "fable_rt.listAverage($0)" [ xs ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ListModule", "AverageBy", [ f; xs ] ->
-        rt "fable_rt.listAverageBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] when mapType ctx r t = TPrim "fable_rt.NetDecimal" ->
-        rt "fable_rt.arraySumDec($0)" [ a ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] -> pure' "fable_rt.arraySum($0)" [ a ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ArrayModule", "Average", [ a ] ->
-        rt "fable_rt.arrayAverage($0)" [ a ] (mapType ctx r t)
-    | "Microsoft.FSharp.Collections.ArrayModule", "SumBy", [ f; a ] ->
-        trySpecArrayHof
-            ctx
-            r
-            name
-            args
-            t
-            (function
-            | [ f'; a' ] -> rt "fable_rt.arraySumBy($R, $0, $1)" [ f'; a' ] (mapType ctx r t)
-            | _ -> rt "fable_rt.arraySumBy($R, $0, $1)" [ f; a ] (mapType ctx r t)
-            )
-        |> Option.defaultWith (fun () -> rt "fable_rt.arraySumBy($R, $0, $1)" [ f; a ] (mapType ctx r t))
-    | "Microsoft.FSharp.Collections.ArrayModule", "AverageBy", [ f; a ] ->
-        rt "fable_rt.arrayAverageBy($R, $0, $1)" [ f; a ] (mapType ctx r t)
-    | "System.Array", "Copy", [ Uncast src; Uncast dst; n ] ->
-        rt "fable_rt.arrayCopyRange($0, 0, $1, 0, $2)" [ src; dst; n ] tVoid
-    | "System.Array", "Copy", [ Uncast src; si; Uncast dst; di; n ] ->
-        rt "fable_rt.arrayCopyRange($0, $1, $2, $3, $4)" [ src; si; dst; di; n ] tVoid
-    | "System.Array", "IndexOf", [ Uncast a; Uncast x ] -> rt "fable_rt.arrayIndexOf($0, $1, 0, null)" [ a; x ] tI32
-    | "System.Array", "IndexOf", [ Uncast a; Uncast x; start ] ->
-        rt "fable_rt.arrayIndexOf($0, $1, $2, null)" [ a; x; start ] tI32
-    | "System.Array", "IndexOf", [ Uncast a; Uncast x; start; count ] ->
-        rt "fable_rt.arrayIndexOf($0, $1, $2, $3)" [ a; x; start; count ] tI32
-    | "System.Array", "ConvertAll", [ a; f ] -> rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
-    | "Microsoft.FSharp.Core.Operators.OperatorIntrinsics", "SetArraySlice", [ target; lo; hi; source ] ->
-        rt "fable_rt.arraySetSlice($0, $1, $2, $3)" [ target; lo; hi; source ] tVoid
-
-    // int, int64, byte, float, char, ...: conversions between numbers, with .NET's results
-    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when
-        name.StartsWith("To", System.StringComparison.Ordinal)
-        ->
-        let ty = mapType ctx r t
-
-        bindArgs
-            ctx
-            [ lw ctx x ]
-            (fun xs ->
-                let from = typeOf xs.Head
-
-                if from = ty then
-                    xs.Head
-                elif isNumber from && isNumber ty then
-                    ctx.State.UsesRuntime <- true
-                    EPrim("conv", xs, ty)
+            bindArgs ctx [ lw ctx x ] (fun xs -> EEmit("fable_rt.exnStackTrace($0)", xs, tStr))
+        | "Microsoft.FSharp.Core.Operators", "Raise", [ x ] ->
+            bindArgs ctx [ lw ctx x ] (fun xs -> ERaise(xs.Head, mapType ctx r t))
+        | "Microsoft.FSharp.Core.Operators", "Reraise", _ ->
+            match ctx.CaughtExn with
+            | Some exV -> ERaise(EVar exV, mapType ctx r t)
+            | None -> fail r "`reraise ()` is only possible inside a `with` handler"
+        | "Microsoft.FSharp.Core.Operators", "Ignore", [ x ] -> lwStmt ctx x
+        | "Microsoft.FSharp.Core.Operators", "Identity", [ x ] -> lw ctx x
+        | "Microsoft.FSharp.Core.Operators", "Fst", [ x ] ->
+            bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 0, mapType ctx r t))
+        | "Microsoft.FSharp.Core.Operators", "Snd", [ x ] ->
+            bindArgs ctx [ lw ctx x ] (fun xs -> EGet(xs.Head, PItem 1, mapType ctx r t))
+        // .NET's members by domain: decimal, bigint, checked arithmetic (Fable2Zig.Dotnet.Numbers.fs)
+        | DomainCall "numbers" ctx r info t lowered -> lowered
+        // .NET's members by domain, in Fable2Zig.Dotnet.fs (enums, Convert and BitConverter,
+        // Random, Nullable, Stack and Queue, tuples): here, in their place among the cases
+        | DomainCall "misc" ctx r info t lowered -> lowered
+        // ---- obj ----
+        | "Microsoft.FSharp.Core.Operators", "Box", [ x ] when unwrapNullness x.Type <> Fable.Any -> boxed ctx x
+        | "Microsoft.FSharp.Core.Operators", "Box", [ x ] -> lw ctx x
+        | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
+          ("Unbox" | "UnboxGeneric" | "UnboxFast"),
+          [ Uncast x ] when unwrapNullness x.Type = Fable.Any && unwrapNullness t <> Fable.Any -> unboxed ctx r x t
+        | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions"),
+          ("Unbox" | "UnboxGeneric" | "UnboxFast"),
+          [ Uncast x ] when
+            isInterfaceType ctx.Com x.Type
+            && isFatIfaceTy (mapType ctx r x.Type)
+            && unwrapNullness t <> Fable.Any
+            ->
+            ifaceDowncast ctx r x t
+        // `obj.ReferenceEquals(a, b)` and `PhysicalEquality a b`: the same cell (what F# boxes for
+        // the call is looked through: a record is not copied by it on .NET)
+        | ("System.Object" | "Microsoft.FSharp.Core.LanguagePrimitives"),
+          ("ReferenceEquals" | "PhysicalEquality"),
+          [ Uncast a; Uncast b ] ->
+            let a, b =
+                if a.Type = b.Type then
+                    a, b
                 else
-                    fail r "the Zig target does not support %s.%s yet" entity name
-            )
-    | _ ->
-        // (where the value is a function that is applied at once, Fable gives the read the type
-        // of the application: the option's item type is the one to go by)
-        let t =
-            match entity, name, args with
-            | ("Microsoft.FSharp.Core.FSharpOption`1" | "Microsoft.FSharp.Core.FSharpValueOption`1"),
-              "get_Value",
-              o :: _ ->
-                match o.Type with
-                | Fable.Option(item, _) -> item
-                | _ -> t
-            | _ -> t
+                    Fable.TypeCast(a, Fable.Any), Fable.TypeCast(b, Fable.Any)
 
-        // (a member of F#'s list reached through a trait call, `(^a: (member Length: int) x)`,
-        // comes with the list's type as its type argument; the functions take the item's)
-        let info =
-            match entity, info.ThisArg with
-            | "Microsoft.FSharp.Collections.FSharpList`1", Some this ->
-                match this.Type with
-                | Fable.List item -> { info with GenericArgs = [ item ] }
-                | _ -> info
-            | _ -> info
+            // (numbers, chars and bools are boxed one by one for the call: never the same object)
+            match a.Type, b.Type with
+            | (Fable.Number _ | Fable.Char | Fable.Boolean), _
+            | _, (Fable.Number _ | Fable.Char | Fable.Boolean) ->
+                lw ctx (Fable.Sequential [ a; b; Fable.Value(Fable.BoolConstant false, r) ])
+            | _ ->
 
-        let fallback args' =
-            match libraryFunction entity name with
-            | Some(file, fn) -> libraryCall ctx r file fn info args' t
-            | None -> fail r "the Zig target does not support %s.%s yet" entity name
+                // (a record, a union or a tuple that is a value here has no identity to compare)
+                match mapType ctx r a.Type with
+                | TEnt(e, _) when e.Kind = KRecord || e.Kind = KValueUnion ->
+                    fail
+                        r
+                        "the Zig target keeps %s as a value, which has no identity: ReferenceEquals and PhysicalEquality cannot be answered as on .NET (mark the type [<ReferenceEquality>] to give its values one)"
+                        e.Ref.FullName
+                | TTuple _ ->
+                    fail
+                        r
+                        "the Zig target keeps tuples as values, which have no identity: ReferenceEquals cannot be answered as on .NET"
+                | _ -> pure' "fable_rt.refEql($0, $1)" [ a; b ] tBool
+        // `x.Equals(o)`: by the type's `Equals`, through an object
+        | "System.Object", "Equals", [ a; b ] ->
+            let asObj (x: Fable.Expr) =
+                match x with
+                | Uncast inner when unwrapNullness inner.Type <> Fable.Any -> Fable.TypeCast(inner, Fable.Any)
+                | _ -> x
 
-        match
-            if entity = "Microsoft.FSharp.Collections.ListModule" then
-                trySpecListHof ctx r name args t fallback
+            pure' "fable_rt.eql($0, $1)" [ asObj a; asObj b ] tBool
+        | ("System.Object" | "System.String" | "System.Boolean" | "System.Char" | "System.SByte" | "System.Byte" | "System.Int16" | "System.UInt16" | "System.Int32" | "System.UInt32" | "System.Int64" | "System.UInt64" | "System.Single" | "System.Double" | "System.Decimal" | "System.Numerics.BigInteger"),
+          "GetHashCode",
+          [ x ] -> pure' "fable_rt.hash($0)" [ x ] tI32
+        | "System.Collections.Generic.EqualityComparer`1", "Equals", [ _; a; b ] ->
+            pure' "fable_rt.eql($0, $1)" [ a; b ] tBool
+        | "System.Collections.Generic.EqualityComparer`1", "GetHashCode", [ _; x ] ->
+            pure' "fable_rt.hash($0)" [ x ] tI32
+        | "System.Collections.Generic.EqualityComparer`1", "get_Default", [] -> EUnit
+        // ---- numbers ----
+        | "System.MathF", _, _ -> dotnetCall ctx r "System.Math" name info t
+        | ("System.Double" | "System.Single"),
+          ("IsNaN" | "IsInfinity" | "IsPositiveInfinity" | "IsNegativeInfinity" | "IsFinite"),
+          [ x ] ->
+            let f =
+                match name with
+                | "IsNaN" -> "isNan"
+                | "IsInfinity" -> "isInf"
+                | "IsPositiveInfinity" -> "isPositiveInf"
+                | "IsNegativeInfinity" -> "isNegativeInf"
+                | _ -> "isFinite"
+
+            pure' $"std.math.%s{f}($0)" [ x ] tBool
+        // `Math.DivRem(a, b)`: `struct (a / b, a % b)`; with `&rem`, the remainder goes there
+        | ("System.Math" | "System.Numerics.BigInteger"), "DivRem", a :: b :: rest ->
+            let n = divRemTemps.Value.Value
+            divRemTemps.Value.Value <- n + 1
+            let ai = AST.makeTypedIdent a.Type $"divRemA%d{n}"
+            let bi = AST.makeTypedIdent b.Type $"divRemB%d{n}"
+
+            let op k =
+                if isBig a then
+                    // (bigint's operators are calls)
+                    let selector =
+                        if k = BinaryDivide then
+                            "op_Division"
+                        else
+                            "op_Modulus"
+
+                    Fable.Call(
+                        Fable.Import(
+                            {
+                                Selector = selector
+                                Path = Replacements.DotnetPrefix + "System.Numerics.BigInteger"
+                                Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create())
+                            },
+                            Fable.Any,
+                            None
+                        ),
+                        { info with
+                            Args = [ Fable.IdentExpr ai; Fable.IdentExpr bi ]
+                            ThisArg = None
+                        },
+                        a.Type,
+                        r
+                    )
+                else
+                    Fable.Operation(Fable.Binary(k, Fable.IdentExpr ai, Fable.IdentExpr bi), [], a.Type, r)
+
+            let body =
+                match rest, t with
+                | [ Fable.Operation(Fable.Unary(UnaryAddressOf, (Fable.IdentExpr _ as out)), _, _, _) ], _ ->
+                    Fable.Sequential [ Fable.Set(out, Fable.ValueSet, a.Type, op BinaryModulus, r); op BinaryDivide ]
+                | [], Fable.Tuple(_, isStruct) ->
+                    Fable.Value(Fable.NewTuple([ op BinaryDivide; op BinaryModulus ], isStruct), r)
+                | _ -> fail r "the Zig target does not support this DivRem yet"
+
+            lw ctx (Fable.Let(ai, a, Fable.Let(bi, b, body)))
+        | ("Microsoft.FSharp.Core.Operators" | "System.Numerics.BigInteger"),
+          ("op_BitwiseAnd" | "op_BitwiseOr" | "op_ExclusiveOr" | "op_LeftShift" | "op_RightShift"),
+          [ a; b ] when isBig a ->
+            let f =
+                match name with
+                | "op_BitwiseAnd" -> "bigAnd"
+                | "op_BitwiseOr" -> "bigOr"
+                | "op_ExclusiveOr" -> "bigXor"
+                | "op_LeftShift" -> "bigShl"
+                | _ -> "bigShr"
+
+            pure' $"fable_rt.%s{f}($0, $1)" [ a; b ] tBig
+        | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Abs", [ x ] ->
+            rt "fable_rt.absOf(@as($R, $0))" [ x ] (mapType ctx r x.Type)
+        | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Sign", [ x ] ->
+            rt $"fable_rt.signOf(%s{typedArg ctx r x 0})" [ x ] tI32
+        | "Microsoft.FSharp.Core.Operators", "PowInteger", [ x; n ] ->
+            pure' "fable_rt.pown(@as($R, $0), $1)" [ x; n ] (mapType ctx r x.Type)
+        | ("Microsoft.FSharp.Core.Operators" | "System.Math"), ("op_Exponentiation" | "Pow"), [ x; y ] ->
+            pure' "std.math.pow($R, $0, $1)" [ x; y ] (mapType ctx r x.Type)
+        | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Round", [ x ] ->
+            pure' "fable_rt.roundEven(@as($R, $0))" [ x ] (mapType ctx r x.Type)
+        | "System.Math", "Round", [ x; digits ] when isInt digits -> pure' "fable_rt.roundTo($0, $1)" [ x; digits ] tF64
+        | "System.Math", "Log", [ x; b ] -> pure' "fable_rt.logBase($0, $1)" [ x; b ] tF64
+        | "System.Math", "Clamp", [ x; lo; hi ] ->
+            rt "fable_rt.clamp(@as($R, $0), $1, $2)" [ x; lo; hi ] (mapType ctx r x.Type)
+        | "System.Math", ("Max" | "Min"), [ a; b ] ->
+            let f =
+                if name = "Max" then
+                    "mathMax"
+                else
+                    "mathMin"
+
+            pure' $"fable_rt.%s{f}(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
+        | "System.Math", "get_PI", [] -> ELit("std.math.pi", tF64)
+        | "System.Math", "get_E", [] -> ELit("std.math.e", tF64)
+        | ("Microsoft.FSharp.Core.Operators" | "System.Math"),
+          ("Sqrt" | "Sin" | "Cos" | "Tan" | "Exp" | "Log" | "Log10" | "Floor" | "Ceiling" | "Truncate" | "Asin" | "Acos" | "Atan" | "Sinh" | "Cosh" | "Tanh" | "Log2"),
+          [ x ] ->
+            let zig =
+                match name with
+                | "Sqrt" -> "@sqrt($0)"
+                | "Sin" -> "@sin($0)"
+                | "Cos" -> "@cos($0)"
+                | "Tan" -> "@tan($0)"
+                | "Exp" -> "@exp($0)"
+                | "Log" -> "@log($0)"
+                | "Log10" -> "@log10($0)"
+                | "Log2" -> "@log2($0)"
+                | "Floor" -> "@floor($0)"
+                | "Ceiling" -> "@ceil($0)"
+                | "Truncate" -> "@trunc($0)"
+                | "Asin" -> "std.math.asin($0)"
+                | "Acos" -> "std.math.acos($0)"
+                | "Atan" -> "std.math.atan($0)"
+                | "Sinh" -> "std.math.sinh($0)"
+                | "Cosh" -> "std.math.cosh($0)"
+                | _ -> "std.math.tanh($0)"
+
+            pure' (zig.Replace("$0", "@as($R, $0)")) [ x ] (mapType ctx r x.Type)
+        | ("Microsoft.FSharp.Core.Operators" | "System.Math"), ("Atan2" | "Atan2"), [ y; x ] ->
+            pure' "std.math.atan2(@as(f64, $0), @as(f64, $1))" [ y; x ] tF64
+        // `char "a"` and `Char.Parse "a"`: a string of exactly one char
+        | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), "ToChar", [ x ]
+        | "System.Char", "Parse", [ x ] when unwrapNullness x.Type = Fable.String ->
+            rt "fable_rt.strToChar($0)" [ x ] (TPrim "u16")
+        // text to numbers: F#'s conversions read `0x`, `0o`, `0b` and `_`; .NET's `Parse` does not
+        | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when
+            name.StartsWith("To", System.StringComparison.Ordinal)
+            && unwrapNullness x.Type = Fable.String
+            ->
+            let ty = mapType ctx r t
+
+            if isFloatTy ty then
+                rt "fable_rt.parseFloat($R, $0)" [ x ] ty
+            elif intBits ty > 0 then
+                rt "fable_rt.parseIntFs($R, $0)" [ x ] ty
+            elif t = Fable.Boolean then
+                rt "fable_rt.parseBool($0)" [ x ] ty
             else
-                None
-        with
-        | Some lowered -> lowered
-        | None -> fallback args
+                fail r "the Zig target does not support %s.%s of a string yet" entity name
+        | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64"),
+          "Parse",
+          [ x ] -> rt "fable_rt.parseInt($R, $0)" [ x ] (mapType ctx r t)
+        | ("System.Double" | "System.Single"), "Parse", [ x ] ->
+            rt "fable_rt.parseFloat($R, $0)" [ x ] (mapType ctx r t)
+        | "System.Boolean", "Parse", [ x ] -> rt "fable_rt.parseBool($0)" [ x ] tBool
+        // (`Int32.Parse(s, provider)`: the invariant culture's, as without one)
+        | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single"),
+          "Parse",
+          [ x; provider ] when
+            (match unwrapNullness provider.Type with
+             | Fable.DeclaredType(e, _) ->
+                 e.FullName = "System.IFormatProvider"
+                 || e.FullName = "System.Globalization.CultureInfo"
+             | _ -> false)
+            ->
+            dotnetCall ctx r entity name { info with Args = [ x ] } t
+        // `TryParse(s, &v)`: what F# gives is `(ok, v)`, with `v` an out-variable of its own; or
+        // `TryParse` given as a function, whose `v` is a ref cell (`f(s, r)`). On failure `v` is the
+        // type's default, as on .NET.
+        | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single" | "System.Decimal" | "System.Boolean" | "System.Numerics.BigInteger"),
+          "TryParse",
+          [ x; out ] when
+            (match out with
+             | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr o), _, _, _) -> ctx.Vars.ContainsKey o.Name
+             // (`&r.contents` of a ref cell)
+             | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.Get(cell, Fable.FieldGet info, _, _)), _, _, _) ->
+                 info.Name = "contents"
+                 && (
+                     match cell.Type with
+                     | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
+                     | _ -> false
+                 )
+             | _ ->
+                 match out.Type with
+                 | Fable.DeclaredType(e, [ _ ]) -> e.FullName = refName
+                 | _ -> false)
+            ->
+            let valueType =
+                match out with
+                | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.IdentExpr o), _, _, _) -> unByref o.Type
+                | Fable.Operation(Fable.Unary(UnaryAddressOf, (Fable.Get _ as place)), _, _, _) -> place.Type
+                | _ ->
+                    match out.Type with
+                    | Fable.DeclaredType(_, [ v ]) -> v
+                    | _ -> fail r "internal: TryParse"
+
+            let ty = mapType ctx r valueType
+            let tmp = AST.makeTypedIdent (Fable.Option(valueType, false)) "parsed"
+
+            let parsed =
+                Fable.Emit(
+                    {
+                        Macro = $"fable_rt.tryParseAny(%s{zigTypeName ty}, $0)"
+                        IsStatement = false
+                        CallInfo = Fable.CallInfo.Create(args = [ x ])
+                    },
+                    Fable.Option(valueType, false),
+                    r
+                )
+
+            let orDefault =
+                Fable.Emit(
+                    {
+                        Macro = $"fable_rt.orDefault(%s{zigTypeName ty}, $0)"
+                        IsStatement = false
+                        CallInfo = Fable.CallInfo.Create(args = [ Fable.IdentExpr tmp ])
+                    },
+                    valueType,
+                    r
+                )
+
+            let store =
+                match out with
+                | Fable.Operation(Fable.Unary(UnaryAddressOf, (Fable.IdentExpr _ as v)), _, _, _) ->
+                    Fable.Set(v, Fable.ValueSet, valueType, orDefault, r)
+                | Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.Get(cell, _, _, _)), _, _, _) ->
+                    Fable.Set(cell, Fable.FieldSet "contents", valueType, orDefault, r)
+                | refCell -> Fable.Set(refCell, Fable.FieldSet "contents", valueType, orDefault, r)
+
+            let isSome = Fable.Test(Fable.IdentExpr tmp, Fable.OptionTest true, r)
+
+            lw ctx (Fable.Let(tmp, parsed, Fable.Sequential [ store; isSome ]))
+        | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64"),
+          "Parse",
+          [ s; Fable.Value(Fable.NumberConstant(Fable.NumberValue.Int32(512 | 515), _), _) ] ->
+            rt "fable_rt.parseHex($R, $0)" [ s ] (mapType ctx r t)
+        // sums and averages: the runtime adds with `+` of the item type
+        | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] when mapType ctx r t = TPrim "fable_rt.NetDecimal" ->
+            rt "fable_rt.listSumDec($0)" [ xs ] (mapType ctx r t)
+        | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] ->
+            pure' "fable_rt.listSum($0)" [ xs ] (mapType ctx r t)
+        | "Microsoft.FSharp.Collections.ListModule", "SumBy", [ f; xs ] ->
+            trySpecListHof
+                ctx
+                r
+                name
+                args
+                t
+                (function
+                | [ f'; xs' ] -> rt "fable_rt.listSumBy($R, $0, $1)" [ f'; xs' ] (mapType ctx r t)
+                | _ -> rt "fable_rt.listSumBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
+                )
+            |> Option.defaultWith (fun () -> rt "fable_rt.listSumBy($R, $0, $1)" [ f; xs ] (mapType ctx r t))
+        | "Microsoft.FSharp.Collections.ListModule", "Average", [ xs ] ->
+            rt "fable_rt.listAverage($0)" [ xs ] (mapType ctx r t)
+        | "Microsoft.FSharp.Collections.ListModule", "AverageBy", [ f; xs ] ->
+            rt "fable_rt.listAverageBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
+        | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] when mapType ctx r t = TPrim "fable_rt.NetDecimal" ->
+            rt "fable_rt.arraySumDec($0)" [ a ] (mapType ctx r t)
+        | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] ->
+            pure' "fable_rt.arraySum($0)" [ a ] (mapType ctx r t)
+        | "Microsoft.FSharp.Collections.ArrayModule", "Average", [ a ] ->
+            rt "fable_rt.arrayAverage($0)" [ a ] (mapType ctx r t)
+        | "Microsoft.FSharp.Collections.ArrayModule", "SumBy", [ f; a ] ->
+            trySpecArrayHof
+                ctx
+                r
+                name
+                args
+                t
+                (function
+                | [ f'; a' ] -> rt "fable_rt.arraySumBy($R, $0, $1)" [ f'; a' ] (mapType ctx r t)
+                | _ -> rt "fable_rt.arraySumBy($R, $0, $1)" [ f; a ] (mapType ctx r t)
+                )
+            |> Option.defaultWith (fun () -> rt "fable_rt.arraySumBy($R, $0, $1)" [ f; a ] (mapType ctx r t))
+        | "Microsoft.FSharp.Collections.ArrayModule", "AverageBy", [ f; a ] ->
+            rt "fable_rt.arrayAverageBy($R, $0, $1)" [ f; a ] (mapType ctx r t)
+        | "System.Array", "Copy", [ Uncast src; Uncast dst; n ] ->
+            rt "fable_rt.arrayCopyRange($0, 0, $1, 0, $2)" [ src; dst; n ] tVoid
+        | "System.Array", "Copy", [ Uncast src; si; Uncast dst; di; n ] ->
+            rt "fable_rt.arrayCopyRange($0, $1, $2, $3, $4)" [ src; si; dst; di; n ] tVoid
+        | "System.Array", "IndexOf", [ Uncast a; Uncast x ] -> rt "fable_rt.arrayIndexOf($0, $1, 0, null)" [ a; x ] tI32
+        | "System.Array", "IndexOf", [ Uncast a; Uncast x; start ] ->
+            rt "fable_rt.arrayIndexOf($0, $1, $2, null)" [ a; x; start ] tI32
+        | "System.Array", "IndexOf", [ Uncast a; Uncast x; start; count ] ->
+            rt "fable_rt.arrayIndexOf($0, $1, $2, $3)" [ a; x; start; count ] tI32
+        | "System.Array", "ConvertAll", [ a; f ] -> rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
+        | "Microsoft.FSharp.Core.Operators.OperatorIntrinsics", "SetArraySlice", [ target; lo; hi; source ] ->
+            rt "fable_rt.arraySetSlice($0, $1, $2, $3)" [ target; lo; hi; source ] tVoid
+
+        // int, int64, byte, float, char, ...: conversions between numbers, with .NET's results
+        | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.ExtraTopLevelOperators"), _, [ x ] when
+            name.StartsWith("To", System.StringComparison.Ordinal)
+            ->
+            let ty = mapType ctx r t
+
+            bindArgs
+                ctx
+                [ lw ctx x ]
+                (fun xs ->
+                    let from = typeOf xs.Head
+
+                    if from = ty then
+                        xs.Head
+                    elif isNumber from && isNumber ty then
+                        ctx.State.UsesRuntime <- true
+                        EPrim("conv", xs, ty)
+                    else
+                        fail r "the Zig target does not support %s.%s yet" entity name
+                )
+        | _ ->
+            // (where the value is a function that is applied at once, Fable gives the read the type
+            // of the application: the option's item type is the one to go by)
+            let t =
+                match entity, name, args with
+                | ("Microsoft.FSharp.Core.FSharpOption`1" | "Microsoft.FSharp.Core.FSharpValueOption`1"),
+                  "get_Value",
+                  o :: _ ->
+                    match o.Type with
+                    | Fable.Option(item, _) -> item
+                    | _ -> t
+                | _ -> t
+
+            // (a member of F#'s list reached through a trait call, `(^a: (member Length: int) x)`,
+            // comes with the list's type as its type argument; the functions take the item's)
+            let info =
+                match entity, info.ThisArg with
+                | "Microsoft.FSharp.Collections.FSharpList`1", Some this ->
+                    match this.Type with
+                    | Fable.List item -> { info with GenericArgs = [ item ] }
+                    | _ -> info
+                | _ -> info
+
+            let fallback args' =
+                match libraryFunction entity name with
+                | Some(file, fn) -> libraryCall ctx r file fn info args' t
+                | None -> fail r "the Zig target does not support %s.%s yet" entity name
+
+            match
+                if entity = "Microsoft.FSharp.Collections.ListModule" then
+                    trySpecListHof ctx r name args t fallback
+                else
+                    None
+            with
+            | Some lowered -> lowered
+            | None -> fallback args
 
 /// The item type of a cell type of one type argument.
 and itemOf (x: Expr) : Ty =

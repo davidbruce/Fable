@@ -949,6 +949,22 @@ let parallelAll<'T> (computations: SeqOf<AsyncOf<'T>>) : AsyncOf<'T[]> =
                         }
     )
 
+
+/// `Async.Parallel(computations, maxDegreeOfParallelism)`: the degree checked where the call is
+/// made, as .NET does (the computations then run as `Async.Parallel` runs them)
+let parallelAllMax<'T> (computations: SeqOf<AsyncOf<'T>>) (maxDegree: int option) : AsyncOf<'T[]> =
+    match maxDegree with
+    | Some d when d < 1 ->
+        raise (
+            System.ArgumentException(
+                "maxDegreeOfParallelism must be positive, was " + string d,
+                "maxDegreeOfParallelism"
+            )
+        )
+    | _ -> ()
+
+    parallelAll computations
+
 let returnValue<'T> (value: 'T) : AsyncOf<'T> = builderReturn value
 
 // ---- MailboxProcessor ----

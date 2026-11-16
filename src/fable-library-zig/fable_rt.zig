@@ -3059,6 +3059,10 @@ fn objAsIface(comptime C: type, p: Obj) ?C {
 
 pub const ObjHeader = struct {
     @"$rc": u32 = 1,
+    /// the object's identity hash, given the first time it is asked for (.NET keeps one in the
+    /// object's header too: an object made where a freed one was does not hash as it did);
+    /// it fills the room after the count, so costs nothing on 64-bit targets
+    stamp: u32 = 0,
     /// the collector's header of this object, if what it holds can be part of a cycle
     gc: ?*sgc.Hdr = null,
     type: *const ObjType,
@@ -3586,6 +3590,42 @@ pub fn unbox(comptime T: type, x: anytype) Raised!T {
     b.addAscii(netTypeName(T));
     b.addAscii("'.");
     return raise(InvalidCastException, b.finish());
+}
+
+var next_stamp = std.atomic.Value(u32).init(0);
+
+/// An object's identity hash: a number of its own, as .NET gives (never 0, which means none yet)
+pub fn objStamp(o: Obj) i32 {
+    const now = @atomicLoad(u32, &o.stamp, .monotonic);
+    if (now != 0) return @bitCast(now);
+    // (a sequence spread over the 32 bits, as .NET's are random-looking)
+    var s = (next_stamp.fetchAdd(1, .monotonic) +% 1) *% 0x9E3779B1;
+    if (s == 0) s = 1;
+    if (@cmpxchgStrong(u32, &o.stamp, 0, s, .monotonic, .monotonic)) |other| return @bitCast(other);
+    return @bitCast(s);
+}
+
+/// `LanguagePrimitives.PhysicalHash x`: of a value that is a reference (a cell, an object, a
+/// string), its identity; of any other, its hash
+pub fn physicalHash(x: anytype) i32 {
+    const T = @TypeOf(x);
+    if (comptime isCellPtr(T)) return @truncate(@as(isize, @bitCast(@intFromPtr(x) >> 4)));
+    if (comptime @typeInfo(T) == .optional and isCellPtr(@typeInfo(T).optional.child)) {
+        const p = x orelse return 0;
+        return @truncate(@as(isize, @bitCast(@intFromPtr(p) >> 4)));
+    }
+    if (T == Any) {
+        const p = x orelse return 0;
+        return objStamp(p);
+    }
+    if (T == Obj) return objStamp(x);
+    // (a value: .NET boxes it for the call, a new object each time)
+    if (comptime !isManaged(T) or @typeInfo(T) == .@"struct") {
+        var st = (next_stamp.fetchAdd(1, .monotonic) +% 1) *% 0x9E3779B1;
+        if (st == 0) st = 1;
+        return @bitCast(st);
+    }
+    return hash(x);
 }
 
 /// A map changed through `IDictionary` or `ICollection`: .NET's NotSupportedException
@@ -5172,7 +5212,8 @@ pub fn hash(x: anytype) i32 {
     if (T == Exn) {
         if (x.type.hash) |f| return f(x);
     }
-    if (T == Exn or T == Obj) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
+    if (T == Obj) return objStamp(x);
+    if (T == Exn) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
     if (comptime isDecimal(T)) return decHash(x);
     if (comptime isFunc(T)) return @truncate(@as(isize, @bitCast(@intFromPtr(x.env) ^ @intFromPtr(x.code))));
     if (comptime isIface(T)) {

@@ -577,7 +577,12 @@ pub fn arrayAverageBy(comptime R: type, f: anytype, a: anytype) Raised!R {
 
 /// `Array.Copy(source, sourceIndex, target, targetIndex, length)`
 pub fn arrayCopyRange(source: anytype, si: i32, target: @TypeOf(source), ti: i32, n: i32) Raised!void {
-    if (si < 0 or n < 0 or si + n > source.items.len) return raise(ArgumentException, str("Source array was not long enough. Check the source index, length, and the array's lower bounds. (Parameter 'sourceArray')"));
+    // (.NET's Array.Copy: a negative count or index is out of range; a range past an end, an
+    // argument error)
+    if (n < 0) return raise(ArgumentOutOfRangeException, str("Non-negative number required. (Parameter 'length')"));
+    if (si < 0) return raise(ArgumentOutOfRangeException, str("Index was less than the array's lower bound in the first dimension. (Parameter 'sourceIndex')"));
+    if (ti < 0) return raise(ArgumentOutOfRangeException, str("Index was less than the array's lower bound in the first dimension. (Parameter 'destinationIndex')"));
+    if (si + n > source.items.len) return raise(ArgumentException, str("Source array was not long enough. Check the source index, length, and the array's lower bounds. (Parameter 'sourceArray')"));
     if (ti < 0 or ti + n > target.items.len) return raise(ArgumentException, str("Destination array was not long enough. Check the destination index, length, and the array's lower bounds. (Parameter 'destinationArray')"));
     const from: usize = @intCast(si);
     const to: usize = @intCast(ti);

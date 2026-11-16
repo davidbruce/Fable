@@ -374,7 +374,7 @@ let truncate<'T> (count: int) (array: 'T[]) : 'T[] =
 
 let skip<'T> (count: int) (array: 'T[]) : 'T[] =
     if count > array.Length then
-        invalidArg "count" "outOfRange"
+        raise (System.ArgumentOutOfRangeException("count", "outOfRange"))
 
     let start =
         if count < 0 then
@@ -457,7 +457,27 @@ let except<'T when 'T: equality> (itemsToExclude: 'T list) (array: 'T[]) : 'T[] 
     distinct (Array.filter (fun x -> not (List.contains x itemsToExclude)) array)
 
 let blit<'T> (source: 'T[]) (sourceIndex: int) (target: 'T[]) (targetIndex: int) (count: int) : unit =
-    if sourceIndex < 0 || count < 0 || sourceIndex + count > source.Length then
+    // (as System.Array.Copy, which FSharp.Core's blit calls: negative is out of range)
+    if count < 0 then
+        raise (System.ArgumentOutOfRangeException("length", "Non-negative number required."))
+
+    if sourceIndex < 0 then
+        raise (
+            System.ArgumentOutOfRangeException(
+                "sourceIndex",
+                "Index was less than the array's lower bound in the first dimension."
+            )
+        )
+
+    if targetIndex < 0 then
+        raise (
+            System.ArgumentOutOfRangeException(
+                "destinationIndex",
+                "Index was less than the array's lower bound in the first dimension."
+            )
+        )
+
+    if sourceIndex + count > source.Length then
         invalidArg
             "sourceArray"
             "Source array was not long enough. Check the source index, length, and the array's lower bounds."

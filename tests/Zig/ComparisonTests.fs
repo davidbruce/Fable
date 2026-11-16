@@ -793,3 +793,396 @@ let ``test wide numeric types work as hash keys`` () =
     let bigs = System.Collections.Generic.HashSet<bigint>()
     bigs.Add 2I |> ignore
     bigs.Contains 2I |> equal true
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<CustomEquality; NoComparison>]
+type FuzzyInt =
+    | FuzzyInt of int
+    override x.GetHashCode() =
+        let (FuzzyInt x) = x
+        x.GetHashCode()
+
+    override x.Equals(y: obj) =
+        match y with
+        | :? FuzzyInt as y ->
+            let (FuzzyInt x) = x
+            let (FuzzyInt y) = y
+            x - 2 <= y && y <= x + 2
+        | _ -> false
+
+type Test(i: int) =
+    member x.Value = i
+    override x.GetHashCode() = i
+    override x.Equals(yobj) =
+       match yobj with
+         | :? Test as y -> y.Value + 1 = x.Value
+         | _ -> false
+    interface System.IComparable with
+        member x.CompareTo(yobj) =
+            match yobj with
+            | :? Test as y -> compare (y.Value + 1) x.Value
+            | _ -> invalidArg "yobj" "cannot compare values of different types"
+            // | _ -> -1
+
+    interface System.IEquatable<Test> with
+        member x.Equals(y) =
+            y.Value + 1 = x.Value
+
+let genericCompare (a: 'T) (b: 'T) : int =
+    let cmp = Comparer<'T>.Default
+    cmp.Compare(a, b)
+
+
+[<Fact>]
+let ``test Array custom equality works`` () =
+    let xs = [| FuzzyInt 3; FuzzyInt 5 |]
+    let ys = [| FuzzyInt 2; FuzzyInt 4 |]
+    let zs = [| FuzzyInt 2; FuzzyInt 8 |]
+    xs = ys |> equal true
+    xs = zs |> equal false
+
+[<Fact>]
+let ``test GetHashCode with tuples works`` () =
+    ((1, 2).GetHashCode(), (1, 2).GetHashCode()) ||> equal
+    ((2, 1).GetHashCode(), (1, 2).GetHashCode()) ||> notEqual
+
+[<Fact>]
+let ``test GetHashCode with options works`` () =
+    ((Some 1).GetHashCode(), (Some 1).GetHashCode()) ||> equal
+    ((Some 2).GetHashCode(), (Some 1).GetHashCode()) ||> notEqual
+    ((Some None).GetHashCode(), (Some 1).GetHashCode()) ||> notEqual
+
+[<Fact>]
+let ``test GetHashCode with unions works`` () =
+    ((UTest.A 1).GetHashCode(), (UTest.A 1).GetHashCode()) ||> equal
+    ((UTest.A 2).GetHashCode(), (UTest.A 1).GetHashCode()) ||> notEqual
+    ((UTest.B 1).GetHashCode(), (UTest.A 1).GetHashCode()) ||> notEqual
+
+[<Fact>]
+let ``test GetHashCode with records works`` () =
+    ({a=1; b=2}.GetHashCode(), {a=1; b=2}.GetHashCode()) ||> equal
+    ({a=2; b=1}.GetHashCode(), {a=1; b=2}.GetHashCode()) ||> notEqual
+
+[<Fact>]
+let ``test GetHashCode with structs works`` () =
+    (STest(1).GetHashCode(), STest(1).GetHashCode()) ||> equal
+    (STest(2).GetHashCode(), STest(1).GetHashCode()) ||> notEqual
+
+[<Fact>]
+let ``test GetHashCode with objects works`` () =
+    (OTest(1).GetHashCode(), OTest(1).GetHashCode()) ||> notEqual
+    (OTest(2).GetHashCode(), OTest(1).GetHashCode()) ||> notEqual
+
+[<Fact>]
+let ``test GetHashCode with objects that overwrite it works`` () =
+    (Test(1).GetHashCode(), Test(1).GetHashCode()) ||> equal
+    (Test(2).GetHashCode(), Test(1).GetHashCode()) ||> notEqual
+
+[<Fact>]
+let ``test GetHashCode with same object works`` () =
+    let o = OTest(1)
+    let h1 = o.GetHashCode()
+    o.A <- 2
+    let h2 = o.GetHashCode()
+    (h1, h2) ||> equal
+
+[<Fact>]
+let ``test GetHashCode with primitives works`` () =
+    ((1).GetHashCode(), (1).GetHashCode()) ||> equal
+    ((2).GetHashCode(), (1).GetHashCode()) ||> notEqual
+    ("1".GetHashCode(), "1".GetHashCode()) ||> equal
+    ("2".GetHashCode(), "1".GetHashCode()) ||> notEqual
+
+[<Fact>]
+let ``test Equals with primitives works`` () =
+    (true).Equals(true) |> equal true
+    ('1').Equals('1') |> equal true
+    (1y).Equals(1y) |> equal true
+    (1uy).Equals(1uy) |> equal true
+    (1s).Equals(1s) |> equal true
+    (1).Equals(1) |> equal true
+    (1L).Equals(1L) |> equal true
+    (1u).Equals(1u) |> equal true
+    (1us).Equals(1us) |> equal true
+    (1ul).Equals(1ul) |> equal true
+    (1uL).Equals(1uL) |> equal true
+    (1.f).Equals(1.f) |> equal true
+    (1.).Equals(1.) |> equal true
+    (1.m).Equals(1.m) |> equal true
+    ("1").Equals("1") |> equal true
+
+[<Fact>]
+let ``test CompareTo with primitives works`` () =
+    (true).CompareTo(true) |> equal 0
+    ('1').CompareTo('1') |> equal 0
+    (1y).CompareTo(1y) |> equal 0
+    (1uy).CompareTo(1uy) |> equal 0
+    (1s).CompareTo(1s) |> equal 0
+    (1).CompareTo(1) |> equal 0
+    (1L).CompareTo(1L) |> equal 0
+    (1u).CompareTo(1u) |> equal 0
+    (1us).CompareTo(1us) |> equal 0
+    (1ul).CompareTo(1ul) |> equal 0
+    (1uL).CompareTo(1uL) |> equal 0
+    (1.f).CompareTo(1.f) |> equal 0
+    (1.).CompareTo(1.) |> equal 0
+    (1.m).CompareTo(1.m) |> equal 0
+    ("1").CompareTo("1") |> equal 0
+
+[<Fact>]
+let ``test hash works with JS objects`` () =
+    // See #2281
+    let _ = obj () |> hash
+    ()
+
+[<Fact>]
+let ``test hash with arrays works`` () =
+    (hash [|1; 2|], hash [|1; 2|]) ||> equal
+    (hash [|2; 1|], hash [|1; 2|]) ||> notEqual
+
+[<Fact>]
+let ``test hash with lists works`` () =
+    (hash [1; 2], hash [1; 2]) ||> equal
+    (hash [2; 1], hash [1; 2]) ||> notEqual
+
+[<Fact>]
+let ``test hash with tuples works`` () =
+    (hash (1, 2), hash (1, 2)) ||> equal
+    (hash (2, 1), hash (1, 2)) ||> notEqual
+
+[<Fact>]
+let ``test hash with options works`` () =
+    (hash (Some 1), hash (Some 1)) ||> equal
+    (hash (Some 2), hash (Some 1)) ||> notEqual
+    (hash (Some None), hash (Some 1)) ||> notEqual
+
+[<Fact>]
+let ``test hash with unions works`` () =
+    (hash (UTest.A 1), hash (UTest.A 1)) ||> equal
+    (hash (UTest.A 2), hash (UTest.A 1)) ||> notEqual
+    (hash (UTest.B 1), hash (UTest.A 1)) ||> notEqual
+
+[<Fact>]
+let ``test hash with records works`` () =
+    (hash {a=1; b=2}, hash {a=1; b=2}) ||> equal
+    (hash {a=2; b=1}, hash {a=1; b=2}) ||> notEqual
+
+[<Fact>]
+let ``test hash with structs works`` () =
+    (hash (STest(1)), hash (STest(1))) ||> equal
+    (hash (STest(2)), hash (STest(1))) ||> notEqual
+
+[<Fact>]
+let ``test hash with objects works`` () =
+    (hash (OTest(1)), hash (OTest(1))) ||> notEqual
+    (hash (OTest(2)), hash (OTest(1))) ||> notEqual
+
+[<Fact>]
+let ``test hash with same object works`` () =
+    let o = OTest(1)
+    let h1 = hash o
+    o.A <- 2
+    let h2 = hash o
+    (h1, h2) ||> equal
+
+[<Fact>]
+let ``test hash with longs works`` () =
+    (hash (1L<<<33), hash (1L<<<33)) ||> equal
+    (hash (1L<<<34), hash (1L<<<33)) ||> notEqual
+    (hash 3L, hash (3L + (1L<<<33))) ||> notEqual
+    (hash (-3L), hash (3L))          ||> notEqual
+
+[<Fact>]
+let ``test hash with primitives works`` () =
+    (hash 111, hash 111) ||> equal
+    (hash 222, hash 111) ||> notEqual
+    (hash "1", hash "1") ||> equal
+    (hash "2", hash "1") ||> notEqual
+
+[<Fact>]
+let ``test Unchecked.hash with primitives works`` () =
+    (Unchecked.hash 111, Unchecked.hash 111) ||> equal
+    (Unchecked.hash 222, Unchecked.hash 333) ||> notEqual
+    (Unchecked.hash "1", Unchecked.hash "1") ||> equal
+    (Unchecked.hash "2", Unchecked.hash "3") ||> notEqual
+
+[<Fact>]
+let ``test Unchecked.hash with lists works`` () =
+    (Unchecked.hash [1;2], Unchecked.hash [1;2]) ||> equal
+    (Unchecked.hash [2;1], Unchecked.hash [1;2]) ||> notEqual
+
+[<Fact>]
+let ``test Unchecked.hash with arrays works`` () =
+    (Unchecked.hash [|1;2|], Unchecked.hash [|1;2|]) ||> equal
+    (Unchecked.hash [|2;1|], Unchecked.hash [|1;2|]) ||> notEqual
+
+[<Fact>]
+let ``test Unchecked.hash with tuples works`` () =
+    (Unchecked.hash (1,2), Unchecked.hash (1,2)) ||> equal
+    (Unchecked.hash (2,1), Unchecked.hash (1,2)) ||> notEqual
+
+[<Fact>]
+let ``test Unchecked.equals works`` () =
+    Unchecked.equals 111 111 |> equal true
+    Unchecked.equals 222 333 |> equal false
+    Unchecked.equals "1" "1" |> equal true
+    Unchecked.equals "2" "3" |> equal false
+    Unchecked.equals [1] [1] |> equal true
+    Unchecked.equals [2] [3] |> equal false
+    // Use mutable values to prevent inlining
+    let mutable ones = 111
+    let mutable twos = 222
+    let mutable threes = 333
+    let mutable oneStr = "1"
+    let mutable twoStr = "2"
+    let mutable threeStr = "3"
+    Unchecked.equals ones ones |> equal true
+    Unchecked.equals twos threes |> equal false
+    Unchecked.equals oneStr oneStr |> equal true
+    Unchecked.equals twoStr threeStr |> equal false
+
+[<Fact>]
+let ``test Unchecked.compare works`` () =
+    Unchecked.compare 111 111 |> equal 0
+    Unchecked.compare 222 333 |> equal -1
+    Unchecked.compare 333 222 |> equal 1
+    Unchecked.compare "1" "1" |> equal 0
+    Unchecked.compare "2" "3" |> equal -1
+    Unchecked.compare "3" "2" |> equal 1
+    Unchecked.compare [1] [1] |> equal 0
+    Unchecked.compare [2] [3] |> equal -1
+    Unchecked.compare [3] [2] |> equal 1
+
+[<Fact>]
+let ``test DU comparison works`` () =
+    let hasStatusReached expectedStatus status =
+        status >= expectedStatus
+    let mutable run = fun x y ->
+        x >= y |> equal true
+        hasStatusReached y x |> equal true
+    run Status.CreateNewMeterReadingPicture Status.SelectingNewDevice
+
+[<Fact>]
+let ``test LanguagePrimitives.GenericHash with primitives works`` () =
+    (LanguagePrimitives.GenericHash 111, LanguagePrimitives.GenericHash 111) ||> equal
+    (LanguagePrimitives.GenericHash 222, LanguagePrimitives.GenericHash 111) ||> notEqual
+    (LanguagePrimitives.GenericHash "1", LanguagePrimitives.GenericHash "1") ||> equal
+    (LanguagePrimitives.GenericHash "2", LanguagePrimitives.GenericHash "1") ||> notEqual
+
+[<Fact>]
+let ``test LanguagePrimitives.GenericHash with lists works`` () =
+    (LanguagePrimitives.GenericHash [1;2], LanguagePrimitives.GenericHash [1;2]) ||> equal
+    (LanguagePrimitives.GenericHash [2;1], LanguagePrimitives.GenericHash [1;2]) ||> notEqual
+
+[<Fact>]
+let ``test LanguagePrimitives.GenericHash with arrays works`` () =
+    (LanguagePrimitives.GenericHash [|1;2|], LanguagePrimitives.GenericHash [|1;2|]) ||> equal
+    (LanguagePrimitives.GenericHash [|2;1|], LanguagePrimitives.GenericHash [|1;2|]) ||> notEqual
+
+[<Fact>]
+let ``test LanguagePrimitives.GenericHash with tuples works`` () =
+    (LanguagePrimitives.GenericHash (1,2), LanguagePrimitives.GenericHash (1,2)) ||> equal
+    (LanguagePrimitives.GenericHash (2,1), LanguagePrimitives.GenericHash (1,2)) ||> notEqual
+
+[<Fact>]
+let ``test LanguagePrimitives.PhysicalHash with primitives works`` () =
+    (LanguagePrimitives.PhysicalHash "1", LanguagePrimitives.PhysicalHash "1") ||> equal
+    (LanguagePrimitives.PhysicalHash "2", LanguagePrimitives.PhysicalHash "1") ||> notEqual
+
+[<Fact>]
+let ``test LanguagePrimitives.PhysicalHash with tuples works`` () =
+    (LanguagePrimitives.PhysicalHash (1,2), LanguagePrimitives.PhysicalHash (1,2)) ||> notEqual
+    (LanguagePrimitives.PhysicalHash (2,1), LanguagePrimitives.PhysicalHash (1,2)) ||> notEqual
+
+[<Fact>]
+let ``test LanguagePrimitives.GenericComparison works`` () =
+    LanguagePrimitives.GenericComparison 111 111 |> equal 0
+    LanguagePrimitives.GenericComparison 222 333 |> equal -1
+    LanguagePrimitives.GenericComparison 333 222 |> equal 1
+    LanguagePrimitives.GenericComparison "1" "1" |> equal 0
+    LanguagePrimitives.GenericComparison "2" "3" |> equal -1
+    LanguagePrimitives.GenericComparison "3" "2" |> equal 1
+    LanguagePrimitives.GenericComparison [1] [1] |> equal 0
+    LanguagePrimitives.GenericComparison [2] [3] |> equal -1
+    LanguagePrimitives.GenericComparison [3] [2] |> equal 1
+
+[<Fact>]
+let ``test LanguagePrimitives.GenericEquality works`` () =
+    LanguagePrimitives.GenericEquality 111 111 |> equal true
+    LanguagePrimitives.GenericEquality 222 333 |> equal false
+    LanguagePrimitives.GenericEquality "1" "1" |> equal true
+    LanguagePrimitives.GenericEquality "2" "3" |> equal false
+    LanguagePrimitives.GenericEquality [1] [1] |> equal true
+    LanguagePrimitives.GenericEquality [2] [3] |> equal false
+    // Use mutable values to prevent inlining
+    let mutable ones = 111
+    let mutable twos = 222
+    let mutable threes = 333
+    let mutable oneStr = "1"
+    let mutable twoStr = "2"
+    let mutable threeStr = "3"
+    LanguagePrimitives.GenericEquality ones ones |> equal true
+    LanguagePrimitives.GenericEquality twos threes |> equal false
+    LanguagePrimitives.GenericEquality oneStr oneStr |> equal true
+    LanguagePrimitives.GenericEquality twoStr threeStr |> equal false
+
+[<Fact>]
+let ``test LanguagePrimitives.PhysicalEquality works`` () =
+    LanguagePrimitives.PhysicalEquality "1" "1" |> equal true
+    LanguagePrimitives.PhysicalEquality "2" "3" |> equal false
+    LanguagePrimitives.PhysicalEquality [1] [1] |> equal false
+    LanguagePrimitives.PhysicalEquality [2] [3] |> equal false
+    // Use mutable values to prevent inlining
+    let mutable oneStr = "1"
+    let mutable twoStr = "2"
+    let mutable threeStr = "3"
+    LanguagePrimitives.PhysicalEquality oneStr oneStr |> equal true
+    LanguagePrimitives.PhysicalEquality twoStr threeStr |> equal false
+
+[<Fact>]
+let ``test LanguagePrimitives.SByteWithMeasure works`` () =
+    let distance: sbyte<m> = LanguagePrimitives.SByteWithMeasure 1y
+    distance |> equal 1y<m>
+
+[<Fact>]
+let ``test LanguagePrimitives.Int16WithMeasure works`` () =
+    let distance: int16<m> = LanguagePrimitives.Int16WithMeasure 1s
+    distance |> equal 1s<m>
+
+[<Fact>]
+let ``test LanguagePrimitives.Int32WithMeasure works`` () =
+    let distance: int<m> = LanguagePrimitives.Int32WithMeasure 1
+    distance |> equal 1<m>
+
+[<Fact>]
+let ``test LanguagePrimitives.Int64WithMeasure works`` () =
+    let distance: int64<m> = LanguagePrimitives.Int64WithMeasure 1L
+    distance |> equal 1L<m>
+
+[<Fact>]
+let ``test LanguagePrimitives.Float32WithMeasure works`` () =
+    let distance: float32<m> = LanguagePrimitives.Float32WithMeasure 1.0f
+    distance |> equal 1.0f<m>
+
+[<Fact>]
+let ``test LanguagePrimitives.FloatWithMeasure works`` () =
+    let distance: float<m> = LanguagePrimitives.FloatWithMeasure 1.0
+    distance |> equal 1.0<m>
+
+[<Fact>]
+let ``test LanguagePrimitives.DecimalWithMeasure works`` () =
+    let distance: decimal<m> = LanguagePrimitives.DecimalWithMeasure 1.0m
+    distance |> equal 1.0m<m>
+
+[<Fact>]
+let ``test EqualityComparer.Equals works`` () =
+    genericEquals 1 1 |> equal true
+    genericEquals 1 2 |> equal false
+    genericEquals "1" "1" |> equal true
+    genericEquals "1" "2" |> equal false
+
+[<Fact>]
+let ``test EqualityComparer.GetHashCode works`` () =
+    genericHash 1 |> equal ((1).GetHashCode())
+    genericHash "1" |> equal ("1".GetHashCode())

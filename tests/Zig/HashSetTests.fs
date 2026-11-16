@@ -467,3 +467,5 @@ let ``test HashSet works with union items`` () =
     xs.Remove(Int 1) |> equal true
     xs.Contains(Int 1) |> equal false
     xs.Count |> equal 1
+
+// ---- ported from tests/Js/Main (2026-11-16) ----

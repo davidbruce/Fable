@@ -1352,3 +1352,199 @@ let ``test FromContinuations rejects a second completion`` () =
     equal false (valueCalls.Contains "43")
     equal false (valueCalls.Contains "error")
     equal false (valueCalls.Contains "cancel")
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[<Fact>]
+let ``test Generic FromContinuations accepts erased unit callbacks`` () =
+    let calls = ResizeArray<string>()
+    let start work = Async.StartWithContinuations(work, (fun _ -> calls.Add "success"), (fun e -> calls.Add e.Message), (fun e -> calls.Add e.Message))
+    let unitWork: Async<unit> = fromGenericCallback (fun ok _ _ -> ok ())
+    start unitWork
+    let valueWork = fromGenericCallback (fun ok _ _ -> ok 42)
+    Async.StartWithContinuations(valueWork, (fun value -> equal 42 value; calls.Add "value"), raise, raise)
+    let errorWork: Async<unit> = fromGenericCallback (fun _ error _ -> error (exn "error"))
+    start errorWork
+    let cancelWork: Async<unit> = fromGenericCallback (fun _ _ cancelled -> cancelled (OperationCanceledException("cancel")))
+    start cancelWork
+    equal [|"success"; "value"; "error"; "cancel"|] (calls.ToArray())
+
+[<Fact>]
+let ``test Generic unit continuations work through recursive bindings and aliases`` () =
+    let mutable recurse = true
+    let rec fromValue value =
+        if recurse then
+            recurse <- false
+            fromValue value
+        else Async.FromContinuations(fun (ok, _, _) -> ok value)
+    let alias = fromValue
+    let mutable completed = 0
+    Async.StartWithContinuations(fromValue (), (fun () -> completed <- completed + 1), raise, raise)
+    recurse <- true
+    Async.StartWithContinuations(alias (), (fun () -> completed <- completed + 1), raise, raise)
+    Async.StartWithContinuations(alias 42, (fun value -> equal 42 value; completed <- completed + 1), raise, raise)
+    equal 3 completed
+
+[<Fact>]
+let ``test Generic unit continuations work through tuple pattern bindings`` () =
+    let fromValue, fromOther =
+        (fun (value: 'T) -> Async.FromContinuations(fun (ok, _, _) -> ok value)),
+        (fun (value: 'U) -> Async.FromContinuations(fun (ok, _, _) -> ok value))
+    let mutable completed = 0
+    Async.StartWithContinuations(fromValue (), (fun () -> completed <- completed + 1), raise, raise)
+    Async.StartWithContinuations(fromValue 42, (fun value -> equal 42 value; completed <- completed + 1), raise, raise)
+    Async.StartWithContinuations(fromOther (), (fun () -> completed <- completed + 1), raise, raise)
+    Async.StartWithContinuations(fromOther "a", (fun value -> equal "a" value; completed <- completed + 1), raise, raise)
+    equal 4 completed
+
+[<Fact>]
+let ``test Generic unit continuations work inside nested lambdas and object expressions`` () =
+    let fromValue value = Async.FromContinuations(fun (ok, _, _) -> ok value)
+    let mutable completed = 0
+    let startUnit () = Async.StartWithContinuations(fromValue (), (fun () -> completed <- completed + 1), raise, raise)
+    let disposable =
+        { new IDisposable with
+            member _.Dispose() =
+                Async.StartWithContinuations(fromValue (), (fun () -> completed <- completed + 1), raise, raise) }
+    startUnit ()
+    startUnit ()
+    disposable.Dispose()
+    Async.StartWithContinuations(fromValue 42, (fun value -> equal 42 value; completed <- completed + 1), raise, raise)
+    equal 4 completed
+
+[<Fact>]
+let ``test Unit continuations preserve captured callbacks`` () =
+    let mutable calls = 0
+    let rec genericDeadline callback value remaining =
+        if remaining > 0 then genericDeadline callback value (remaining - 1)
+        else Async.StartWithContinuations(async { return value }, (fun result -> callback result), raise, raise)
+    let rec unitDeadline (callback: unit -> unit) remaining =
+        if remaining > 0 then unitDeadline callback (remaining - 1)
+        else Async.StartWithContinuations(async { return () }, (fun () -> callback ()), raise, raise)
+    genericDeadline (fun () -> calls <- calls + 1) () 2
+    unitDeadline (fun () -> calls <- calls + 1) 2
+    equal 2 calls
+
+[<Fact>]
+let ``test Finalizer failure overrides success once`` () =
+    let mutable finalizers = 0
+    let terminal = ResizeArray<string>()
+    let work = async {
+        try return! successWork
+        finally
+            finalizers <- finalizers + 1
+            failwith "finalizer"
+    }
+    Async.StartWithContinuations(work, (fun _ -> terminal.Add "success"), (fun error -> terminal.Add error.Message), (fun _ -> terminal.Add "cancel"))
+    equal [| "finalizer" |] (terminal.ToArray())
+    equal 1 finalizers
+
+[<Fact>]
+let ``test Finalizer failure overrides body failure once`` () =
+    let mutable finalizers = 0
+    let terminal = ResizeArray<string>()
+    let work = async {
+        try return! errorWork
+        finally
+            finalizers <- finalizers + 1
+            failwith "finalizer"
+    }
+    Async.StartWithContinuations(work, (fun _ -> terminal.Add "success"), (fun error -> terminal.Add error.Message), (fun _ -> terminal.Add "cancel"))
+    equal [| "finalizer" |] (terminal.ToArray())
+    equal 1 finalizers
+
+[<Fact>]
+let ``test Finalizer failure preserves cancellation once`` () =
+    let mutable finalizers = 0
+    let terminal = ResizeArray<string>()
+    let work = async {
+        try return! cancelWork
+        finally
+            finalizers <- finalizers + 1
+            failwith "finalizer"
+    }
+    Async.StartWithContinuations(work, (fun _ -> terminal.Add "success"), (fun _ -> terminal.Add "error"), (fun _ -> terminal.Add "cancel"))
+    equal [| "cancel" |] (terminal.ToArray())
+    equal 1 finalizers
+
+[<Fact>]
+let ``test Non captured exception in async is propagated when using Async.StartImmediate`` () =
+    throwsAnyError (fun _ ->
+        async {
+            failwith "boom!"
+        } |> Async.StartImmediate
+    )
+
+[<Fact>]
+let ``test Async.StartWithContinuations works`` () =
+    let res1, res2, res3 = ref "", ref "", ref ""
+    Async.StartWithContinuations(successWork, (fun x -> res1 := x), ignore, ignore)
+    Async.StartWithContinuations(errorWork, ignore, (fun x -> res2 := x.Message), ignore)
+    Async.StartWithContinuations(cancelWork, ignore, ignore, (fun x -> res3 := x.Message))
+    equal "success" !res1
+    equal "error" !res2
+    equal "cancelled" !res3
+
+[<Fact>]
+let ``test Async try .. with returns correctly from 'with' branch`` () =
+    let work = async {
+        try
+          failwith "testing"
+          return -1
+        with e ->
+          return 42 }
+    let mutable result = 0
+    Async.StartWithContinuations(work, (fun r -> result <- r), ignore, ignore)
+    equal result 42
+
+[<Fact>]
+let ``test Async try .. with does not run 'with' branch when body succeeds`` () =
+    let work = async {
+        try
+          return 1
+        with _ ->
+          return 99 }
+    let mutable result = 0
+    Async.StartWithContinuations(work, (fun r -> result <- r), ignore, ignore)
+    equal result 1
+
+[<Fact>]
+let ``test Exception thrown by the continuation is not redirected to the 'with' branch`` () =
+    let work = async {
+        try
+          return 1
+        with _ ->
+          return 99 }
+    let mutable calls = 0
+    throwsAnyError (fun () ->
+        Async.StartWithContinuations(
+            work,
+            (fun _ -> calls <- calls + 1; failwith "boom from continuation"),
+            ignore,
+            ignore))
+    equal 1 calls
+
+[<Fact>]
+let ``test Async.Parallel rejects a maxDegreeOfParallelism below 1`` () =
+    let mutable raised = false
+    try
+        Async.Parallel([ async { return 1 } ], maxDegreeOfParallelism = 0) |> ignore
+    with :? ArgumentException -> raised <- true
+    equal true raised
+

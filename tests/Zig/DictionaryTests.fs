@@ -414,3 +414,5 @@ let ``test conversion from array works with duplicates`` () =
     let dic = [| "A",1; "A",3; "B",2 |] |> dict
     dic.Values.Count
     |> equal 2
+
+// ---- ported from tests/Js/Main (2026-11-16) ----

@@ -1757,3 +1757,449 @@ let ``test specialized Array HOFs handle negative counts and abandon buffers on 
     throwsError "arr-map-boom" (fun () -> xs |> Array.map (fun s -> if s.EndsWith("4") then failwith "arr-map-boom" else s + "!") |> ignore)
     throwsError "arr-mapi-boom" (fun () -> xs |> Array.mapi (fun i s -> if i = 4 then failwith "arr-mapi-boom" else string i + ":" + s) |> ignore)
     throwsError "arr-filter-boom" (fun () -> xs |> Array.filter (fun s -> if s.EndsWith("4") then failwith "arr-filter-boom" else true) |> ignore)
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Struct>]
+type MyStruct(value: int, flag: bool) =
+    member _.Value = value
+    member _.Flag = flag
+
+
+[<Fact>]
+let ``test Array.zeroCreate and Array.create evaluate the count once`` () =
+    let mutable calls = 0
+    let size () =
+        calls <- calls + 1
+        2
+    Array.zeroCreate<decimal> (size ()) |> equal [| 0M; 0M |]
+    calls |> equal 1
+    Array.create (size ()) "a" |> equal [| "a"; "a" |]
+    calls |> equal 2
+
+[<Fact>]
+let ``test Array slice works for slices of length 1 starting at 0`` () =
+    // See #2844
+    let a = [|1;2;3;4;5;6|]
+    a.[0..0] <- [|999|]
+    a.[3..3] <- [|999|]
+    a |> equal [|999; 2; 3; 999; 5; 6|]
+
+[<Fact>]
+let ``test Array getter throws an exception when out of bounds`` () =
+    let a = [| 1.; 2.; 3.; 4.; 5. |]
+    throwsAnyError (fun () -> Array.get a 5)
+    throwsAnyError (fun () -> Array.get a -10)
+    // Check empty array
+    let b = [| |]
+    throwsAnyError (fun () -> Array.get b 0)
+
+[<Fact>]
+let ``test Array `arr[idx]` throws an exception when out of bounds`` () =
+    let a = [| 1.; 2.; 3.; 4.; 5. |]
+    throwsAnyError (fun () -> a[5])
+    throwsAnyError (fun () -> a[-10])
+    // Check empty array
+    let b = [| |]
+    throwsAnyError (fun () -> b[0])
+
+[<Fact>]
+let ``test Array `arr.[idx]` throws an exception when out of bounds`` () =
+    let a = [| 1.; 2.; 3.; 4.; 5. |]
+    throwsAnyError (fun () -> a.[5])
+    throwsAnyError (fun () -> a.[-10])
+    // Check empty array
+    let b = [| |]
+    throwsAnyError (fun () -> b.[0])
+
+[<Fact>]
+let ``test Array indexer evaluates the array once`` () =
+    let mutable calls = 0
+    let size () =
+        calls <- calls + 1
+        3
+    (Array.zeroCreate<int> (size ())).[1] |> equal 0
+    calls |> equal 1
+    throwsAnyError (fun () -> (Array.zeroCreate<int> (size ())).[5])
+    calls |> equal 2
+
+[<Fact>]
+let ``test Array getter returns None for an in-bounds option element`` () =
+    let xs = [| Some 1; None; Some 3 |]
+    Array.get xs 1 |> equal None
+    xs[1] |> equal None
+    xs.[1] |> equal None
+    Array.item 1 xs |> equal None
+    xs[2] |> equal (Some 3)
+    throwsAnyError (fun () -> xs[3])
+
+[<Fact>]
+let ``test Array getter evaluates the array and the index once`` () =
+    let mutable calls = 0
+    let xs = [| 10; 20; 30 |]
+    let next () =
+        calls <- calls + 1
+        calls
+    xs.[next ()] |> equal 20
+    calls |> equal 1
+    let ys = ResizeArray [ "a"; "b" ]
+    let pick () =
+        calls <- calls + 1
+        ys
+    (pick ()).[1] |> equal "b"
+    calls |> equal 2
+    throwsAnyError (fun () -> xs.[next ()])
+    calls |> equal 3
+
+[<Fact>]
+let ``test Array setter throws an exception when out of bounds`` () =
+    let a = [| 1.; 2.; 3.; 4.; 5. |]
+    throwsAnyError (fun () -> Array.set a 5 10.)
+    throwsAnyError (fun () -> Array.set a -10 10.)
+    throwsAnyError (fun () -> a[5] <- 10.)
+    throwsAnyError (fun () -> a[-5] <- 10.)
+    throwsAnyError (fun () -> a.[5] <- 10.)
+    throwsAnyError (fun () -> a.[-5] <- 10.)
+    // Check empty array
+    let b = [| |]
+    throwsAnyError (fun () -> Array.set b 0 10.)
+    throwsAnyError (fun () -> b[0] <- 10.)
+    throwsAnyError (fun () -> b.[0] <- 10.)
+
+[<Fact>]
+let ``test Array.Length works`` () =
+    let xs = [| 1.; 2.; 3.; 4. |]
+    xs.Length |> equal 4
+
+[<Fact>]
+let ``test Array.zeroCreate works with struct`` () =
+    let arr = Array.zeroCreate<MyStruct> 3
+    equal 0 arr.[0].Value
+    equal false arr.[0].Flag
+    equal 3 arr.Length
+
+[<Fact>]
+let ``test Array.blit works with overlapping ranges in the same array`` () =
+    let xs = [| "a"; "b"; "c"; "d"; "e" |]
+    Array.blit xs 0 xs 1 3
+    xs |> equal [| "a"; "a"; "b"; "c"; "e" |]
+    let ys = [| "a"; "b"; "c"; "d"; "e" |]
+    Array.blit ys 1 ys 0 3
+    ys |> equal [| "b"; "c"; "d"; "d"; "e" |]
+
+[<Fact>]
+let ``test Array distinctBy works on large array`` () =
+    let xs = [| 0 .. 50000 |]
+    let ys =
+        Array.append xs xs
+        |> Array.distinctBy(fun x -> x.ToString())
+    ys |> equal xs
+
+[<Fact>]
+let ``test Mapping with typed arrays doesn't coerce`` () =
+    let data = [| 1 .. 12 |]
+    let page size page data =
+        data
+        |> Array.skip ((page-1) * size)
+        |> Array.take size
+    let test1 =
+        [| 1..4 |]
+        |> Array.map (fun x -> page 3 x data)
+    let test2 =
+        [| 1..4 |]
+        |> Seq.map (fun x -> page 3 x data)
+        |> Array.ofSeq
+    test1 |> Array.concat |> Array.sum |> equal 78
+    test2 |> Array.concat |> Array.sum |> equal 78
+
+[<Fact>]
+let ``test Array.groupBy does not run into undefined exception`` () =
+    let ys = [| 1;2;3 |] |> Array.groupBy (fun x -> x = 2)
+    ys |> equal [| (false, [| 1;3 |]); (true, [| 2 |]) |]
+
+[<Fact>]
+let ``test Array.groupBy maintains order`` () =
+    let xs = [| 0,5; 1,5; 2,5; 3,5; 0,6; 1,6; 2,6; 3,6 |]
+    let mapped = xs |> Array.take 4 |> Array.map (fun (x,y) -> x, [|x,y; x,y+1|])
+    let grouped = xs |> Array.groupBy fst
+    grouped |> equal mapped
+
+[<Fact>]
+let ``test Array.except works`` () =
+    Array.except [|2|] [|1; 3; 2|] |> Array.last |> equal 3
+    Array.except [|2|] [|2; 4; 6|] |> Array.head |> equal 4
+    Array.except [|1|] [|1; 1; 1; 1|] |> Array.isEmpty |> equal true
+    Array.except [|'t'; 'e'; 's'; 't'|] [|'t'; 'e'; 's'; 't'|] |> Array.isEmpty |> equal true
+    Array.except [|'t'; 'e'; 's'; 't'|] [|'t'; 't'|] |> Array.isEmpty |> equal true
+    Array.except [|(1, 2)|] [|(1, 2)|] |> Array.isEmpty |> equal true
+    Array.except [|Map.empty |> (fun m -> m.Add(1, 2))|] [|Map.ofList [(1, 2)]|] |> Array.isEmpty |> equal true
+    Array.except [|{ Bar= "test" }|] [|{ Bar = "test" }|] |> Array.isEmpty |> equal true
+
+[<Fact>]
+let ``test Array iterators from range do rewind`` () =
+    let xs = [|1..5|] |> Array.toSeq
+    xs |> Seq.map string |> String.concat "," |> equal "1,2,3,4,5"
+    xs |> Seq.map string |> String.concat "," |> equal "1,2,3,4,5"
+
+[<Fact>]
+let ``test Array indexed works`` () =
+    let xs = [|"a"; "b"; "c"|] |> Array.indexed
+    xs.Length |> equal 3
+    fst xs.[2] |> equal 2
+    snd xs.[2] |> equal "c"
+
+[<Fact>]
+let ``test Array.chunkBySize works`` () =
+    [|1..8|] |> Array.chunkBySize 4 |> equal [| [|1..4|]; [|5..8|] |]
+    [|1..10|] |> Array.chunkBySize 4 |> equal [| [|1..4|]; [|5..8|]; [|9..10|] |]
+
+[<Fact>]
+let ``test Array.splitAt works`` () =
+    let ar = [|1;2;3;4|]
+    Array.splitAt 0 ar |> equal ([||], [|1;2;3;4|])
+    Array.splitAt 3 ar |> equal ([|1;2;3|], [|4|])
+    Array.splitAt 4 ar |> equal ([|1;2;3;4|], [||])
+
+[<Fact>]
+let ``test Arrays are independent from type of the elements`` () =
+    let fromArrayToListAndBack a = a |> Array.toList |> List.toArray
+    [|"a";"b"|] |> fromArrayToListAndBack |> equal [|"a";"b"|]
+    [|1;2|] |> fromArrayToListAndBack |> equal [|1;2|]
+
+[<Fact>]
+let ``test Arrays are independent from being binded to a name`` () =
+    let intList = [1;2;3]
+    intList |> List.toArray |> equal [|1;2;3|]
+    [1;2;3] |> List.toArray |> equal [|1;2;3|]
+
+[<Fact>]
+let ``test Functions on arrays should behave the same whether binded to a name or not`` () =
+    // TODO: Fix inlined generic local functions in TypeScript
+    let fromArrayToListAndBack (a: int[]) = a |> Array.toList |> List.toArray
+    [|1;2|] |> Array.toList |> List.toArray  |> equal ([|1;2|] |> fromArrayToListAndBack)
+
+[<Fact>]
+let ``test Array.skip works`` () =
+    let xs = [|1.; 2.; 3.; 4.; 5.|]
+    let ys = xs |> Array.skip 1
+    ys |> Array.head
+    |> equal 2.
+
+[<Fact>]
+let ``test Array.take works`` () =
+    let xs = [|1.; 2.; 3.; 4.; 5.|]
+    xs |> Array.take 2
+    |> Array.last
+    |> equal 2.
+    // Array.take should throw an exception if there're not enough elements
+    try xs |> Array.take 20 |> Array.length with _ -> -1
+    |> equal -1
+
+[<Fact>]
+let ``test System.Array.Copy works with Int64 indexes and length`` () =
+    let source = [| "xy"; "xx"; "xyz" |]
+    let destination = [| "a"; "b"; "c"; "d" |]
+    System.Array.Copy(source, destination, 3L)
+    equal [| "xy"; "xx"; "xyz"; "d" |] destination
+    System.Array.Copy(source, 1L, destination, 2L, 2L)
+    equal [| "xy"; "xx"; "xx"; "xyz" |] destination
+
+[<Fact>]
+let ``test Array.udpateAt works`` () =
+    // integer list
+    equal [|0; 2; 3; 4; 5|] (Array.updateAt 0 0 [|1..5|])
+    equal [|1; 2; 0; 4; 5|] (Array.updateAt 2 0 [|1..5|])
+    equal [|1; 2; 3; 4; 0|] (Array.updateAt 4 0 [|1..5|])
+
+    //string list
+    equal [|"0"; "2"; "3"; "4"; "5"|] (Array.updateAt 0 "0" [|"1"; "2"; "3"; "4"; "5"|])
+    equal [|"1"; "2"; "0"; "4"; "5"|] (Array.updateAt 2 "0" [|"1"; "2"; "3"; "4"; "5"|])
+    equal [|"1"; "2"; "3"; "4"; "0"|] (Array.updateAt 4 "0" [|"1"; "2"; "3"; "4"; "5"|])
+
+    // empty list & out of bounds
+    throwsAnyError (fun () -> Array.updateAt 0 0 [||] |> ignore)
+    throwsAnyError (fun () -> Array.updateAt -1 0 [|1|] |> ignore)
+    throwsAnyError (fun () -> Array.updateAt 2 0 [|1|] |> ignore)
+
+[<Fact>]
+let ``test Array.randomShuffleWith gives .NET's results for the same seed`` () =
+    let rng = System.Random(42)
+    Array.randomShuffleWith rng [|0 .. 4|] |> equal [|3; 1; 2; 4; 0|]
+    rng.Next() |> equal 361709742
+    let rng = System.Random(12345)
+    Array.randomShuffleWith rng [|0 .. 9|] |> equal [|0; 1; 8; 6; 2; 9; 3; 5; 4; 7|]
+    rng.Next() |> equal 1086637143
+    let rng = System.Random(42)
+    let xs = [|0 .. 9|]
+    Array.randomShuffleInPlaceWith rng xs
+    xs |> equal [|6; 2; 3; 0; 5; 1; 8; 4; 7; 9|]
+    rng.Next() |> equal 1634773126
+
+[<Fact>]
+let ``test Array.randomShuffleBy gives .NET's results`` () =
+    Array.randomShuffleBy (fun () -> 0.0) [|0 .. 4|] |> equal [|0; 1; 2; 3; 4|]
+    Array.randomShuffleBy (fun () -> 0.999) [|0 .. 4|] |> equal [|4; 0; 1; 2; 3|]
+    let xs = [|0 .. 4|]
+    Array.randomShuffleInPlaceBy (fun () -> 0.999) xs
+    xs |> equal [|4; 0; 1; 2; 3|]
+
+[<Fact>]
+let ``test Array.randomSampleWith gives .NET's results for the same seed`` () =
+    let rng = System.Random(42)
+    Array.randomSampleWith rng 3 [|0 .. 4|] |> equal [|3; 0; 4|]
+    rng.Next() |> equal 1122627734
+    let rng = System.Random(12345)
+    Array.randomSampleWith rng 10 [|0 .. 29|] |> equal [|2; 29; 21; 13; 20; 25; 3; 16; 5; 10|]
+    rng.Next() |> equal 494509053
+    let rng = System.Random(42)
+    Array.randomSampleWith rng 10 [|0 .. 99|] |> equal [|66; 14; 12; 52; 16; 26; 72; 51; 17; 76|]
+    rng.Next() |> equal 503774878
+    // Draws again on a repeated index
+    let rng = System.Random(7)
+    Array.randomSampleWith rng 5 [|0 .. 21|] |> equal [|8; 19; 14; 1; 0|]
+    rng.Next() |> equal 2048632168
+
+[<Fact>]
+let ``test Array.randomSampleBy gives .NET's results`` () =
+    Array.randomSampleBy (fun () -> 0.0) 3 [|0 .. 4|] |> equal [|0; 4; 3|]
+    Array.randomSampleBy (fun () -> 0.999) 3 [|0 .. 4|] |> equal [|4; 3; 2|]
+
+[<Fact>]
+let ``test Array.randomChoicesWith gives .NET's results for the same seed`` () =
+    let rng = System.Random(42)
+    Array.randomChoicesWith rng 4 [|0 .. 9|] |> equal [|6; 1; 1; 5|]
+    rng.Next() |> equal 361709742
+
+[<Fact>]
+let ``test Array functions raise ArgumentException on empty arrays`` () =
+    let xs: int[] = [||]
+    let ys: string[] = [||]
+    raisedExceptionType (fun () -> Array.reduce (+) xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.reduce (+) ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.reduceBack (+) xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.reduceBack (+) ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.Parallel.reduce (+) xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.min xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.max ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.minBy id xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.maxBy id ys) |> equal "ArgumentException"
+
+[<Fact>]
+let ``test Array functions raise FSharp.Core's exception types for out of range counts`` () =
+    raisedExceptionType (fun () -> Array.take 5 [|1|]) |> equal "InvalidOperationException"
+    raisedExceptionType (fun () -> Array.take -1 [|1|]) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.skip 5 [|1|]) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.splitAt 5 [|1|]) |> equal "InvalidOperationException"
+    raisedExceptionType (fun () -> Array.splitAt -1 [|1|]) |> equal "ArgumentException"
+
+[<Fact>]
+let ``test Array functions raise ArgumentException for arrays of different lengths`` () =
+    let xs = [|1|]
+    let ys = [|1; 2|]
+    raisedExceptionType (fun () -> Array.zip xs ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.zip3 xs ys xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.map2 (+) xs ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.mapi2 (fun i x y -> i + x + y) xs ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.map3 (fun x y z -> x + y + z) xs ys xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.iter2 (fun _ _ -> ()) xs ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.iteri2 (fun _ _ _ -> ()) xs ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.fold2 (fun acc x y -> acc + x + y) 0 xs ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.foldBack2 (fun x y acc -> x + y + acc) xs ys 0) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.forall2 (fun x y -> x = y) xs ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.exists2 (fun x y -> x = y) xs ys) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.transpose [| xs; ys |]) |> equal "ArgumentException"
+
+[<Fact>]
+let ``test Array functions raise KeyNotFoundException when nothing satisfies the predicate`` () =
+    let xs = [|1; 2|]
+    raisedExceptionType (fun () -> Array.find (fun x -> x > 2) xs) |> equal "KeyNotFoundException"
+    raisedExceptionType (fun () -> Array.findBack (fun x -> x > 2) xs) |> equal "KeyNotFoundException"
+    raisedExceptionType (fun () -> Array.findIndex (fun x -> x > 2) xs) |> equal "KeyNotFoundException"
+    raisedExceptionType (fun () -> Array.findIndexBack (fun x -> x > 2) xs) |> equal "KeyNotFoundException"
+    raisedExceptionType (fun () -> Array.pick (fun x -> if x > 2 then Some x else None) xs) |> equal "KeyNotFoundException"
+
+[<Fact>]
+let ``test Array functions raise FSharp.Core's exception types for invalid arguments`` () =
+    raisedExceptionType (fun () -> Array.windowed 0 [|1|]) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.permute (fun i -> i + 1) [|1; 2|]) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.permute (fun _ -> 0) [|1; 2|]) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.randomShuffleInPlaceBy (fun () -> 1.0) [|1; 2|]) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.randomShuffleBy (fun () -> 1.0) [|1; 2|]) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.randomChoiceBy (fun () -> 1.0) [|1; 2|]) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.randomChoicesBy (fun () -> 1.0) 2 [|1; 2|]) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.randomSampleBy (fun () -> -0.1) 1 [|1; 2|]) |> equal "ArgumentOutOfRangeException"
+
+[<Fact>]
+let ``test Array.sub raises FSharp.Core's exception types for out of range arguments`` () =
+    let xs = [|1; 2; 3|]
+    raisedExceptionType (fun () -> Array.sub xs -1 2) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.sub xs 1 -1) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.sub xs 2 5) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.sub xs 4 0) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.sub [|"a"; "b"; "c"|] 3 1) |> equal "ArgumentOutOfRangeException"
+    Array.sub xs 3 0 |> equal [||]
+
+[<Fact>]
+let ``test Array.fill raises FSharp.Core's exception types for out of range arguments`` () =
+    let xs = [|1; 2; 3|]
+    raisedExceptionType (fun () -> Array.fill xs -1 2 0) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.fill xs 0 -1 0) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.fill xs 3 1 0) |> equal "IndexOutOfRangeException"
+    raisedExceptionType (fun () -> Array.fill [|"a"; "b"; "c"|] 2 5 "z") |> equal "IndexOutOfRangeException"
+    xs |> equal [|1; 2; 3|]
+    Array.fill xs 4 0 0
+    xs |> equal [|1; 2; 3|]
+
+[<Fact>]
+let ``test Array.blit raises System.Array.Copy's exception types for out of range arguments`` () =
+    let xs = [|1; 2; 3|]
+    let ys: int[] = Array.zeroCreate 5
+    raisedExceptionType (fun () -> Array.blit xs 0 ys 0 -1) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.blit xs -1 ys 0 2) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.blit xs 0 ys -1 2) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.blit xs 2 ys 0 2) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.blit xs 0 ys 4 2) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.blit xs 4 ys 0 0) |> equal "ArgumentException"
+    ys |> equal [|0; 0; 0; 0; 0|]
+    let zs = [|"a"; "b"; "c"|]
+    let ws = Array.create 5 "_"
+    raisedExceptionType (fun () -> Array.blit zs 0 ws 0 -1) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.blit zs -1 ws 0 2) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.blit zs 0 ws -1 2) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Array.blit zs 2 ws 0 2) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.blit zs 0 ws 4 2) |> equal "ArgumentException"
+    ws |> equal [|"_"; "_"; "_"; "_"; "_"|]
+    Array.blit zs 3 ws 5 0
+    Array.blit zs 1 ws 3 2
+    ws |> equal [|"_"; "_"; "_"; "b"; "c"|]
+
+[<Fact>]
+let ``test System.Array.Copy raises .NET's exception types for out of range arguments`` () =
+    let xs = [|1; 2; 3|]
+    let ys: int[] = Array.zeroCreate 5
+    raisedExceptionType (fun () -> System.Array.Copy(xs, 0, ys, 0, -1)) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> System.Array.Copy(xs, -1, ys, 0, 2)) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> System.Array.Copy(xs, 0, ys, -1, 2)) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> System.Array.Copy(xs, 2, ys, 0, 2)) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> System.Array.Copy(xs, 0, ys, 4, 2)) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> System.Array.Copy(xs, ys, 4)) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> System.Array.Copy([|"a"; "b"|], [|"c"|], 2)) |> equal "ArgumentException"
+    ys |> equal [|0; 0; 0; 0; 0|]
+
+[<Fact>]
+let ``test Array.removeManyAt raises ArgumentException only when FSharp.Core does`` () =
+    let xs = [|1; 2; 3|]
+    let empty: int[] = [||]
+    raisedExceptionType (fun () -> Array.removeManyAt -1 0 xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.removeManyAt -1 1 xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.removeManyAt 1 3 xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.removeManyAt 3 1 xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.removeManyAt 4 0 xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Array.removeManyAt 0 1 empty) |> equal "ArgumentException"
+    Array.removeManyAt 0 0 xs |> equal [|1; 2; 3|]
+    Array.removeManyAt 1 0 xs |> equal [|1; 2; 3|]
+    Array.removeManyAt 3 0 xs |> equal [|1; 2; 3|]
+    Array.removeManyAt 0 0 empty |> equal [||]
+    Array.removeManyAt 1 2 xs |> equal [|1|]
+    Array.removeManyAt 0 2 [|"a"; "b"; "c"|] |> equal [|"c"|]
+
