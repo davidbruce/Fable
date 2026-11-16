@@ -711,6 +711,8 @@ let emptyCycleInfo =
 type FileState() =
     let mutable varCounter = 0
     member val Fns = List<FnInfo>()
+    /// a handler of the file can catch OutOfMemoryException (see fable_rt.oom_catchable)
+    member val CatchesOom = false with get, set
     /// local generic values (`let f_opt = Some f`, generalized by F#) lifted as functions without
     /// parameters: each use calls it at its own type arguments
     member val GenericValues = HashSet<string>()

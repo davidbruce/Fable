@@ -59,14 +59,20 @@ pub fn ItemOf(comptime A: type) type {
 }
 
 pub fn arrayItems(comptime A: type, n: usize) []ItemOf(A) {
-    return rt.allocator.alloc(ItemOf(A), n) catch @panic("fable: out of memory");
+    return rt.allocator.alloc(ItemOf(A), n) catch rt.oom();
+}
+
+/// The items of an array of a length the program computed: OutOfMemoryException when they do
+/// not fit (see `rt.oom_policy`)
+pub fn arrayItemsOrRaise(comptime A: type, n: usize) Raised![]ItemOf(A) {
+    return rt.allocator.alloc(ItemOf(A), n) catch return rt.oomRaise();
 }
 
 /// A new array that owns `items`.
 pub fn arrayFrom(comptime A: type, items: []ItemOf(A)) A {
     const C = @typeInfo(A).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = rt.allocator.create(C) catch @panic("fable: out of memory");
+    const c = rt.allocator.create(C) catch rt.oom();
     c.* = .{ .items = items };
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -88,7 +94,7 @@ fn NullOf(comptime A: type) type {
             if (made) |c| return c;
             const c = arrayFrom(A, &.{});
             c.@"$rc" = null_count;
-            rt.thread.null_arrays.append(rt.bookkeeping(), .{ .cell = c, .free = free }) catch @panic("fable: out of memory");
+            rt.thread.null_arrays.append(rt.bookkeeping(), .{ .cell = c, .free = free }) catch rt.oom();
             rt.uncount();
             made = c;
             return c;
@@ -164,7 +170,7 @@ pub fn hasZero(comptime T: type) bool {
 /// union's first case, a function that raises NullReferenceException).
 pub fn arrayZero(comptime A: type, n: i32) Raised!A {
     if (n < 0) return countNegative(n);
-    const items = arrayItems(A, @intCast(n));
+    const items = try arrayItemsOrRaise(A, @intCast(n));
     fillDefault(A, items) catch |e| {
         rt.allocator.free(items);
         return e;
@@ -192,7 +198,7 @@ pub fn arrayResize(place: anytype, n: i32) Raised!void {
     if (n < 0) return raise(rt.ArgumentOutOfRangeException, str("Non-negative number required. (Parameter 'newSize')"));
     const old = place.*;
     const kept = @min(old.items.len, @as(usize, @intCast(n)));
-    const items = arrayItems(A, @intCast(n));
+    const items = try arrayItemsOrRaise(A, @intCast(n));
     for (items[0..kept], 0..) |*x, i| x.* = arrayItemAt(old, i);
     fillDefault(A, items[kept..]) catch |e| {
         for (items[0..kept]) |x| rt.drop(x);
@@ -206,7 +212,7 @@ pub fn arrayResize(place: anytype, n: i32) Raised!void {
 /// `Array.create n x`
 pub fn arrayCreate(comptime A: type, n: i32, x: ItemOf(A)) Raised!A {
     if (n < 0) return countNegative(n);
-    const items = arrayItems(A, @intCast(n));
+    const items = try arrayItemsOrRaise(A, @intCast(n));
     for (items) |*item| item.* = dup(x);
     return arrayFrom(A, items);
 }
@@ -220,7 +226,7 @@ pub fn arrayAbandon(items: anytype, n: usize) void {
 /// `Array.init n f`
 pub fn arrayInit(comptime A: type, n: i32, f: anytype) Raised!A {
     if (n < 0) return countNegative(n);
-    const items = arrayItems(A, @intCast(n));
+    const items = try arrayItemsOrRaise(A, @intCast(n));
     for (items, 0..) |*item, i| {
         item.* = f.code(f.env, @as(i32, @intCast(i))) catch |e| {
             arrayAbandon(items, i);
@@ -466,7 +472,7 @@ pub const FilterBuf = struct {
 
 pub inline fn arrayFilterNew(n: usize) FilterBuf {
     return .{
-        .keep = rt.allocator.alloc(bool, n) catch @panic("fable: out of memory"),
+        .keep = rt.allocator.alloc(bool, n) catch rt.oom(),
         .count = 0,
     };
 }
@@ -503,7 +509,7 @@ fn parallelItems(comptime A: type, n: usize, f: anytype, a: anytype, comptime ma
     const items = arrayItems(A, n);
     const T = ItemOf(A);
     // (an item not made yet is all zero: what an exception leaves is given up as far as made)
-    const done = rt.allocator.alloc(bool, n) catch @panic("fable: out of memory");
+    const done = rt.allocator.alloc(bool, n) catch rt.oom();
     defer rt.allocator.free(done);
     @memset(done, false);
     const Ctx = struct { f: @TypeOf(f), a: @TypeOf(a), items: []T, done: []bool };
@@ -603,7 +609,7 @@ pub fn arrayFold(f: anytype, state: anytype, a: anytype) Raised!@TypeOf(state) {
 /// `Array.filter f a`
 pub fn arrayFilter(f: anytype, a: anytype) Raised!@TypeOf(a) {
     const A = @TypeOf(a);
-    const keep = rt.allocator.alloc(bool, a.items.len) catch @panic("fable: out of memory");
+    const keep = rt.allocator.alloc(bool, a.items.len) catch rt.oom();
     defer rt.allocator.free(keep);
     var n: usize = 0;
     for (keep, 0..) |*k, i| {
@@ -656,7 +662,7 @@ fn sortSliceCore(
 ) Raised!void {
     if (items.len <= 1) return;
     const n = items.len;
-    const tmp = rt.allocator.alloc(T, n) catch @panic("fable: out of memory");
+    const tmp = rt.allocator.alloc(T, n) catch rt.oom();
     defer rt.allocator.free(tmp);
     var src: []T = items;
     var dst: []T = tmp;
@@ -748,7 +754,7 @@ pub fn arraySortInPlace(a: anytype) void {
         return;
     }
     const n = a.items.len;
-    const work = rt.allocator.alloc(T, n) catch @panic("fable: out of memory");
+    const work = rt.allocator.alloc(T, n) catch rt.oom();
     for (work, 0..) |*to, i| to.* = arrayItemAt(a, i);
     sortSliceCmp(T, work, false);
     for (work, 0..) |x, i| arrayPut(a, i, x);
@@ -763,7 +769,7 @@ pub fn arraySortInPlaceWith(f: anytype, a: anytype) Raised!void {
         return sortSliceWith(T, a.items, f);
     }
     const n = a.items.len;
-    const work = rt.allocator.alloc(T, n) catch @panic("fable: out of memory");
+    const work = rt.allocator.alloc(T, n) catch rt.oom();
     for (work, 0..) |*to, i| to.* = arrayItemAt(a, i);
     sortSliceWith(T, work, f) catch |e| {
         arrayAbandon(work, n);

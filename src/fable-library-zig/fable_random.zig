@@ -65,7 +65,7 @@ pub const Random = *struct {
 
 /// `Random(seed)`
 pub fn randomNew(seed: i32) Random {
-    const c = rt.allocator.create(@typeInfo(Random).pointer.child) catch @panic("fable: out of memory");
+    const c = rt.allocator.create(@typeInfo(Random).pointer.child) catch rt.oom();
     c.* = .{};
     const subtraction: i32 = if (seed == std.math.minInt(i32)) mbig else @intCast(@abs(seed));
     var mj: i32 = 161803398 - subtraction;
@@ -173,14 +173,14 @@ pub const StringBuilder = *struct {
 
     pub fn fable_show(b: *Shower, x: anytype, depth: i32) *Layout {
         _ = depth;
-        return b.leaf(false, b.arena.dupe(u16, x.units.items) catch @panic("fable: out of memory"), false);
+        return b.leaf(false, b.arena.dupe(u16, x.units.items) catch rt.oom(), false);
     }
 };
 
 pub fn sbNew(init: String) StringBuilder {
-    const c = rt.allocator.create(@typeInfo(StringBuilder).pointer.child) catch @panic("fable: out of memory");
+    const c = rt.allocator.create(@typeInfo(StringBuilder).pointer.child) catch rt.oom();
     c.* = .{};
-    c.units.appendSlice(rt.allocator, unitsOf(init)) catch @panic("fable: out of memory");
+    c.units.appendSlice(rt.allocator, unitsOf(init)) catch rt.oom();
     if (track) thread.stats.allocs += 1;
     return c;
 }

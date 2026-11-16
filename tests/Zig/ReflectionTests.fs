@@ -701,3 +701,33 @@ let ``test Reflection works for a union with an erased generic union field`` () 
 
 #endif
 #endif
+
+type ReflBox<'T>(v: 'T) =
+    member _.Value = v
+
+type ReflPoint(x: int, y: int) =
+    member _.X = x
+    member _.Y = y
+    override _.ToString() = sprintf "(%d, %d)" x y
+
+let private makeBoxType (t: System.Type) = typedefof<ReflBox<_>>.MakeGenericType([| t |])
+
+[<Fact>]
+let ``test MakeGenericType of types known only when the program runs`` () =
+    let types = [| typeof<int>; typeof<string> |]
+    let made = makeBoxType types.[0]
+    made.Name |> equal "ReflBox`1"
+    made = typeof<ReflBox<int>> |> equal true
+    made = typeof<ReflBox<string>> |> equal false
+    makeBoxType types.[1] = typeof<ReflBox<string>> |> equal true
+    made.GetGenericArguments().[0] = typeof<int> |> equal true
+    let known = typedefof<ReflBox<_>>.MakeGenericType([| typeof<int> |])
+    known.Name |> equal "ReflBox`1"
+    let b = System.Activator.CreateInstance(known, [| box 7 |])
+    (b :?> ReflBox<int>).Value |> equal 7
+
+[<Fact>]
+let ``test Activator.CreateInstance with an array of arguments`` () =
+    let p = System.Activator.CreateInstance(typeof<ReflPoint>, [| box 3; box 4 |]) :?> ReflPoint
+    p.ToString() |> equal "(3, 4)"
+    p.X + p.Y |> equal 7

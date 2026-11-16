@@ -400,7 +400,7 @@ fn declared(comptime T: type, comptime C: type, comptime d: anytype) TypeInfo {
             info.make = &struct {
                 fn f(vals: []const Any) Raised!Any {
                     const v: T = if (C == T) try fill(T, vals) else blk: {
-                        const cell = rt.allocator.create(C) catch @panic("fable: out of memory");
+                        const cell = rt.allocator.create(C) catch rt.oom();
                         cell.* = try fill(C, vals);
                         break :blk cell;
                     };
@@ -465,7 +465,7 @@ fn CaseMake(comptime T: type, comptime cname: []const u8, comptime P: type) type
                 break :blk @unionInit(T, cname, {});
             } else if (@typeInfo(P) == .pointer) blk: {
                 const S = @typeInfo(P).pointer.child;
-                const cell = rt.allocator.create(S) catch @panic("fable: out of memory");
+                const cell = rt.allocator.create(S) catch rt.oom();
                 cell.* = try fill(S, vals);
                 break :blk @unionInit(T, cname, cell);
             } else @unionInit(T, cname, try fill(P, vals));
@@ -602,17 +602,62 @@ pub fn typeNamed(name_: String) Type {
     var tmp: [4]u8 = undefined;
     for (rt.unitsOf(name_)) |u| {
         const n = std.unicode.utf8Encode(u, &tmp) catch 1;
-        buf.appendSlice(rt.allocator, tmp[0..n]) catch @panic("fable: out of memory");
+        buf.appendSlice(rt.allocator, tmp[0..n]) catch rt.oom();
     }
     rt.lockField(&reflect_lock);
     defer rt.unlockField(&reflect_lock);
     if (named_types.get(buf.items)) |existing| return existing;
     const bk = rt.bookkeeping();
-    const full = bk.dupe(u8, buf.items) catch @panic("fable: out of memory");
-    const info = bk.create(TypeInfo) catch @panic("fable: out of memory");
+    const full = bk.dupe(u8, buf.items) catch rt.oom();
+    const info = bk.create(TypeInfo) catch rt.oom();
     const at = if (std.mem.lastIndexOfAny(u8, full, ".+")) |i| i + 1 else 0;
     info.* = .{ .full_name = full, .name = full[at..], .namespace = if (at > 0) full[0 .. at - 1] else "", .kind = .other };
-    named_types.put(bk, full, info) catch @panic("fable: out of memory");
+    named_types.put(bk, full, info) catch rt.oom();
+    return info;
+}
+
+/// `def.MakeGenericType(args)` of types known only when the program runs: the constructed type
+/// (interned by its full name, which `equals` compares as it does a type made by `typeof`)
+pub fn makeGenericType(def: Type, args: rt.Array(Type)) Raised!Type {
+    const d = def.definition orelse def;
+    const items = args.items;
+    const arity: usize = blk: {
+        const tick = std.mem.lastIndexOfScalar(u8, d.full_name, '`') orelse break :blk 0;
+        const end = std.mem.indexOfScalarPos(u8, d.full_name, tick, '[') orelse d.full_name.len;
+        break :blk std.fmt.parseInt(usize, d.full_name[tick + 1 .. end], 10) catch 0;
+    };
+    if (!(def.is_definition or def.args.len > 0) or arity == 0)
+        return rt.raise(rt.InvalidOperationException, rt.str("Method may only be called on a Type for which Type.IsGenericParameter is true."));
+    if (items.len != arity)
+        return rt.raise(rt.ArgumentException, rt.str("The number of generic arguments provided doesn't equal the arity of the generic type definition. (Parameter 'instantiation')"));
+    const base = if (std.mem.indexOfScalar(u8, d.full_name, '[')) |i| d.full_name[0..i] else d.full_name;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(rt.allocator);
+    buf.appendSlice(rt.allocator, base) catch rt.oom();
+    buf.append(rt.allocator, '[') catch rt.oom();
+    for (items, 0..) |a, i| {
+        if (i > 0) buf.append(rt.allocator, ',') catch rt.oom();
+        buf.appendSlice(rt.allocator, a.full_name) catch rt.oom();
+    }
+    buf.append(rt.allocator, ']') catch rt.oom();
+    rt.lockField(&reflect_lock);
+    defer rt.unlockField(&reflect_lock);
+    if (named_types.get(buf.items)) |existing| return existing;
+    const bk = rt.bookkeeping();
+    const full = bk.dupe(u8, buf.items) catch rt.oom();
+    const own_args = bk.dupe(Type, items) catch rt.oom();
+    const info = bk.create(TypeInfo) catch rt.oom();
+    info.* = .{
+        .full_name = full,
+        .name = d.name,
+        .namespace = d.namespace,
+        .kind = d.kind,
+        .args = own_args,
+        .definition = d,
+        .parent = d.parent,
+        .interfaces = d.interfaces,
+    };
+    named_types.put(bk, full, info) catch rt.oom();
     return info;
 }
 
@@ -825,9 +870,9 @@ pub fn typeOfObject(o: Any) Raised!Type {
     defer rt.unlockField(&reflect_lock);
     if (class_types.get(p.type)) |existing| return existing;
     const bk = rt.bookkeeping();
-    const info = bk.create(TypeInfo) catch @panic("fable: out of memory");
+    const info = bk.create(TypeInfo) catch rt.oom();
     info.* = .{ .full_name = p.type.name, .name = p.type.name[if (std.mem.lastIndexOfAny(u8, p.type.name, ".+")) |i| i + 1 else 0..], .namespace = "", .kind = .class };
-    class_types.put(bk, p.type, info) catch @panic("fable: out of memory");
+    class_types.put(bk, p.type, info) catch rt.oom();
     return info;
 }
 
@@ -838,7 +883,7 @@ pub fn typeOfExn(e: rt.Exn) Type {
     if (exn_types.get(e.type)) |existing| return existing;
     const bk = rt.bookkeeping();
     const full = e.type.name;
-    const info = bk.create(TypeInfo) catch @panic("fable: out of memory");
+    const info = bk.create(TypeInfo) catch rt.oom();
     const dot = std.mem.lastIndexOfScalar(u8, full, '.');
     info.* = .{
         .full_name = full,
@@ -846,7 +891,7 @@ pub fn typeOfExn(e: rt.Exn) Type {
         .namespace = if (dot) |i| full[0..i] else "",
         .kind = .class,
     };
-    exn_types.put(bk, e.type, info) catch @panic("fable: out of memory");
+    exn_types.put(bk, e.type, info) catch rt.oom();
     return info;
 }
 
@@ -940,24 +985,24 @@ pub fn functionElements(t: Type) Raised!struct { Type, Type } {
 pub fn makeTupleType(types: rt.Array(Type)) Type {
     var names: std.ArrayList(u8) = .empty;
     defer names.deinit(rt.allocator);
-    names.print(rt.allocator, "System.Tuple`{d}[", .{types.items.len}) catch @panic("fable: out of memory");
+    names.print(rt.allocator, "System.Tuple`{d}[", .{types.items.len}) catch rt.oom();
     for (types.items, 0..) |e, i| {
-        if (i > 0) names.append(rt.allocator, ',') catch @panic("fable: out of memory");
-        names.appendSlice(rt.allocator, e.full_name) catch @panic("fable: out of memory");
+        if (i > 0) names.append(rt.allocator, ',') catch rt.oom();
+        names.appendSlice(rt.allocator, e.full_name) catch rt.oom();
     }
-    names.append(rt.allocator, ']') catch @panic("fable: out of memory");
+    names.append(rt.allocator, ']') catch rt.oom();
     rt.lockField(&reflect_lock);
     defer rt.unlockField(&reflect_lock);
     if (tuple_types.get(names.items)) |existing| return existing;
     const bk = rt.bookkeeping();
-    const elems = bk.dupe(Type, types.items) catch @panic("fable: out of memory");
+    const elems = bk.dupe(Type, types.items) catch rt.oom();
     const base_len = std.fmt.count("System.Tuple`{d}", .{elems.len});
-    const full = bk.dupe(u8, names.items) catch @panic("fable: out of memory");
-    const info = bk.create(TypeInfo) catch @panic("fable: out of memory");
+    const full = bk.dupe(u8, names.items) catch rt.oom();
+    const info = bk.create(TypeInfo) catch rt.oom();
     info.* = .{ .full_name = full, .name = full["System.".len..base_len], .namespace = "System", .kind = .tuple, .args = elems };
     // (what a tuple of these is made of: the one `typeof` gives, when the program has it)
     info.make = null;
-    tuple_types.put(bk, full, info) catch @panic("fable: out of memory");
+    tuple_types.put(bk, full, info) catch rt.oom();
     return info;
 }
 

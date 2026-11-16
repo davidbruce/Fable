@@ -33,9 +33,9 @@ pub fn weakGone(addr: usize) void {
 }
 
 pub fn weakHandle(addr: usize) *WeakHandle {
-    const entry = thread.weak.getOrPut(bookkeeping(), addr) catch @panic("fable: out of memory");
+    const entry = thread.weak.getOrPut(bookkeeping(), addr) catch rt.oom();
     if (!entry.found_existing) {
-        const h = bookkeeping().create(WeakHandle) catch @panic("fable: out of memory");
+        const h = bookkeeping().create(WeakHandle) catch rt.oom();
         h.* = .{ .target = addr, .refs = 0 };
         entry.value_ptr.* = h;
     }
@@ -52,7 +52,7 @@ fn CellOf(comptime T: type) type {
 fn handleOf(target: anytype) *WeakHandle {
     if (comptime @typeInfo(@TypeOf(target)) == .optional) {
         const p = target orelse {
-            const h = bookkeeping().create(WeakHandle) catch @panic("fable: out of memory");
+            const h = bookkeeping().create(WeakHandle) catch rt.oom();
             h.* = .{ .target = null, .refs = 1 };
             return h;
         };
@@ -105,7 +105,7 @@ fn notShared(target: anytype) Raised!void {
 /// `WeakReference<'T>(target)`
 pub fn weakNew(comptime W: type, target: @typeInfo(W).pointer.child.fable_weak) Raised!W {
     try notShared(target);
-    const c = rt.allocator.create(@typeInfo(W).pointer.child) catch @panic("fable: out of memory");
+    const c = rt.allocator.create(@typeInfo(W).pointer.child) catch rt.oom();
     c.* = .{ .handle = handleOf(target) };
     if (track) thread.stats.allocs += 1;
     return c;

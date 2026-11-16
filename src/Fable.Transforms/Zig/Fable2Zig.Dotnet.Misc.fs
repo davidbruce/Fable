@@ -1030,6 +1030,28 @@ let call
         | "Microsoft.FSharp.Reflection.UnionCaseInfo", "GetFields", [ c ] -> pureRfl "caseFieldsOf" [ c ] resultTy
         | "Microsoft.FSharp.Reflection.UnionCaseInfo", "get_DeclaringType", [ c ] ->
             pureRfl "caseDeclaringType" [ c ] tType
+        // `def.MakeGenericType(args)`: the type, where its definition and arguments are known
+        // here (see staticTypeOf); else made when the program runs
+        | _, "MakeGenericType", [ def; typeArgs ] ->
+            let items =
+                match typeArgs with
+                | Fable.Value(Fable.NewArray(Fable.ArrayValues ts, _, _), _) -> Some ts
+                | _ -> None
+
+            let known =
+                match Fable.Transforms.Zig.Lower.staticTypeOf ctx def, items with
+                | Some(Fable.DeclaredType(ent, gs)), Some ts when gs.Length = ts.Length ->
+                    let ks = ts |> List.map (Fable.Transforms.Zig.Lower.staticTypeOf ctx)
+
+                    if ks |> List.forall Option.isSome then
+                        Some(Fable.DeclaredType(ent, ks |> List.map Option.get))
+                    else
+                        None
+                | _ -> None
+
+            match known with
+            | Some t -> bindArgs ctx [ lw ctx def; lw ctx typeArgs ] (fun _ -> typeOfIr t)
+            | None -> rfl "makeGenericType" [ def; typeArgs ] tType
         | _ ->
             fail
                 r

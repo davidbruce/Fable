@@ -2689,6 +2689,38 @@ let freeNames (ctx: Ctx) (bodies: (Fable.Ident list * Fable.Expr) list) : string
 
     List.ofSeq found
 
+/// Can a `with` handler catch OutOfMemoryException? It catches everything unless it raises again
+/// what it caught (F# makes `| :? T -> ...` a handler that tests and re-raises the rest); then
+/// only if it tests for a type of which OutOfMemoryException is one, or tests in a way not known
+/// here.
+let handlerMayCatchOom (caught: Fable.Ident) (handler: Fable.Expr) : bool =
+    let mutable reraises = false
+    let mutable catches = false
+
+    let rec isCaught (e: Fable.Expr) =
+        match e with
+        | Fable.IdentExpr i -> i.Name = caught.Name
+        | Fable.TypeCast(x, _) -> isCaught x
+        | _ -> false
+
+    let rec walk (e: Fable.Expr) =
+        match e with
+        | Fable.Extended(Fable.Throw(None, _), _) -> reraises <- true
+        | Fable.Extended(Fable.Throw(Some x, _), _) when isCaught x -> reraises <- true
+        | Fable.Test(x, Fable.TypeTest(Fable.DeclaredType(ent, _)), _) when isCaught x ->
+            match ent.FullName with
+            | "System.Exception"
+            | "System.SystemException"
+            | "System.OutOfMemoryException" -> catches <- true
+            | _ -> ()
+        | Fable.Test(x, _, _) when isCaught x -> catches <- true
+        | _ -> ()
+
+        AST.getSubExpressions e |> List.iter walk
+
+    walk handler
+    not reraises || catches
+
 let uniqueName (ctx: Ctx) (wanted: string) =
     let mutable name = wanted
     let mutable i = 1
@@ -8571,6 +8603,9 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         let guarded =
             match catch with
             | Some(id, handler) ->
+                if not ctx.State.CatchesOom && handlerMayCatchOom id handler then
+                    ctx.State.CatchesOom <- true
+
                 let exV = ctx.State.NewVar(id.Name, tExn, VLocal, false)
                 let bodyIr = lw ctx body
                 ctx.Vars[id.Name] <- exV

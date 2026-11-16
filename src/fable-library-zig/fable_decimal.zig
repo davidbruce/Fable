@@ -136,7 +136,7 @@ pub fn decOfBits(bits: Array(i32)) Raised!NetDecimal {
 /// `Decimal.GetBits d`: the 96 bits of the magnitude, then the sign and the scale
 pub fn decGetBits(d: NetDecimal) Array(i32) {
     const mag: u128 = @intCast(@abs(d.m));
-    const items = rt.allocator.alloc(i32, 4) catch @panic("fable: out of memory");
+    const items = rt.allocator.alloc(i32, 4) catch rt.oom();
     items[0] = @bitCast(@as(u32, @truncate(mag)));
     items[1] = @bitCast(@as(u32, @truncate(mag >> 32)));
     items[2] = @bitCast(@as(u32, @truncate(mag >> 64)));

@@ -472,7 +472,9 @@ and ex (em: Em) (e: Expr) : string =
                         x, y, argT
                 | _ -> x, y, argT
 
-            if isManaged argT || holdsDecimal argT then
+            // (a `System.Type`: compared by what it stands for, as one made when the program
+            // runs is another pointer)
+            if isManaged argT || holdsDecimal argT || argT = TPrim "fable_rt.reflect.Type" then
                 $"fable_rt.eql(%s{x}, %s{y})"
             else
                 $"std.meta.eql(%s{x}, %s{y})"
@@ -2375,7 +2377,7 @@ let emitFile (state: FileState) : string =
 
     out
         .AppendLine(
-            $"pub const @\"$cycles\" = fable_rt.joinCycles(.{{ .holds = %s{b cyc.Holds}, .generic = %s{b cyc.Generic}, .instantiated = %s{b cyc.Instantiated}, .captures = %s{b cyc.Captures}, .cap_generic = %s{b cyc.CapGeneric}, .cap_instantiated = %s{b cyc.CapInstantiated}, .stack_traces = %s{b state.UsesStackTrace}, .reflection = %s{b state.UsesReflection}, .exn_show = __FABLE_EXN_SHOW__ }}, %s{used});"
+            $"pub const @\"$cycles\" = fable_rt.joinCycles(.{{ .holds = %s{b cyc.Holds}, .generic = %s{b cyc.Generic}, .instantiated = %s{b cyc.Instantiated}, .captures = %s{b cyc.Captures}, .cap_generic = %s{b cyc.CapGeneric}, .cap_instantiated = %s{b cyc.CapInstantiated}, .stack_traces = %s{b state.UsesStackTrace}, .reflection = %s{b state.UsesReflection}, .exn_show = __FABLE_EXN_SHOW__, .oom_catch = %s{b state.CatchesOom} }}, %s{used});"
         )
         .AppendLine()
     |> ignore

@@ -39,7 +39,7 @@ pub fn isBigInt(comptime T: type) bool {
 }
 
 pub fn bigOom(_: anyerror) noreturn {
-    @panic("fable: out of memory");
+    rt.oom();
 }
 
 pub fn bigEmpty() Big {
@@ -47,7 +47,7 @@ pub fn bigEmpty() Big {
 }
 
 pub fn bigFrom(m: Big) BigInt {
-    const c = rt.allocator.create(@typeInfo(BigInt).pointer.child) catch @panic("fable: out of memory");
+    const c = rt.allocator.create(@typeInfo(BigInt).pointer.child) catch rt.oom();
     c.* = .{ .value = m };
     if (track) thread.stats.allocs += 1;
     return c;
@@ -225,7 +225,7 @@ pub fn bigText(a: BigInt) String {
 /// `BigInteger.Parse s`
 pub fn bigParse(s: String) Raised!BigInt {
     const u = trimmed(s);
-    var buf = rt.allocator.alloc(u8, u.len) catch @panic("fable: out of memory");
+    var buf = rt.allocator.alloc(u8, u.len) catch rt.oom();
     defer rt.allocator.free(buf);
     var n: usize = 0;
     for (u, 0..) |c, i| {

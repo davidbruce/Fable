@@ -15,12 +15,12 @@ const sys = std.posix.system;
 /// The arguments of `[<EntryPoint>] main argv`: the command line without the program's name, as
 /// .NET gives them
 pub fn programArgs(args: std.process.Args) rt.Array(String) {
-    var it = std.process.Args.Iterator.initAllocator(args, rt.allocator) catch @panic("fable: out of memory");
+    var it = std.process.Args.Iterator.initAllocator(args, rt.allocator) catch rt.oom();
     defer it.deinit();
     _ = it.skip();
     var items: std.ArrayList(String) = .empty;
-    while (it.next()) |a| items.append(rt.allocator, fromUtf8(a)) catch @panic("fable: out of memory");
-    return rt.arrayFrom(rt.Array(String), items.toOwnedSlice(rt.allocator) catch @panic("fable: out of memory"));
+    while (it.next()) |a| items.append(rt.allocator, fromUtf8(a)) catch rt.oom();
+    return rt.arrayFrom(rt.Array(String), items.toOwnedSlice(rt.allocator) catch rt.oom());
 }
 
 // ---- the console ----
@@ -36,7 +36,7 @@ pub fn consoleWrite(s: String, to_err: bool, newline: bool) void {
 /// The UTF-8 of `s`, ended by a zero (the caller frees it)
 fn utf8z(s: String) [:0]u8 {
     const units = rt.unitsOf(s);
-    const buf = rt.allocator.allocSentinel(u8, units.len * 3, 0) catch @panic("fable: out of memory");
+    const buf = rt.allocator.allocSentinel(u8, units.len * 3, 0) catch rt.oom();
     const n = std.unicode.wtf16LeToWtf8(buf, units);
     buf[n] = 0;
     return buf[0..n :0];
@@ -128,10 +128,10 @@ fn cwd() []u8 {
     var buf: [4096]u8 = undefined;
     const rc = sys.getcwd(&buf, buf.len);
     if (comptime @TypeOf(rc) == ?[*]u8 or @TypeOf(rc) == [*c]u8) {
-        if (rc == null) return rt.allocator.dupe(u8, "/") catch @panic("fable: out of memory");
-    } else if (std.posix.errno(rc) != .SUCCESS) return rt.allocator.dupe(u8, "/") catch @panic("fable: out of memory");
+        if (rc == null) return rt.allocator.dupe(u8, "/") catch rt.oom();
+    } else if (std.posix.errno(rc) != .SUCCESS) return rt.allocator.dupe(u8, "/") catch rt.oom();
     const n = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
-    return rt.allocator.dupe(u8, buf[0..n]) catch @panic("fable: out of memory");
+    return rt.allocator.dupe(u8, buf[0..n]) catch rt.oom();
 }
 
 /// `Path.GetFullPath(path)`: absolute, without `.`, `..` and repeated separators
@@ -141,10 +141,10 @@ fn fullPathBytes(path: []const u8) []u8 {
     if (path.len == 0 or path[0] != '/') {
         const dir = cwd();
         defer rt.allocator.free(dir);
-        joined.appendSlice(rt.allocator, dir) catch @panic("fable: out of memory");
-        joined.append(rt.allocator, '/') catch @panic("fable: out of memory");
+        joined.appendSlice(rt.allocator, dir) catch rt.oom();
+        joined.append(rt.allocator, '/') catch rt.oom();
     }
-    joined.appendSlice(rt.allocator, path) catch @panic("fable: out of memory");
+    joined.appendSlice(rt.allocator, path) catch rt.oom();
 
     var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(rt.allocator);
@@ -155,16 +155,16 @@ fn fullPathBytes(path: []const u8) []u8 {
             if (parts.items.len > 0) _ = parts.pop();
             continue;
         }
-        parts.append(rt.allocator, p) catch @panic("fable: out of memory");
+        parts.append(rt.allocator, p) catch rt.oom();
     }
     var out: std.ArrayList(u8) = .empty;
     for (parts.items) |p| {
-        out.append(rt.allocator, '/') catch @panic("fable: out of memory");
-        out.appendSlice(rt.allocator, p) catch @panic("fable: out of memory");
+        out.append(rt.allocator, '/') catch rt.oom();
+        out.appendSlice(rt.allocator, p) catch rt.oom();
     }
     // (a path that ends with a separator keeps it, as .NET keeps it)
-    if (out.items.len == 0 or (path.len > 0 and path[path.len - 1] == '/')) out.append(rt.allocator, '/') catch @panic("fable: out of memory");
-    return out.toOwnedSlice(rt.allocator) catch @panic("fable: out of memory");
+    if (out.items.len == 0 or (path.len > 0 and path[path.len - 1] == '/')) out.append(rt.allocator, '/') catch rt.oom();
+    return out.toOwnedSlice(rt.allocator) catch rt.oom();
 }
 
 pub fn fullPath(path: String) Raised!String {
@@ -202,7 +202,7 @@ fn fail(e: Errno, path: []const u8, comptime is_dir: bool) Raised {
 
 fn parentExists(full: []const u8) bool {
     const slash = std.mem.lastIndexOfScalar(u8, full, '/') orelse return true;
-    const parent = dupeZ(if (slash == 0) "/" else full[0..slash]) catch @panic("fable: out of memory");
+    const parent = dupeZ(if (slash == 0) "/" else full[0..slash]) catch rt.oom();
     defer rt.allocator.free(parent);
     return isDir(parent);
 }
@@ -252,9 +252,9 @@ fn readAll(path: [*:0]const u8) ![]u8 {
         }
         const n: usize = @intCast(r);
         if (n == 0) break;
-        out.appendSlice(rt.allocator, buf[0..n]) catch @panic("fable: out of memory");
+        out.appendSlice(rt.allocator, buf[0..n]) catch rt.oom();
     }
-    return out.toOwnedSlice(rt.allocator) catch @panic("fable: out of memory");
+    return out.toOwnedSlice(rt.allocator) catch rt.oom();
 }
 
 /// (an errno carried as a Zig error, to be turned into .NET's exception)
@@ -398,7 +398,7 @@ pub fn createDirectory(path: String) Raised!void {
     var i: usize = 1;
     while (i <= full.len) : (i += 1) {
         if (i == full.len or full[i] == '/') {
-            const part = dupeZ(full[0..i]) catch @panic("fable: out of memory");
+            const part = dupeZ(full[0..i]) catch rt.oom();
             defer rt.allocator.free(part);
             if (isDir(part)) continue;
             const rc = sys.mkdir(part, 0o777);
@@ -437,8 +437,8 @@ pub fn tempPath() String {
     if (dir.len > 0 and dir[dir.len - 1] == '/') return fromUtf8(dir);
     var b: std.ArrayList(u8) = .empty;
     defer b.deinit(rt.allocator);
-    b.appendSlice(rt.allocator, dir) catch @panic("fable: out of memory");
-    b.append(rt.allocator, '/') catch @panic("fable: out of memory");
+    b.appendSlice(rt.allocator, dir) catch rt.oom();
+    b.append(rt.allocator, '/') catch rt.oom();
     return fromUtf8(b.items);
 }
 
@@ -467,12 +467,12 @@ pub fn tempFileName() Raised!String {
     while (tries < 100) : (tries += 1) {
         var b: std.ArrayList(u8) = .empty;
         defer b.deinit(rt.allocator);
-        b.appendSlice(rt.allocator, dir) catch @panic("fable: out of memory");
-        if (dir.len == 0 or dir[dir.len - 1] != '/') b.append(rt.allocator, '/') catch @panic("fable: out of memory");
-        b.appendSlice(rt.allocator, "tmp") catch @panic("fable: out of memory");
-        for (0..6) |_| b.append(rt.allocator, randomChar()) catch @panic("fable: out of memory");
-        b.appendSlice(rt.allocator, ".tmp") catch @panic("fable: out of memory");
-        const z = dupeZ(b.items) catch @panic("fable: out of memory");
+        b.appendSlice(rt.allocator, dir) catch rt.oom();
+        if (dir.len == 0 or dir[dir.len - 1] != '/') b.append(rt.allocator, '/') catch rt.oom();
+        b.appendSlice(rt.allocator, "tmp") catch rt.oom();
+        for (0..6) |_| b.append(rt.allocator, randomChar()) catch rt.oom();
+        b.appendSlice(rt.allocator, ".tmp") catch rt.oom();
+        const z = dupeZ(b.items) catch rt.oom();
         defer rt.allocator.free(z);
         const rc = sys.open(z, openFlags(.create_new), @as(std.posix.mode_t, 0o600));
         switch (std.posix.errno(rc)) {

@@ -27,7 +27,93 @@ pub const interface_version: i32 = 12;
 // ---------------------------------------------------------------------------------------------
 
 /// Where cells come from. A program may set this before it allocates anything.
-pub var allocator: std.mem.Allocator = if (builtin.link_libc)
+pub var allocator: std.mem.Allocator = if (@hasDecl(root, "fable_oom_hook"))
+    .{ .ptr = @constCast(@ptrCast(&base_allocator)), .vtable = &OomHooked.vtable }
+else
+    base_allocator;
+
+// ---------------------------------------------------------------------------------------------
+// Out of memory
+//
+// On .NET an allocation that fails throws OutOfMemoryException; one that nothing catches ends
+// the program with "Unhandled exception. System.OutOfMemoryException: ..." (exit code 134 on
+// Unix), without running `finally` blocks. Here, by the policy (`fable_oom_policy` in the root
+// file, or by the optimization mode):
+//
+// - `.dotnet` (Debug, ReleaseSafe): the allocations a program can expect to fail (arrays of a
+//   length it computes, `Array.Resize`, a collection's capacity) raise OutOfMemoryException, which
+//   a handler can catch; an allocation of a cell (a record, a closure, a list cell) ends the
+//   program as an exception nothing catches does on .NET. Whether any handler of the program can
+//   catch OutOfMemoryException is known when it is compiled (`oom_catch`, joined over its files
+//   as `$cycles` is): when none can, every allocation that fails ends the program right there,
+//   and no code is spent on raising.
+// - `.abort` (ReleaseFast, ReleaseSmall): every allocation that fails ends the program so.
+//
+// A program may also declare `pub fn fable_oom_hook(bytes: usize) bool`: called when an
+// allocation fails, before any of this; when it returns true (it freed memory: caches, say) the
+// allocation is tried again.
+// ---------------------------------------------------------------------------------------------
+
+pub const OomPolicy = enum { dotnet, abort };
+
+pub const oom_policy: OomPolicy = blk: {
+    if (@hasDecl(root, "fable_oom_policy")) break :blk root.fable_oom_policy;
+    break :blk switch (builtin.mode) {
+        .Debug, .ReleaseSafe => .dotnet,
+        .ReleaseFast, .ReleaseSmall => .abort,
+    };
+};
+
+/// Can a handler of the program catch OutOfMemoryException (so that what can raise it does)?
+pub const oom_catchable: bool = blk: {
+    if (oom_policy != .dotnet) break :blk false;
+    if (builtin.is_test) break :blk true;
+    if (!@hasDecl(root, "$cycles")) break :blk true;
+    const c = root.@"$cycles";
+    if (@hasField(@TypeOf(c), "oom_catch")) break :blk c.oom_catch;
+    break :blk true;
+};
+
+/// An allocation failed where it cannot raise: the program ends as .NET ends it when nothing
+/// catches OutOfMemoryException (written without allocating)
+pub fn oom() noreturn {
+    @branchHint(.cold);
+    write_err("Unhandled exception. System.OutOfMemoryException: Insufficient memory to continue the execution of the program.\n");
+    std.process.abort();
+}
+
+/// An allocation failed where it can raise: OutOfMemoryException, when a handler can catch it
+pub fn oomRaise() Raised {
+    @branchHint(.cold);
+    if (comptime !oom_catchable) oom();
+    return raise(OutOfMemoryException, str("Insufficient memory to continue the execution of the program."));
+}
+
+/// The allocator a program's `fable_oom_hook` is asked through before an allocation fails
+const OomHooked = struct {
+    fn hooked_alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const base: *const std.mem.Allocator = @ptrCast(@alignCast(ctx));
+        while (true) {
+            if (base.rawAlloc(len, alignment, ret_addr)) |p| return p;
+            if (!root.fable_oom_hook(len)) return null;
+        }
+    }
+    fn hooked_resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const base: *const std.mem.Allocator = @ptrCast(@alignCast(ctx));
+        return base.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn hooked_remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const base: *const std.mem.Allocator = @ptrCast(@alignCast(ctx));
+        return base.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn hooked_free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const base: *const std.mem.Allocator = @ptrCast(@alignCast(ctx));
+        base.rawFree(memory, alignment, ret_addr);
+    }
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = hooked_alloc, .resize = hooked_resize, .remap = hooked_remap, .free = hooked_free };
+};
+
+const base_allocator: std.mem.Allocator = if (builtin.link_libc)
     std.heap.c_allocator
 else if (builtin.single_threaded)
     std.heap.page_allocator
@@ -97,7 +183,7 @@ pub fn Cell(comptime T: type, comptime tag: std.meta.Tag(T)) type {
 pub inline fn cell(comptime T: type, comptime tag: std.meta.Tag(T), init: Cell(T, tag)) *Cell(T, tag) {
     const C = Cell(T, tag);
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch @panic("fable: out of memory");
+    const c = allocator.create(C) catch oom();
     c.* = init;
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -230,7 +316,7 @@ pub fn threadStart(t: ThreadOf) Raised!void {
     if (t.started) return raise(ThreadStateException, str("Thread is running or terminated; it cannot restart."));
     // (the thread object too: the new thread holds it, and the flag in it, until it ends)
     try markShared(t);
-    const h = allocator.create(std.Thread) catch @panic("fable: out of memory");
+    const h = allocator.create(std.Thread) catch oom();
     h.* = std.Thread.spawn(.{}, threadMain, .{ dup(t.start), &t.finished, dup(t) }) catch {
         allocator.destroy(h);
         return raise(OutOfMemoryException, str("Thread failed to start."));
@@ -353,11 +439,11 @@ fn acquireMonitor(key: usize) *MonitorNode {
         head.* = .{ .refs = 1 };
         break :blk head;
     } else blk: {
-        const fresh = bookkeeping().create(MonitorNode) catch @panic("fable: out of memory");
+        const fresh = bookkeeping().create(MonitorNode) catch oom();
         fresh.* = .{ .refs = 1 };
         break :blk fresh;
     };
-    monitors.put(bookkeeping(), key, node) catch @panic("fable: out of memory");
+    monitors.put(bookkeeping(), key, node) catch oom();
     return node;
 }
 
@@ -1073,7 +1159,7 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
 pub inline fn new(comptime P: type, init: @typeInfo(P).pointer.child) P {
     const C = @typeInfo(P).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch @panic("fable: out of memory");
+    const c = allocator.create(C) catch oom();
     c.* = init;
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -1704,7 +1790,7 @@ pub fn Lazy(comptime T: type) type {
 pub fn lazyNew(comptime L: type, thunk: anytype) L {
     const C = @typeInfo(L).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch @panic("fable: out of memory");
+    const c = allocator.create(C) catch oom();
     c.* = .{ .state = .{ .thunk = dup(thunk) } };
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -1715,7 +1801,7 @@ pub fn lazyNew(comptime L: type, thunk: anytype) L {
 pub fn lazyOf(comptime L: type, value: anytype) L {
     const C = @typeInfo(L).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch @panic("fable: out of memory");
+    const c = allocator.create(C) catch oom();
     c.* = .{ .state = .{ .value = dup(value) } };
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -1856,8 +1942,8 @@ test {
 /// `seq [a; b; c; d; ...]`: how `%A` writes a .NET collection (four items, then `...`).
 fn showSeq(b: *Shower, items: []const *Layout, more: bool) *Layout {
     var all: std.ArrayList(*Layout) = .empty;
-    all.appendSlice(b.arena, items) catch @panic("fable: out of memory");
-    if (more) all.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+    all.appendSlice(b.arena, items) catch oom();
+    if (more) all.append(b.arena, b.word("...")) catch oom();
     const list = if (all.items.len == 0)
         b.word("[]")
     else
@@ -1909,7 +1995,7 @@ pub fn rItem(comptime R: type) type {
 pub fn raNew(comptime R: type) R {
     const C = @typeInfo(R).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch @panic("fable: out of memory");
+    const c = allocator.create(C) catch oom();
     c.* = .{};
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -1920,7 +2006,7 @@ pub fn raGrow(r: anytype, need: usize) void {
     if (need <= r.capacity) return;
     const cap = @max(need, @max(4, r.capacity * 2));
     const T = rItem(@TypeOf(r));
-    const block = allocator.alloc(T, cap) catch @panic("fable: out of memory");
+    const block = allocator.alloc(T, cap) catch oom();
     @memcpy(block[0..r.items.len], r.items);
     if (r.capacity != 0) allocator.free(r.items.ptr[0..r.capacity]);
     r.items = block[0..r.items.len];
@@ -2143,9 +2229,9 @@ fn showPlain(b: *Shower, x: anytype, depth: i32) *Layout {
 
 fn showPlainShape(b: *Shower, x: anytype, comptime shape: TypeShape, node_idx: u16, depth: i32) *Layout {
     const T = @TypeOf(x);
-    if (T == String) return b.leaf(false, b.arena.dupe(u16, unitsOf(x)) catch @panic("fable: out of memory"), false);
+    if (T == String) return b.leaf(false, b.arena.dupe(u16, unitsOf(x)) catch oom(), false);
     const node: ShowNode = if (node_idx < shape.nodes.len) shape.nodes[node_idx] else .{};
-    if (T == u16 and node.kind != .u16_num) return b.leaf(false, b.arena.dupe(u16, &.{x}) catch @panic("fable: out of memory"), false);
+    if (T == u16 and node.kind != .u16_num) return b.leaf(false, b.arena.dupe(u16, &.{x}) catch oom(), false);
     switch (@typeInfo(T)) {
         .int, .float, .bool => {
             var scratch: [scratch_len]u8 align(2) = undefined;
@@ -2236,7 +2322,7 @@ pub fn ValueOf(comptime D: type) type {
 pub fn htNew(comptime D: type) D {
     const C = @typeInfo(D).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch @panic("fable: out of memory");
+    const c = allocator.create(C) catch oom();
     c.* = .{};
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -2320,7 +2406,7 @@ pub fn htBucket(d: anytype, h: i32) usize {
 
 pub fn htResize(d: anytype, size: usize) void {
     const C = @TypeOf(d.*);
-    const block = allocator.alloc(C.Entry, size) catch @panic("fable: out of memory");
+    const block = allocator.alloc(C.Entry, size) catch oom();
     @memcpy(block[0..d.entries.len], d.entries);
     if (d.capacity != 0) {
         allocator.free(d.entries.ptr[0..d.capacity]);
@@ -2328,7 +2414,7 @@ pub fn htResize(d: anytype, size: usize) void {
     }
     d.entries = block[0..d.entries.len];
     d.capacity = size;
-    d.buckets = allocator.alloc(i32, size) catch @panic("fable: out of memory");
+    d.buckets = allocator.alloc(i32, size) catch oom();
     @memset(d.buckets, 0);
     for (d.entries, 0..) |*e, i| {
         if (e.kv == null) continue;
@@ -2572,7 +2658,7 @@ pub fn dictToList(d: anytype) List(struct { KeyOf(@TypeOf(d)), ValueOf(@TypeOf(d
     var items: std.ArrayList(P) = .empty;
     defer items.deinit(allocator);
     for (d.entries) |e| {
-        if (e.kv) |kv| items.append(allocator, .{ kv.key, kv.value }) catch @panic("fable: out of memory");
+        if (e.kv) |kv| items.append(allocator, .{ kv.key, kv.value }) catch oom();
     }
     return listOf(P, items.items);
 }
@@ -2584,7 +2670,7 @@ pub fn dictKeys(d: anytype) List(KeyOf(@TypeOf(d))) {
     var items: std.ArrayList(KeyOf(@TypeOf(d))) = .empty;
     defer items.deinit(allocator);
     for (d.entries) |e| {
-        if (e.kv) |kv| items.append(allocator, kv.key) catch @panic("fable: out of memory");
+        if (e.kv) |kv| items.append(allocator, kv.key) catch oom();
     }
     return listOf(KeyOf(@TypeOf(d)), items.items);
 }
@@ -2596,7 +2682,7 @@ pub fn dictValues(d: anytype) List(ValueOf(@TypeOf(d))) {
     var items: std.ArrayList(ValueOf(@TypeOf(d))) = .empty;
     defer items.deinit(allocator);
     for (d.entries) |e| {
-        if (e.kv) |kv| items.append(allocator, kv.value) catch @panic("fable: out of memory");
+        if (e.kv) |kv| items.append(allocator, kv.value) catch oom();
     }
     return listOf(ValueOf(@TypeOf(d)), items.items);
 }
@@ -3097,7 +3183,7 @@ fn ObjCell(comptime Chain: type) type {
 
         pub fn alloc(ty: *const ObjType) Obj {
             if (comptime cyclic) gcTick();
-            const raw = allocator.create(Raw) catch @panic("fable: out of memory");
+            const raw = allocator.create(Raw) catch oom();
             const o: Obj = @ptrCast(@alignCast(&raw.bytes));
             o.* = .{ .type = ty };
             if (comptime init_bytes_len > 0) {
@@ -3114,7 +3200,7 @@ fn ObjCell(comptime Chain: type) type {
 
         pub fn new(ty: *const ObjType, chain: Chain) Obj {
             if (comptime cyclic) gcTick();
-            const raw = allocator.create(Raw) catch @panic("fable: out of memory");
+            const raw = allocator.create(Raw) catch oom();
             const o: Obj = @ptrCast(@alignCast(&raw.bytes));
             o.* = .{ .type = ty };
             inline for (0..parts.len) |i| part(o, i).* = chainPart(chain, i);
@@ -3726,12 +3812,12 @@ fn CellNull(comptime P: type) type {
         fn get() P {
             if (made) |c| return c;
             if (comptime hasGc(C)) gcTick();
-            const c = allocator.create(C) catch @panic("fable: out of memory");
+            const c = allocator.create(C) catch oom();
             if (track) thread.stats.allocs += 1;
             made = c;
             fillNullCell(P, c);
             c.@"$gc" = gcHeader(C, c);
-            thread.null_arrays.append(bookkeeping(), .{ .cell = c, .free = freeNull }) catch @panic("fable: out of memory");
+            thread.null_arrays.append(bookkeeping(), .{ .cell = c, .free = freeNull }) catch oom();
             uncount();
             return c;
         }
@@ -4024,7 +4110,9 @@ pub inline fn objPart(comptime P: type, comptime parts: []const type, o: Obj) P 
 }
 
 /// `string o`: its class's `ToString`, or .NET's name of its class.
-pub fn objText(o: Obj) Raised!String {
+pub fn objText(x: anytype) Raised!String {
+    // (`x.ToString()` of a null object: NullReferenceException)
+    const o: Obj = if (comptime @typeInfo(@TypeOf(x)) == .optional) (x orelse return nullRef()) else x;
     if (o.type.to_string) |f| return f(null, o, {});
     var b: TextBuilder = .{};
     b.addAscii(o.type.name);
@@ -4173,6 +4261,8 @@ pub const Cycles = struct {
     stack_traces: bool = false,
     reflection: bool = false,
     exn_show: bool = true,
+    /// a handler of the program can catch OutOfMemoryException
+    oom_catch: bool = false,
 };
 
 /// A file's own answer joined with those of the files it uses.
@@ -4188,6 +4278,7 @@ pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
         if (@hasField(@TypeOf(u), "stack_traces")) r.stack_traces = r.stack_traces or u.stack_traces;
         if (@hasField(@TypeOf(u), "reflection")) r.reflection = r.reflection or u.reflection;
         if (@hasField(@TypeOf(u), "exn_show")) r.exn_show = r.exn_show or u.exn_show;
+        if (@hasField(@TypeOf(u), "oom_catch")) r.oom_catch = r.oom_catch or u.oom_catch;
     }
     return r;
 }
@@ -4669,7 +4760,7 @@ pub fn strWords(len: usize) usize {
 
 /// A new string of `len` units, to be filled in by the caller. Its count is one.
 pub fn strNew(len: usize) struct { *Str, []u16 } {
-    const words = allocator.alloc(u32, strWords(len)) catch @panic("fable: out of memory");
+    const words = allocator.alloc(u32, strWords(len)) catch oom();
     const s: *Str = @ptrCast(words.ptr);
     s.* = .{ .rc = 1, .len = @intCast(len), .cap = @intCast(len) };
     if (track) thread.stats.allocs += 1;
@@ -4724,11 +4815,11 @@ pub const TextBuilder = struct {
     list: std.ArrayList(u16) = .empty,
 
     pub fn add(b: *TextBuilder, u: []const u16) void {
-        b.list.appendSlice(allocator, u) catch @panic("fable: out of memory");
+        b.list.appendSlice(allocator, u) catch oom();
     }
 
     pub fn addOne(b: *TextBuilder, c: u16) void {
-        b.list.append(allocator, c) catch @panic("fable: out of memory");
+        b.list.append(allocator, c) catch oom();
     }
 
     pub fn addAscii(b: *TextBuilder, text: []const u8) void {
@@ -4779,8 +4870,8 @@ fn encodeUnits(enc: TextEncoding, units: []const u16) Array(u8) {
     var out: std.ArrayList(u8) = .empty;
     switch (enc) {
         .utf16le => for (units) |u| {
-            out.append(allocator, @truncate(u)) catch @panic("fable: out of memory");
-            out.append(allocator, @truncate(u >> 8)) catch @panic("fable: out of memory");
+            out.append(allocator, @truncate(u)) catch oom();
+            out.append(allocator, @truncate(u >> 8)) catch oom();
         },
         .utf8 => {
             var i: usize = 0;
@@ -4788,11 +4879,11 @@ fn encodeUnits(enc: TextEncoding, units: []const u16) Array(u8) {
                 const cp = nextCodePoint(units, &i);
                 var buf: [4]u8 = undefined;
                 const n = std.unicode.utf8Encode(cp, &buf) catch 0;
-                out.appendSlice(allocator, buf[0..n]) catch @panic("fable: out of memory");
+                out.appendSlice(allocator, buf[0..n]) catch oom();
             }
         },
     }
-    return arrayFrom(Array(u8), out.toOwnedSlice(allocator) catch @panic("fable: out of memory"));
+    return arrayFrom(Array(u8), out.toOwnedSlice(allocator) catch oom());
 }
 
 fn rangeOf(len: usize, index: i32, count: i32) Raised![2]usize {
@@ -5269,7 +5360,7 @@ pub fn strAppend(a: String, b: String) String {
     if (need > p.cap) {
         const cap = @max(need, @as(usize, p.cap) * 2);
         const old: [*]u32 = @ptrCast(@alignCast(p));
-        const words = allocator.realloc(old[0..strWords(p.cap)], strWords(cap)) catch @panic("fable: out of memory");
+        const words = allocator.realloc(old[0..strWords(p.cap)], strWords(cap)) catch oom();
         s = @ptrCast(words.ptr);
         s.cap = @intCast(cap);
     }
@@ -6618,13 +6709,13 @@ pub const Shower = struct {
     outer: usize = 0,
 
     pub fn leaf(b: *Shower, tight_left: bool, text: []const u16, tight_right: bool) *Layout {
-        const l = b.arena.create(Layout) catch @panic("fable: out of memory");
+        const l = b.arena.create(Layout) catch oom();
         l.* = .{ .tight_left = tight_left, .tight_right = tight_right, .what = .{ .leaf = text } };
         return l;
     }
 
     pub fn ascii(b: *Shower, tight_left: bool, text: []const u8, tight_right: bool) *Layout {
-        const u = b.arena.alloc(u16, text.len) catch @panic("fable: out of memory");
+        const u = b.arena.alloc(u16, text.len) catch oom();
         for (text, u) |c, *to| to.* = c;
         return b.leaf(tight_left, u, tight_right);
     }
@@ -6634,7 +6725,7 @@ pub const Shower = struct {
     }
 
     pub fn join(b: *Shower, l: *Layout, r: *Layout, joint: Joint) *Layout {
-        const n = b.arena.create(Layout) catch @panic("fable: out of memory");
+        const n = b.arena.create(Layout) catch oom();
         n.* = .{ .tight_left = l.tight_left, .tight_right = r.tight_right, .what = .{ .node = .{ .l = l, .r = r, .joint = joint } } };
         return n;
     }
@@ -6694,10 +6785,10 @@ pub const Shower = struct {
             var row: std.ArrayList(*Layout) = .empty;
             for (items[i * arr_shape[1] ..][0..arr_shape[1]]) |item| {
                 if (row.items.len == print_length) {
-                    row.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+                    row.append(b.arena, b.word("...")) catch oom();
                     break;
                 }
-                row.append(b.arena, b.showShape(item, shape, child_idx, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
+                row.append(b.arena, b.showShape(item, shape, child_idx, .bracket_if_tuple, depth - 1)) catch oom();
             }
             const inner = if (row.items.len == 0) b.word("[]") else b.tight(b.tight(b.ascii(false, "[", true), b.separated(row.items, ";")), b.ascii(true, "]", false));
             all = if (all) |above| b.join(above, inner, .{ .broken = 0 }) else inner;
@@ -6791,11 +6882,11 @@ pub const Shower = struct {
         }
         text[n] = '\'';
         n += 1;
-        return b.leaf(false, b.arena.dupe(u16, text[0..n]) catch @panic("fable: out of memory"), false);
+        return b.leaf(false, b.arena.dupe(u16, text[0..n]) catch oom(), false);
     }
 
     pub fn quoted(b: *Shower, u: []const u16) *Layout {
-        const text = b.arena.alloc(u16, u.len + 2) catch @panic("fable: out of memory");
+        const text = b.arena.alloc(u16, u.len + 2) catch oom();
         text[0] = '"';
         @memcpy(text[1..][0..u.len], u);
         text[u.len + 1] = '"';
@@ -6822,7 +6913,7 @@ pub const Shower = struct {
             var buf: [41]u8 = undefined;
             const t = decAscii(x, &buf);
             buf[t.len] = 'M';
-            const copy = b.arena.dupe(u8, buf[0 .. t.len + 1]) catch @panic("fable: out of memory");
+            const copy = b.arena.dupe(u8, buf[0 .. t.len + 1]) catch oom();
             return b.word(copy);
         }
         if (comptime isCellPtr(T)) {
@@ -6860,10 +6951,10 @@ pub const Shower = struct {
                     var items: std.ArrayList(*Layout) = .empty;
                     for (x.items) |item| {
                         if (items.items.len == print_length) {
-                            items.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+                            items.append(b.arena, b.word("...")) catch oom();
                             break;
                         }
-                        items.append(b.arena, b.showShape(item, shape, child, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
+                        items.append(b.arena, b.showShape(item, shape, child, .bracket_if_tuple, depth - 1)) catch oom();
                     }
                     return b.tight(b.tight(b.ascii(false, "[|", true), b.separated(items.items, ";")), b.ascii(true, "|]", false));
                 }
@@ -6932,7 +7023,7 @@ pub const Shower = struct {
                     var w = TreeWalk(T).init(x);
                     while (w.next()) |n| {
                         if (items.items.len == 9) {
-                            items.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+                            items.append(b.arena, b.word("...")) catch oom();
                             break;
                         }
                         const item = if (comptime T.fable_collection == .map) blk: {
@@ -6942,7 +7033,7 @@ pub const Shower = struct {
                             };
                             break :blk b.bracket(b.separated(&pair_items, ","));
                         } else b.showShape(n.key, shape, k_idx, .bracket_if_tuple, depth - 1);
-                        items.append(b.arena, item) catch @panic("fable: out of memory");
+                        items.append(b.arena, item) catch oom();
                     }
                     const list = if (items.items.len == 0)
                         b.word("[]")
@@ -6958,10 +7049,10 @@ pub const Shower = struct {
                     var rest = x;
                     while (rest == .Cons) : (rest = rest.Cons.Tail) {
                         if (items.items.len == print_length) {
-                            items.append(b.arena, b.word("...")) catch @panic("fable: out of memory");
+                            items.append(b.arena, b.word("...")) catch oom();
                             break;
                         }
-                        items.append(b.arena, b.showShape(rest.Cons.Head, shape, child, .bracket_if_tuple, depth - 1)) catch @panic("fable: out of memory");
+                        items.append(b.arena, b.showShape(rest.Cons.Head, shape, child, .bracket_if_tuple, depth - 1)) catch oom();
                     }
                     return b.tight(b.tight(b.ascii(false, "[", true), b.separated(items.items, ";")), b.ascii(true, "]", false));
                 }
@@ -7025,7 +7116,7 @@ pub const Shower = struct {
                             pos, const right = b.fit(pos + mid, n.r);
                             return .{ pos, left + mid + right };
                         }
-                        b.savings.append(b.arena, saving) catch @panic("fable: out of memory");
+                        b.savings.append(b.arena, saving) catch oom();
                         pos, const right = b.fit(pos + mid, n.r);
                         const made = b.savings.pop().? < 0;
                         if (b.outer > b.savings.items.len) b.outer = b.savings.items.len;
@@ -7556,7 +7647,7 @@ pub inline fn ifaceClosure(comptime I: type, comptime Captures: type, captures: 
     if (@sizeOf(Captures) == 0) return .{ .data = null, .vt = vt };
     const E = EnvOf(Captures);
     if (comptime E.cyclic) gcTick();
-    const e = allocator.create(E) catch @panic("fable: out of memory");
+    const e = allocator.create(E) catch oom();
     e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
     if (comptime E.cyclic) {
         e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
@@ -7755,7 +7846,7 @@ pub fn EnvOf(comptime Captures: type) type {
 pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captures, code: @FieldType(F, "code")) F {
     const E = EnvOf(Captures);
     if (comptime E.cyclic) gcTick();
-    const e = allocator.create(E) catch @panic("fable: out of memory");
+    const e = allocator.create(E) catch oom();
     e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
     if (comptime E.cyclic) {
         e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
@@ -7775,7 +7866,7 @@ pub inline fn closure2(
 ) F {
     const E = EnvOf(Captures);
     if (comptime E.cyclic) gcTick();
-    const e = allocator.create(E) catch @panic("fable: out of memory");
+    const e = allocator.create(E) catch oom();
     e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
     if (comptime E.cyclic) {
         e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
@@ -8005,7 +8096,7 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
             exnText(&t, e);
             const s = t.finish();
             defer drop(s);
-            return b.leaf(false, b.arena.dupe(u16, unitsOf(s)) catch @panic("fable: out of memory"), false);
+            return b.leaf(false, b.arena.dupe(u16, unitsOf(s)) catch oom(), false);
         }
 
         pub fn setInner(e: Exn, within: Exn) void {
@@ -8038,7 +8129,7 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
 
         pub fn new(payload: Payload) Exn {
             if (comptime cyclic) gcTick();
-            const c = allocator.create(Whole) catch @panic("fable: out of memory");
+            const c = allocator.create(Whole) catch oom();
             c.* = .{ .header = .{ .type = &info }, .payload = payload };
             if (comptime cyclic) {
                 c.hdr = thread.collector.hdr(&K.desc, K.isLeaf(c));
@@ -10375,4 +10466,35 @@ test "arraySetAt, dropAll, callM/xcallM, and exn_show" {
         try std.testing.expect(exn_show);
     }
     try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "an array that does not fit raises OutOfMemoryException" {
+    const saved = allocator;
+    defer allocator = saved;
+    // (an allocator that refuses what is larger than a page, as a heap does what it cannot fit)
+    const Big = struct {
+        var base: std.mem.Allocator = undefined;
+        fn bigAlloc(_: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            if (len > 4096) return null;
+            return base.rawAlloc(len, a, ra);
+        }
+        fn bigResize(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            return base.rawResize(m, a, n, ra);
+        }
+        fn bigRemap(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            return base.rawRemap(m, a, n, ra);
+        }
+        fn bigFree(_: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            base.rawFree(m, a, ra);
+        }
+        const vt: std.mem.Allocator.VTable = .{ .alloc = bigAlloc, .resize = bigResize, .remap = bigRemap, .free = bigFree };
+    };
+    Big.base = saved;
+    allocator = .{ .ptr = undefined, .vtable = &Big.vt };
+    const A = Array(i64);
+    try std.testing.expectError(error.Raised, arrayZero(A, 1000));
+    allocator = saved;
+    const e = take();
+    try std.testing.expectEqualStrings("System.OutOfMemoryException", e.type.name);
+    drop(e);
 }
