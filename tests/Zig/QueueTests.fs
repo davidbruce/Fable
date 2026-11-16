@@ -182,3 +182,12 @@ let ``test Contains finds entries in queue`` () =
     q.Contains(3) |> equal true
     q.Contains(4) |> equal true
     q.Contains(5) |> equal false
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Can dequeue then enqueue to queue constructed from list`` () =
+    let q = Queue<int>([0])
+    q.Dequeue() |> ignore
+    q.Enqueue(42)
+    q.Dequeue() |> equal 42
+

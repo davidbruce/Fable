@@ -1429,3 +1429,149 @@ let ``test Seq.removeManyAt does not raise when the count runs past the end or i
     Seq.removeManyAt 2 2 [|1; 2; 3|] |> Seq.toList |> equal [1; 2]
     Seq.removeManyAt 1 0 xs |> Seq.toList |> equal [1; 2; 3]
     Seq.removeManyAt 1 -1 [1; 2; 3] |> Seq.toList |> equal [1; 2; 3]
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Ranges with a zero step raise ArgumentException`` () =
+    let step = 0
+    raisedExceptionType (fun () -> [0 .. step .. 5]) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> [|0L .. 0L .. 5L|]) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> [0. .. 0. .. 1.]) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> seq {0M .. 0M .. 1M} |> Seq.toList) |> equal "ArgumentException"
+
+[<Fact>]
+let ``test Seq.sortWith works`` () =
+    let xs = [3; 4; 1; 2]
+    let ys = xs |> Seq.sortWith (fun x y -> int (x - y))
+    ys |> Seq.toArray |> equal [|1; 2; 3; 4|]
+
+[<Fact>]
+let ``test Seq.toArray works II`` () =
+    let xs = [|1.; 2.; 3.|]
+    let ys = xs |> Seq.toArray
+    xs.[0] <- 2.
+    ys.[0] + ys.[1] |> equal 3.
+
+[<Fact>]
+let ``test Seq.cache works for infinite sequences`` () =
+    let guids =
+        Seq.initInfinite (fun _ -> System.Guid.NewGuid())
+        |> Seq.cache
+
+    let n = 10
+
+    let xs = guids |> Seq.truncate n |> Seq.toList
+    let ys = guids |> Seq.truncate n |> Seq.toList
+
+    xs |> equal ys
+
+[<Fact>]
+let ``test Seq.cache works when enumerating partially`` () =
+    let xs = seq {
+      yield 1
+      yield 1
+      yield 99
+    }
+
+    let rec loop xs ts =
+      match Seq.tryHead xs with
+      | Some x ->
+        if x < 10 then
+          loop (Seq.tail xs) (x :: ts)
+        else
+          Error x
+      | None ->
+        Ok (List.rev ts)
+
+    loop (Seq.cache xs) [] |> equal (Error 99)
+    loop xs [] |> equal (Error 99)
+
+[<Fact>]
+let ``test Seq random functions give .NET's results for the same seed`` () =
+    let rng = System.Random(42)
+    Seq.randomShuffleWith rng [0 .. 4] |> Seq.toList |> equal [3; 1; 2; 4; 0]
+    rng.Next() |> equal 361709742
+    let rng = System.Random(7)
+    Seq.randomSampleWith rng 5 [0 .. 21] |> Seq.toList |> equal [8; 19; 14; 1; 0]
+    rng.Next() |> equal 2048632168
+
+[<Fact>]
+let ``test Seq.randomChoicesWith draws on enumeration`` () =
+    let rng = System.Random(42)
+    let xs = Seq.randomChoicesWith rng 3 [0 .. 9]
+    rng.Next() |> equal 1434747710
+    xs |> Seq.toList |> equal [1; 1; 5]
+    xs |> Seq.toList |> equal [1; 2; 7]
+    let mutable calls = 0
+    let ys = Seq.randomChoicesBy (fun () -> calls <- calls + 1; 0.5) 3 [0 .. 9]
+    calls |> equal 0
+    ys |> Seq.toList |> equal [5; 5; 5]
+    calls |> equal 3
+    throwsError "The input must be non-negative.\ncount = -1 (Parameter 'count')" (fun () -> Seq.randomChoicesWith rng -1 [1])
+    throwsError "The input sequence was empty. (Parameter 'source')" (fun () -> Seq.randomChoicesWith rng 1 Seq.empty<int>)
+
+[<Fact>]
+let ``test Seq functions raise ArgumentException on empty sequences`` () =
+    let xs = seq { for x in [1; 2] do if x > 2 then yield x }
+    raisedExceptionType (fun () -> Seq.reduce (+) xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.reduceBack (+) xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.min xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.max xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.minBy id xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.maxBy id xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.tail xs |> Seq.toList) |> equal "ArgumentException"
+
+[<Fact>]
+let ``test Seq functions raise InvalidOperationException when there are not enough elements`` () =
+    raisedExceptionType (fun () -> Seq.take 5 [1] |> Seq.toList) |> equal "InvalidOperationException"
+    raisedExceptionType (fun () -> Seq.skip 5 [1] |> Seq.toList) |> equal "InvalidOperationException"
+
+[<Fact>]
+let ``test Seq functions raise FSharp.Core's exception types for invalid arguments`` () =
+    raisedExceptionType (fun () -> Seq.windowed 0 [1] |> Seq.toList) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.permute (fun i -> i + 1) [1; 2] |> Seq.toList) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.permute (fun _ -> 0) [1; 2] |> Seq.toList) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.randomChoiceBy (fun () -> 1.0) [1; 2]) |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Seq.randomShuffleBy (fun () -> 1.0) [1; 2] |> Seq.toList) |> equal "ArgumentOutOfRangeException"
+
+[<Fact>]
+let ``test Seq functions check their arguments when called, before enumerating`` () =
+    let xs = seq { for x in [1; 2; 3] do yield x }
+    raisedExceptionType (fun () -> Seq.init -1 id) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.replicate -1 "a") |> equal "ArgumentOutOfRangeException"
+    raisedExceptionType (fun () -> Seq.take -1 xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.take -1 [1; 2]) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.chunkBySize 0 xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.windowed 0 xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.splitInto 0 xs) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.removeManyAt -1 0 xs) |> equal "ArgumentException"
+    Seq.init 0 id |> Seq.toList |> equal []
+    Seq.take 0 xs |> Seq.toList |> equal []
+
+[<Fact>]
+let ``test Seq.removeManyAt raises ArgumentException only when FSharp.Core does`` () =
+    let xs = seq { for x in [1; 2; 3] do yield x }
+    let empty: int seq = Seq.empty
+    raisedExceptionType (fun () -> Seq.removeManyAt 3 0 xs |> Seq.toList) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.removeManyAt 3 0 [|1; 2; 3|] |> Seq.toList) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.removeManyAt 4 1 xs |> Seq.toList) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Seq.removeManyAt 0 0 empty |> Seq.toList) |> equal "ArgumentException"
+    Seq.removeManyAt 0 4 xs |> Seq.toList |> equal []
+    Seq.removeManyAt 1 3 xs |> Seq.toList |> equal [1]
+    Seq.removeManyAt 1 0 xs |> Seq.toList |> equal [1; 2; 3]
+    Seq.removeManyAt 1 -1 [1; 2; 3] |> Seq.toList |> equal [1; 2; 3]
+    Seq.removeManyAt 2 2 [|1; 2; 3|] |> Seq.toList |> equal [1; 2]
+
+[<Fact>]
+let ``test Seq.transpose groups the items of jagged sequences by index`` () =
+    let transpose (xss: seq<seq<int>>) = Seq.transpose xss |> Seq.map Seq.toList |> Seq.toList
+    transpose [seq [1; 2]; seq [3]] |> equal [[1; 3]; [2]]
+    transpose [seq [1]; seq [2; 3]] |> equal [[1; 2]; [3]]
+    transpose [Seq.empty; seq [1]] |> equal [[1]]
+    transpose [seq [1]; Seq.empty] |> equal [[1]]
+    transpose [seq [1; 2; 3]; seq [4]; seq [5; 6]] |> equal [[1; 4; 5]; [2; 6]; [3]]
+    transpose (seq { for xs in [[1; 2]; [3]] do yield seq { for x in xs do yield x } }) |> equal [[1; 3]; [2]]
+    Seq.transpose [[1; 2]; [3]] |> Seq.map Seq.toList |> Seq.toList |> equal [[1; 3]; [2]]
+    Seq.transpose [| [|1|]; [|2; 3|] |] |> Seq.map Seq.toList |> Seq.toList |> equal [[1; 2]; [3]]
+

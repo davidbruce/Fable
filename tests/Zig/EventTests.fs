@@ -265,3 +265,26 @@ let ``test Events are unsubscribed correctly`` () = // See #609
         test.Trigger(i)
 
     equal 300 counter
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Event.Trigger delivers zero value`` () =
+    let mutable result = -1
+    let source = Event<int>()
+    source.Publish |> Event.add (fun n -> result <- n)
+    source.Trigger 0
+    equal 0 result
+
+[<Fact>]
+let ``test Classes can trigger CLI events with zero value`` () =
+    let mutable result = -1
+    let mutable actualSender = null
+    let classWithEvent = new ClassWithCLIEvent()
+    classWithEvent.Event.Add(fun (sender, x) ->
+        actualSender <- box sender
+        result <- x)
+    classWithEvent.TestEvent(0)
+    equal 0 result
+    equal (box classWithEvent) actualSender
+

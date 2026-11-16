@@ -3588,6 +3588,11 @@ pub fn unbox(comptime T: type, x: anytype) Raised!T {
     return raise(InvalidCastException, b.finish());
 }
 
+/// A map changed through `IDictionary` or `ICollection`: .NET's NotSupportedException
+pub fn mapNotMutable(comptime T: type) Raised!T {
+    return raise(NotSupportedException, str("Map values cannot be mutated."));
+}
+
 /// `o :?> I` of an interface that has no null: null raises NullReferenceException
 pub fn unboxNonNull(comptime T: type, x: Any) Raised!T {
     if (x == null) return nullRef();

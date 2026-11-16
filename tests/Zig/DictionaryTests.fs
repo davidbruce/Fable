@@ -298,3 +298,119 @@ let ``test Dictionary enumeration to KeyValuePair arrays and lists works`` () =
     let arrayKeys = arrayResult |> Array.map (fun kvp -> kvp.Key) |> Array.sort
     let listKeys = listResult |> List.map (fun kvp -> kvp.Key) |> List.sort |> List.toArray
     arrayKeys |> equal listKeys
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+type DictKey =
+    | Int of int
+    | Str of string
+
+[<Fact>]
+let ``test Dictionary works when keys share a hash`` () =
+    let comparer =
+        { new IEqualityComparer<string> with
+            member _.Equals(x, y) = x = y
+            member _.GetHashCode(_) = 1 }
+    let dic = Dictionary<_,_>(comparer)
+    dic.Add("A", 1)
+    dic.Add("B", 2)
+    dic.Add("C", 3)
+    dic.Count |> equal 3
+    dic.["C"] |> equal 3
+    dic.ContainsKey("B") |> equal true
+    dic.ContainsKey("D") |> equal false
+    dic.Remove("B") |> equal true
+    dic.Remove("B") |> equal false
+    dic.ContainsKey("C") |> equal true
+    dic.Count |> equal 2
+    throwsAnyError (fun _ -> dic.Add("A", 4))
+
+[<Fact>]
+let ``test Dictionary.Count works with indexer insert`` () =
+    let dic = Dictionary<string,int>()
+    dic.["A"] <- 1
+    dic.["B"] <- 2
+    dic.Count |> equal 2
+
+[<Fact>]
+let ``test Dictionary.Count works with indexer replace`` () =
+    let dic = Dictionary<string,int>()
+    dic.Add("A", 1)
+    dic.["A"] <- 2
+    dic.Count |> equal 1
+    dic.["A"] |> equal 2
+
+[<Fact>]
+let ``test Dictionary works with union keys`` () =
+    let dic = Dictionary<DictKey, int>()
+    dic.Add(Int 1, 1)
+    dic.Add(Str "a", 2)
+    dic.[Int 1] |> equal 1
+    dic.[Str "a"] |> equal 2
+    dic.ContainsKey(Int 1) |> equal true
+    dic.ContainsKey(Int 2) |> equal false
+    dic.ContainsKey(Str "b") |> equal false
+    dic.[Int 1] <- 3
+    dic.[Int 1] |> equal 3
+    dic.Count |> equal 2
+    dic.Remove(Str "a") |> equal true
+    dic.ContainsKey(Str "a") |> equal false
+    dic.Count |> equal 1
+
+[<Fact>]
+let ``test Interface IDictionary.Count works`` () =
+    let dic = dict <| seq { for i in 1. .. 10. -> i.ToString(), i*i }
+    dic.Count |> equal 10
+
+[<Fact>]
+let ``test Interface IDictionary indexer getter works`` () =
+    let dic = dict <| seq { for i in 1. .. 10. -> i.ToString(), i*i }
+    dic.["2"] |> equal 4.
+
+[<Fact>]
+let ``test Interface IDictionary.Keys works`` () =
+    let dic = dict <| seq { for i in 1. .. 10. -> i.ToString(), i*i }
+    let i = ref ""
+    for key in dic.Keys do
+       i := key + !i
+    !i |> equal "10987654321"
+
+[<Fact>]
+let ``test Interface IDictionary.Values works`` () =
+    let dic = dict <| seq { for i in 1. .. 10. -> i.ToString(), i*i }
+    let i = ref 0.
+    for value in dic.Values do
+       i := value + !i
+    !i |> equal 385.
+
+[<Fact>]
+let ``test Interface IDictionary.ContainsKey works`` () =
+    let dic = dict <| [ ("A", 1.); ("B", 2.) ]
+    dic.ContainsKey("A") |> equal true
+    dic.ContainsKey("C") |> equal false
+
+[<Fact>]
+let ``test Adding 2 items with the same key throws`` () =
+    let dic = Dictionary<_,_>()
+    dic.Add("A", 65)
+    // throwsError "An item with the same key has already been added. Key: A" (fun _ -> dic.Add("A", 95))
+    throwsAnyError (fun _ -> dic.Add("A", 95))
+
+[<Fact>]
+let ``test Indexer throws when key not found`` () =
+    let dic = Dictionary<_,_>()
+    dic.Add("A", 65)
+    // throwsError "The given key 'B' was not present in the dictionary." (fun _ -> dic.["B"] |> ignore)
+    throwsAnyError (fun () -> dic.["B"])
+
+[<Fact>]
+let ``test conversion from array works`` () =
+    let dic = [| "A",1; "B",2 |] |> dict
+    dic.Values.Count
+    |> equal 2
+
+[<Fact>]
+let ``test conversion from array works with duplicates`` () =
+    let dic = [| "A",1; "A",3; "B",2 |] |> dict
+    dic.Values.Count
+    |> equal 2

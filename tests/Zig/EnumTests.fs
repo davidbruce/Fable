@@ -25,6 +25,9 @@ let myRootValue =
 module EnumOperations =
     let inline enumOfValue1<'T,'U when 'U: enum<'T>> (value: 'T) : 'U = LanguagePrimitives.EnumOfValue<'T,'U>(value)
     let inline enumOfValue2 value = LanguagePrimitives.EnumOfValue value
+    let enumToInt<'TEnum when 'TEnum: enum<int>> (value: 'TEnum) : int =
+        int (LanguagePrimitives.EnumToValue value)
+    let isDefinedGeneric<'a> (t: System.Type) (value: 'a) : bool = System.Enum.IsDefined(t, value)
     // let enumOfValue3 value = LanguagePrimitives.EnumOfValue value
     // let enumOfValue4 = LanguagePrimitives.EnumOfValue
 
@@ -273,3 +276,100 @@ let ``test Enum.TryParse works`` () =
     Enum.TryParse<MyEnum>("Foo") |> equal (true, MyEnum.Foo)
     Enum.TryParse<MyEnum>("Bar") |> equal (true, MyEnum.Bar)
     Enum.TryParse<MyEnum>("Ozu") |> fst |> equal false
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+
+
+
+[<Fact>]
+let ``test Enum operator = works`` () =
+    let a = Fruits.Apple
+    let b = Fruits.Banana
+
+    Fruits.Apple = Fruits.Apple |> equal true
+    a = Fruits.Apple |> equal true
+    Fruits.Apple = a |> equal true
+    a = a |> equal true
+
+[<Fact>]
+let ``test Enum operator <> works`` () =
+    let a = Fruits.Apple
+    let b = Fruits.Banana
+
+    Fruits.Apple <> Fruits.Apple |> equal false
+    a <> Fruits.Apple |> equal false
+    Fruits.Apple <> a |> equal false
+    a <> a |> equal false
+
+[<Fact>]
+let ``test Enum operator < works`` () =
+    let a = Fruits.Apple
+    let b = Fruits.Banana
+
+    Fruits.Apple < Fruits.Apple |> equal false
+    a < Fruits.Apple |> equal false
+    Fruits.Apple < a |> equal false
+    a < a |> equal false
+
+    Fruits.Apple < Fruits.Banana |> equal true
+    a < Fruits.Banana |> equal true
+    Fruits.Banana < a |> equal false
+    a < b |> equal true
+
+[<Fact>]
+let ``test Enum operator <= works`` () =
+    let a = Fruits.Apple
+    let b = Fruits.Banana
+
+    Fruits.Apple <= Fruits.Apple |> equal true
+    a <= Fruits.Apple |> equal true
+    Fruits.Apple <= a |> equal true
+    a <= a |> equal true
+
+    Fruits.Apple <= Fruits.Banana |> equal true
+    a <= Fruits.Banana |> equal true
+    Fruits.Banana <= a |> equal false
+    a <= b |> equal true
+
+[<Fact>]
+let ``test Enum operator > works`` () =
+    let a = Fruits.Apple
+    let b = Fruits.Banana
+
+    Fruits.Apple > Fruits.Apple |> equal false
+    a > Fruits.Apple |> equal false
+    Fruits.Apple > a |> equal false
+    a > a |> equal false
+
+    Fruits.Apple > Fruits.Banana |> equal false
+    a > Fruits.Banana |> equal false
+    Fruits.Banana > a |> equal true
+    a > b |> equal false
+
+[<Fact>]
+let ``test Enum operator >= works`` () =
+    let a = Fruits.Apple
+    let b = Fruits.Banana
+
+    Fruits.Apple >= Fruits.Apple |> equal true
+    a >= Fruits.Apple |> equal true
+    Fruits.Apple >= a |> equal true
+    a >= a |> equal true
+
+    Fruits.Apple >= Fruits.Banana |> equal false
+    a >= Fruits.Banana |> equal false
+    Fruits.Banana >= a |> equal true
+    a >= b |> equal false
+
+[<Fact>]
+let ``test Enum.IsDefined works in a generic function`` () =
+    EnumOperations.isDefinedGeneric typeof<MyEnum> "Foo" |> equal true
+    EnumOperations.isDefinedGeneric typeof<MyEnum> 5y |> equal true
+    EnumOperations.isDefinedGeneric typeof<MyEnum> 10y |> equal false
+
+[<Fact>]
+let ``test Generic function with enum constraint works`` () =
+    EnumOperations.enumToInt Fruits.Banana |> equal 2
+    EnumOperations.enumToInt Fruits.Coconut |> equal 4
+

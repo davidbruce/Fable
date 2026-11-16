@@ -96,3 +96,27 @@ let ``test first overload`` () =
 let ``test second overload`` () =
     toLen 1<em>
     |> equal "1em"
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+type CustomPow =
+    { Ok: bool }
+    static member Pow(x: CustomPow, n: int) = { Ok = true }
+
+
+[<Fact>]
+let ``test Custom Pow works`` () =
+    // See #2496
+    let x = { Ok = false }
+    x ** 2 |> equal { Ok = true }
+
+[<Fact>]
+let ``test Custom Exp works`` () =
+    let x = { value=10 }
+    exp x |> equal { value= 11 }
+
+[<Fact>]
+let ``test Float Exp works`` () =
+    let x = 0.0
+    exp x |> equal 1.
+

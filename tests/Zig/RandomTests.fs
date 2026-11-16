@@ -130,3 +130,14 @@ let ``test System.Random.Shared works`` () =
     let x = Random.Shared.NextDouble()
     (x >= 0.0 && x < 1.0) |> equal true
     obj.ReferenceEquals(Random.Shared, Random.Shared) |> equal true
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test System.Random seeded Next works for ranges above Int32.MaxValue`` () =
+    let rnd = Random(42)
+    rnd.Next(Int32.MinValue, Int32.MaxValue) |> equal 1434747709
+    rnd.Next(Int32.MinValue, Int32.MaxValue) |> equal -269548476
+    let rnd = Random(0)
+    [ for _ in 1 .. 3 -> rnd.Next(-1000000000, 2000000000) ] |> equal [-589364906; 1652034034; 809049730]
+

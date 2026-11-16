@@ -468,3 +468,30 @@ let ``test Nullable works`` () =
     y.HasValue |> equal false
     let errorThrown = try y.Value |> ignore; false with _ -> true
     equal true errorThrown
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test defaultValueArg works`` () =
+    let f o = defaultValueArg o 5
+    f (ValueSome 2) |> equal 2
+    f ValueNone |> equal 5
+
+[<Fact>]
+let ``test Option.IsSome/IsNone works`` () =
+    let o1 = None
+    let o2 = Some 5
+    o1.IsNone |> equal true
+    o1.IsSome |> equal false
+    o2.IsNone |> equal false
+    o2.IsSome |> equal true
+
+[<Fact>]
+let ``test ValueOption.IsSome/IsNone works`` () =
+    let o1: int voption = ValueNone
+    let o2 = Some 5
+    o1.IsNone |> equal true
+    o1.IsSome |> equal false
+    o2.IsNone |> equal false
+    o2.IsSome |> equal true
+

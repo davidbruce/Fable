@@ -360,3 +360,52 @@ let ``test Map enumerator Current raises InvalidOperationException outside the e
     raisedExceptionType (fun () -> e.Current) |> equal "InvalidOperationException"
     while e.MoveNext() do ()
     raisedExceptionType (fun () -> e.Current) |> equal "InvalidOperationException"
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Map.IsEmpty works`` () =
+    let xs = Map.empty<int, int>
+    xs.IsEmpty |> equal true
+    let ys = Map [1,1; 2,2]
+    ys.IsEmpty |> equal false
+
+[<Fact>]
+let ``test Map.Count works`` () =
+    let xs = Map.empty<int, int>
+    xs.Count
+    |> equal 0
+
+[<Fact>]
+let ``test Map.Add works`` () =
+    let xs = Map.empty.Add(1, 1)
+    xs.Count
+    |> equal 1
+
+[<Fact>]
+let ``test Map.ContainsKey works`` () =
+    let xs = Map.empty |> Map.add 1 1
+    xs.ContainsKey 1 |> equal true
+    xs.ContainsKey 2 |> equal false
+
+[<Fact>]
+let ``test Map.Remove works`` () =
+    let xs = (Map.empty |> Map.add 1 1).Remove 1
+    xs.IsEmpty |> equal true
+
+[<Fact>]
+let ``test Map.TryFind works`` () =
+    let xs = Map [1,1.; 2,4.; 3,9.; 4,16.]
+    xs.TryFind 3
+    |> Option.isSome
+    |> equal true
+
+[<Fact>]
+let ``test Map raises NotSupportedException when mutated through IDictionary or ICollection`` () =
+    let dic = Map [1, "a"] :> IDictionary<int, string>
+    let coll = Map [1, "a"] :> ICollection<KeyValuePair<int, string>>
+    raisedExceptionType (fun () -> dic.Add(2, "b")) |> equal "NotSupportedException"
+    raisedExceptionType (fun () -> dic.Remove(1)) |> equal "NotSupportedException"
+    raisedExceptionType (fun () -> dic.[2] <- "b") |> equal "NotSupportedException"
+    raisedExceptionType (fun () -> coll.Clear()) |> equal "NotSupportedException"
+

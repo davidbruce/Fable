@@ -460,7 +460,7 @@ let call
                     Args = items :: rest
                 }
                 t
-        | ("FindAll" | "FindIndex" | "FindLastIndex" | "Exists" | "TrueForAll" | "ForEach" | "RemoveAll" | "RemoveRange" | "GetRange" | "InsertRange"),
+        | ("FindAll" | "FindIndex" | "FindLastIndex" | "Exists" | "TrueForAll" | "ForEach" | "RemoveAll" | "RemoveRange" | "GetRange" | "InsertRange" | "ConvertAll"),
           _
         | "AddRange", [ _ ] ->
             let fn = name.Substring(0, 1).ToLowerInvariant() + name.Substring(1)
@@ -519,6 +519,20 @@ let call
         | Some(listIr, "list") ->
             bindArgs ctx [ listIr ] (fun xs -> EEmit("fable_rt.dictOfList($R, $0, false)", xs, mapType ctx r t))
         | _ -> fail r "the Zig target cannot copy this into a Dictionary yet"
+    // (a map seen as `IDictionary` or `ICollection` is read-only: .NET's NotSupportedException)
+    | ("System.Collections.Generic.IDictionary`2" | "System.Collections.Generic.ICollection`1"),
+      ("Add" | "Remove" | "set_Item" | "Clear"),
+      Uncast m :: _ when
+        (match m.Type with
+         | Fable.DeclaredType(ent, _) ->
+             ent.FullName = mapName
+             // (an `ICollection` that is a list here: a map's entries, keys or values)
+             || (ent.FullName = "System.Collections.Generic.ICollection`1"
+                 && entity = "System.Collections.Generic.ICollection`1")
+         | _ -> false)
+        ->
+        ctx.State.UsesRuntime <- true
+        bindArgs ctx (args |> List.map (lw ctx)) (fun _ -> ERt("fable_rt.mapNotMutable($R)", [], mapType ctx r t))
     | ("System.Collections.Generic.IDictionary`2" | "System.Collections.Generic.IReadOnlyDictionary`2"), _, _ ->
         dotnetCall ctx r "System.Collections.Generic.Dictionary`2" name info t
     // (what a dictionary is as a collection of its entries)

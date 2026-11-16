@@ -427,3 +427,43 @@ let ``test HashSet.IsProperSupersetOf works`` () =
 //     coll.Remove(("D", 3)) |> equal false
 //     coll.Remove(("B", 2)) |> equal true
 //     coll.Count |> equal 2
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+type SetItem =
+    | Int of int
+    | Str of string
+
+
+[<Fact>]
+let ``test HashSet works when items share a hash`` () =
+    let comparer =
+        { new IEqualityComparer<string> with
+            member _.Equals(x, y) = x = y
+            member _.GetHashCode(_) = 1 }
+    let xs = HashSet<_>(comparer)
+    xs.Add "A" |> equal true
+    xs.Add "B" |> equal true
+    xs.Add "C" |> equal true
+    xs.Add "B" |> equal false
+    xs.Count |> equal 3
+    xs.Contains "C" |> equal true
+    xs.Contains "D" |> equal false
+    xs.Remove "B" |> equal true
+    xs.Remove "B" |> equal false
+    xs.Contains "C" |> equal true
+    xs.Count |> equal 2
+
+[<Fact>]
+let ``test HashSet works with union items`` () =
+    let xs = HashSet<SetItem>()
+    xs.Add(Int 1) |> equal true
+    xs.Add(Str "a") |> equal true
+    xs.Add(Int 1) |> equal false
+    xs.Contains(Int 1) |> equal true
+    xs.Contains(Int 2) |> equal false
+    xs.Contains(Str "a") |> equal true
+    xs.Count |> equal 2
+    xs.Remove(Int 1) |> equal true
+    xs.Contains(Int 1) |> equal false
+    xs.Count |> equal 1

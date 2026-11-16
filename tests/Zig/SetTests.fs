@@ -354,3 +354,67 @@ let ``test Set enumerator Current raises InvalidOperationException outside the e
     raisedExceptionType (fun () -> e.Current) |> equal "InvalidOperationException"
     while e.MoveNext() do ()
     raisedExceptionType (fun () -> e.Current) |> equal "InvalidOperationException"
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Set.IsEmpty works`` () =
+    let xs = Set.empty<int>
+    xs.IsEmpty |> equal true
+    let ys = set [1; 1]
+    ys.IsEmpty |> equal false
+
+[<Fact>]
+let ``test Set.Add works`` () =
+    let xs = Set.empty.Add 1
+    Set.count xs
+    |> equal 1
+
+[<Fact>]
+let ``test Set.Contains works`` () =
+    let xs = Set.empty |> Set.add 1
+    xs.Contains 1 |> equal true
+    xs.Contains 2 |> equal false
+
+[<Fact>]
+let ``test Set.Remove works`` () =
+    let xs = (Set.empty |> Set.add 1).Remove 1
+    xs.IsEmpty |> equal true
+
+[<Fact>]
+let ``test Set.IsSubset works`` () =
+    let xs = set [1.; 2.; 3.; 4.]
+    let ys = set [1.; 2.]
+    ys.IsSubsetOf xs
+    |> equal true
+
+[<Fact>]
+let ``test Set.IsSuperset works`` () =
+    let xs = set [1.; 2.; 3.; 4.]
+    let ys = set [1.; 2.]
+    xs.IsSupersetOf ys
+    |> equal true
+
+[<Fact>]
+let ``test Set.IsProperSubset works`` () =
+    let xs = set [1.; 2.; 3.; 4.]
+    let ys = set [1.; 2.]
+    ys.IsProperSubsetOf xs
+    |> equal true
+
+[<Fact>]
+let ``test Set.IsProperSuperset works`` () =
+    let xs = set [1.; 2.; 3.; 4.]
+    let ys = set [1.; 2.]
+    xs.IsProperSupersetOf ys
+    |> equal true
+
+[<Fact>]
+let ``test Set functions raise ArgumentException on empty sets`` () =
+    let s: Set<int> = Set.empty
+    raisedExceptionType (fun () -> Set.minElement s) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Set.maxElement s) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> s.MinimumElement) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> s.MaximumElement) |> equal "ArgumentException"
+    raisedExceptionType (fun () -> Set.intersectMany ([]: Set<int> list)) |> equal "ArgumentException"
+

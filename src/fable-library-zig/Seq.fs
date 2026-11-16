@@ -806,6 +806,9 @@ let sortBy<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (source: Seq
 let sortDescending<'T when 'T: comparison> (source: SeqOf<'T>) : SeqOf<'T> =
     delay (fun () -> ofList (List.sortDescending (toList source)))
 
+let sortWith<'T> (comparer: 'T -> 'T -> int) (source: SeqOf<'T>) : SeqOf<'T> =
+    delay (fun () -> ofList (List.sortWith comparer (toList source)))
+
 let distinct<'T when 'T: equality> (source: SeqOf<'T>) : SeqOf<'T> =
     make (fun () ->
         let w = walk source
@@ -843,16 +846,45 @@ let groupBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (source: SeqO
 let countBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (source: SeqOf<'T>) : SeqOf<'Key * int> =
     delay (fun () -> ofList (List.countBy projection (toList source)))
 
+/// `Seq.cache`: one walk of the source, made as far as an enumeration needs it (the source may
+/// be infinite), its items kept for the enumerations after
 let cache<'T> (source: SeqOf<'T>) : SeqOf<'T> =
-    let mutable saved: 'T list option = None
+    let items = ResizeArray<'T>()
+    let mutable shared: Walk<'T> option = None
+    let mutable finished = false
 
-    delay (fun () ->
-        match saved with
-        | Some items -> ofList items
-        | None ->
-            let items = toList source
-            saved <- Some items
-            ofList items
+    let fill () =
+        if finished then
+            false
+        else
+            let w =
+                match shared with
+                | Some w -> w
+                | None ->
+                    let w = walk source
+                    shared <- Some w
+                    w
+
+            match w.next () with
+            | Some x ->
+                items.Add x
+                true
+            | None ->
+                finished <- true
+                shared <- None
+                w.close ()
+                false
+
+    make (fun () ->
+        let mutable i = 0
+
+        walker
+        <| fun () ->
+            if i < items.Count || fill () then
+                i <- i + 1
+                Some items.[i - 1]
+            else
+                None
     )
 
 /// `seq { ... }` and `{ a .. b }`: what is given is the sequence.
@@ -1649,9 +1681,11 @@ let ofGetEnumerator<'T> (get: unit -> System.Collections.Generic.IEnumerator<'T>
             close
     )
 
-/// `(s :> IEnumerable<'T>).GetEnumerator()`: an enumerator over a walk of the sequence
+/// `(s :> IEnumerable<'T>).GetEnumerator()`: an enumerator over a walk of the sequence.
+/// (`Reset` starts a new walk: what .NET's enumerators of arrays, lists and collections do; one of
+/// a sequence expression raises NotSupportedException on .NET, here it walks the sequence again)
 let getEnumerator<'T> (source: SeqOf<'T>) : System.Collections.Generic.IEnumerator<'T> =
-    let w = walk source
+    let mutable w = walk source
     let mutable current: 'T option = None
 
     let value () =
@@ -1669,7 +1703,9 @@ let getEnumerator<'T> (source: SeqOf<'T>) : System.Collections.Generic.IEnumerat
               current.IsSome
 
           member _.Reset() =
-              raise (System.NotSupportedException "Specified method is not supported.")
+              w.close ()
+              w <- walk source
+              current <- None
       interface System.IDisposable with
           member _.Dispose() = w.close ()
     }

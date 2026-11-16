@@ -68,3 +68,19 @@ let ``test .NET Enumerator can be converted to JS iterator back and forth`` () =
     |> Seq.toList
     |> List.sum
     |> equal 55
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Array enumerator can be reset`` () =
+    let e = ([| 1; 2; 3 |] :> seq<int>).GetEnumerator()
+    e.MoveNext() |> equal true
+    e.MoveNext() |> equal true
+    e.Current |> equal 2
+    e.Reset()
+    e.MoveNext() |> equal true
+    e.Current |> equal 1
+    e.MoveNext() |> equal true
+    e.MoveNext() |> equal true
+    e.MoveNext() |> equal false
+

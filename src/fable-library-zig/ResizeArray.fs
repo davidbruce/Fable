@@ -45,6 +45,15 @@ let tryFindLast<'T> (r: ResizeArray<'T>) (predicate: 'T -> bool) : 'T option =
 
     found
 
+/// `r.ConvertAll(converter)`
+let convertAll<'T, 'U> (r: ResizeArray<'T>) (converter: 'T -> 'U) : ResizeArray<'U> =
+    let result = ResizeArray<'U>(r.Count)
+
+    for i in 0 .. r.Count - 1 do
+        result.Add(converter r.[i])
+
+    result
+
 let findAll<'T> (r: ResizeArray<'T>) (predicate: 'T -> bool) : ResizeArray<'T> =
     let result = ResizeArray<'T>()
 

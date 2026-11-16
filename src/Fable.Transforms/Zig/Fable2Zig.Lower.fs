@@ -3271,7 +3271,7 @@ let libraryFunction (entity: string) (name: string) : (string * string) option =
         )
     | "Microsoft.FSharp.Collections.SeqModule" when
         has
-            "Empty Singleton Delay OfList OfArray Append Map MapIndexed Filter Where Choose Collect Concat Initialize InitializeInfinite Unfold Take Truncate Skip TakeWhile SkipWhile Zip Indexed Pairwise Iterate IterateIndexed Fold ToList ToArray Length IsEmpty TryHead Head TryLast Last TryItem Item TryFind Find TryPick Pick Exists ForAll Contains Reduce Reverse Sort SortBy SortDescending Distinct Max Min MaxBy MinBy GroupBy CountBy Cache
+            "Empty Singleton Delay OfList OfArray Append Map MapIndexed Filter Where Choose Collect Concat Initialize InitializeInfinite Unfold Take Truncate Skip TakeWhile SkipWhile Zip Indexed Pairwise Iterate IterateIndexed Fold ToList ToArray Length IsEmpty TryHead Head TryLast Last TryItem Item TryFind Find TryPick Pick Exists ForAll Contains Reduce Reverse Sort SortBy SortWith SortDescending Distinct Max Min MaxBy MinBy GroupBy CountBy Cache
              Map2 Zip3 Scan Replicate DistinctBy Except Windowed ChunkBySize Cast ReadOnly Iterate2 Fold2 Exists2 ForAll2
              CompareWith TryFindIndex FindIndex TryFindBack FindBack TryFindIndexBack FindIndexBack FoldBack FoldBack2
              ExactlyOne TryExactlyOne ReduceBack SortByDescending SplitInto Permute MapFold MapFoldBack AllPairs
@@ -7877,6 +7877,28 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         lw ctx x
     // a value given where an interface is expected: fat-pointer `{ data, vt }` built from static
     // vtable slots (zero allocation for class objects; boxed for value types/records)
+    // (a map seen as the collection of its entries: the list of its pairs, as `ICollection` is a
+    // list here and an entry a pair)
+    | Fable.TypeCast(x, Fable.DeclaredType(c, [ _ ])) when
+        (c.FullName = "System.Collections.Generic.ICollection`1"
+         || c.FullName = "System.Collections.Generic.IReadOnlyCollection`1")
+        && (
+            match x.Type with
+            | Fable.DeclaredType(m, [ _; _ ]) -> m.FullName = mapName
+            | _ -> false
+        )
+        ->
+        let k, v =
+            match x.Type with
+            | Fable.DeclaredType(_, [ k; v ]) -> mapTypeArg ctx e.Range k, mapTypeArg ctx e.Range v
+            | _ -> failwith "unreachable"
+
+        bindArgs
+            ctx
+            [ lw ctx x ]
+            (fun xs ->
+                ECall(libraryTarget ctx "Map" "toList", [ k; v ], xs, TEnt(listEnt ctx.State, [ TTuple [ k; v ] ]))
+            )
     | Fable.TypeCast(x, ifaceTarget) when isInterfaceType ctx.Com ifaceTarget && not (isInterfaceType ctx.Com x.Type) ->
         let ifaceRef, _ =
             match unwrapNullness ifaceTarget with

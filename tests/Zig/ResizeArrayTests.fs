@@ -420,3 +420,11 @@ let ``test ResizeArray uses reference equality not structural equality`` () = //
     equal true (xs = xs)
     equal true (xs <> ys)
     equal false (xs <> xs)
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test ResizeArray.ConvertAll works`` () =
+    let xs = ResizeArray<_> [1.; 2.; 3.; 4.]
+    let ys = xs.ConvertAll(System.Converter(fun x -> int x))
+    ys |> Seq.toList |> equal [1;2;3;4]
+

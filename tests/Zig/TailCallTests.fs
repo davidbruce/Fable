@@ -352,3 +352,21 @@ let ``test generic and raising mutual tail recursion runs in constant stack`` ()
 
     checkedA 100001 ("ok" + string 1) |> equal "ok1!"
     throwsError "neg:boom" (fun () -> checkedA -1 ("boom" + "") |> ignore)
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+[<Fact>]
+let ``test Arguments can be consumed after being "passed" in tailcall optimizations`` () =
+    sum 0L 100000L 0L
+    |> equal 4999950000L
+
+[<Fact>]
+let ``test Tailcall optimization doesn't cause endless loops`` () =
+    // See #675
+    One("a", 42)
+    |> tryFind "a"
+    |> equal (Some 42)
+    Tree.Empty
+    |> tryFind "a"
+    |> equal None
+
