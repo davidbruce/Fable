@@ -55,7 +55,7 @@ let tokenNone () : CancellationTokenOf = { source = newSource () }
 let sourceCreate () : CancellationSource = newSource ()
 
 /// `cts.Cancel()`: the handlers run, last registered first; what they raise is raised again
-/// together, as an AggregateException whose InnerException is the first raised
+/// together, as an AggregateException of them (its InnerException is the first raised)
 let sourceCancel (s: CancellationSource) : unit =
     if not s.cancelled then
         s.cancelled <- true
@@ -73,7 +73,7 @@ let sourceCancel (s: CancellationSource) : unit =
             | None -> ()
 
         if errors.Count > 0 then
-            raise (System.AggregateException("One or more errors occurred.", errors.[0]))
+            raise (System.AggregateException("One or more errors occurred.", errors.ToArray()))
 
 // ---- time: what waits is a timer of the real clock, run in the order of its time when the
 // computation that started it is waited for; the thread sleeps until the earliest is due ----
@@ -244,6 +244,10 @@ let tokenRegister (t: CancellationTokenOf) (f: unit -> unit) : System.IDisposabl
                 if index < s.handlers.Count then
                     s.handlers.[index] <- None
         }
+
+/// `token.Register(f, state)`: `f state` when the token is cancelled
+let tokenRegisterWith (t: CancellationTokenOf) (f: obj -> unit) (state: obj) : System.IDisposable =
+    tokenRegister t (fun () -> f state)
 
 // ---- running computations ----
 

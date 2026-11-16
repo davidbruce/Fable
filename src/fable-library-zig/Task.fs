@@ -118,7 +118,7 @@ let builderTryFinally<'T> (body: TaskCode<'T>) (compensation: unit -> unit) : Ta
     }
 
 let private aggregate (e: exn) =
-    raise (System.AggregateException("One or more errors occurred. (" + e.Message + ")"))
+    raise (System.AggregateException("One or more errors occurred.", e))
 
 /// `t.Result`
 let resultOf<'T> (task: TaskOf<'T>) : 'T =

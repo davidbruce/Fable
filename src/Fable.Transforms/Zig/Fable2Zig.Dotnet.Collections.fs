@@ -558,8 +558,12 @@ let call
          | _ -> false)
         ->
         pure' "fable_rt.arrayLen($0)" [ xs ] tI32
-    | "System.Collections.Generic.IList`1", "get_Item", [ xs; i ] ->
-        rt "fable_rt.arrayGet($0, $1)" [ xs; i ] (mapType ctx r t)
+    // (a `ReadOnlyCollection<'T>` is an array here too)
+    | "System.Collections.ObjectModel.ReadOnlyCollection`1", "get_Count", [ xs ] ->
+        pure' "fable_rt.arrayLen($0)" [ xs ] tI32
+    | ("System.Collections.Generic.IList`1" | "System.Collections.ObjectModel.ReadOnlyCollection`1"),
+      "get_Item",
+      [ xs; i ] -> rt "fable_rt.arrayGet($0, $1)" [ xs; i ] (mapType ctx r t)
     | "System.Collections.Generic.IList`1", "set_Item", [ xs; i; x ] ->
         rt "fable_rt.arraySet($0, $1, $2)" [ xs; i; x ] tVoid
     | ("System.Collections.Generic.Dictionary`2.KeyCollection" | "System.Collections.Generic.Dictionary`2.ValueCollection" | "System.Collections.Generic.ICollection`1"),

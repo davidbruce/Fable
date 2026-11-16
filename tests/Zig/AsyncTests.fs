@@ -1548,3 +1548,48 @@ let ``test Async.Parallel rejects a maxDegreeOfParallelism below 1`` () =
     with :? ArgumentException -> raised <- true
     equal true raised
 
+[<Fact>]
+let ``test Cancellation registrations dispose pending callbacks and invoke late callbacks`` () =
+    use source = new System.Threading.CancellationTokenSource()
+    let calls = ResizeArray<int>()
+    let first: IDisposable = source.Token.Register(fun () -> calls.Add 1)
+    let mutable second: IDisposable = null
+    second <- source.Token.Register(fun () ->
+        second.Dispose()
+        first.Dispose()
+        calls.Add 2)
+    source.Cancel()
+    let late: IDisposable = source.Token.Register((fun state -> calls.Add (unbox<int> state)), box 0)
+    late.Dispose()
+    second.Dispose()
+    equal [| 2; 0 |] (calls.ToArray())
+
+[<Fact>]
+let ``test Cancellation callback failure preserves remaining listeners`` () =
+    use source = new System.Threading.CancellationTokenSource()
+    let mutable remaining = 0
+    let mutable errors = -1
+    source.Token.Register(fun () -> remaining <- remaining + 1) |> ignore
+    source.Token.Register(fun () -> failwith "callback") |> ignore
+    try source.Cancel()
+    with error ->
+        errors <- (error :?> AggregateException).InnerExceptions.Count
+    equal 1 errors
+    equal 1 remaining
+
+[<Fact>]
+let ``test AggregateException holds its inner exceptions`` () =
+    let a = exn "a"
+    let b = InvalidOperationException "b"
+    let describe (e: AggregateException) =
+        e.Message, e.InnerExceptions.Count, (if isNull e.InnerException then "" else e.InnerException.Message)
+    describe (AggregateException()) |> equal ("One or more errors occurred.", 0, "")
+    describe (AggregateException("m")) |> equal ("m", 0, "")
+    describe (AggregateException("m", a)) |> equal ("m (a)", 1, "a")
+    describe (AggregateException(a, b)) |> equal ("One or more errors occurred. (a) (b)", 2, "a")
+    describe (AggregateException("m", [| a; b |])) |> equal ("m (a) (b)", 2, "a")
+    describe (AggregateException([ a; b ] :> seq<exn>)) |> equal ("One or more errors occurred. (a) (b)", 2, "a")
+    let e = AggregateException(a, b)
+    [ for x in e.InnerExceptions -> x.Message ] |> equal [ "a"; "b" ]
+    e.InnerExceptions.[1].Message |> equal "b"
+    AggregateException(e, exn "c").Flatten().InnerExceptions.Count |> equal 3

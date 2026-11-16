@@ -206,7 +206,10 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         ->
         TPrim "fable_rt.TextEncoding"
     // (`IList<'T>`, as an array is seen through it: the array; `System.Array`: an array of objects)
-    | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.IList`1" ->
+    | Fable.DeclaredType(ent, [ item ]) when
+        ent.FullName = "System.Collections.Generic.IList`1"
+        || ent.FullName = "System.Collections.ObjectModel.ReadOnlyCollection`1"
+        ->
         mapType ctx r (Fable.Array(item, Fable.MutableArray))
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Array" ->
         mapType ctx r (Fable.Array(Fable.Any, Fable.MutableArray))

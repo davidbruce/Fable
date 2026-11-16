@@ -79,6 +79,7 @@ let call
     | "System.Threading.CancellationToken", "ThrowIfCancellationRequested", [ tk ] ->
         lib "tokenThrowIfCancellationRequested" [ tk ]
     | "System.Threading.CancellationToken", "Register", [ tk; f ] -> lib "tokenRegister" [ tk; f ]
+    | "System.Threading.CancellationToken", "Register", [ tk; f; state ] -> lib "tokenRegisterWith" [ tk; f; state ]
     | "System.Threading.CancellationTokenRegistration", "Dispose", [ reg ] ->
         dotnetCall
             ctx

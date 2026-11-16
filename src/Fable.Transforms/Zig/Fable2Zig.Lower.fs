@@ -2315,8 +2315,11 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
             let v = ctx.State.NewVar("enumerable", mapType ctx e.Range x.Type, VLocal, false)
             ctx.Vars[obj.Name] <- v
             ELet(v, lw ctx x, lowerSeqOfGetEnumerator ctx e.Range item getEnumerator)
-        // (an `IList<'T>`: the array it is here)
-        | Fable.DeclaredType(il, [ item ]) when il.FullName = "System.Collections.Generic.IList`1" ->
+        // (an `IList<'T>`, a `ReadOnlyCollection<'T>`: the array it is here)
+        | Fable.DeclaredType(il, [ item ]) when
+            il.FullName = "System.Collections.Generic.IList`1"
+            || il.FullName = "System.Collections.ObjectModel.ReadOnlyCollection`1"
+            ->
             lw ctx (Fable.TypeCast(Fable.TypeCast(x, Fable.Array(item, Fable.MutableArray)), e.Type))
         // (a `System.Array`: an array of objects here)
         | Fable.DeclaredType(arr, []) when arr.FullName = "System.Array" ->
@@ -2380,6 +2383,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         )
         ->
         libraryCall ctx e.Range "Async" "sourceAsDisposable" (Fable.CallInfo.Create(args = [ x ])) [ x ] e.Type
+    // (a cancellation registration given as an `IDisposable`: it is one here)
+    | Fable.TypeCast(x, Fable.DeclaredType(target, _)) when
+        target.FullName = "System.IDisposable"
+        && (
+            match x.Type with
+            | Fable.DeclaredType(e, _) -> e.FullName = "System.Threading.CancellationTokenRegistration"
+            | _ -> false
+        )
+        ->
+        lw ctx x
     // an interface given where an interface it inherits is expected: fat-pointer upcast preserving
     // underlying identity and sub-interface type for round-trip casts
     | Fable.TypeCast(x, (Fable.DeclaredType _ as ifaceType)) when
@@ -5518,6 +5531,56 @@ and dotnetCall
         | "Microsoft.FSharp.Core.Operators", "NullArg", [ arg ] ->
             let message = ELit(stringLiteral "Value cannot be null.", tStr)
             raiseArgument ctx r "System.ArgumentNullException" message arg t
+        // `AggregateException(exceptions)` and `AggregateException(message, exceptions)`: the
+        // exception with them inside it
+        | "System.AggregateException", ".ctor", args when
+            (match args with
+             | [ arr ]
+             | [ _; arr ] ->
+                 (match arr.Type with
+                  | Fable.Array(Fable.DeclaredType(e, _), _) ->
+                      e.FullName = "System.Exception" || dotnetExceptions.ContainsKey e.FullName
+                  | Fable.DeclaredType(s, [ Fable.DeclaredType(e, _) ]) ->
+                      s.FullName = "System.Collections.Generic.IEnumerable`1"
+                      && (e.FullName = "System.Exception" || dotnetExceptions.ContainsKey e.FullName)
+                  | _ -> false)
+                 && (args.Length = 1 || args.Head.Type = Fable.String)
+             | _ -> false)
+            ->
+            let message, arr =
+                match args with
+                | [ arr ] -> ELit(stringLiteral "One or more errors occurred.", tStr), arr
+                | message :: arr :: _ -> lw ctx message, arr
+                | _ -> failwith "unreachable"
+
+            // (a sequence of them: its array)
+            let arr =
+                match arr.Type with
+                | Fable.DeclaredType(_, [ item ]) ->
+                    Fable.Call(
+                        Fable.Import(
+                            {
+                                Selector = "ToArray"
+                                Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Collections.SeqModule"
+                                Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                            },
+                            Fable.Any,
+                            None
+                        ),
+                        Fable.CallInfo.Create(args = [ arr ], genArgs = [ item ]),
+                        Fable.Array(item, Fable.MutableArray),
+                        r
+                    )
+                | _ -> arr
+
+            bindArgsIn
+                true
+                ctx
+                [ message ]
+                (fun xs ->
+                    let outer = EExnNew(dotnetExnEnt ctx "System.AggregateException", xs)
+                    bindArgs ctx [ outer; lw ctx arr ] (fun ys -> EEmit("fable_rt.exnWithInners($0, $1)", ys, tExn))
+                )
         // `System.Exception("...")` and the other classes: a new exception with that message
         // `Exception(message, inner)`: the exception, with the one inside it
         | cls, ".ctor", [ message; inner ] when
@@ -5623,6 +5686,9 @@ and dotnetCall
                     )
                 )
         | "Microsoft.FSharp.Collections.FSharpList`1", "get_Empty", _ -> ECon(mapType ctx r t, "Empty", [], None)
+        | "System.AggregateException", "Flatten", [ x ] -> pure' "fable_rt.exnFlatten($0)" [ x ] tExn
+        | "System.AggregateException", "get_InnerExceptions", [ x ] ->
+            pure' "fable_rt.exnInnerList($0)" [ x ] (mapType ctx r t)
         | entity, "get_InnerException", [ x ] when entity = "System.Exception" || dotnetExceptions.ContainsKey entity ->
             rt "fable_rt.exnInner($0)" [ x ] tExn
         | "Microsoft.FSharp.Core.Operators", "IsNull", [ Fable.Call(Fable.Import(imp, _, _), inner, _, _) ] when
@@ -6133,6 +6199,12 @@ and forInSource (ctx: Ctx) (source: Fable.Expr) : (Expr * string) option =
     match inner.Type with
     | Fable.List _ -> Some(lw ctx inner, "list")
     | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> Some(lw ctx inner, "array")
+    // (a `ReadOnlyCollection<'T>`, `IList<'T>`: an array here)
+    | Fable.DeclaredType(ent, [ _ ]) when
+        ent.FullName = "System.Collections.ObjectModel.ReadOnlyCollection`1"
+        || ent.FullName = "System.Collections.Generic.IList`1"
+        ->
+        Some(lw ctx inner, "array")
     | Fable.DeclaredType(ent, _) when
         ent.FullName = "System.Collections.Generic.ICollection`1"
         || ent.FullName = "System.Collections.Generic.Dictionary`2.KeyCollection"

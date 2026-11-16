@@ -601,11 +601,7 @@ pub fn parallelForRange(from: i32, to: i32, f: anytype) Raised!void {
 /// (as .NET's Parallel raises an exception of its work: an AggregateException with it inside)
 fn aggregated(e: Exn) Raised {
     defer drop(e);
-    const inner_text = exnMessage(e);
-    defer drop(inner_text);
-    const head = strConcat(str("One or more errors occurred. ("), inner_text);
-    defer drop(head);
-    const agg = AggregateException.new(.{ .Message = strConcat(head, str(")")) });
+    const agg = AggregateException.new(.{ .Message = str("One or more errors occurred.") });
     defer drop(agg);
     throw(exnWithInner(agg, e));
     return error.Raised;
@@ -5721,6 +5717,9 @@ pub const raise = fable_exn.raise;
 pub const div = fable_exn.div;
 pub const rem = fable_exn.rem;
 pub const exnWithInner = fable_exn.exnWithInner;
+pub const exnWithInners = fable_exn.exnWithInners;
+pub const exnInnerList = fable_exn.exnInnerList;
+pub const exnFlatten = fable_exn.exnFlatten;
 pub const exnInner = fable_exn.exnInner;
 pub const exnInnerBoxed = fable_exn.exnInnerBoxed;
 pub const exnHasNoInner = fable_exn.exnHasNoInner;

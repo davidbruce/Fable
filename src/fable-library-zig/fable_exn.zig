@@ -74,6 +74,9 @@ pub const ExnType = struct {
     /// a .NET exception's `InnerException`
     set_inner: ?*const fn (Exn, Exn) void = null,
     inner: ?*const fn (Exn) ?Exn = null,
+    /// an AggregateException's `InnerExceptions`, when it was made with them
+    set_inners: ?*const fn (Exn, rt.Array(Exn)) void = null,
+    inners: ?*const fn (Exn) ?rt.Array(Exn) = null,
     /// an ArgumentException's `ParamName`
     set_param: ?*const fn (Exn, String) void = null,
     param: ?*const fn (Exn) String = null,
@@ -118,6 +121,7 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
         );
 
         const is_match_failure = std.mem.eql(u8, name, "Microsoft.FSharp.Core.MatchFailureException");
+        const is_aggregate = std.mem.eql(u8, name, "System.AggregateException");
 
         pub const info: ExnType = .{
             .name = name,
@@ -131,6 +135,8 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
             .hash = if (Payload == Described or @hasField(Payload, "fable_message")) null else payloadHash,
             .set_inner = setInner,
             .inner = innerOf,
+            .set_inners = setInners,
+            .inners = innersOf,
             .set_param = setParam,
             .param = paramOf,
         };
@@ -172,6 +178,20 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
             }
         }
 
+        pub fn setInners(e: Exn, all: rt.Array(Exn)) void {
+            if (Payload == Described) {
+                const p: *Payload = @constCast(of(e));
+                if (p.Inners) |old| drop(old);
+                p.Inners = dup(all);
+                if (p.InnerException) |old| drop(old);
+                p.InnerException = if (all.items.len > 0) dup(all.items[0]) else null;
+            }
+        }
+
+        pub fn innersOf(e: Exn) ?rt.Array(Exn) {
+            return if (Payload == Described) of(e).Inners else null;
+        }
+
         pub fn setParam(e: Exn, param_name: String) void {
             if (Payload == Described) {
                 const p: *Payload = @constCast(of(e));
@@ -189,6 +209,7 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
         }
 
         pub fn message(e: Exn) String {
+            if (comptime is_aggregate) return aggregateMessage(e, of(e).Message);
             return dup(of(e).Message);
         }
 
@@ -269,7 +290,7 @@ pub fn MayRaise(comptime T: type, comptime callees: anytype) type {
 }
 
 /// What a .NET exception class holds: its message.
-pub const Described = struct { Message: String, InnerException: ?Exn = null, ParamName: String = null };
+pub const Described = struct { Message: String, InnerException: ?Exn = null, ParamName: String = null, Inners: ?rt.Array(Exn) = null };
 
 /// What `failwith` raises: .NET's `System.Exception` with a message. (Every exception is a
 /// `System.Exception`, so a test for that class is not a test at all; this is the test for
@@ -349,6 +370,77 @@ pub fn rem(comptime T: type, a: T, b: T) Raised!T {
 pub fn exnWithInner(e: Exn, inner_exn: Exn) Exn {
     if (e.type.set_inner) |f| f(e, inner_exn);
     return dup(e);
+}
+
+/// `AggregateException(message, exceptions)`: the new exception, with them inside it (the first
+/// is its `InnerException`)
+pub fn exnWithInners(e: Exn, all: anytype) Exn {
+    const A = rt.Array(Exn);
+    const list: A = if (comptime @typeInfo(@TypeOf(all)) == .optional)
+        (all orelse rt.arrayFrom(A, rt.arrayItems(A, 0)))
+    else
+        all;
+    if (e.type.set_inners) |f| f(e, list);
+    if (comptime @typeInfo(@TypeOf(all)) == .optional) {
+        if (all == null) drop(list);
+    }
+    return dup(e);
+}
+
+/// `e.InnerExceptions`: those an AggregateException was made with, or the one inside it
+pub fn exnInnerList(e: Exn) rt.Array(Exn) {
+    const A = rt.Array(Exn);
+    if (e.type.inners) |f| {
+        if (f(e)) |all| return dup(all);
+    }
+    const inner: ?Exn = if (e.type.inner) |f| f(e) else null;
+    const items = rt.arrayItems(A, if (inner == null) 0 else 1);
+    if (inner) |i| items[0] = dup(i);
+    return rt.arrayFrom(A, items);
+}
+
+/// `e.Flatten()`: an AggregateException of the exceptions inside `e` and inside the
+/// AggregateExceptions among them, at every depth, with `e`'s own message
+pub fn exnFlatten(e: Exn) Exn {
+    var leaves: std.ArrayList(Exn) = .empty;
+    collectLeaves(&leaves, e);
+    const A = rt.Array(Exn);
+    const list = rt.arrayFrom(A, leaves.toOwnedSlice(rt.allocator) catch rt.oom());
+    defer drop(list);
+    const own: String = if (e.type.inners != null) AggregateException.of(e).Message else null;
+    const flat = AggregateException.new(.{ .Message = dup(own) });
+    defer drop(flat);
+    return exnWithInners(flat, list);
+}
+
+fn collectLeaves(leaves: *std.ArrayList(Exn), e: Exn) void {
+    const all = exnInnerList(e);
+    defer drop(all);
+    for (all.items) |i| {
+        if (AggregateException.is(i)) {
+            collectLeaves(leaves, i);
+        } else {
+            leaves.append(rt.allocator, dup(i)) catch rt.oom();
+        }
+    }
+}
+
+/// An AggregateException's message: its own, then the message of each exception inside it in
+/// parentheses, as .NET writes it
+fn aggregateMessage(e: Exn, own: String) String {
+    const all = exnInnerList(e);
+    defer drop(all);
+    if (all.items.len == 0) return dup(own);
+    var b: TextBuilder = .{};
+    b.add(unitsOf(own));
+    for (all.items) |i| {
+        b.addAscii(" (");
+        const m = exnMessage(i);
+        defer drop(m);
+        b.add(unitsOf(m));
+        b.addAscii(")");
+    }
+    return b.finish();
 }
 
 /// `e.InnerException`, which is null for most exceptions.
