@@ -4892,6 +4892,8 @@ and formatParts (ctx: Ctx) (r: SourceLocation option) (fmt: string) (args: Fable
                     // (a value whose type is a type parameter: its `ToString`, known when the
                     // Zig is compiled)
                     | ('P' | 'O' | 's'), Fable.GenericParam _ -> 'T'
+                    // (unit: the empty text, as .NET writes null)
+                    | ('P' | 'O' | 's'), Fable.Unit -> 'T'
                     // (an object, an array, an exception, an object of a class, an interface: its
                     // own `ToString`, as .NET writes it; null as the empty text)
                     | ('P' | 'O' | 's'), (Fable.Any | Fable.Array _ | Fable.DeclaredType _ | Fable.Nullable _) -> 'T'

@@ -4005,6 +4005,7 @@ pub fn emptyAs(comptime T: type, x: anytype) T {
 /// the type it stands for
 pub fn genericText(x: anytype) Raised!String {
     const T = @TypeOf(x);
+    if (T == void) return str("");
     if (T == String) return strConcat(x, null);
     if (T == u16) return format(.{arg(.{ .kind = 'c' }, x)});
     if (T == Any) return anyToString(x, true);

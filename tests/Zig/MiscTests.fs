@@ -368,12 +368,10 @@ let delay (f: unit -> unit) = f
 
 let mutable mutableValue = 0
 
-#if !FABLE_COMPILER_ZIG // (a recursive value defined through a function value of unit)
 let rec recursive1 = delay (fun () -> recursive2())
 and recursive2 =
     mutableValue <- 5
     fun () -> mutableValue <- mutableValue * 2
-#endif
 
 let empty<'a> = [Unchecked.defaultof<'a>]
 
@@ -486,12 +484,10 @@ let ``test Passing delegate works`` () = // #3862
     dtest1 dInvoke |> equal 42
     dtest2 dInvoke |> equal 43
 
-#if !FABLE_COMPILER_ZIG // (uses a declaration excluded above)
 [<Fact>]
 let ``test Generic unit args work`` () = // #3584
     let to_str = inlineToString (fun (props: unit) -> "s")
     to_str () |> equal $"{()}"
-#endif
 
 [<Fact>]
 let ``test lambdas returning member expression accessing JS object work`` () = // #2311
@@ -1450,13 +1446,11 @@ let ``test FSharpRef can be used in properties`` () = // See #521
     match x with TestRef r2 -> r2.Value
     |> equal true
 
-#if !FABLE_COMPILER_ZIG // (uses a declaration excluded above)
 [<Fact>]
 let ``test Recursive values work`` () = // See #237
     mutableValue |> equal 5
     recursive1()
     mutableValue |> equal 10
-#endif
 
 [<Fact>]
 let ``test Module generic methods without arguments work`` () =

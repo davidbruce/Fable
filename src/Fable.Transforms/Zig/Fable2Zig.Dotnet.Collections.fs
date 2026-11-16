@@ -874,7 +874,14 @@ let call
     | "Microsoft.FSharp.Control.LazyExtensions", "CreateFromValue", [ v ] ->
         pure' "fable_rt.lazyOf($R, $0)" [ v ] (mapType ctx r t)
     | ("Microsoft.FSharp.Control.LazyExtensions" | "System.Lazy`1"), ("Force" | "get_Value"), l :: _ ->
-        rt "fable_rt.lazyForce($0)" [ l ] (mapType ctx r t)
+        // (what the lazy holds: its type's argument, as F#'s recursive values force one whose
+        // call Fable types as unit)
+        let valueType =
+            match l.Type with
+            | Fable.DeclaredType(e, [ v ]) when e.FullName = "System.Lazy`1" -> v
+            | _ -> t
+
+        rt "fable_rt.lazyForce($0)" [ l ] (mapType ctx r valueType)
     | "System.Lazy`1", "get_IsValueCreated", [ l ] -> pure' "fable_rt.lazyIsCreated($0)" [ l ] tBool
 
     // ---- native pointers: `stackalloc` (memory of the function, see fable_rt.StackAlloc) ----
