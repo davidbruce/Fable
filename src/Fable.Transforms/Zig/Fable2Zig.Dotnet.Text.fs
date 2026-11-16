@@ -94,6 +94,11 @@ let call
         console (which = "get_Error") (name = "WriteLine") rest
     // ---- StringBuilder ----
     | "System.Text.StringBuilder", ".ctor", [] -> pure' "fable_rt.sbNew(null)" [] (mapType ctx r t)
+    // (a capacity, or a string and a capacity: the capacity is only a hint)
+    | "System.Text.StringBuilder", ".ctor", [ n ] when isInt n ->
+        bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.sbNew(null)" [] (mapType ctx r t))
+    | "System.Text.StringBuilder", ".ctor", [ init; n ] when unwrapNullness init.Type = Fable.String && isInt n ->
+        bindArgs ctx [ lwStmt ctx n ] (fun _ -> pure' "fable_rt.sbNew($0)" [ init ] (mapType ctx r t))
     | "System.Text.StringBuilder", ".ctor", [ init ] when init.Type = Fable.String ->
         pure' "fable_rt.sbNew($0)" [ init ] (mapType ctx r t)
     | "System.Text.StringBuilder", ("Append" | "AppendLine"), sb :: rest when rest.Length <= 1 ->

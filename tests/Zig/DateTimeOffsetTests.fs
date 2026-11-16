@@ -794,3 +794,24 @@ let ``test DateTimeOffset.Now is representable as a whole number of ticks`` () =
     let u = DateTimeOffset.UtcNow
     DateTimeOffset(u.Ticks, u.Offset) |> equal u
 
+[<Fact>]
+let ``test DateTimeOffset.Parse with only date and offset works`` () =
+    // See #1422
+    let d = DateTimeOffset.Parse("05/01/2008 +3:00")
+    d.Year + d.Month + d.Day |> equal 2014
+    d.Offset |> equal (TimeSpan.FromHours(3.))
+
+[<Fact>]
+let ``test DateTimeOffset.Parse doesn't confuse day and offset`` () =
+    let d = DateTimeOffset.Parse("2021-11-15")
+    d.Year |> equal 2021
+    d.Month |> equal 11
+    d.Day |> equal 15
+    d.Offset = (TimeSpan.FromHours(1.) + TimeSpan.FromMinutes(5.)) |> equal false
+    d.Offset = (TimeSpan.FromHours(1.) + TimeSpan.FromMinutes(50.)) |> equal false
+    d.Offset = (TimeSpan.FromHours(15.)) |> equal false
+
+    let d = DateTimeOffset.Parse("2021-11-08-08")
+    d.Year + d.Month + d.Day |> equal 2040
+    d.Offset |> equal (TimeSpan.FromHours(-8.))
+

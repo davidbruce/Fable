@@ -842,63 +842,182 @@ let parseRaw (input: string) : (int64 * int64 option) option =
                             Some(int64 (h * 3600 + m * 60 + sec) * ticksPerSecond + fraction)
                         | _ -> None
 
-    // the zone: Z, or +hh:mm / -hh:mm / +hhmm / +hh; its offset
+    // the zone: Z, GMT or UTC (after a space too), or +hh:mm / -hh:mm / +hhmm / +hh; its offset
     let zone () : int64 option option =
-        match peek () with
-        | 'Z'
-        | 'z' ->
-            i <- i + 1
+        let save = i
+        skipSpaces ()
+        let rest = s.Substring(i).ToUpperInvariant()
+
+        if rest = "GMT" || rest = "UTC" then
+            i <- s.Length
+        else
+            i <- save
+
+        if i = s.Length && (rest = "GMT" || rest = "UTC") then
             Some(Some 0L)
-        | '+'
-        | '-' as sign ->
-            i <- i + 1
+        else
 
-            match number 2 with
-            | Some hh ->
-                let _ = expect ':'
-                let mm = defaultArg (number 2) 0
-                let off = int64 hh * ticksPerHour + int64 mm * ticksPerMinute
+            match peek () with
+            | 'Z'
+            | 'z' ->
+                i <- i + 1
+                Some(Some 0L)
+            | '+'
+            | '-' as sign ->
+                i <- i + 1
 
-                Some(
+                match number 2 with
+                | Some hh ->
+                    let _ = expect ':'
+                    let mm = defaultArg (number 2) 0
+                    let off = int64 hh * ticksPerHour + int64 mm * ticksPerMinute
+
                     Some(
-                        if sign = '-' then
-                            -off
-                        else
-                            off
+                        Some(
+                            if sign = '-' then
+                                -off
+                            else
+                                off
+                        )
                     )
-                )
-            | None -> None
-        | _ -> Some None
+                | None -> None
+            | _ -> Some None
 
     let validDate y m d =
         y >= 1 && y <= 9999 && m >= 1 && m <= 12 && d >= 1 && d <= daysInMonth y m
 
-    // the date: yyyy-MM-dd or M/d/yyyy (or none: today)
+    // (a word of letters at i, read)
+    let word () =
+        let start = i
+
+        while i < s.Length && System.Char.IsLetter s.[i] do
+            i <- i + 1
+
+        s.Substring(start, i - start).ToLowerInvariant()
+
+    let monthNames =
+        [|
+            "january"
+            "february"
+            "march"
+            "april"
+            "may"
+            "june"
+            "july"
+            "august"
+            "september"
+            "october"
+            "november"
+            "december"
+        |]
+
+    let dayNames =
+        [|
+            "sunday"
+            "monday"
+            "tuesday"
+            "wednesday"
+            "thursday"
+            "friday"
+            "saturday"
+        |]
+
+    // (a month or a day by its name, whole or its first three letters)
+    let nameIndex (names: string[]) (w: string) =
+        let mutable found = -1
+
+        for k in 0 .. names.Length - 1 do
+            if w = names.[k] || (w.Length = 3 && names.[k].StartsWith w) then
+                found <- k
+
+        found
+
+    // the date: yyyy-MM-dd, M/d/yyyy, or [weekday,] d MMM yyyy (or none: today)
     let date () : int64 option =
         let start = i
 
-        match number 4 with
-        | Some y when i - start = 4 && peek () = '-' ->
-            i <- i + 1
+        // (a weekday's name first, as RFC 1123 writes it: `Sun, 06 Nov 1994`)
+        let w = word ()
 
-            match number 2 with
-            | Some m when expect '-' ->
-                match number 2 with
-                | Some d when validDate y m d -> Some(dateToTicks y m d)
-                | _ -> None
-            | _ -> None
-        | Some m when peek () = '/' ->
-            i <- i + 1
-
-            match number 2 with
-            | Some d when expect '/' ->
-                match number 4 with
-                | Some y when validDate y m d -> Some(dateToTicks y m d)
-                | _ -> None
-            | _ -> None
-        | _ ->
+        if w <> "" && nameIndex dayNames w >= 0 then
+            let _ = expect ','
+            skipSpaces ()
+        else
             i <- start
-            Some((today ()).ticks)
+
+        let named () =
+            let back = i
+
+            match number 2 with
+            | Some d ->
+                skipSpaces ()
+                let m = nameIndex monthNames (word ())
+                skipSpaces ()
+
+                match number 4 with
+                | Some y when m >= 0 && validDate y (m + 1) d -> Some(dateToTicks y (m + 1) d)
+                | _ ->
+                    i <- back
+                    None
+            | None ->
+                // (the month's name first: `January 15, 2024`)
+                let m = nameIndex monthNames (word ())
+
+                if m < 0 then
+                    i <- back
+                    None
+                else
+                    skipSpaces ()
+
+                    match number 2 with
+                    | Some d ->
+                        let _ = expect ','
+                        skipSpaces ()
+
+                        // (no year: this year's, as .NET takes `May 6`)
+                        let y =
+                            match number 4 with
+                            | Some y -> y
+                            | None -> year (today ())
+
+                        if validDate y (m + 1) d then
+                            Some(dateToTicks y (m + 1) d)
+                        else
+                            i <- back
+                            None
+                    | None ->
+                        i <- back
+                        None
+
+        let afterName = i
+
+        match named () with
+        | Some ticks -> Some ticks
+        | None ->
+            i <- afterName
+
+            match number 4 with
+            | Some y when i - start = 4 && peek () = '-' ->
+                i <- i + 1
+
+                match number 2 with
+                | Some m when expect '-' ->
+                    match number 2 with
+                    | Some d when validDate y m d -> Some(dateToTicks y m d)
+                    | _ -> None
+                | _ -> None
+            | Some m when peek () = '/' ->
+                i <- i + 1
+
+                match number 2 with
+                | Some d when expect '/' ->
+                    match number 4 with
+                    | Some y when validDate y m d -> Some(dateToTicks y m d)
+                    | _ -> None
+                | _ -> None
+            | _ ->
+                i <- start
+                Some((today ()).ticks)
 
     let afterDate = i
 
@@ -910,8 +1029,21 @@ let parseRaw (input: string) : (int64 * int64 option) option =
         if hadDate && (peek () = 'T' || peek () = ' ') then
             i <- i + 1
 
+        // (a date and then an offset, and no time: `05/01/2008 +3:00`, `2021-11-08-08`)
+        let save = i
+
+        if hadDate then
+            skipSpaces ()
+
+        let offsetNext = hadDate && i < s.Length && (s.[i] = '+' || s.[i] = '-')
+
+        if not offsetNext then
+            i <- save
+
         let t =
-            if i < s.Length then
+            if offsetNext then
+                Some 0L
+            elif i < s.Length then
                 time ()
             elif hadDate then
                 Some 0L

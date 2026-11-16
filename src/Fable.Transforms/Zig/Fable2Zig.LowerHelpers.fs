@@ -264,6 +264,86 @@ let kprintf
     | Some cont -> Fable.CurriedApply(cont, [ text ], t, r)
     | None -> text
 
+/// `Printf.bprintf sb fmt a b` and `Printf.kbprintf cont sb fmt a b`: the text appended to the
+/// StringBuilder, then the continuation called
+let bprintf
+    (imp: Fable.ImportInfo)
+    (info: Fable.CallInfo)
+    (args: Fable.Expr list)
+    (t: Fable.Type)
+    (r: SourceLocation option)
+    : Fable.Expr
+    =
+    let cont, sb, fmtArg =
+        match info.Args with
+        | [ cont; sb; fmtArg ] -> Some cont, sb, fmtArg
+        | [ sb; fmtArg ] -> None, sb, fmtArg
+        | _ -> raise (ZigError("the Zig target does not support this kind of printf yet", r))
+
+    let toString =
+        Fable.Call(
+            Fable.Import(
+                { imp with
+                    Selector = "PrintFormatToString"
+                    Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.ExtraTopLevelOperators"
+                },
+                Fable.Any,
+                None
+            ),
+            { info with Args = [ fmtArg ] },
+            Fable.String,
+            r
+        )
+
+    let text =
+        if args.IsEmpty then
+            toString
+        else
+            Fable.CurriedApply(toString, args, Fable.String, r)
+
+    let sbType = sb.Type
+
+    let append =
+        Fable.Call(
+            Fable.Import(
+                {
+                    Selector = "Append"
+                    Path = Replacements.DotnetPrefix + "System.Text.StringBuilder"
+                    Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                },
+                Fable.Any,
+                None
+            ),
+            Fable.CallInfo.Create(thisArg = sb, args = [ text ], sigArgTypes = [ Fable.String ]),
+            sbType,
+            r
+        )
+
+    let appended =
+        Fable.Call(
+            Fable.Import(
+                {
+                    Selector = "Ignore"
+                    Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.Operators"
+                    Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                },
+                Fable.Any,
+                None
+            ),
+            Fable.CallInfo.Create(args = [ append ], genArgs = [ sbType ]),
+            Fable.Unit,
+            r
+        )
+
+    match cont with
+    | Some cont ->
+        Fable.Sequential
+            [
+                appended
+                Fable.CurriedApply(cont, [ Fable.Value(Fable.UnitConstant, None) ], t, r)
+            ]
+    | None -> appended
+
 /// (for the names of the operands of `Math.DivRem`)
 let internal divRemTemps =
     new System.Threading.ThreadLocal<int ref>(fun () -> ref 0)

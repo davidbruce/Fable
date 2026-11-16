@@ -1971,3 +1971,19 @@ let ``test System.String.Concat treats null arguments as empty`` () =
     String.Concat([| "a"; null; "b" |]) |> equal "ab"
     String.Concat(box "a", null, box 1) |> equal "a1"
 
+[<Fact>]
+let ``test kbprintf works`` () =
+    let sb = System.Text.StringBuilder()
+    let mutable i = 0
+    let f () = i <- i + 1
+    Printf.kbprintf f sb "Hello"
+    Printf.kbprintf f sb " %s!" "world"
+    i |> equal 2
+    sb.ToString() |> equal "Hello world!"
+
+[<Fact>]
+let ``test bprintf works`` () =
+    let sb = System.Text.StringBuilder(10)
+    Printf.bprintf sb "Hello"
+    Printf.bprintf sb " %s!" "world"
+    sb.ToString() |> equal "Hello world!"

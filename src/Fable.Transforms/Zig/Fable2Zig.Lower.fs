@@ -1816,6 +1816,19 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         && (imp.Selector = "PrintFormatThen" || imp.Selector = "PrintFormatToStringThen")
         ->
         lw ctx (kprintf imp info [] t r)
+    // `Printf.bprintf sb fmt a b` and `kbprintf`
+    | Fable.CurriedApply(Fable.Call(Fable.Import(imp, _, _), info, _, _), args, t, r) when
+        imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.PrintfModule"
+        && (imp.Selector = "PrintFormatToStringBuilder"
+            || imp.Selector = "PrintFormatToStringBuilderThen")
+        ->
+        lw ctx (bprintf imp info args t r)
+    | Fable.Call(Fable.Import(imp, _, _), info, t, r) when
+        imp.Path = Replacements.DotnetPrefix + "Microsoft.FSharp.Core.PrintfModule"
+        && (imp.Selector = "PrintFormatToStringBuilder"
+            || imp.Selector = "PrintFormatToStringBuilderThen")
+        ->
+        lw ctx (bprintf imp info [] t r)
     | Fable.CurriedApply(Fable.CurriedApply(PrintfCall(selector, fmt, []), first, _, _), rest, t, r) ->
         formatted ctx r selector fmt (first @ rest) t
     // A printf that is not given all its values where it stands (`List.iter (printfn "%d") xs`)
