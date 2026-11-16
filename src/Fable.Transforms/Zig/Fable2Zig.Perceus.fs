@@ -1330,7 +1330,9 @@ let private tryUnpack (p: P) (env: PEnv) (x: int) (borrowers: Set<int>) (e: Expr
 
     let case =
         match xv.Ty with
-        | TEnt(ent, _) when ent.Kind = KRecord -> Some ""
+        // (a record by reference (one that contains itself or can be assigned) is a counted cell:
+        // unpacked as a union's cell is, when it is not shared)
+        | TEnt(ent, _) when ent.Kind = KRecord || ent.Kind = KRefRecord -> Some ""
         | TTuple _ -> Some ""
         | _ -> env.Known.TryFind(vk x)
     // The aliases of x's own fields move out; deeper aliases must hang off one of them (they
@@ -1373,7 +1375,13 @@ let private tryUnpack (p: P) (env: PEnv) (x: int) (borrowers: Set<int>) (e: Expr
                 fields
                 |> List.filter (fun (f, t) -> isManaged t && not (List.contains f fieldsMoved))
 
-            let heap = isHeapTy xv.Ty
+            let heap =
+                isHeapTy xv.Ty
+                || (
+                    match xv.Ty with
+                    | TEnt(ent, _) -> ent.Kind = KRefRecord
+                    | _ -> false
+                )
 
             let token =
                 if heap && hasConOfShape (xv.Ty, case) e then

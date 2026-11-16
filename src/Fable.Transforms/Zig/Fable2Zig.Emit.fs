@@ -931,7 +931,12 @@ let emitUnpack (em: Em) (ind: string) (u: Unpack) =
         |> String.concat ", "
 
     if u.Heap then
-        let cell = $"%s{x}.%s{fieldIdent u.Case}"
+        // (a union's cell is its case's payload; a record by reference is a cell itself)
+        let cell =
+            if u.Case = "" then
+                x
+            else
+                $"%s{x}.%s{fieldIdent u.Case}"
 
         let fate =
             if u.Token.IsSome then
