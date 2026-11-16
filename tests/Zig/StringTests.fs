@@ -2003,3 +2003,30 @@ let ``test input of interpolated print format can be retrieved`` () =
     f $"wow %d{x}" |> equal ("wow %d%P()", "wow 42")
     f $"a %d{x} b %s{s} c {x + 1}" |> equal ("a %d%P() b %s%P() c %P()", "a 42 b z c 43")
 
+[<Fact>]
+let ``test System.String.Normalize works`` () =
+    let name1 = "\u0041\u006d\u00e9\u006c\u0069\u0065";
+    let name2 = "\u0041\u006d\u0065\u0301\u006c\u0069\u0065";
+    notEqual name1 name2
+
+    let normalized1 = name1.Normalize System.Text.NormalizationForm.FormC
+    let normalized2 = name2.Normalize System.Text.NormalizationForm.FormC
+    equal normalized1 normalized2
+
+
+[<Fact>]
+let ``test String.Normalize gives each of Unicode's forms`` () =
+    let hex (s: string) = s |> Seq.map (fun c -> (int c).ToString("X4")) |> String.concat " "
+    let forms (s: string) =
+        [ System.Text.NormalizationForm.FormC; System.Text.NormalizationForm.FormD
+          System.Text.NormalizationForm.FormKC; System.Text.NormalizationForm.FormKD ]
+        |> List.map (fun f -> hex (s.Normalize f))
+    forms "é" |> equal [ "00E9"; "0065 0301"; "00E9"; "0065 0301" ]
+    forms "ﬁ" |> equal [ "FB01"; "FB01"; "0066 0069"; "0066 0069" ]
+    forms "한" |> equal [ "D55C"; "1112 1161 11AB"; "D55C"; "1112 1161 11AB" ]
+    forms "ḍ̇" |> equal [ "1E0D 0307"; "0064 0323 0307"; "1E0D 0307"; "0064 0323 0307" ]
+    forms "Å" |> equal [ "00C5"; "0041 030A"; "00C5"; "0041 030A" ]
+    "é".IsNormalized() |> equal false
+    "é".IsNormalized(System.Text.NormalizationForm.FormD) |> equal true
+    hex ("\uDC00".Normalize()) |> equal "FFFD"
+    throwsAnyError (fun () -> "a￾".Normalize() |> ignore)

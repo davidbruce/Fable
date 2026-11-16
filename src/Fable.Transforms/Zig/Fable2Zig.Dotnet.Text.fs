@@ -111,6 +111,12 @@ let call
         )
         ->
         rt "fable_rt.printfFormatText($0)" [ f ] tStr
+    // `s.Normalize()` and `s.IsNormalized()`: Unicode's forms (fable_normalize.zig); FormC unless
+    // one is given
+    | "System.String", "Normalize", [ s ] -> rt "fable_rt.strNormalize($0, 1)" [ s ] tStr
+    | "System.String", "Normalize", [ s; form ] -> rt "fable_rt.strNormalize($0, @intCast($1))" [ s; form ] tStr
+    | "System.String", "IsNormalized", [ s ] -> rt "fable_rt.strIsNormalized($0, 1)" [ s ] tBool
+    | "System.String", "IsNormalized", [ s; form ] -> rt "fable_rt.strIsNormalized($0, @intCast($1))" [ s; form ] tBool
     | "System.Text.StringBuilder", ".ctor", [] -> pure' "fable_rt.sbNew(null)" [] (mapType ctx r t)
     // (a capacity, or a string and a capacity: the capacity is only a hint)
     | "System.Text.StringBuilder", ".ctor", [ n ] when isInt n ->
