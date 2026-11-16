@@ -634,3 +634,61 @@ let ``test Iso.pack refuses a value that is not isolated`` () =
 
     kept.Length |> equal 2
 #endif
+
+type RingNode = { mutable Next: RingNode option; V: int }
+
+let private ringOf n =
+    let first = { Next = None; V = 0 }
+    let mutable last = first
+
+    for i in 1 .. n - 1 do
+        let x = { Next = None; V = i }
+        last.Next <- Some x
+        last <- x
+
+    last.Next <- Some first
+    first
+
+let private sumRing (start: RingNode) =
+    let mutable total = start.V
+    let mutable cur = start.Next.Value
+
+    while not (obj.ReferenceEquals(cur, start)) do
+        total <- total + cur.V
+        cur <- cur.Next.Value
+
+    total
+
+type RingMsg =
+    | Ring of Fable.Core.Zig.Iso<RingNode>
+    | Pair of Fable.Core.Zig.Iso<int list * int list>
+    | RingTotal of AsyncReplyChannel<int>
+
+[<Fact>]
+let ``test Iso moves cycles and shared parts between threads`` () =
+    let mb =
+        MailboxProcessor.Start(fun inbox ->
+            let rec loop total =
+                async {
+                    match! inbox.Receive() with
+                    | Ring iso -> return! loop (total + sumRing (Fable.Core.Zig.Iso.unpack iso))
+                    | Pair iso ->
+                        let (a, b) = Fable.Core.Zig.Iso.unpack iso
+                        return! loop (total + List.sum a + List.sum b)
+                    | RingTotal ch -> ch.Reply total
+                }
+
+            loop 0
+        )
+
+    let t =
+        Thread(fun () ->
+            for k in 1..50 do
+                mb.Post(Ring(Fable.Core.Zig.Iso.pack (ringOf 10)))
+                let leaf = [ k ]
+                mb.Post(Pair(Fable.Core.Zig.Iso.pack (leaf, leaf)))
+        )
+
+    t.Start()
+    t.Join()
+    mb.PostAndReply RingTotal |> equal 4800

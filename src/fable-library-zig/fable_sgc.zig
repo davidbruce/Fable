@@ -725,6 +725,58 @@ pub const Gc = struct {
         gc.unref(r);
     }
 
+    // ---- a value moved to another thread whole (`Fable.Core.Zig.Iso`, Verona's region
+    // migration). Its cells leave this collector at `pack` and join the receiving thread's at
+    // `unpack`. A cell in no structure is flagged as a target: the rule (A) test, which compares
+    // births on this thread's clock, is never applied with it as the owner, and what it reaches
+    // (cells of the same value, all flagged, or shared ones) keeps "a flagged cell reaches only
+    // flagged cells outside structures". A structure moves whole: its members are detached here
+    // and joined to a new structure there, whose count of references from outside is worked
+    // out from scratch (`outsideRefs`), so it dies when the receiver lets go of the last. ----
+
+    /// Can `h`'s structure move (not being checked, not dying, no member pinned by a walk)?
+    pub fn canMove(gc: *Gc, h: *Hdr) bool {
+        if (h.meta.flags & F_STACKED != 0) return false;
+        if (h.st == 0) return true;
+        const r = gc.root(h);
+        if (r.dead or gc.check == r) return false;
+        return true;
+    }
+
+    /// The structure `h` is a member of, as a key, and how many members it has (h.st != 0)
+    pub fn structureOf(gc: *Gc, h: *Hdr) struct { key: usize, members: usize } {
+        const r = gc.root(h);
+        return .{ .key = @intFromPtr(r), .members = r.members };
+    }
+
+    /// A cell in no structure, moving: flagged (see above)
+    pub fn moveLoose(h: *Hdr) void {
+        h.meta.flags |= F_TARGET;
+    }
+
+    /// `h`'s structure leaves this collector: each member detached (the record is recycled
+    /// with the last one)
+    pub fn moveOut(gc: *Gc, h: *Hdr) void {
+        const r = gc.root(h);
+        r.refs += 1; // (kept over the detaches)
+        while (r.ring.next != &r.ring) gc.detach(r.ring.next, r);
+        gc.unref(r);
+    }
+
+    /// Cells that were one structure join this collector as one, dirty (see above)
+    pub fn moveIn(gc: *Gc, members: []const *Hdr) void {
+        if (members.len == 0) return;
+        const r = gc.newRecord();
+        for (members) |h| {
+            h.meta.flags = 0;
+            h.meta.state = .idle;
+            gc.join(h, r);
+        }
+        // (the references from outside counted exactly: dropping the last one frees the
+        // structure at once, as for one built here)
+        r.ext = @intCast(gc.outsideRefs(r, null));
+    }
+
     pub inline fn onStore(gc: *Gc, owner: *Hdr, child: *Hdr) void {
         if (isShared(child)) return;
         if (owner.st != 0) return gc.stored(owner, child);

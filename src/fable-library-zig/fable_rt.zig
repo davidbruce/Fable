@@ -381,13 +381,34 @@ pub fn Iso(comptime T: type) type {
         full: std.atomic.Value(u8) = .init(1),
         /// the value, as bytes nothing walks (see above)
         held: [@sizeOf(T)]u8 align(@alignOf(T)) = undefined,
+        /// the structures of the cycle collector the value moved out of the packing thread's
+        /// collector with: their members, one group after another, and where each group ends
+        moved: []*sgc.Hdr = &.{},
+        moved_ends: []usize = &.{},
 
         fn ptr(c: *Self) *T {
             return @ptrCast(&c.held);
         }
 
+        /// (the moved structures join this thread's collector)
+        fn settle(c: *Self) void {
+            if (c.moved_ends.len != 0 and !thread.collector_ready) collectorSetup();
+            var start: usize = 0;
+            for (c.moved_ends) |end| {
+                thread.collector.moveIn(c.moved[start..end]);
+                start = end;
+            }
+            if (c.moved.len != 0) allocator.free(c.moved);
+            if (c.moved_ends.len != 0) allocator.free(c.moved_ends);
+            c.moved = &.{};
+            c.moved_ends = &.{};
+        }
+
         pub fn fable_free(c: *Self) void {
-            if (c.full.load(.acquire) == 1) drop(c.ptr().*);
+            if (c.full.load(.acquire) == 1) {
+                c.settle();
+                drop(c.ptr().*);
+            } else c.settle();
         }
 
         pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
@@ -466,28 +487,244 @@ pub fn isoPack(comptime T: type) type {
         pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
 
         pub fn call(x: T) Raised!Iso(T) {
-            if (!isolated(x)) {
-                drop(x);
-                return raise(InvalidOperationException, str("Iso.pack: the value is not isolated (something else refers to a part of it, or it holds a function, an object or a value the cycle collector follows)."));
-            }
-            // (its cells are the Iso's, wherever it goes: plain counts, no identity stamps of this
-            // thread's)
-            adoptRegion(x);
             const I = @typeInfo(Iso(T)).pointer.child;
+            // (a tree of cells counted once, none the collector follows: the quick test)
+            if (isolated(x)) {
+                adoptRegion(x);
+                const c = allocator.create(I) catch oom();
+                if (track) thread.stats.allocs += 1;
+                c.* = .{};
+                c.ptr().* = x;
+                return c;
+            }
+            // (shared parts, cycles, cells the collector follows: each cell counted exactly as
+            // often as the value refers to it)
+            var region: Region = .{};
+            defer region.deinit();
+            region.visit(x);
+            if (!region.ok or !region.closed()) {
+                drop(x);
+                return raise(InvalidOperationException, str("Iso.pack: the value is not isolated (something else refers to a part of it, or it holds a function, an object, an interface or a weak reference, or a structure of the cycle collector that is being checked)."));
+            }
             const c = allocator.create(I) catch oom();
             if (track) thread.stats.allocs += 1;
             c.* = .{};
+            region.moveOut(&c.moved, &c.moved_ends);
             c.ptr().* = x;
             return c;
         }
     };
 }
 
+/// A MailboxProcessor's message as it is sent across threads (see Async.fs's MessageQueue): an
+/// isolated tree of cells goes in unmarked (its counts stay plain: the receiver gets it as its
+/// own); anything else is marked shared, as any value that reaches another thread is
+pub fn isoSend(comptime T: type) type {
+    return struct {
+        pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
+
+        pub fn call(x: T) Iso(T) {
+            if (isolated(x)) adoptRegion(x) else shareStored(x);
+            return isoBox(T, x);
+        }
+    };
+}
+
+/// A message boxed by the thread that holds it (a mailbox of one thread, or a message put back)
+pub fn isoHold(comptime T: type) type {
+    return struct {
+        pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
+
+        pub fn call(x: T) Iso(T) {
+            return isoBox(T, x);
+        }
+    };
+}
+
+fn isoBox(comptime T: type, x: T) Iso(T) {
+    const I = @typeInfo(Iso(T)).pointer.child;
+    const c = allocator.create(I) catch oom();
+    if (track) thread.stats.allocs += 1;
+    c.* = .{};
+    c.ptr().* = x;
+    return c;
+}
+
+/// The value in a box, left in it (a reference of its own)
+pub fn isoPeek(iso: anytype) @typeInfo(@TypeOf(iso)).pointer.child.fable_iso {
+    return dup(iso.ptr().*);
+}
+
 /// `Iso.unpack iso`: the value, once (InvalidOperationException after)
 pub fn isoUnpack(iso: anytype) Raised!@typeInfo(@TypeOf(iso)).pointer.child.fable_iso {
     if (iso.full.swap(0, .acq_rel) != 1) return raise(InvalidOperationException, str("Iso.unpack: the value was taken already."));
+    iso.settle();
     return iso.ptr().*;
 }
+
+/// The cells a value reaches, each with the references to it found inside the value (the value
+/// itself is reached once: the caller gave it up). Isolated: each cell's count is that number,
+/// nothing is reached through hooks of its own, and every member of a structure of the cycle
+/// collector that it reaches is reached (the structure moves whole).
+const Region = struct {
+    const Reached = struct { rc: *u32, seen: u32, hdr: ?*sgc.Hdr };
+    cells: std.AutoHashMapUnmanaged(usize, Reached) = .empty,
+    ok: bool = true,
+
+    fn deinit(r: *Region) void {
+        r.cells.deinit(bookkeeping());
+    }
+
+    /// One reference found to the cell at `addr`: true when it was seen before (not walked again)
+    fn reach(r: *Region, addr: usize, rc: *u32, hdr: ?*sgc.Hdr) bool {
+        const e = r.cells.getOrPut(bookkeeping(), addr) catch oom();
+        if (e.found_existing) {
+            e.value_ptr.seen += 1;
+            return true;
+        }
+        e.value_ptr.* = .{ .rc = rc, .seen = 1, .hdr = hdr };
+        return false;
+    }
+
+    fn visit(r: *Region, x: anytype) void {
+        if (!r.ok) return;
+        const T = @TypeOf(x);
+        if (comptime !isManaged(T)) return;
+        if (comptime isFunc(T) or isIface(T) or T == Obj or T == Exn or T == Any) {
+            r.ok = false;
+            return;
+        }
+        if (T == String) {
+            const p = x orelse return;
+            if (@atomicLoad(u32, &p.rc, .acquire) == Str.literal) return;
+            _ = r.reach(@intFromPtr(p), &p.rc, null);
+            return;
+        }
+        if (comptime isSlice(T)) {
+            for (x) |item| r.visit(item);
+            return;
+        }
+        switch (@typeInfo(T)) {
+            .pointer => |ptr| {
+                const C = ptr.child;
+                if (comptime @hasDecl(C, "fable_weak") or @hasDecl(C, "fable_object") or @hasDecl(C, "fable_iso")) {
+                    r.ok = false;
+                    return;
+                }
+                var cur = x;
+                while (r.ok) {
+                    if (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(cur))) {
+                        r.ok = false;
+                        return;
+                    }
+                    if (r.reach(@intFromPtr(cur), &cur.@"$rc", gcOf(cur))) return;
+                    var next: ?T = null;
+                    inline for (@typeInfo(C).@"struct".field_names) |name| {
+                        if (comptime isCount(name)) continue;
+                        const F = @TypeOf(@field(cur, name));
+                        if (F == T) next = @field(cur, name) else if (F == ?T) next = @field(cur, name) else r.visit(@field(cur, name));
+                    }
+                    cur = next orelse return;
+                }
+            },
+            .optional => if (x) |v| r.visit(v),
+            .@"struct" => |st| inline for (st.field_names) |name| r.visit(@field(x, name)),
+            .@"union" => {
+                var cur = x;
+                while (r.ok) {
+                    var next: ?T = null;
+                    switch (cur) {
+                        inline else => |p| {
+                            const P = @TypeOf(p);
+                            if (comptime isCellPtr(P)) {
+                                if (r.reach(@intFromPtr(p), &p.@"$rc", gcOf(p))) return;
+                                inline for (@typeInfo(@typeInfo(P).pointer.child).@"struct".field_names) |name| {
+                                    if (comptime isCount(name)) continue;
+                                    if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else r.visit(@field(p, name));
+                                }
+                            } else r.visit(p);
+                        },
+                    }
+                    cur = next orelse return;
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Is every cell counted exactly as often as the value refers to it, and every structure of
+    /// the collector it reaches reached whole and free to move?
+    fn closed(r: *Region) bool {
+        var per_structure: std.AutoHashMapUnmanaged(usize, usize) = .empty;
+        defer per_structure.deinit(bookkeeping());
+        var it = r.cells.iterator();
+        while (it.next()) |e| {
+            const reached = e.value_ptr.*;
+            if (@atomicLoad(u32, reached.rc, .acquire) & ~shared_bit != reached.seen) return false;
+            const h = reached.hdr orelse continue;
+            if (!thread.collector.canMove(h)) return false;
+            if (h.st == 0) continue;
+            const s = thread.collector.structureOf(h);
+            const n = per_structure.getOrPut(bookkeeping(), s.key) catch oom();
+            if (!n.found_existing) n.value_ptr.* = 0;
+            n.value_ptr.* += 1;
+        }
+        var ps = per_structure.iterator();
+        while (ps.next()) |e| {
+            // (any member of the structure, to ask how many it has)
+            var cells = r.cells.iterator();
+            while (cells.next()) |c| {
+                const h = c.value_ptr.hdr orelse continue;
+                if (h.st == 0) continue;
+                const s = thread.collector.structureOf(h);
+                if (s.key != e.key_ptr.*) continue;
+                if (s.members != e.value_ptr.*) return false;
+                break;
+            }
+        }
+        return true;
+    }
+
+    /// The value's cells made the Iso's: plain counts, no identity stamps of this thread's,
+    /// loose collector cells flagged, structures moved out (their members listed for `settle`)
+    fn moveOut(r: *Region, moved: *[]*sgc.Hdr, ends: *[]usize) void {
+        var groups: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(*sgc.Hdr)) = .empty;
+        defer {
+            for (groups.values()) |*g| g.deinit(bookkeeping());
+            groups.deinit(bookkeeping());
+        }
+        var it = r.cells.iterator();
+        while (it.next()) |e| {
+            const reached = e.value_ptr.*;
+            reached.rc.* = reached.seen;
+            if (thread.stamps.count() != 0) _ = thread.stamps.remove(e.key_ptr.*);
+            const h = reached.hdr orelse continue;
+            if (h.st == 0) {
+                sgc.Gc.moveLoose(h);
+                continue;
+            }
+            const key = thread.collector.structureOf(h).key;
+            const g = groups.getOrPut(bookkeeping(), key) catch oom();
+            if (!g.found_existing) g.value_ptr.* = .empty;
+            g.value_ptr.append(bookkeeping(), h) catch oom();
+        }
+        if (groups.count() == 0) return;
+        var total: usize = 0;
+        for (groups.values()) |g| total += g.items.len;
+        const all = allocator.alloc(*sgc.Hdr, total) catch oom();
+        const group_ends = allocator.alloc(usize, groups.count()) catch oom();
+        var at: usize = 0;
+        for (groups.values(), 0..) |g, i| {
+            // (the structure leaves this collector: one member is enough to name it)
+            thread.collector.moveOut(g.items[0]);
+            @memcpy(all[at .. at + g.items.len], g.items);
+            at += g.items.len;
+            group_ends[i] = at;
+        }
+        moved.* = all;
+        ends.* = group_ends;
+    }
+};
 
 /// `markShared`, or false where the value reaches a cell the cycle collector follows (what was
 /// marked before it stays marked: its counts are atomic from then on, which is still right)

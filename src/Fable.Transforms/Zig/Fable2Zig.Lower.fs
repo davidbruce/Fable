@@ -2092,11 +2092,20 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
         // (`Fable.Core.Zig.Iso.pack x`: a call that takes `x`, given up when it is its last use,
         // dup'ed when the caller goes on using it, which makes it not isolated; see fable_rt.isoPack)
-        if info.Macro = "$iso_pack($0)" then
+        // (and the library's boxes of a MailboxProcessor's messages, which take theirs the same
+        // way: `$iso_send`, `$iso_hold`; see Async.fs's MessageQueue)
+        let ownedCall =
+            match info.Macro with
+            | "$iso_pack($0)" -> Some "fable_rt.isoPack"
+            | "$iso_send($0)" -> Some "fable_rt.isoSend"
+            | "$iso_hold($0)" -> Some "fable_rt.isoHold"
+            | _ -> None
+
+        if ownedCall.IsSome then
             ctx.State.UsesRuntime <- true
             let x = info.CallInfo.Args.Head
 
-            bindArgs ctx [ lw ctx x ] (fun xs -> ECall("fable_rt.isoPack", [ mapTypeArg ctx r x.Type ], xs, ty))
+            bindArgs ctx [ lw ctx x ] (fun xs -> ECall(ownedCall.Value, [ mapTypeArg ctx r x.Type ], xs, ty))
         else
 
             // (an instance member: the object is `$0`, the arguments follow, as in the other targets)

@@ -1177,7 +1177,28 @@ let private waitReplyReady (_x: 'a) : unit = Fable.Core.Util.nativeOnly
 
 [<Fable.Core.Emit("fable_rt.setAndWakeAll(&($0).ready)")>]
 let private wakeReplyReady (_x: 'a) : unit = Fable.Core.Util.nativeOnly
+
+/// (a message boxed as it is sent: see MessageQueue; isolated, it is not marked shared)
+[<Fable.Core.Emit("$iso_send($0)")>]
+let private sendBox (_x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Util.nativeOnly
+
+/// (a message boxed as it is, by the thread that holds it)
+[<Fable.Core.Emit("$iso_hold($0)")>]
+let private holdBox (_x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("try fable_rt.isoUnpack($0)")>]
+let private unbox' (_x: Fable.Core.Zig.Iso<'a>) : 'a = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.isoPeek($0)")>]
+let private peekBox (_x: Fable.Core.Zig.Iso<'a>) : 'a = Fable.Core.Util.nativeOnly
 #else
+let private sendBox (x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Zig.Iso<'a>(x)
+let private holdBox (x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Zig.Iso<'a>(x)
+let private unbox' (x: Fable.Core.Zig.Iso<'a>) : 'a = x.Take()
+
+let private peekBox (_x: Fable.Core.Zig.Iso<'a>) : 'a =
+    failwith "the library's .NET build does not run"
+
 let private isCellShared (_x: 'a) : bool = false
 let private shareValue (_x: 'a) : unit = ()
 let private waitReplyReady (_x: 'a) : unit = ()
@@ -1185,23 +1206,33 @@ let private wakeReplyReady (_x: 'a) : unit = ()
 #endif
 
 /// A mailbox's messages, in order: those of `items` from `head` on. Taking the first leaves None
-/// in its place (the queue lets go of it at once: the receiver may then be its only holder) and
-/// moves `head`; the part before `head` goes once it is half of `items`. Taking is O(1) amortised,
-/// where removing the first of a ResizeArray moves all the others.
+/// in its place and moves `head`; the part before `head` goes once it is half of `items`. Taking
+/// is O(1) amortised, where removing the first of a ResizeArray moves all the others. Each
+/// message is in a box (fable_rt.Iso): one that crossed from another thread was boxed by its
+/// poster before the mailbox's lock (`sendBox`), so the poster holds only the box afterwards and
+/// its last references, given up after the lock, never touch the message's cells; an isolated
+/// message is not marked shared at all (Pony's `iso` sent, Verona's region moved).
 type MessageQueue<'Msg> =
     {
-        items: ResizeArray<'Msg option>
+        items: ResizeArray<Fable.Core.Zig.Iso<'Msg> option>
         mutable head: int
     }
 
 let private queueCount (q: MessageQueue<'Msg>) = q.items.Count - q.head
 
-let private queueAdd (q: MessageQueue<'Msg>) (msg: 'Msg) = q.items.Add(Some msg)
+let private queueAddBox (q: MessageQueue<'Msg>) (box: Fable.Core.Zig.Iso<'Msg>) = q.items.Add(Some box)
 
-/// The `i`th message (of those waiting)
+let private queueAdd (q: MessageQueue<'Msg>) (msg: 'Msg) = queueAddBox q (holdBox msg)
+
+/// The `i`th message (of those waiting), left in the queue
 let private queueItem (q: MessageQueue<'Msg>) (i: int) : 'Msg =
     match q.items.[q.head + i] with
-    | Some msg -> msg
+    | Some box -> peekBox box
+    | None -> failwith "a message queue's slot is empty"
+
+let private queueBox (q: MessageQueue<'Msg>) (i: int) : Fable.Core.Zig.Iso<'Msg> =
+    match q.items.[q.head + i] with
+    | Some box -> box
     | None -> failwith "a message queue's slot is empty"
 
 let private queueCompact (q: MessageQueue<'Msg>) =
@@ -1211,16 +1242,16 @@ let private queueCompact (q: MessageQueue<'Msg>) =
 
 /// The `i`th message, taken out
 let private queueRemoveAt (q: MessageQueue<'Msg>) (i: int) : 'Msg =
+    let box = queueBox q i
+
     if i = 0 then
-        let msg = queueItem q 0
         q.items.[q.head] <- None
         q.head <- q.head + 1
         queueCompact q
-        msg
     else
-        let msg = queueItem q i
         q.items.RemoveAt(q.head + i)
-        msg
+
+    unbox' box
 
 /// A `MailboxProcessor<'Msg>`: its messages, the `Receive` that waits for one (if any), and its
 /// body, which starts with `Start`
@@ -1354,7 +1385,8 @@ let mailboxStartNew<'Msg>
 /// in the poster's turn when shared across threads), or to the queue
 let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
     if isCellShared mb then
-        shareValue msg
+        // (the message's last use here: boxed, and only the box is held from now on)
+        let box = sendBox msg
 
         let action =
             lock
@@ -1364,7 +1396,7 @@ let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
                         mb.begun <- true
                         mb.running <- true
                         mb.turnToken <- mb.turnToken + 1
-                        queueAdd mb.queue msg
+                        queueAddBox mb.queue box
                         BeginBody mb.turnToken
                     else
                         match mb.waiting with
@@ -1374,13 +1406,13 @@ let mailboxPost<'Msg> (mb: MailboxOf<'Msg>) (msg: 'Msg) : unit =
                             mb.turnToken <- mb.turnToken + 1
                             Resume(resume, mb.turnToken)
                         | None ->
-                            queueAdd mb.queue msg
+                            queueAddBox mb.queue box
                             Queued
                 )
 
         match action with
         | BeginBody turn -> runMailboxTurn mb turn (fun () -> beginMailboxBody mb)
-        | Resume(resume, turn) -> runMailboxTurn mb turn (fun () -> resume msg)
+        | Resume(resume, turn) -> runMailboxTurn mb turn (fun () -> resume (unbox' box))
         | Queued -> ()
     else
         match mb.waiting with
