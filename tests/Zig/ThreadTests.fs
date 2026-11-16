@@ -753,3 +753,73 @@ let ``test A shared cell in an Iso keeps its weak references`` () =
     (w.TryGetTarget(&target) && obj.ReferenceEquals(target, g)) |> equal true
     List.sum xs |> equal 1
 #endif
+
+type OuterNode = { mutable Count: int; Node: RingNode }
+
+[<Fact>]
+let ``test An Iso of a value reaching collector cells deep down can be dropped on a fresh thread`` () =
+    // (the outer record cannot be part of a cycle; the node inside can)
+    let iso = Fable.Core.Zig.Iso.pack { Count = 1; Node = { Next = None; V = 2 } }
+    let seen = ref 0
+
+    let t =
+        Thread(fun () ->
+            let o = Fable.Core.Zig.Iso.unpack iso
+            seen.Value <- o.Count + o.Node.V
+        )
+
+    t.Start()
+    t.Join()
+    seen.Value |> equal 3
+
+[<Fact>]
+let ``test Iso.tryPack gives an Iso, or the value back`` () =
+    match Fable.Core.Zig.Iso.tryPack [ 1; 2 ] with
+    | Ok iso -> Fable.Core.Zig.Iso.unpack iso |> equal [ 1; 2 ]
+    | Error _ -> failwith "a fresh value is isolated"
+
+#if FABLE_COMPILER_ZIG
+    let kept = [ 3; 4 ]
+
+    match Fable.Core.Zig.Iso.tryPack kept with
+    | Ok _ -> failwith "a value still used is not isolated"
+    | Error back -> back |> equal [ 3; 4 ]
+
+    kept.Length |> equal 2
+#endif
+
+#if FABLE_COMPILER_ZIG
+type Counter() =
+    member val N = 0 with get, set
+
+[<Fact>]
+let ``test Iso.pack refuses functions and objects that are not shared already`` () =
+    let refused (f: unit -> unit) =
+        try
+            f ()
+            false
+        with :? System.InvalidOperationException ->
+            true
+
+    let xs = [ 1; 2 ]
+    let f = fun () -> List.sum xs
+    refused (fun () -> Fable.Core.Zig.Iso.pack (f, xs) |> ignore) |> equal true
+    let ys = [ 3 ]
+    let g = fun () -> List.sum ys
+    refused (fun () -> Fable.Core.Zig.Iso.pack (ys, g) |> ignore) |> equal true
+    let c = Counter()
+    refused (fun () -> Fable.Core.Zig.Iso.pack c |> ignore) |> equal true
+    c.N <- 1
+    c.N |> equal 1
+
+[<Fable.Core.Zig.StackArena(65536)>]
+let private packTextFromArena (n: int) : bool =
+    try
+        Fable.Core.Zig.Iso.pack (sprintf "x=%d" n) |> ignore
+        false
+    with :? System.InvalidOperationException ->
+        true
+
+[<Fact>]
+let ``test Iso.pack refuses a string made in a stack arena`` () = packTextFromArena 1 |> equal true
+#endif

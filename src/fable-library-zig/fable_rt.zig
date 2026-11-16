@@ -260,7 +260,11 @@ pub fn markShared(x: anytype) Raised!void {
     if (T == String) {
         const p = x orelse return;
         const rc = @atomicLoad(u32, &p.rc, .monotonic);
-        if (rc != Str.literal and rc & shared_bit == 0) p.rc = rc | shared_bit;
+        if (rc != Str.literal and rc & shared_bit == 0) {
+            // (made in a `[<StackArena>]` function: its memory is that function's stack)
+            if (inThreadArena(p)) return notShareable("a string made in a [<StackArena>] function");
+            p.rc = rc | shared_bit;
+        }
         return;
     }
     if (comptime isSlice(T)) {
@@ -362,6 +366,7 @@ fn adoptRegion(x: anytype) void {
                             if (comptime hasGc(C)) return;
                             if (!countedOnce(p)) return;
                             p.@"$rc" = 1;
+                            if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(p));
                             inline for (@typeInfo(C).@"struct".field_names) |name| {
                                 if (comptime isCount(name)) continue;
                                 if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else adoptRegion(@field(p, name));
@@ -394,6 +399,9 @@ pub fn Iso(comptime T: type) type {
         @"$rc": u32 = 1,
         /// 1 while the value is in it
         full: std.atomic.Value(u8) = .init(1),
+        /// the value reaches cells the cycle collector follows (in a structure or not, however
+        /// deep): the thread that unpacks it makes its collector if it has none
+        has_gc: bool = false,
         /// the value, as bytes nothing walks (see above)
         held: [@sizeOf(T)]u8 align(@alignOf(T)) = undefined,
         /// the structures of the cycle collector the value moved out of the packing thread's
@@ -409,9 +417,7 @@ pub fn Iso(comptime T: type) type {
         fn settle(c: *Self) void {
             // (cells the collector follows, in a structure or not, are this thread's now: its
             // collector is made if it was not)
-            if (comptime holdsCyclic(T)) {
-                if (!thread.collector_ready) collectorSetup();
-            }
+            if (c.has_gc and !thread.collector_ready) collectorSetup();
             var start: usize = 0;
             for (c.moved_ends) |end| {
                 thread.collector.moveIn(c.moved[start..end]);
@@ -446,7 +452,8 @@ fn isolated(x: anytype) bool {
     if (T == String) {
         const p = x orelse return true;
         const rc = @atomicLoad(u32, &p.rc, .acquire);
-        return rc == Str.literal or rc & ~shared_bit == 1;
+        if (rc == Str.literal) return true;
+        return rc & ~shared_bit == 1 and !inThreadArena(p);
     }
     if (comptime isSlice(T)) {
         for (x) |item| if (!isolated(item)) return false;
@@ -501,36 +508,55 @@ fn isolated(x: anytype) bool {
 }
 
 /// `Iso.pack x` (`x` owned: the caller gives it, or keeps it, which makes it not isolated)
+/// `x` in an Iso if it is isolated (see above); null otherwise, `x` left as it was
+fn packOrNull(comptime T: type, x: T) ?Iso(T) {
+    const I = @typeInfo(Iso(T)).pointer.child;
+    // (a tree of cells counted once, none the collector follows: the quick test)
+    if (isolated(x)) {
+        adoptRegion(x);
+        const c = allocator.create(I) catch oom();
+        if (track) thread.stats.allocs += 1;
+        c.* = .{};
+        c.ptr().* = x;
+        return c;
+    }
+    // (shared parts, cycles, cells the collector follows: each cell counted exactly as often as
+    // the value refers to it)
+    var region: Region = .{};
+    defer region.deinit();
+    region.visit(x);
+    if (!region.ok or !region.closed()) return null;
+    const c = allocator.create(I) catch oom();
+    if (track) thread.stats.allocs += 1;
+    c.* = .{};
+    c.has_gc = region.saw_gc;
+    region.moveOut(&c.moved, &c.moved_ends);
+    c.ptr().* = x;
+    return c;
+}
+
+/// `Iso.pack x` (`x` owned: the caller gives it, or keeps it, which makes it not isolated)
 pub fn isoPack(comptime T: type) type {
     return struct {
         pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
 
         pub fn call(x: T) Raised!Iso(T) {
-            const I = @typeInfo(Iso(T)).pointer.child;
-            // (a tree of cells counted once, none the collector follows: the quick test)
-            if (isolated(x)) {
-                adoptRegion(x);
-                const c = allocator.create(I) catch oom();
-                if (track) thread.stats.allocs += 1;
-                c.* = .{};
-                c.ptr().* = x;
-                return c;
-            }
-            // (shared parts, cycles, cells the collector follows: each cell counted exactly as
-            // often as the value refers to it)
-            var region: Region = .{};
-            defer region.deinit();
-            region.visit(x);
-            if (!region.ok or !region.closed()) {
-                drop(x);
-                return raise(InvalidOperationException, str("Iso.pack: the value is not isolated (something else refers to a part of it, or it holds a function, an object, an interface or a weak reference, or a structure of the cycle collector that is being checked)."));
-            }
-            const c = allocator.create(I) catch oom();
-            if (track) thread.stats.allocs += 1;
-            c.* = .{};
-            region.moveOut(&c.moved, &c.moved_ends);
-            c.ptr().* = x;
-            return c;
+            if (packOrNull(T, x)) |c| return c;
+            drop(x);
+            return raise(InvalidOperationException, str("Iso.pack: the value is not isolated (something else refers to a part of it, or it holds a function, an object or an interface not shared already, a weak reference, something made in a [<StackArena>], or a structure of the cycle collector that is being checked)."));
+        }
+    };
+}
+
+/// `Iso.tryPack x`: the Iso, or the value given back (as an F# tuple of two options, which
+/// Fable.Core.Zig's inline `tryPack` turns into a Result where it is used)
+pub fn isoTryPack(comptime T: type) type {
+    return struct {
+        pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
+
+        pub fn call(x: T) @Tuple(&.{ ?Iso(T), ?T }) {
+            if (packOrNull(T, x)) |c| return .{ c, null };
+            return .{ null, x };
         }
     };
 }
@@ -561,7 +587,8 @@ fn transferOrShare(x: anytype) void {
     if (T == String) {
         const p = x orelse return;
         const rc = @atomicLoad(u32, &p.rc, .monotonic);
-        if (rc == Str.literal or rc & shared_bit != 0 or rc == 1) return;
+        if (rc == Str.literal or rc & shared_bit != 0) return;
+        if (rc == 1 and !inThreadArena(p)) return;
         return shareStored(x);
     }
     if (comptime isSlice(T)) {
@@ -652,9 +679,13 @@ pub fn isoUnpack(iso: anytype) Raised!@typeInfo(@TypeOf(iso)).pointer.child.fabl
 /// nothing is reached through hooks of its own, and every member of a structure of the cycle
 /// collector that it reaches is reached (the structure moves whole).
 const Region = struct {
-    const Reached = struct { rc: *u32, seen: u32, hdr: ?*sgc.Hdr };
+    /// `share`: a function's environment, an object or an exception, reached through hooks of
+    /// its own: counted as a cell, and marked shared once the value is found isolated
+    const Reached = struct { rc: *u32, seen: u32, hdr: ?*sgc.Hdr, share: ?*const fn (usize) Raised!void = null };
     cells: std.AutoHashMapUnmanaged(usize, Reached) = .empty,
     ok: bool = true,
+    /// a cell the cycle collector follows was reached
+    saw_gc: bool = false,
 
     fn deinit(r: *Region) void {
         r.cells.deinit(bookkeeping());
@@ -667,28 +698,66 @@ const Region = struct {
             e.value_ptr.seen += 1;
             return true;
         }
+        if (hdr != null) r.saw_gc = true;
         e.value_ptr.* = .{ .rc = rc, .seen = 1, .hdr = hdr };
         return false;
     }
 
+    /// One reference found to something reached through hooks (see Reached)
+    fn reachOpaque(r: *Region, comptime P: type, p: P) void {
+        if (isShared(p)) return;
+        const e = r.cells.getOrPut(bookkeeping(), @intFromPtr(p)) catch oom();
+        if (e.found_existing) {
+            e.value_ptr.seen += 1;
+            return;
+        }
+        const S = struct {
+            fn share(a: usize) Raised!void {
+                const q: P = @ptrFromInt(a);
+                if (P == *Env) {
+                    if (try markCell(q)) try q.share(q);
+                } else try markShared(q);
+            }
+        };
+        e.value_ptr.* = .{ .rc = &p.@"$rc", .seen = 1, .hdr = null, .share = S.share };
+    }
+
     /// (what is shared between threads already is left as it is: the value's cells may point at
-    /// it, its counts are atomic; a function, an object, an exception or an interface is shared
-    /// first, so that it is one of those)
+    /// it, its counts are atomic. A function's environment, an object or an exception, whose
+    /// parts are reached through hooks, is shared already (a shared mailbox's reply channel), or
+    /// counted as a cell and marked shared once the whole value is found isolated (marking it
+    /// while walking would change the counts of what it captured, which the walk relies on);
+    /// what it captured is then shared too. An interface's value cannot be told apart.)
     fn visit(r: *Region, x: anytype) void {
         if (!r.ok) return;
         const T = @TypeOf(x);
         if (comptime !isManaged(T)) return;
-        if (comptime isFunc(T) or isIface(T) or T == Obj or T == Exn or T == Any) {
-            markShared(x) catch {
-                drop(take());
-                r.ok = false;
-            };
+        if (comptime isFunc(T)) {
+            const e = x.env orelse return;
+            r.reachOpaque(*Env, e);
+            return;
+        }
+        if (T == Obj or T == Exn) {
+            r.reachOpaque(T, x);
+            return;
+        }
+        if (T == Any) {
+            const o = x orelse return;
+            r.reachOpaque(Obj, o);
+            return;
+        }
+        if (comptime isIface(T)) {
+            r.ok = false;
             return;
         }
         if (T == String) {
             const p = x orelse return;
             const rc = @atomicLoad(u32, &p.rc, .acquire);
             if (rc == Str.literal or rc & shared_bit != 0) return;
+            if (inThreadArena(p)) {
+                r.ok = false;
+                return;
+            }
             _ = r.reach(@intFromPtr(p), &p.rc, null);
             return;
         }
@@ -770,6 +839,15 @@ const Region = struct {
         }
         var ps = per_structure.valueIterator();
         while (ps.next()) |n| if (n.reached != n.members) return false;
+        // (isolated: what is reached through hooks becomes a part shared already)
+        var shares = r.cells.iterator();
+        while (shares.next()) |e| {
+            const share = e.value_ptr.share orelse continue;
+            share(e.key_ptr.*) catch {
+                drop(take());
+                return false;
+            };
+        }
         return true;
     }
 
@@ -784,6 +862,7 @@ const Region = struct {
         var it = r.cells.iterator();
         while (it.next()) |e| {
             const reached = e.value_ptr.*;
+            if (reached.share != null) continue;
             reached.rc.* = reached.seen;
             if (thread.stamps.count() != 0) _ = thread.stamps.remove(e.key_ptr.*);
             const h = reached.hdr orelse continue;

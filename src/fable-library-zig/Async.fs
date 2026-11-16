@@ -1733,6 +1733,11 @@ let private makeReplyChannel<'Msg, 'R> (mb: MailboxOf<'Msg>) : ReplyBox<'R> * Re
                             schedule 0 (fun () -> w r) |> ignore
         }
 
+    // (the channel of a mailbox shared between threads is shared at once: a message that holds
+    // it crosses with the rest unmarked, the channel a part shared already)
+    if isCellShared mb then
+        shareValue channel
+
     replyBox, channel
 
 /// `mb.PostAndAsyncReply(build)`: the message, made with a reply channel, is posted now (as

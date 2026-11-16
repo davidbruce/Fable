@@ -106,6 +106,10 @@ module Iso =
     [<Emit("try fable_rt.isoUnpack($0)")>]
     let unpack (iso: Iso<'T>) : 'T = iso.Take()
 
+    /// `pack`, with the value given back where it is not isolated (Error) instead of an exception
+    [<Emit("$iso_trypack_result($0)")>]
+    let tryPack (value: 'T) : Result<Iso<'T>, 'T> = Ok(Iso<'T>(value))
+
 /// What the runtime did, for programs and tests that want to see it. The runtime counts in
 /// Debug and ReleaseSafe builds only.
 [<RequireQualifiedAccess>]

@@ -2094,31 +2094,80 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
         // dup'ed when the caller goes on using it, which makes it not isolated; see fable_rt.isoPack)
         // (and the library's boxes of a MailboxProcessor's messages, which take theirs the same
         // way: `$iso_send`, `$iso_hold`; see Async.fs's MessageQueue)
-        let ownedCall =
-            match info.Macro with
-            | "$iso_pack($0)" -> Some "fable_rt.isoPack"
-            | "$iso_send($0)" -> Some "fable_rt.isoSend"
-            | "$iso_hold($0)" -> Some "fable_rt.isoHold"
-            | _ -> None
+        // (`Iso.tryPack x`: the runtime gives the Iso or the value back, as a tuple of two options
+        // (`$iso_trypack`); the Result is made here, of the type F# gave the call)
+        if info.Macro = "$iso_trypack_result($0)" then
+            match t with
+            | Fable.DeclaredType(resultEnt, genArgs) when genArgs.Length = 2 ->
+                let isoT = genArgs.[0]
+                let valueT = genArgs.[1]
 
-        if ownedCall.IsSome then
-            ctx.State.UsesRuntime <- true
-            let x = info.CallInfo.Args.Head
+                let partsT =
+                    Fable.Tuple([ Fable.Option(isoT, false); Fable.Option(valueT, false) ], false)
 
-            bindArgs ctx [ lw ctx x ] (fun xs -> ECall(ownedCall.Value, [ mapTypeArg ctx r x.Type ], xs, ty))
+                let parts =
+                    Fable.Emit(
+                        {
+                            Macro = "$iso_trypack($0)"
+                            IsStatement = false
+                            CallInfo = info.CallInfo
+                        },
+                        partsT,
+                        r
+                    )
+
+                let v = AST.makeTypedIdent partsT (tempName ctx "parts")
+
+                let item i ty =
+                    Fable.Get(Fable.IdentExpr v, Fable.TupleIndex i, Fable.Option(ty, false), r)
+
+                let some i ty =
+                    Fable.Get(item i ty, Fable.OptionValue, ty, r)
+
+                let case tag value =
+                    Fable.Value(Fable.NewUnion([ value ], tag, resultEnt, genArgs), r)
+
+                lw
+                    ctx
+                    (Fable.Let(
+                        v,
+                        parts,
+                        Fable.IfThenElse(
+                            Fable.Test(item 0 isoT, Fable.OptionTest true, r),
+                            case 0 (some 0 isoT),
+                            case 1 (some 1 valueT),
+                            r
+                        )
+                    ))
+            | _ -> fail r "internal: Iso.tryPack of an unexpected type"
         else
 
-            // (an instance member: the object is `$0`, the arguments follow, as in the other targets)
-            let args =
-                (Option.toList info.CallInfo.ThisArg @ info.CallInfo.Args)
-                |> List.filter (fun a -> not (isUnit a.Type))
-                |> List.map (lw ctx)
+            let ownedCall =
+                match info.Macro with
+                | "$iso_pack($0)" -> Some "fable_rt.isoPack"
+                | "$iso_send($0)" -> Some "fable_rt.isoSend"
+                | "$iso_hold($0)" -> Some "fable_rt.isoHold"
+                | "$iso_trypack($0)" -> Some "fable_rt.isoTryPack"
+                | _ -> None
 
-            // (`[<Emit("try f($0)")>]`: a call that may raise, whose exception goes on as F#'s does)
-            if info.Macro.StartsWith("try ", System.StringComparison.Ordinal) then
-                bindArgs ctx args (fun xs -> ERt(info.Macro.Substring 4, xs, ty))
+            if ownedCall.IsSome then
+                ctx.State.UsesRuntime <- true
+                let x = info.CallInfo.Args.Head
+
+                bindArgs ctx [ lw ctx x ] (fun xs -> ECall(ownedCall.Value, [ mapTypeArg ctx r x.Type ], xs, ty))
             else
-                bindArgs ctx args (fun xs -> EEmit(info.Macro, xs, ty))
+
+                // (an instance member: the object is `$0`, the arguments follow, as in the other targets)
+                let args =
+                    (Option.toList info.CallInfo.ThisArg @ info.CallInfo.Args)
+                    |> List.filter (fun a -> not (isUnit a.Type))
+                    |> List.map (lw ctx)
+
+                // (`[<Emit("try f($0)")>]`: a call that may raise, whose exception goes on as F#'s does)
+                if info.Macro.StartsWith("try ", System.StringComparison.Ordinal) then
+                    bindArgs ctx args (fun xs -> ERt(info.Macro.Substring 4, xs, ty))
+                else
+                    bindArgs ctx args (fun xs -> EEmit(info.Macro, xs, ty))
 
     // a field of an exception, which is known to be of the declared type
     | Fable.Get(x, Fable.FieldGet info, t, r) when
