@@ -69,6 +69,7 @@ let raisedExceptionType (f: unit -> 'a) : string =
     | :? FormatException -> "FormatException"
     | :? IndexOutOfRangeException -> "IndexOutOfRangeException"
     | :? NotSupportedException -> "NotSupportedException"
+    | :? OverflowException -> "OverflowException"
     | :? System.Collections.Generic.KeyNotFoundException -> "KeyNotFoundException"
     | e -> "Unexpected exception: " + e.Message
 

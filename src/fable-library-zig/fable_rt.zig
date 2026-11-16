@@ -2913,6 +2913,9 @@ pub fn spanReverse(s: anytype) void {
 pub const bigint = @import("fable_bigint.zig");
 pub const BigInt = bigint.BigInt;
 pub const bigAbs = bigint.bigAbs;
+pub const bigGcd = bigint.bigGcd;
+pub const bigLog2 = bigint.bigLog2;
+pub const bigBitLength = bigint.bigBitLength;
 pub const bigAdd = bigint.bigAdd;
 pub const bigAnd = bigint.bigAnd;
 pub const bigCompare = bigint.bigCompare;
@@ -2957,6 +2960,8 @@ pub const decOfParts = decimal.decOfParts;
 pub const decParse = decimal.decParse;
 pub const decRem = decimal.decRem;
 pub const decRound = decimal.decRound;
+pub const decRoundMode = decimal.decRoundMode;
+pub const decPown = decimal.decPown;
 pub const decSign = decimal.decSign;
 const decSpecText = decimal.decSpecText;
 pub const decSub = decimal.decSub;
@@ -3626,6 +3631,11 @@ pub fn physicalHash(x: anytype) i32 {
         return @bitCast(st);
     }
     return hash(x);
+}
+
+/// A whole-number format (`B`, `X`, `D`) given to a float or a decimal: .NET's FormatException
+pub fn formatSpecifierInvalid(comptime T: type) Raised!T {
+    return raise(FormatException, str("Format specifier was invalid."));
 }
 
 /// A map changed through `IDictionary` or `ICollection`: .NET's NotSupportedException
@@ -5181,7 +5191,8 @@ pub fn minOf(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
         if (a != a) return a;
         if (b != b) return b;
     }
-    return dup(if (compare(a, b) > 0) b else a);
+    // (of two equal values, the second, as F#'s `if a < b then a else b` and .NET's decimal.Min)
+    return dup(if (compare(a, b) < 0) a else b);
 }
 
 /// F#'s `hash`: equal values have equal hashes. A number is its own hash, as on .NET; the
@@ -6676,7 +6687,13 @@ pub fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
             const currency = letter == 'C' or letter == 'c';
             if (percent and d.len != 0) d.point += 2;
             d.roundTo(d.point + places, even);
-            if (negative) t.put(if (currency) '(' else '-');
+            // (a decimal that rounds to zero is written without its sign; a float keeps it)
+            var zero = true;
+            for (d.digits[0..d.len]) |c| {
+                if (c != 0) zero = false;
+            }
+            const signed = negative and !(isDec and zero);
+            if (signed) t.put(if (currency) '(' else '-');
             if (currency) t.put(0xA4);
             wholeDigits(&t, &d, !(letter == 'F' or letter == 'f'));
             fraction(&t, &d, places);
@@ -6684,7 +6701,7 @@ pub fn netText(comptime fmt: []const u8, value: anytype, out: []u8) []const u8 {
                 t.put(' ');
                 t.put('%');
             }
-            if (negative and currency) t.put(')');
+            if (signed and currency) t.put(')');
         },
         'E', 'e' => {
             const places: i32 = @min(given orelse 6, 80);
@@ -8830,10 +8847,54 @@ pub fn roundEven(x: anytype) @TypeOf(x) {
 }
 
 /// `Math.Round(x, digits)`
-pub fn roundTo(x: f64, digits: i32) f64 {
-    if (digits <= 0) return roundEven(x);
-    const scale = std.math.pow(f64, 10, @floatFromInt(digits));
-    return roundEven(x * scale) / scale;
+/// `Math.Round(x, mode)`: the mode checked first, whatever the value (.NET's)
+pub fn roundModeOnly(x: anytype, mode: i32) Raised!@TypeOf(x) {
+    if (mode < 0 or mode > 4) return raise(ArgumentException, format(.{ "The value '", mode, "' is not valid for this usage of the type MidpointRounding. (Parameter 'mode')" }));
+    return roundMode(x, 0, mode);
+}
+
+pub fn roundTo(x: anytype, digits: i32) Raised!@TypeOf(x) {
+    return roundMode(x, digits, 0);
+}
+
+/// `Math.Round(x, digits, mode)` with .NET's MidpointRounding (see `decRoundMode`)
+pub fn roundMode(x: anytype, digits: i32, mode: i32) Raised!@TypeOf(x) {
+    const T = @TypeOf(x);
+    // (.NET's: 15 digits of a double, 6 of a float32; a value with no fraction to round, or not
+    // finite, is given back before the mode is looked at)
+    const max_digits: i32 = if (T == f32) 6 else 15;
+    if (digits < 0 or digits > max_digits) return raise(ArgumentOutOfRangeException, format(.{ "Rounding digits must be between 0 and ", max_digits, ", inclusive. (Parameter 'digits')" }));
+    const limit: T = if (T == f32) 1e8 else 1e16;
+    if (!std.math.isFinite(x) or @abs(x) >= limit) return x;
+    if (mode < 0 or mode > 4) return raise(ArgumentException, format(.{ "The value '", mode, "' is not valid for this usage of the type MidpointRounding. (Parameter 'mode')" }));
+    const scale = std.math.pow(T, 10, @floatFromInt(digits));
+    const y = x * scale;
+    const r = switch (mode) {
+        0 => roundEven(y),
+        1 => @round(y),
+        2 => @trunc(y),
+        3 => @floor(y),
+        else => @ceil(y),
+    };
+    return r / scale;
+}
+
+/// `Math.MaxMagnitude(x, y)` and `MinMagnitude`: by absolute value (NaN wins; of equal
+/// magnitudes, the larger value, or for MinMagnitude the smaller), as .NET
+pub fn maxMagnitude(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
+    const ax = @abs(x);
+    const ay = @abs(y);
+    if (ax > ay or std.math.isNan(ax)) return x;
+    if (ax == ay) return if (std.math.signbit(x)) y else x;
+    return y;
+}
+
+pub fn minMagnitude(x: anytype, y: @TypeOf(x)) @TypeOf(x) {
+    const ax = @abs(x);
+    const ay = @abs(y);
+    if (ax < ay or std.math.isNan(ax)) return x;
+    if (ax == ay) return if (std.math.signbit(x)) x else y;
+    return y;
 }
 
 /// `Math.Log(x, b)`
@@ -8883,6 +8944,8 @@ pub const parseInt = convert.parseInt;
 pub const parseIntFs = convert.parseIntFs;
 const parseWhole = convert.parseWhole;
 pub const trimmed = convert.trimmed;
+pub const numberText = convert.numberText;
+pub const parseFloatFs = convert.parseFloatFs;
 pub const tryParseAny = convert.tryParseAny;
 pub const tryParseFloat = convert.tryParseFloat;
 pub const tryParseInt = convert.tryParseInt;
@@ -9808,7 +9871,7 @@ test "numbers: what .NET raises and returns" {
     try std.testing.expectEqual(@as(f64, 2), roundEven(@as(f64, 2.5)));
     try std.testing.expectEqual(@as(f64, 4), roundEven(@as(f64, 3.5)));
     try std.testing.expectEqual(@as(f64, -2), roundEven(@as(f64, -2.5)));
-    try std.testing.expectEqual(@as(f64, 2.57), roundTo(2.567, 2));
+    try std.testing.expectEqual(@as(f64, 2.57), try roundTo(@as(f64, 2.567), 2));
     try std.testing.expectEqual(@as(i32, -7), try parseIntFs(i32, str(" -7 ")));
     try std.testing.expectEqual(@as(i32, 31), try parseIntFs(i32, str("0x1F")));
     try std.testing.expectEqual(@as(i32, 5), try parseIntFs(i32, str("0b101")));

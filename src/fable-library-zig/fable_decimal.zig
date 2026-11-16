@@ -21,6 +21,7 @@ const raise = rt.raise;
 const str = rt.str;
 const strNew = rt.strNew;
 const trimmed = rt.trimmed;
+const numberText = rt.numberText;
 
 // ---------------------------------------------------------------------------------------------
 // decimal: .NET's System.Decimal, a value: a whole number below 2^96 and a scale of 0 to 28
@@ -197,12 +198,16 @@ pub fn decDiv(a: NetDecimal, b: NetDecimal) Raised!NetDecimal {
         q += 1;
         if (q > dec_max) return decFit(negative, q, @intCast(scale));
     }
+    // (a quotient that rounds to nothing is .NET's plain 0)
+    if (q == 0 and decMag(a) != 0) return decMake(false, 0, 0);
     return decMake(negative, q, @intCast(scale));
 }
 
 /// `a % b`: what is left after a whole number of `b`, with the sign of `a`
 pub fn decRem(a: NetDecimal, b: NetDecimal) Raised!NetDecimal {
     if (b.m == 0) return raise(DivideByZeroException, str("Attempted to divide by zero."));
+    // (.NET's: a dividend smaller than the divisor is the remainder as it is, its scale kept)
+    if (decMag(a) * pow10(b.scale) < decMag(b) * pow10(a.scale)) return a;
     const x, const y, const s = decAligned(a, b);
     const r = @rem(x, y);
     return decFit(r < 0, @intCast(@abs(r)), s);
@@ -288,11 +293,37 @@ pub fn decToFloat(comptime T: type, a: NetDecimal) T {
     return std.fmt.parseFloat(T, text) catch unreachable;
 }
 
+/// `pown d n`: by repeated multiplication, as FSharp.Core's; a negative power divides 1 by it
+pub fn decPown(a: NetDecimal, n: i32) Raised!NetDecimal {
+    var result = decLit(1, 0);
+    var k: i32 = if (n < 0) -n else n;
+    while (k > 0) : (k -= 1) result = try decMul(result, a);
+    if (n < 0) return decDiv(decLit(1, 0), result);
+    return result;
+}
+
 /// `Math.Round(d, digits)`: a tie to the even digit, or away from zero
 pub fn decRound(a: NetDecimal, digits: i32, even: bool) NetDecimal {
     if (digits < 0 or a.scale <= digits) return a;
     const k: u32 = a.scale - @as(u32, @intCast(digits));
     return decMake(a.m < 0, divRound(decMag(a), k, even), @intCast(digits));
+}
+
+/// `Math.Round(d, digits, mode)` with .NET's MidpointRounding: ToEven (0), AwayFromZero (1),
+/// ToZero (2), ToNegativeInfinity (3), ToPositiveInfinity (4)
+pub fn decRoundMode(a: NetDecimal, digits: i32, mode: i32) Raised!NetDecimal {
+    if (digits < 0 or digits > 28) return raise(rt.ArgumentOutOfRangeException, str("Decimal can only round to between 0 and 28 digits of precision. (Parameter 'decimals')"));
+    if (mode < 0 or mode > 4) return raise(rt.ArgumentException, rt.format(.{ "The value '", mode, "' is not valid for this usage of the type MidpointRounding. (Parameter 'mode')" }));
+    if (mode <= 1) return decRound(a, digits, mode == 0);
+    if (a.scale <= digits) return a;
+    const k: u32 = a.scale - @as(u32, @intCast(digits));
+    const p = pow10(k);
+    var q = decMag(a) / p;
+    const exact = decMag(a) % p == 0;
+    if (!exact) {
+        if ((mode == 3 and a.m < 0) or (mode == 4 and a.m > 0)) q += 1;
+    }
+    return decMake(a.m < 0, q, @intCast(digits));
 }
 
 /// `floor`, `ceil` (`up`) and `truncate` (neither)
@@ -420,7 +451,7 @@ pub fn decSpecText(comptime spec: Spec, a: NetDecimal, out: []u8) []const u8 {
 /// `Decimal.Parse s` (`fsharp`: F#'s `decimal s`, which also reads an exponent)
 pub fn decParse(s: String, comptime fsharp: bool) Raised!NetDecimal {
     if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
-    return decRead(trimmed(s), fsharp) catch |e| switch (e) {
+    return decRead(numberText(s), fsharp) catch |e| switch (e) {
         error.Format => badFormat(s),
         error.Raised => error.Raised,
     };
@@ -456,6 +487,11 @@ pub fn decRead(u: []const u16, comptime fsharp: bool) (error{Format} || Raised)!
         } else break;
     }
     if (!any) return error.Format;
+    // (.NET's NumberStyles.Number: a sign after the digits, where none came before)
+    if (!fsharp and i < u.len and (u[i] == '-' or u[i] == '+') and !(u.len > 0 and (u[0] == '-' or u[0] == '+'))) {
+        negative = u[i] == '-';
+        i += 1;
+    }
     if (fsharp and i < u.len and (u[i] == 'e' or u[i] == 'E')) {
         i += 1;
         var eneg = false;

@@ -312,6 +312,20 @@ pub fn trimmed(s: String) []const u16 {
     return u;
 }
 
+/// The text of a number as .NET's parsers read it: trailing NULs left out, then ASCII white space
+/// (tab to carriage return, space) at both ends; other white space is part of the text
+pub fn numberText(s: String) []const u16 {
+    var u = unitsOf(s);
+    while (u.len != 0 and u[u.len - 1] == 0) u = u[0 .. u.len - 1];
+    while (u.len != 0 and isNumberWhite(u[0])) u = u[1..];
+    while (u.len != 0 and isNumberWhite(u[u.len - 1])) u = u[0 .. u.len - 1];
+    return u;
+}
+
+fn isNumberWhite(c: u16) bool {
+    return c == ' ' or (c >= 0x09 and c <= 0x0D);
+}
+
 pub fn badFormat(s: String) Raised {
     return raise(FormatException, format(.{ "The input string '", s, "' was not in a correct format." }));
 }
@@ -417,23 +431,69 @@ pub fn parseReal(comptime T: type, u: []const u16) ?T {
     const text = buf[0..u.len];
     const body = if (text[0] == '-' or text[0] == '+') text[1..] else text;
     const negative = text[0] == '-';
-    if (std.mem.eql(u8, body, "NaN")) return std.math.nan(T);
-    if (std.mem.eql(u8, body, "Infinity") or std.mem.eql(u8, body, "∞")) return if (negative) -std.math.inf(T) else std.math.inf(T);
+    _ = negative;
     for (body) |c| {
         if (std.ascii.isAlphabetic(c) and c != 'e' and c != 'E') return null;
     }
     return std.fmt.parseFloat(T, text) catch null;
 }
 
-/// `Double.Parse s` and F#'s `float s`
+/// .NET's symbols of a float, `NaN` and `Infinity`, in any case, with a sign, white space of
+/// any kind around them (but no NUL)
+fn floatSymbol(comptime T: type, units: []const u16) ?T {
+    var u = units;
+    while (u.len != 0 and unicode.isWhiteSpace(u[0])) u = u[1..];
+    while (u.len != 0 and unicode.isWhiteSpace(u[u.len - 1])) u = u[0 .. u.len - 1];
+    var negative = false;
+    if (u.len != 0 and (u[0] == '-' or u[0] == '+')) {
+        negative = u[0] == '-';
+        u = u[1..];
+    }
+    var buf: [8]u8 = undefined;
+    if (u.len > buf.len) return null;
+    for (u, 0..) |c, i| {
+        if (c > 0x7F) return null;
+        buf[i] = @intCast(c);
+    }
+    const body = buf[0..u.len];
+    if (std.ascii.eqlIgnoreCase(body, "NaN")) return std.math.nan(T);
+    if (std.ascii.eqlIgnoreCase(body, "Infinity")) return if (negative) -std.math.inf(T) else std.math.inf(T);
+    return null;
+}
+
+/// (a float's symbol, or its digits with .NET's white space and trailing NULs around them)
+fn readFloat(comptime T: type, units: []const u16) ?T {
+    if (floatSymbol(T, units)) |x| return x;
+    var u = units;
+    while (u.len != 0 and u[u.len - 1] == 0) u = u[0 .. u.len - 1];
+    while (u.len != 0 and isNumberWhite(u[0])) u = u[1..];
+    while (u.len != 0 and isNumberWhite(u[u.len - 1])) u = u[0 .. u.len - 1];
+    return parseReal(T, u);
+}
+
+/// `Double.Parse s`
 pub fn parseFloat(comptime T: type, s: String) Raised!T {
     if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
-    return parseReal(T, trimmed(s)) orelse badFormat(s);
+    return readFloat(T, unitsOf(s)) orelse badFormat(s);
+}
+
+/// F#'s `float s` and `float32 s`: as FSharp.Core reads them, without the underscores
+pub fn parseFloatFs(comptime T: type, s: String) Raised!T {
+    if (s == null) return raise(ArgumentNullException, str("Value cannot be null. (Parameter 's')"));
+    var buf: [128]u16 = undefined;
+    var n: usize = 0;
+    for (unitsOf(s)) |c| {
+        if (c == '_') continue;
+        if (n == buf.len) return badFormat(s);
+        buf[n] = c;
+        n += 1;
+    }
+    return readFloat(T, buf[0..n]) orelse badFormat(s);
 }
 
 pub fn tryParseFloat(comptime T: type, s: String) ?T {
     if (s == null) return null;
-    return parseReal(T, trimmed(s));
+    return readFloat(T, unitsOf(s));
 }
 
 /// `Boolean.Parse s`

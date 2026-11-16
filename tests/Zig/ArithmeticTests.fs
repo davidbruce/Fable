@@ -1553,3 +1553,562 @@ let ``test A guard that does not rule out zero or -1 leaves the division checked
     raised (fun () -> f 0) |> equal "DivideByZeroException"
     raised (fun () -> g 0) |> equal "DivideByZeroException"
     raised (fun () -> g -1) |> equal "OverflowException"
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+let negativeInfinity = Double.NegativeInfinity
+
+
+let compareTo (x:'a) (y:'a) = compare x y
+
+let equals (x:'a) (y:'a) = x = y
+
+let isNaN = fun x -> Double.IsNaN(x)
+
+let positiveInfinity = Double.PositiveInfinity
+
+
+open System.Globalization
+
+[<Fact>]
+let ``test Negating negative literals inlined in computation expressions works`` () =
+    // #4251
+    let f x = x
+    let result =
+        [
+            let x = -5.0
+            f (-x)
+        ]
+    result |> equal [5.0]
+
+[<Fact>]
+let ``test Math.DivRem works with ints and ref`` () =
+    let rem = ref -1
+    Math.DivRem(5, 2, rem) |> equal 2
+    rem.Value |> equal 1
+    Math.DivRem(4, 2, rem) |> equal 2
+    rem.Value |> equal 0
+
+[<Fact>]
+let ``test Math.DivRem works with longs and ref`` () =
+    let rem = ref -1L
+    Math.DivRem(5L, 2L, rem) |> equal 2L
+    rem.Value |> equal 1L
+    Math.DivRem(4L, 2L, rem) |> equal 2L
+    rem.Value |> equal 0L
+
+[<Fact>]
+let ``test Decimal ToString keeps the sign of values below 0.1`` () =
+    string (decimal -0.001) |> equal "-0.001"
+    string (decimal -0.05) |> equal "-0.05"
+    string (decimal -0.1) |> equal "-0.1"
+    string (decimal -1.5) |> equal "-1.5"
+    string -0.001M |> equal "-0.001"
+    string (decimal 0) |> equal "0"
+
+[<Fact>]
+let ``test Decimal ToString round-trips negative values parsed from a string`` () =
+    string (decimal "-0.000001") |> equal "-0.000001"
+    string (decimal "-0.001") |> equal "-0.001"
+    string (decimal "-0.05") |> equal "-0.05"
+    string (decimal "-0.5") |> equal "-0.5"
+    string (decimal "-0.000") |> equal "0.000"
+
+[<Fact>]
+let ``test Decimal fixed-point formatting respects the precision`` () =
+    let inv = System.Globalization.CultureInfo.InvariantCulture
+    (decimal 0.001).ToString("F2", inv) |> equal "0.00"
+    (decimal 0.05).ToString("F1", inv) |> equal "0.1"
+    (decimal 0.001).ToString("N2", inv) |> equal "0.00"
+    (decimal "0.001").ToString("F2", inv) |> equal "0.00"
+    sprintf "%.2f" (decimal 0.001) |> equal "0.00"
+
+[<Fact>]
+let ``test Decimal fixed-point formatting omits the sign when the result rounds to zero`` () =
+    let inv = System.Globalization.CultureInfo.InvariantCulture
+    (-0.001M).ToString("F2", inv) |> equal "0.00"
+    (-0.1M).ToString("F0", inv) |> equal "0"
+    (-0.4M).ToString("F0", inv) |> equal "0"
+    (-0.001M).ToString("N2", inv) |> equal "0.00"
+    (-0.6M).ToString("F0", inv) |> equal "-1"
+    (-1.5M).ToString("F0", inv) |> equal "-2"
+
+[<Fact>]
+let ``test Decimal round with MidpointRounding works`` () =
+    let round mode = [ 2.5M; -2.5M; 3.5M; -3.5M; 2.4M; -2.6M ] |> List.map (fun x -> Math.Round(x, (mode: MidpointRounding)))
+    round MidpointRounding.ToEven |> equal [ 2.M; -2.M; 4.M; -4.M; 2.M; -3.M ]
+    round MidpointRounding.AwayFromZero |> equal [ 3.M; -3.M; 4.M; -4.M; 2.M; -3.M ]
+    round MidpointRounding.ToZero |> equal [ 2.M; -2.M; 3.M; -3.M; 2.M; -2.M ]
+    round MidpointRounding.ToNegativeInfinity |> equal [ 2.M; -3.M; 3.M; -4.M; 2.M; -3.M ]
+    round MidpointRounding.ToPositiveInfinity |> equal [ 3.M; -2.M; 4.M; -3.M; 3.M; -2.M ]
+    let roundDigits mode = [ 1.25M, 1; -1.25M, 1; 1.235M, 2; -1.235M, 2; 1.426M, 2 ] |> List.map (fun (x, d) -> Math.Round(x, d, (mode: MidpointRounding)))
+    roundDigits MidpointRounding.ToEven |> equal [ 1.2M; -1.2M; 1.24M; -1.24M; 1.43M ]
+    roundDigits MidpointRounding.AwayFromZero |> equal [ 1.3M; -1.3M; 1.24M; -1.24M; 1.43M ]
+    roundDigits MidpointRounding.ToZero |> equal [ 1.2M; -1.2M; 1.23M; -1.23M; 1.42M ]
+    roundDigits MidpointRounding.ToNegativeInfinity |> equal [ 1.2M; -1.3M; 1.23M; -1.24M; 1.42M ]
+    roundDigits MidpointRounding.ToPositiveInfinity |> equal [ 1.3M; -1.2M; 1.24M; -1.23M; 1.43M ]
+    Decimal.Round(2.5M, MidpointRounding.AwayFromZero) |> equal 3.M
+    Decimal.Round(-1.25M, 1, MidpointRounding.AwayFromZero) |> equal -1.3M
+
+[<Fact>]
+let ``test Decimal round with MidpointRounding validates its arguments`` () =
+    (fun () -> Math.Round(1.5M, enum<MidpointRounding> 5)) |> throwsAnyError
+    (fun () -> Math.Round(1.5M, 2, enum<MidpointRounding> -1)) |> throwsAnyError
+    (fun () -> Math.Round(1.5M, 29, MidpointRounding.AwayFromZero)) |> throwsAnyError
+    (fun () -> Math.Round(1.5M, -1, MidpointRounding.AwayFromZero)) |> throwsAnyError
+    Math.Round(1.5M, 28, MidpointRounding.AwayFromZero) |> equal 1.5M
+
+[<Fact>]
+let ``test Decimal rounding works for values below 0.1`` () =
+    Math.Floor (decimal -0.0836) |> equal -1.M
+    Math.Floor (decimal (sin (-5. * Math.PI / 180.))) |> equal -1.M
+    Math.Floor (decimal "-0.0836") |> equal -1.M
+    Math.Floor (decimal "-0.0000123") |> equal -1.M
+    Math.Floor -0.0836M |> equal -1.M
+    Math.Floor (decimal 0.0836) |> equal 0.M
+    Math.Ceiling (decimal 0.0836) |> equal 1.M
+    Math.Ceiling (decimal "0.0000123") |> equal 1.M
+    Math.Ceiling (decimal -0.0836) |> equal 0.M
+    Math.Round (decimal 0.06) |> equal 0.M
+    Math.Round (decimal 0.0836, 2) |> equal 0.08M
+    Math.Round (decimal -0.0836, 3) |> equal -0.084M
+    Math.Truncate (decimal -0.0836) |> equal 0.M
+    Math.Floor (0.M - 0.0836M) |> equal -1.M
+
+[<Fact>]
+let ``test Decimal values below 0.1 hash the same however they are built`` () =
+    (decimal -0.0836).GetHashCode() |> equal ((0.M - 0.0836M).GetHashCode())
+    (decimal "0.05").GetHashCode() |> equal ((0.1M / 2.M).GetHashCode())
+    let set = Collections.Generic.HashSet<decimal>()
+    set.Add(decimal -0.0836) |> equal true
+    set.Add(0.M - 0.0836M) |> equal false
+    let dict = Collections.Generic.Dictionary<decimal, string>()
+    dict.[decimal "0.05"] <- "a"
+    dict.ContainsKey(0.1M / 2.M) |> equal true
+
+[<Fact>]
+let ``test Decimal hash ignores trailing zeros and the sign of zero`` () =
+    (decimal "1.0").GetHashCode() |> equal ((decimal "1").GetHashCode())
+    (decimal "0.050").GetHashCode() |> equal ((0.1M / 2.M).GetHashCode())
+    (decimal "0.00").GetHashCode() |> equal ((decimal "0").GetHashCode())
+    (-(0.M)).GetHashCode() |> equal ((0.M).GetHashCode())
+    let set = Collections.Generic.HashSet<decimal>([ 1.M ])
+    set.Contains 1.0M |> equal true
+    set.Add 0.M |> equal true
+    set.Add(Math.Truncate -0.0836M) |> equal false
+    let dict = Collections.Generic.Dictionary<decimal, string>()
+    dict.[0.050M] <- "a"
+    dict.ContainsKey(0.1M / 2.M) |> equal true
+
+[<Fact>]
+let ``test Decimal parsing rounds to 28 places and keeps the scale of zero`` () =
+    string (decimal "0.0000000000000000000000000000004") |> equal "0.0000000000000000000000000000"
+    string (decimal "0.00000000000000000000000000005") |> equal "0.0000000000000000000000000000"
+    string (decimal "0.00000000000000000000000000015") |> equal "0.0000000000000000000000000002"
+    string (decimal "0.000000000000000000000000000012") |> equal "0.0000000000000000000000000000"
+    Decimal.GetBits(decimal "0.0000000000000000000000000000004") |> equal [| 0; 0; 0; 1835008 |]
+    Decimal.GetBits(decimal "0.00") |> equal [| 0; 0; 0; 131072 |]
+    string (-(0.00M)) |> equal "0.00"
+    string (abs 0.00M) |> equal "0.00"
+    string (Math.Round(0.004M, 2)) |> equal "0.00"
+    (0.00M).ToString("E3", System.Globalization.CultureInfo.InvariantCulture) |> equal "0.000E+000"
+    (decimal "0.00").GetHashCode() |> equal (Decimal(0, 0, 0, false, 2uy).GetHashCode())
+
+[<Fact>]
+let ``test Decimal addition and subtraction keep the larger scale`` () =
+    string (1.50M + 0.5M) |> equal "2.00"
+    string (1.5M + 0.50M) |> equal "2.00"
+    string (0.1M + 0.2M) |> equal "0.3"
+    string (1M + 1M) |> equal "2"
+    string (0.00M + 0M) |> equal "0.00"
+    string (0.00M + 1.5M) |> equal "1.50"
+    string (1.0M + (-1.0M)) |> equal "0.0"
+    string (0.05M - 0.05M) |> equal "0.00"
+    string (1.00M - 0.50M) |> equal "0.50"
+    string (100.5M - 0.5M) |> equal "100.0"
+    string (1.5M - 0.00M) |> equal "1.50"
+
+[<Fact>]
+let ``test Decimal multiplication adds the scales up to 28 places`` () =
+    string (2.0M * 3.0M) |> equal "6.00"
+    string (1.5M * 2M) |> equal "3.0"
+    string (0.5M * 0.5M) |> equal "0.25"
+    string (1.50M * 1.0M) |> equal "1.500"
+    string (10M * 0.1M) |> equal "1.0"
+    string (1.10M * 1.10M) |> equal "1.2100"
+    string (0.0M * 5M) |> equal "0.0"
+    string (0M * 1.50M) |> equal "0.00"
+    string (pown 1.50M 2) |> equal "2.2500"
+    string (0.1234567890123456789012345678M * 0.1M) |> equal "0.0123456789012345678901234568"
+    string (0.0000000000000000000000000025M * 0.1M) |> equal "0.0000000000000000000000000002"
+    string (0.0000000000000000000000000035M * 0.1M) |> equal "0.0000000000000000000000000004"
+    string (123456789012345678901234567.89M * 1.1M) |> equal "135802467913580246791358024.68"
+
+[<Fact>]
+let ``test Decimal division keeps the scale of an exact quotient`` () =
+    string (1.00M / 2M) |> equal "0.50"
+    string (10M / 2M) |> equal "5"
+    string (1M / 4M) |> equal "0.25"
+    string (1.0M / 0.5M) |> equal "2"
+    string (2M / 1.0M) |> equal "2"
+    string (5.0M / 2.0M) |> equal "2.5"
+    string (1.000M / 8M) |> equal "0.125"
+    string (1.23M / 0.1M) |> equal "12.3"
+    string (0.0M / 5M) |> equal "0.0"
+
+[<Fact>]
+let ``test Decimal division rounds an inexact quotient half to even to fit a decimal`` () =
+    string (1M / 3M) |> equal "0.3333333333333333333333333333"
+    string (2M / 3M) |> equal "0.6666666666666666666666666667"
+    string (10M / 3M) |> equal "3.3333333333333333333333333333"
+    string (100M / 3M) |> equal "33.333333333333333333333333333"
+    string (1M / 30000M) |> equal "0.0000333333333333333333333333"
+    string (1M / 7M) |> equal "0.1428571428571428571428571429"
+    string (80M / 9M) |> equal "8.888888888888888888888888889"
+    string (1000000000000000000000000000M / 3M) |> equal "333333333333333333333333333.33"
+    string (10000000000000000000000000001M / 2M) |> equal "5000000000000000000000000000.5"
+    string (0.0000000000000000000000000005M / 2M) |> equal "0.0000000000000000000000000002"
+    string (0.0000000000000000000000000007M / 2M) |> equal "0.0000000000000000000000000004"
+    string (0.0000000000000000000000000001M / 2M) |> equal "0"
+
+[<Fact>]
+let ``test Decimal remainder keeps the larger scale`` () =
+    string (5.0M % 2M) |> equal "1.0"
+    string (5M % 2.0M) |> equal "1.0"
+    string (5.5M % 2M) |> equal "1.5"
+    string (7.00M % 2.5M) |> equal "2.00"
+    string (-5.0M % 2M) |> equal "-1.0"
+    string (1.5M % 2.00M) |> equal "1.5"
+
+[<Fact>]
+let ``test Decimal arithmetic and parsing throw on overflow`` () =
+    (fun () -> Decimal.MaxValue + 1M) |> throwsError ""
+    (fun () -> Decimal.MaxValue + 0.5M) |> throwsError ""
+    string (Decimal.MaxValue + 0.4M) |> equal "79228162514264337593543950335"
+    string ((Decimal.MaxValue - 1M) + 1M) |> equal "79228162514264337593543950335"
+    (fun () -> Decimal.MinValue - 1M) |> throwsError ""
+    (fun () -> Decimal.MaxValue * 1.1M) |> throwsError ""
+    string (Decimal.MaxValue * 1.0M) |> equal "79228162514264337593543950335"
+    (fun () -> Decimal.MaxValue / 0.5M) |> throwsError ""
+    (fun () -> decimal "1e30") |> throwsError ""
+    (fun () -> decimal "79228162514264337593543950336") |> throwsError ""
+    (fun () -> decimal "79228162514264337593543950335.5") |> throwsError ""
+    string (decimal "79228162514264337593543950335.4") |> equal "79228162514264337593543950335"
+    (fun () -> decimal 1e30) |> throwsError ""
+
+[<Fact>]
+let ``test Decimal from float rounds to 15 significant digits`` () =
+    let inv = CultureInfo.InvariantCulture
+    string (decimal 0.1) |> equal "0.1"
+    string (decimal (0.1 + 0.2)) |> equal "0.3"
+    string (decimal 123456789.123456789) |> equal "123456789.123457"
+    string (decimal (1.0 / 3.0)) |> equal "0.333333333333333"
+    string (decimal 123456789012345.6789) |> equal "123456789012346"
+    string (decimal 123456789012345678.0) |> equal "123456789012346000"
+    string (decimal 1e20) |> equal "100000000000000000000"
+    string (decimal 1e28) |> equal "10000000000000000000000000000"
+    string (decimal 1e-10) |> equal "0.0000000001"
+    string (decimal 1.5e-28) |> equal "0.0000000000000000000000000002"
+    string (decimal 5e-29) |> equal "0"
+    string (decimal 1e-30) |> equal "0"
+    string (decimal -0.0) |> equal "0"
+    string (decimal 100000000000001.5) |> equal "100000000000002"
+    string (decimal 100000000000002.5) |> equal "100000000000002"
+    (fun () -> decimal 1e29) |> throwsError ""
+    (fun () -> decimal nan) |> throwsError ""
+    (fun () -> decimal infinity) |> throwsError ""
+
+[<Fact>]
+let ``test Decimal from float32 rounds to 7 significant digits`` () =
+    let inv = CultureInfo.InvariantCulture
+    string (decimal 1.1f) |> equal "1.1"
+    string (decimal (0.1f + 0.2f)) |> equal "0.3"
+    string (decimal 16777216.f) |> equal "16777220"
+    string (decimal 1.23456789f) |> equal "1.234568"
+    string (decimal 123456.789f) |> equal "123456.8"
+    string (decimal 1000001.5f) |> equal "1000002"
+    string (decimal 1000002.5f) |> equal "1000002"
+    string (decimal 1e-30f) |> equal "0"
+    (fun () -> decimal 3.4e38f) |> throwsError ""
+
+[<Fact>]
+let ``test Decimal G format keeps the scale without a precision`` () =
+    let inv = CultureInfo.InvariantCulture
+    (1.10M).ToString("G", inv) |> equal "1.10"
+    (0.00M).ToString("G", inv) |> equal "0.00"
+    (1.10M).ToString("G5", inv) |> equal "1.1"
+    (123456M).ToString("G3", inv) |> equal "1.23E+05"
+    (0.0001234M).ToString("G3", inv) |> equal "0.000123"
+    (2.5M).ToString("G1", inv) |> equal "3"
+    (1.5M).ToString("G1", inv) |> equal "2"
+
+[<Fact>]
+let ``test Decimal max returns the first of two equal values`` () =
+    let inv = CultureInfo.InvariantCulture
+    string (max 1.0M 1.00M) |> equal "1.0"
+    string (min 1.0M 1.00M) |> equal "1.00"
+    string (Math.Max(1.0M, 1.00M)) |> equal "1.0"
+    string (Math.Min(1.0M, 1.00M)) |> equal "1.00"
+
+[<Fact>]
+let ``test Decimal static conversions truncate and check the range`` () =
+    Decimal.ToInt32 2.9M |> equal 2
+    Decimal.ToInt32 -2.9M |> equal -2
+    Decimal.ToInt64 -2.9M |> equal -2L
+    Decimal.ToInt64 9223372036854775807.5M |> equal 9223372036854775807L
+    Decimal.ToUInt64 18446744073709551615M |> equal 18446744073709551615UL
+    Decimal.ToInt16 32767.5M |> equal 32767s
+    Decimal.ToUInt16 65535.9M |> equal 65535us
+    Decimal.ToByte 255.9M |> equal 255uy
+    Decimal.ToSByte -128.9M |> equal -128y
+    Decimal.ToUInt32 4294967295.9M |> equal 4294967295u
+    Decimal.ToDouble 0.1M |> equal 0.1
+    Decimal.ToSingle 1.5M |> equal 1.5f
+    (fun () -> Decimal.ToInt32 2147483648M) |> throwsError ""
+    (fun () -> Decimal.ToByte -1M) |> throwsError ""
+    Decimal.ToUInt64 -0.5M |> equal 0UL
+
+[<Fact>]
+let ``test Decimal rounding keeps the requested scale`` () =
+    string (Math.Round(1.20001M, 2)) |> equal "1.20"
+    string (Math.Round(1.2M, 3)) |> equal "1.2"
+    string (Math.Round(1.99M, 1)) |> equal "2.0"
+    string (Math.Floor 1.50M) |> equal "1"
+    string (Math.Ceiling 1.50M) |> equal "2"
+    string (Math.Truncate 1.50M) |> equal "1"
+
+[<Fact>]
+let ``test Decimal rounding is half to even when a trailing zero follows the 5`` () =
+    Math.Round 2.50M |> equal 2.M
+    Math.Round 0.50M |> equal 0.M
+    Math.Round(1.250M, 1) |> equal 1.2M
+    Math.Round(0.050M, 1) |> equal 0.0M
+    Math.Round(0.0050M, 2) |> equal 0.00M
+
+[<Fact>]
+let ``test sqrt matches .net core implementation`` () =
+    checkTo3dp 1732. (sqrt 3.0)
+    sqrt 0.0  |> equal 0.0
+    isNaN (sqrt -3.0) |> equal true
+    isNaN (sqrt Double.NaN) |> equal true
+    isNaN (sqrt negativeInfinity) |> equal true
+    sqrt positiveInfinity |> equal positiveInfinity
+
+[<Fact>]
+let ``test float32 arithmetic rounds every operation like .NET`` () =
+    let a, b, c = 1.5f, 1.2f, 3.3f
+    (a + b) * c |> equal 8.9099998f
+    a + b + c |> equal 6.f
+    0.1f + 0.2f |> equal 0.3f
+    16777216.f + 1.f |> equal 16777216.f
+    1.f / 3.f |> equal 0.33333334f
+    5.5f % 2.2f |> equal 1.0999999f
+    -(a + b) |> equal -2.7f
+    let arr = [| 0.f |]
+    arr.[0] <- a * c
+    arr.[0] |> equal 4.95f
+
+[<Fact>]
+let ``test Math.Round rounds the exact value`` () =
+    // See #5251
+    Math.Round 2.500000001 |> equal 3.
+    Math.Round 3.4999999999 |> equal 3.
+    Math.Round -2.500000001 |> equal -3.
+    Math.Round -3.4999999999 |> equal -3.
+    Math.Round 2.5 |> equal 2.
+    Math.Round 3.5 |> equal 4.
+    Math.Round 0.49999999999999994 |> equal 0.
+    1. / Math.Round(-0.5) |> equal -infinity
+    Math.Round(1.2500000001, 1) |> equal 1.3
+    Math.Round(2.0000000050001, 8) |> equal 2.00000001
+    Math.Round(2.675, 2) |> equal 2.68
+    Math.Round(123456.785, 2) |> equal 123456.78
+    round 2.500000001 |> equal 3.
+    round 3.4999999999 |> equal 3.
+    Convert.ToInt32 2.500000001 |> equal 3
+    Convert.ToInt32 3.4999999999 |> equal 3
+    MathF.Round 2.500001f |> equal 3.f
+    MathF.Round 3.499999f |> equal 3.f
+    MathF.Round 2.5f |> equal 2.f
+
+[<Fact>]
+let ``test Math.Round validates its digits`` () =
+    (fun () -> Math.Round(1., 16)) |> throwsAnyError
+    (fun () -> Math.Round(1., -1)) |> throwsAnyError
+    (fun () -> MathF.Round(1.f, 7)) |> throwsAnyError
+    Math.Round(1.2345678901234567, 15) |> equal 1.234567890123457
+    Math.Round(1e16, 2) |> equal 1e16
+
+[<Fact>]
+let ``test Math.Round with MidpointRounding works`` () =
+    let round mode = [ 2.5; -2.5; 3.5; -3.5; 2.4; -2.6; 0.5; -0.5 ] |> List.map (fun x -> Math.Round(x, (mode: MidpointRounding)))
+    round MidpointRounding.ToEven |> equal [ 2.; -2.; 4.; -4.; 2.; -3.; 0.; -0. ]
+    round MidpointRounding.AwayFromZero |> equal [ 3.; -3.; 4.; -4.; 2.; -3.; 1.; -1. ]
+    round MidpointRounding.ToZero |> equal [ 2.; -2.; 3.; -3.; 2.; -2.; 0.; -0. ]
+    round MidpointRounding.ToNegativeInfinity |> equal [ 2.; -3.; 3.; -4.; 2.; -3.; 0.; -1. ]
+    round MidpointRounding.ToPositiveInfinity |> equal [ 3.; -2.; 4.; -3.; 3.; -2.; 1.; -0. ]
+    Math.Round(0.49999999999999994, MidpointRounding.AwayFromZero) |> equal 0.
+    Math.Round(4503599627370497., MidpointRounding.AwayFromZero) |> equal 4503599627370497.
+    1. / Math.Round(-0.4, MidpointRounding.AwayFromZero) |> equal -infinity
+
+[<Fact>]
+let ``test Math.Round with digits and MidpointRounding works`` () =
+    let round mode = [ 1.25, 1; -1.25, 1; 1.235, 2; 2.675, 2; -2.675, 2; 1.426, 2; 0.125, 2; -1.005, 2 ] |> List.map (fun (x, d) -> Math.Round(x, d, (mode: MidpointRounding)))
+    round MidpointRounding.ToEven |> equal [ 1.2; -1.2; 1.24; 2.68; -2.68; 1.43; 0.12; -1. ]
+    round MidpointRounding.AwayFromZero |> equal [ 1.3; -1.3; 1.24; 2.68; -2.68; 1.43; 0.13; -1. ]
+    round MidpointRounding.ToZero |> equal [ 1.2; -1.2; 1.23; 2.67; -2.67; 1.42; 0.12; -1. ]
+    round MidpointRounding.ToNegativeInfinity |> equal [ 1.2; -1.3; 1.23; 2.67; -2.68; 1.42; 0.12; -1.01 ]
+    round MidpointRounding.ToPositiveInfinity |> equal [ 1.3; -1.2; 1.24; 2.68; -2.67; 1.43; 0.13; -1. ]
+    Math.Round(1e17, 2, MidpointRounding.AwayFromZero) |> equal 1e17
+
+[<Fact>]
+let ``test Math.Round with MidpointRounding.ToEven rounds the exact value`` () =
+    Math.Round(2.500000001, MidpointRounding.ToEven) |> equal 3.
+    Math.Round(-2.500000001, MidpointRounding.ToEven) |> equal -3.
+    Math.Round(2.499999999, MidpointRounding.ToEven) |> equal 2.
+    Math.Round(1.015, 2, MidpointRounding.ToEven) |> equal 1.01
+    Math.Round(1.015, 2, MidpointRounding.AwayFromZero) |> equal 1.01
+    Math.Round(1.025, 2, MidpointRounding.ToEven) |> equal 1.02
+    1. / Math.Round(-0.5, MidpointRounding.ToEven) |> equal -infinity
+    1. / Math.Round(-0.04, 1, MidpointRounding.ToEven) |> equal -infinity
+
+[<Fact>]
+let ``test Math.Round with MidpointRounding keeps NaN and infinities`` () =
+    let modes = [ MidpointRounding.ToEven; MidpointRounding.AwayFromZero; MidpointRounding.ToZero; MidpointRounding.ToNegativeInfinity; MidpointRounding.ToPositiveInfinity ]
+    for mode in modes do
+        Double.IsNaN(Math.Round(nan, mode)) |> equal true
+        Double.IsNaN(Math.Round(nan, 2, mode)) |> equal true
+        Math.Round(infinity, mode) |> equal infinity
+        Math.Round(-infinity, 2, mode) |> equal -infinity
+
+[<Fact>]
+let ``test Math.Round with MidpointRounding validates its arguments`` () =
+    (fun () -> Math.Round(1.5, enum<MidpointRounding> 5)) |> throwsAnyError
+    (fun () -> Math.Round(1e17, enum<MidpointRounding> 5)) |> throwsAnyError
+    (fun () -> Math.Round(nan, enum<MidpointRounding> 5)) |> throwsAnyError
+    (fun () -> Math.Round(1.5, 2, enum<MidpointRounding> -1)) |> throwsAnyError
+    (fun () -> Math.Round(1.5, 16, MidpointRounding.AwayFromZero)) |> throwsAnyError
+    (fun () -> Math.Round(1.5, -1, MidpointRounding.ToEven)) |> throwsAnyError
+    (fun () -> Math.Round(nan, 16, MidpointRounding.ToEven)) |> throwsAnyError
+    Math.Round(1.5, 15, MidpointRounding.AwayFromZero) |> equal 1.5
+
+[<Fact>]
+let ``test Math.Round with digits and MidpointRounding skips mode validation for unrounded values`` () =
+    Math.Round(1e17, 2, enum<MidpointRounding> 5) |> equal 1e17
+    Math.Round(infinity, 2, enum<MidpointRounding> 5) |> equal infinity
+    Double.IsNaN(Math.Round(nan, 2, enum<MidpointRounding> 5)) |> equal true
+
+[<Fact>]
+let ``test MathF.Round with MidpointRounding works`` () =
+    MathF.Round(2.5f, MidpointRounding.AwayFromZero) |> equal 3.f
+    MathF.Round(-2.5f, MidpointRounding.AwayFromZero) |> equal -3.f
+    MathF.Round(2.5f, MidpointRounding.ToEven) |> equal 2.f
+    MathF.Round(2.5f, MidpointRounding.ToZero) |> equal 2.f
+    MathF.Round(-2.5f, MidpointRounding.ToNegativeInfinity) |> equal -3.f
+    MathF.Round(-2.5f, MidpointRounding.ToPositiveInfinity) |> equal -2.f
+    MathF.Round(1.5f, 6, MidpointRounding.AwayFromZero) |> equal 1.5f
+    MathF.Round(1e9f, 2, enum<MidpointRounding> 5) |> equal 1e9f
+    (fun () -> MathF.Round(1.5f, 7, MidpointRounding.AwayFromZero)) |> throwsAnyError
+    (fun () -> MathF.Round(1e9f, enum<MidpointRounding> 5)) |> throwsAnyError
+
+[<Fact>]
+let ``test Math.log10 works`` () =
+    Math.Log10 232.12 |> checkTo3dp 2365.
+
+[<Fact>]
+let ``test Numeric Min/Max/MinMagnitude/MaxMagnitude propagate NaN`` () =
+    Double.IsNaN(Double.Min(nan, 1.0)) |> equal true
+    Double.IsNaN(Double.Min(1.0, nan)) |> equal true
+    Double.IsNaN(Double.Max(nan, 1.0)) |> equal true
+    Double.IsNaN(Double.Max(1.0, nan)) |> equal true
+    Double.IsNaN(Double.MinMagnitude(nan, 1.0)) |> equal true
+    Double.IsNaN(Double.MinMagnitude(1.0, nan)) |> equal true
+    Double.IsNaN(Double.MaxMagnitude(nan, 1.0)) |> equal true
+    Double.IsNaN(Double.MaxMagnitude(1.0, nan)) |> equal true
+
+[<Fact>]
+let ``test Math.Min/Max/MinMagnitude/MaxMagnitude propagate NaN`` () =
+    Double.IsNaN(Math.Min(nan, 1.0)) |> equal true
+    Double.IsNaN(Math.Min(1.0, nan)) |> equal true
+    Double.IsNaN(Math.Max(nan, 1.0)) |> equal true
+    Double.IsNaN(Math.Max(1.0, nan)) |> equal true
+    Double.IsNaN(Math.MinMagnitude(nan, 1.0)) |> equal true
+    Double.IsNaN(Math.MinMagnitude(1.0, nan)) |> equal true
+    Double.IsNaN(Math.MaxMagnitude(nan, 1.0)) |> equal true
+    Double.IsNaN(Math.MaxMagnitude(1.0, nan)) |> equal true
+
+[<Fact>]
+let ``test Long integers equality works`` () =
+    let x = 5L
+    let y = 5L
+    let z = 6L
+    (x = y) |> equal true
+    (y = z) |> equal false
+    equals y x |> equal true
+    equals z x |> equal false
+
+[<Fact>]
+let ``test Long integers comparison works`` () =
+    let x = 5L
+    let y = 5L
+    let z = 6L
+    compare x y |> equal 0
+    compare y z |> equal -1
+    compareTo y x |> equal 0
+    compareTo z x |> equal 1
+
+[<Fact>]
+let ``test bigint equality works`` () =
+    let a = 9007199254740992I
+    let b = 9007199254740993I
+    (a = b) |> equal false
+
+[<Fact>]
+let ``test Big integers equality works`` () =
+    let x = 59823749821707124891298739821798327321028091380980I
+    let y = 59823749821707124891298739821798327321028091380980I
+    let z = 59823749821707124891298739821798327321028091380981I
+    (x = y) |> equal true
+    (y = z) |> equal false
+    equals y x |> equal true
+    equals z x |> equal false
+
+[<Fact>]
+let ``test BigInteger.GreatestCommonDivisor works with negatives`` () =
+    bigint.GreatestCommonDivisor(-4I, 6I) |> equal 2I
+    bigint.GreatestCommonDivisor(4I, -6I) |> equal 2I
+    bigint.GreatestCommonDivisor(-4I, -6I) |> equal 2I
+    bigint.GreatestCommonDivisor(0I, -5I) |> equal 5I
+
+[<Fact>]
+let ``test BigInteger.Log2 works for non-powers-of-two`` () =
+    bigint.Log2 5I |> equal 2I
+    bigint.Log2 8I |> equal 3I
+
+[<Fact>]
+let ``test BigInteger.GetBitLength works`` () =
+    (0I).GetBitLength() |> equal 0L
+    (-1I).GetBitLength() |> equal 0L
+    (255I).GetBitLength() |> equal 8L
+    (-8I).GetBitLength() |> equal 3L
+
+[<Fact>]
+let ``test Sign operator works`` () =
+    // See #1311
+    sign 1 |> equal 1
+    sign 34 |> equal 1
+    sign 1L |> equal 1
+    sign 36L |> equal 1
+    sign 1. |> equal 1
+    sign 89 |> equal 1
+    sign 1 |> equal 1
+    sign 0 |> equal 0
+    sign 0L |> equal 0
+    sign 0. |> equal 0
+    sign -1 |> equal -1
+    sign -56 |> equal -1
+    sign -1L |> equal -1
+    sign -72L |> equal -1
+    sign -1. |> equal -1
+    sign -89. |> equal -1
+

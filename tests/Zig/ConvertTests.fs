@@ -1630,3 +1630,594 @@ let ``test Encoding.UTF8.GetString for range works`` () =
     let bytes = [| 0x7Auy; 0x61uy; 0xCCuy; 0x86uy; 0xC7uy; 0xBDuy; 0xCEuy; 0xB2uy; 0xF1uy; 0x8Fuy; 0xB3uy; 0xBFuy |]
     System.Text.Encoding.UTF8.GetString(bytes, 6, 6)
     |> equal "β񏳿"
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+let private toPlainArray (bytes: byte[]) : byte[] = bytes
+
+
+open System.Globalization
+
+[<Fact>]
+let ``test System.Double.Parse follows .NET's Float grammar`` () =
+    let parse (s: string) = Double.Parse(s, CultureInfo.InvariantCulture)
+    parse "1." |> equal 1.0
+    parse ".5" |> equal 0.5
+    parse "+.5" |> equal 0.5
+    parse "-1.5e3" |> equal -1500.0
+    parse "25E-2" |> equal 0.25
+    parse "\t1\n" |> equal 1.0
+    parse "\v1\f" |> equal 1.0
+    parse "1\u0000" |> equal 1.0
+    parse "1 \u0000\u0000" |> equal 1.0
+    parse "1e99999" |> equal Double.PositiveInfinity
+    for s in [ "0x10"; "0X1A"; "0b101"; "0o7"; "\u00a01"; "\ufeff1"; "1\ufeff"; "\u20281"; "\u30001"; "1\u0000 "; "\u00001"; "1e"; "e5"; "."; "+"; "\uff11" ] do
+        (fun () -> parse s) |> throwsAnyError
+
+[<Fact>]
+let ``test System.Double.Parse accepts the NaN and infinity symbols ignoring case`` () =
+    let parse (s: string) = Double.Parse(s, CultureInfo.InvariantCulture)
+    for s in [ "NaN"; "nan"; "NAN"; "-NaN"; "+nan"; " NaN\n" ] do
+        parse s |> Double.IsNaN |> equal true
+    parse "infinity" |> equal Double.PositiveInfinity
+    parse "+Infinity" |> equal Double.PositiveInfinity
+    parse " -INFINITY " |> equal Double.NegativeInfinity
+    parse " NaN" |> Double.IsNaN |> equal true
+    parse "\u0085Infinity\u2028" |> equal Double.PositiveInfinity
+    parse "\u3000-Infinity" |> equal Double.NegativeInfinity
+    for s in [ "inf"; "\u221e"; "NaN\u0000"; "\ufeffNaN"; "NaN\ufeff"; "- NaN"; "+-Infinity"; "Infinityx"; "NaN0" ] do
+        (fun () -> parse s) |> throwsAnyError
+
+[<Fact>]
+let ``test System.Single.Parse follows .NET's Float grammar`` () =
+    let parse (s: string) = Single.Parse(s, CultureInfo.InvariantCulture)
+    parse ".5" |> equal 0.5f
+    parse "-Infinity" |> float |> equal Double.NegativeInfinity
+    parse "nan" |> float |> Double.IsNaN |> equal true
+    (fun () -> parse "0x10") |> throwsAnyError
+    (fun () -> parse "1_0") |> throwsAnyError
+
+[<Fact>]
+let ``test System.Decimal.Parse accepts .NET's group separator placements`` () =
+    let parse (s: string) = Decimal.Parse(s, CultureInfo.InvariantCulture)
+    parse "1,,0" |> equal 10M
+    parse "1," |> equal 1M
+    parse "1,.5" |> equal 1.5M
+    for s in [ ","; ",1"; "1.5,0" ] do
+        (fun () -> parse s) |> throwsAnyError
+
+[<Fact>]
+let ``test Double.Parse and Convert.ToDouble reject underscores`` () =
+    for s in [ "1_0"; "_1"; "1_"; "_"; "1e1_0"; "1._5" ] do
+        (fun () -> Double.Parse(s, CultureInfo.InvariantCulture)) |> throwsAnyError
+        (fun () -> Convert.ToDouble(s, CultureInfo.InvariantCulture)) |> throwsAnyError
+
+[<Fact>]
+let ``test float and float32 remove underscores like FSharp.Core`` () =
+    float "1_0_0" |> equal 100.0
+    float "_1" |> equal 1.0
+    float "1_" |> equal 1.0
+    float "1e1_0" |> equal 1e10
+    float " _1" |> equal 1.0
+    float "Na_N" |> Double.IsNaN |> equal true
+    float32 "1__0" |> equal 10.0f
+    (fun () -> float "_") |> throwsAnyError
+    (fun () -> float32 "__") |> throwsAnyError
+    (fun () -> float "0x10") |> throwsAnyError
+    (fun () -> float "\u00a01") |> throwsAnyError
+
+[<Fact>]
+let ``test System.Decimal.Parse trims only .NET's white space`` () =
+    let parse (s: string) = Decimal.Parse(s, CultureInfo.InvariantCulture)
+    parse "\t12\r\n" |> equal 12M
+    parse "12\u0000" |> equal 12M
+    parse "12 \u0000" |> equal 12M
+    for s in [ "\u00a012"; "\ufeff12"; "12\u3000"; "12\u0000 " ] do
+        (fun () -> parse s) |> throwsAnyError
+
+[<Fact>]
+let ``test decimal parses like System.Decimal.Parse with NumberStyles.Float`` () =
+    decimal " 12 " |> equal 12M
+    decimal "+12" |> equal 12M
+    decimal "\t12\n" |> equal 12M
+    decimal "12\u0000" |> equal 12M
+    decimal "1e3" |> equal 1000M
+    for s in [ "1,000"; "(1)"; "1-"; "1_0"; "\u00a012"; "0x10"; "NaN" ] do
+        (fun () -> decimal s) |> throwsAnyError
+
+[<Fact>]
+let ``test Convert.ToDecimal parses like System.Decimal.Parse`` () =
+    Convert.ToDecimal(" 12 ", CultureInfo.InvariantCulture) |> equal 12M
+    Convert.ToDecimal("1,000", CultureInfo.InvariantCulture) |> equal 1000M
+    Convert.ToDecimal("1-", CultureInfo.InvariantCulture) |> equal -1M
+    (fun () -> Convert.ToDecimal("1e3", CultureInfo.InvariantCulture)) |> throwsAnyError
+
+[<Fact>]
+let ``test BigInteger.Parse follows .NET's Integer grammar`` () =
+    bigint.Parse " 12 " |> equal 12I
+    bigint.Parse "+12" |> equal 12I
+    bigint.Parse "-12\u0000" |> equal -12I
+    for s in [ ""; " "; "-"; "0x10"; "1_0"; "1.5"; "1e3"; "\u00a012" ] do
+        (fun () -> bigint.Parse s) |> throwsAnyError
+    tryParse bigint.TryParse 0I "" |> equal (false, 0I)
+    tryParse bigint.TryParse 0I "0x10" |> equal (false, 0I)
+    tryParse bigint.TryParse 0I " 12 " |> equal (true, 12I)
+
+[<Fact>]
+let ``test Parsing numbers raises .NET's exception types`` () =
+    raisedExceptionType (fun () -> Double.Parse("1e", CultureInfo.InvariantCulture)) |> equal "FormatException"
+    raisedExceptionType (fun () -> Double.Parse(null, CultureInfo.InvariantCulture)) |> equal "ArgumentNullException"
+    raisedExceptionType (fun () -> Single.Parse("abc", CultureInfo.InvariantCulture)) |> equal "FormatException"
+    raisedExceptionType (fun () -> float "abc") |> equal "FormatException"
+    raisedExceptionType (fun () -> float32 (null: string)) |> equal "ArgumentNullException"
+    raisedExceptionType (fun () -> Int32.Parse "abc") |> equal "FormatException"
+    raisedExceptionType (fun () -> Int32.Parse(null: string)) |> equal "ArgumentNullException"
+    raisedExceptionType (fun () -> Int32.Parse "2147483648") |> equal "OverflowException"
+    raisedExceptionType (fun () -> UInt32.Parse "4294967296") |> equal "OverflowException"
+    raisedExceptionType (fun () -> Byte.Parse "256") |> equal "OverflowException"
+    raisedExceptionType (fun () -> SByte.Parse "-129") |> equal "OverflowException"
+    raisedExceptionType (fun () -> UInt16.Parse "-1") |> equal "OverflowException"
+    raisedExceptionType (fun () -> Int64.Parse "abc") |> equal "FormatException"
+    raisedExceptionType (fun () -> Int64.Parse(null: string)) |> equal "ArgumentNullException"
+    raisedExceptionType (fun () -> UInt64.Parse "-1") |> equal "OverflowException"
+    raisedExceptionType (fun () -> int "1.5") |> equal "FormatException"
+    raisedExceptionType (fun () -> uint32 "4294967296") |> equal "OverflowException"
+    raisedExceptionType (fun () -> int64 "99999999999999999999") |> equal "OverflowException"
+    raisedExceptionType (fun () -> Decimal.Parse("abc", CultureInfo.InvariantCulture)) |> equal "FormatException"
+    raisedExceptionType (fun () -> Decimal.Parse(null, CultureInfo.InvariantCulture)) |> equal "ArgumentNullException"
+    raisedExceptionType (fun () -> Decimal.Parse("79228162514264337593543950336", CultureInfo.InvariantCulture)) |> equal "OverflowException"
+    raisedExceptionType (fun () -> decimal "abc") |> equal "FormatException"
+    raisedExceptionType (fun () -> decimal "1e30") |> equal "OverflowException"
+    raisedExceptionType (fun () -> bigint.Parse "abc") |> equal "FormatException"
+    raisedExceptionType (fun () -> bigint.Parse null) |> equal "ArgumentNullException"
+    tryParse Int32.TryParse 0 null |> equal (false, 0)
+    tryParse Decimal.TryParse 0M null |> equal (false, 0M)
+
+[<Fact>]
+let ``test Parsing numbers raises .NET's exception messages`` () =
+    (fun () -> Int32.Parse "abc") |> throwsError "The input string 'abc' was not in a correct format."
+    (fun () -> Double.Parse("abc", CultureInfo.InvariantCulture)) |> throwsError "The input string 'abc' was not in a correct format."
+    (fun () -> Int32.Parse(null: string)) |> throwsError "Value cannot be null. (Parameter 's')"
+    (fun () -> Int32.Parse "2147483648") |> throwsError "Value was either too large or too small for an Int32."
+    (fun () -> UInt32.Parse "4294967296") |> throwsError "Value was either too large or too small for a UInt32."
+    (fun () -> Byte.Parse "256") |> throwsError "Value was either too large or too small for an unsigned byte."
+    (fun () -> SByte.Parse "128") |> throwsError "Value was either too large or too small for a signed byte."
+    (fun () -> Int64.Parse "9223372036854775808") |> throwsError "Value was either too large or too small for an Int64."
+    (fun () -> bigint.Parse "abc") |> throwsError "The value could not be parsed."
+
+[<Fact>]
+let ``test byte.ToString 'B' works`` () =
+    (255uy).ToString("B2") |> equal "11111111"
+    (255uy).ToString("B15") |> equal "000000011111111"
+
+    (255uy).ToString("b2") |> equal "11111111"
+    (255uy).ToString("b15") |> equal "000000011111111"
+
+[<Fact>]
+let ``test sbyte.ToString 'B' works`` () =
+    (127y).ToString("B2") |> equal "1111111"
+    (127y).ToString("B15") |> equal "000000001111111"
+    // (-127y).ToString("B") |> equal "10000001"
+
+    (127y).ToString("b2") |> equal "1111111"
+    (127y).ToString("b15") |> equal "000000001111111"
+    // (-127y).ToString("b") |> equal "10000001"
+
+[<Fact>]
+let ``test int16.ToString 'B' works`` () =
+    (255s).ToString("B2") |> equal "11111111"
+    (255s).ToString("B15") |> equal "000000011111111"
+    // (-255s).ToString("B") |> equal "1111111100000001"
+
+    (255s).ToString("b2") |> equal "11111111"
+    (255s).ToString("b15") |> equal "000000011111111"
+    // (-255s).ToString("b") |> equal "1111111100000001"
+
+[<Fact>]
+let ``test uint16.ToString 'B' works`` () =
+    (255us).ToString("B2") |> equal "11111111"
+    (255us).ToString("B15") |> equal "000000011111111"
+
+    (255us).ToString("b2") |> equal "11111111"
+    (255us).ToString("b15") |> equal "000000011111111"
+
+[<Fact>]
+let ``test int32.ToString 'B' works`` () =
+    (255).ToString("B2") |> equal "11111111"
+    (255).ToString("B15") |> equal "000000011111111"
+    (-255).ToString("B") |> equal "11111111111111111111111100000001"
+
+    (255).ToString("b2") |> equal "11111111"
+    (255).ToString("b15") |> equal "000000011111111"
+    (-255).ToString("b") |> equal "11111111111111111111111100000001"
+
+[<Fact>]
+let ``test uint32.ToString 'B' works`` () =
+    (255u).ToString("B2") |> equal "11111111"
+    (255u).ToString("B15") |> equal "000000011111111"
+
+    (255u).ToString("b2") |> equal "11111111"
+    (255u).ToString("b15") |> equal "000000011111111"
+
+[<Fact>]
+let ``test decimal.ToString 'B' throws`` () =
+    throwsAnyError( fun _ ->
+        // Use a function to prevet detection at the compile time by Fable
+        let format () = "B"
+        (2323.2368723m).ToString(format())
+    )
+
+[<Fact>]
+let ``test float.ToString 'B' throws`` () =
+    throwsAnyError( fun _ ->
+        // Use a function to prevet detection at the compile time by Fable
+        let format () = "B"
+        (2323.2368723).ToString(format())
+    )
+
+[<Fact>]
+let ``test float32.ToString 'B' throws`` () =
+    throwsAnyError( fun _ ->
+        // Use a function to prevet detection at the compile time by Fable
+        let format () = "B"
+        (2323.2368723f).ToString(format())
+    )
+
+[<Fact>]
+let ``test byte.ToString 'C' works`` () =
+    (255uy).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255uy).ToString("C15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+
+    (255uy).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255uy).ToString("c15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+
+[<Fact>]
+let ``test sbyte.ToString 'C' works`` () =
+    (127y).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤127.00"
+    (127y).ToString("C15", CultureInfo.InvariantCulture) |> equal "¤127.000000000000000"
+    (-127y).ToString("C", CultureInfo.InvariantCulture) |> equal "(¤127.00)"
+
+    (127y).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤127.00"
+    (127y).ToString("c15", CultureInfo.InvariantCulture) |> equal "¤127.000000000000000"
+    (-127y).ToString("c", CultureInfo.InvariantCulture) |> equal "(¤127.00)"
+
+[<Fact>]
+let ``test int16.ToString 'C' works`` () =
+    (255s).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255s).ToString("C15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+    (-255s).ToString("C", CultureInfo.InvariantCulture) |> equal "(¤255.00)"
+
+    (255s).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255s).ToString("c15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+    (-255s).ToString("c", CultureInfo.InvariantCulture) |> equal "(¤255.00)"
+
+[<Fact>]
+let ``test uint16.ToString 'C' works`` () =
+    (255us).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255us).ToString("C15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+
+    (255us).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255us).ToString("c15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+
+[<Fact>]
+let ``test int32.ToString 'C' works`` () =
+    (255).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255).ToString("C15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+    (-255).ToString("C", CultureInfo.InvariantCulture) |> equal "(¤255.00)"
+
+    (255).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255).ToString("c15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+    (-255).ToString("c", CultureInfo.InvariantCulture) |> equal "(¤255.00)"
+
+    (235672367).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤235,672,367.00"
+
+    // #2582: zero precision must not leave a trailing dot
+    (255).ToString("C0", CultureInfo.InvariantCulture) |> equal "¤255"
+    (-255).ToString("C0", CultureInfo.InvariantCulture) |> equal "(¤255)"
+    (235672367).ToString("C0", CultureInfo.InvariantCulture) |> equal "¤235,672,367"
+
+[<Fact>]
+let ``test uint32.ToString 'C' works`` () =
+    (255u).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255u).ToString("C15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+
+    (255u).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255u).ToString("c15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+
+[<Fact>]
+let ``test int64.ToString 'C' works`` () =
+    (255L).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255L).ToString("C15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+    (-255L).ToString("C", CultureInfo.InvariantCulture) |> equal "(¤255.00)"
+
+    (255L).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255L).ToString("c15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+    (-255L).ToString("c", CultureInfo.InvariantCulture) |> equal "(¤255.00)"
+
+    (25523678236826386L).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤25,523,678,236,826,386.00"
+
+[<Fact>]
+let ``test uint64.ToString 'C' works`` () =
+    (255UL).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255UL).ToString("C15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+
+    (255UL).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤255.00"
+    (255UL).ToString("c15", CultureInfo.InvariantCulture) |> equal "¤255.000000000000000"
+
+[<Fact>]
+let ``test float.ToString 'C' works`` () =
+    (255.2357).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤255.24"
+    (255.2357).ToString("C15", CultureInfo.InvariantCulture) |> equal "¤255.235700000000008"
+    (-255.2357).ToString("C", CultureInfo.InvariantCulture) |> equal "(¤255.24)"
+
+    (255.2357).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤255.24"
+    (255.2357).ToString("c15", CultureInfo.InvariantCulture) |> equal "¤255.235700000000008"
+    (-255.2357).ToString("c", CultureInfo.InvariantCulture) |> equal "(¤255.24)"
+
+[<Fact>]
+let ``test float32.ToString 'C' works`` () =
+    (255.2357f).ToString("C2", CultureInfo.InvariantCulture) |> equal "¤255.24"
+    (255.2357f).ToString("C5", CultureInfo.InvariantCulture) |> equal "¤255.23570"
+    (-255.2357f).ToString("C", CultureInfo.InvariantCulture) |> equal "(¤255.24)"
+
+    (255.2357f).ToString("c2", CultureInfo.InvariantCulture) |> equal "¤255.24"
+    (255.2357f).ToString("c5", CultureInfo.InvariantCulture) |> equal "¤255.23570"
+    (-255.2357f).ToString("c", CultureInfo.InvariantCulture) |> equal "(¤255.24)"
+
+[<Fact>]
+let ``test byte.ToString 'D' works`` () =
+    (255uy).ToString("D2") |> equal "255"
+    (255uy).ToString("D15") |> equal "000000000000255"
+
+    (255uy).ToString("d2") |> equal "255"
+    (255uy).ToString("d15") |> equal "000000000000255"
+
+[<Fact>]
+let ``test sbyte.ToString 'D' works`` () =
+    (127y).ToString("D2") |> equal "127"
+    (127y).ToString("D15") |> equal "000000000000127"
+    (-127y).ToString("D") |> equal "-127"
+
+    (127y).ToString("d2") |> equal "127"
+    (127y).ToString("d15") |> equal "000000000000127"
+    (-127y).ToString("d") |> equal "-127"
+    (-127y).ToString("d15") |> equal "-000000000000127"
+
+[<Fact>]
+let ``test int16.ToString 'D' works`` () =
+    (255s).ToString("D2") |> equal "255"
+    (255s).ToString("D15") |> equal "000000000000255"
+    // (-255s).ToString("D") |> equal "255"
+
+    (255s).ToString("d2") |> equal "255"
+    (255s).ToString("d15") |> equal "000000000000255"
+    // (-255s).ToString("d") |> equal "255"
+
+[<Fact>]
+let ``test uint16.ToString 'D' works`` () =
+    (255us).ToString("D2") |> equal "255"
+    (255us).ToString("D15") |> equal "000000000000255"
+
+    (255us).ToString("d2") |> equal "255"
+    (255us).ToString("d15") |> equal "000000000000255"
+
+[<Fact>]
+let ``test int32.ToString 'D' works`` () =
+    (255).ToString("D2") |> equal "255"
+    (255).ToString("D15") |> equal "000000000000255"
+    (-255).ToString("D") |> equal "-255"
+
+    (255).ToString("d2") |> equal "255"
+    (255).ToString("d15") |> equal "000000000000255"
+    (-255).ToString("d") |> equal "-255"
+
+[<Fact>]
+let ``test uint32.ToString 'D' works`` () =
+    (255u).ToString("D2") |> equal "255"
+    (255u).ToString("D15") |> equal "000000000000255"
+
+    (255u).ToString("d2") |> equal "255"
+    (255u).ToString("d15") |> equal "000000000000255"
+
+[<Fact>]
+let ``test int64.ToString 'D' works`` () =
+    (255L).ToString("D2", CultureInfo.InvariantCulture) |> equal "255"
+    (255L).ToString("D15", CultureInfo.InvariantCulture) |> equal "000000000000255"
+    (-255L).ToString("D", CultureInfo.InvariantCulture) |> equal "-255"
+
+    (255L).ToString("d2", CultureInfo.InvariantCulture) |> equal "255"
+    (255L).ToString("d15", CultureInfo.InvariantCulture) |> equal "000000000000255"
+    (-255L).ToString("d", CultureInfo.InvariantCulture) |> equal "-255"
+
+[<Fact>]
+let ``test uint64.ToString 'D' works`` () =
+    (255UL).ToString("D2", CultureInfo.InvariantCulture) |> equal "255"
+    (255UL).ToString("D15", CultureInfo.InvariantCulture) |> equal "000000000000255"
+
+    (255UL).ToString("d2", CultureInfo.InvariantCulture) |> equal "255"
+    (255UL).ToString("d15", CultureInfo.InvariantCulture) |> equal "000000000000255"
+
+[<Fact>]
+let ``test decimal.ToString 'D' throws`` () =
+    throwsAnyError(fun _ ->
+        // Use a function to prevet detection at the compile time by Fable
+        let format () = "D"
+        (2323.2368723m).ToString(format())
+    )
+
+[<Fact>]
+let ``test float.ToString 'D' throws`` () =
+    throwsAnyError(fun _ ->
+        // Use a function to prevet detection at the compile time by Fable
+        let format () = "D"
+        (2323.2368723).ToString(format())
+    )
+
+[<Fact>]
+let ``test float32.ToString 'D' throws`` () =
+    throwsAnyError(fun _ ->
+        // Use a function to prevet detection at the compile time by Fable
+        let format () = "D"
+        (2323.2368723f).ToString(format())
+    )
+
+[<Fact>]
+let ``test byte.ToString 'X' works`` () =
+    (255uy).ToString("X2") |> equal "FF"
+    (255uy).ToString("X15") |> equal "0000000000000FF"
+
+[<Fact>]
+let ``test sbyte.ToString 'X' works`` () =
+    (1y).ToString("X2") |> equal "01"
+    (127y).ToString("X2") |> equal "7F"
+    (127y).ToString("X15") |> equal "00000000000007F"
+    // (-127y).ToString("X") |> equal "81"
+
+[<Fact>]
+let ``test int16.ToString 'X' works`` () =
+    (255s).ToString("X2") |> equal "FF"
+    (255s).ToString("X15") |> equal "0000000000000FF"
+    // (-255s).ToString("X") |> equal "FF01"
+
+[<Fact>]
+let ``test uint16.ToString 'X' works`` () =
+    (255us).ToString("X2") |> equal "FF"
+    (255us).ToString("X15") |> equal "0000000000000FF"
+
+[<Fact>]
+let ``test int32.ToString 'X' works`` () =
+    (255).ToString("X2") |> equal "FF"
+    (255).ToString("X15") |> equal "0000000000000FF"
+    (-255).ToString("X") |> equal "FFFFFF01"
+
+[<Fact>]
+let ``test uint32.ToString 'X' works`` () =
+    (255u).ToString("X2") |> equal "FF"
+    (255u).ToString("X15") |> equal "0000000000000FF"
+
+[<Fact>]
+let ``test int64.ToString 'X' works`` () =
+    (255L).ToString("X2", CultureInfo.InvariantCulture) |> equal "FF"
+    (255L).ToString("X15", CultureInfo.InvariantCulture) |> equal "0000000000000FF"
+    (-255L).ToString("X", CultureInfo.InvariantCulture) |> equal "FFFFFFFFFFFFFF01"
+
+    (25523678236826386L).ToString("x2", CultureInfo.InvariantCulture) |> equal "5aada66eaadb12"
+
+[<Fact>]
+let ``test uint64.ToString 'X' works`` () =
+    (255UL).ToString("X2", CultureInfo.InvariantCulture) |> equal "FF"
+    (255UL).ToString("X15", CultureInfo.InvariantCulture) |> equal "0000000000000FF"
+
+[<Fact>]
+let ``test decimal.ToString 'X' throws`` () =
+    throwsAnyError( fun _ ->
+        // Use a function to prevet detection at the compile time by Fable
+        let format () = "X"
+        (2323.2368723m).ToString(format())
+    )
+
+[<Fact>]
+let ``test float.ToString 'X' throws`` () =
+    throwsAnyError( fun _ ->
+        // Use a function to prevet detection at the compile time by Fable
+        let format () = "X"
+        (2323.2368723).ToString(format())
+    )
+
+[<Fact>]
+let ``test float32.ToString 'X' throws`` () =
+    throwsAnyError( fun _ ->
+        // Use a function to prevet detection at the compile time by Fable
+        let format () = "X"
+        (2323.2368723f).ToString(format())
+    )
+
+[<Fact>]
+let ``test Negative fractions truncate toward zero when converted to small integers`` () =
+    sbyte(-7.9) |> equal -7y
+    sbyte(-7.9f) |> equal -7y
+    int16(-7.9) |> equal -7s
+    int16(-7.9f) |> equal -7s
+    byte(7.9) |> equal 7uy
+    uint16(7.9) |> equal 7us
+
+[<Fact>]
+let ``test Special cases conversion to/from Int64 work`` () =
+    let xn = -1L
+    let xnu = 0xFFFFFFFFFFFFFFFFuL
+    -1 |> uint64 |> equal xnu
+    0xFFFFFFFFu |> int64 |> equal 0xFFFFFFFFL
+    xn |> uint64 |> equal xnu
+    xnu |> int64 |> equal -1L
+    xn |> int32 |> equal -1
+    xn |> uint32 |> equal 0xFFFFFFFFu
+    xnu |> int32 |> equal -1
+    xnu |> uint32 |> equal 0xFFFFFFFFu
+
+[<Fact>]
+let ``test Special cases conversion to Int64 work`` () =
+    int64 "0xFFFFFFFFFFFFFFFF" |> equal -1L
+    int64 "0x8000000000000000" |> equal -9223372036854775808L
+    int64 "0x7FFFFFFFFFFFFFFF" |> equal 9223372036854775807L
+    int64 "-0xFF" |> equal -255L
+    Int64.Parse("FFFFFFFFFFFFFFFF", System.Globalization.NumberStyles.HexNumber) |> equal -1L
+
+[<Fact>]
+let ``test BitConverter.ToBoolean with any nonzero byte works`` () =
+    BitConverter.ToBoolean([|0uy|], 0) |> equal false
+    BitConverter.ToBoolean([|1uy|], 0) |> equal true
+    BitConverter.ToBoolean([|2uy|], 0) |> equal true
+    BitConverter.ToBoolean([|255uy|], 0) |> equal true
+
+[<Fact>]
+let ``test BitConverter.ToString uppercase works`` () =
+    BitConverter.ToString([|0uy; 1uy; 0xABuy; 0xFFuy|]) |> equal "00-01-AB-FF"
+
+[<Fact>]
+let ``test Convert Guid to byte array works`` () =
+    let g = Guid.Parse("96258006-c4ba-4a7f-80c4-de7f2b2898c5")
+    let g2 = Guid.Parse(id "96258006-c4ba-4a7f-80c4-de7f2b2898c5")
+
+    g.ToByteArray() |> equal [|6uy; 128uy; 37uy; 150uy; 186uy; 196uy; 127uy; 74uy; 128uy; 196uy; 222uy; 127uy; 43uy; 40uy; 152uy; 197uy|]
+    g2.ToByteArray() |> equal [|6uy; 128uy; 37uy; 150uy; 186uy; 196uy; 127uy; 74uy; 128uy; 196uy; 222uy; 127uy; 43uy; 40uy; 152uy; 197uy|]
+
+[<Fact>]
+let ``test Convert byte array to Guid works`` () =
+    let g = Guid [|6uy; 128uy; 37uy; 150uy; 186uy; 196uy; 127uy; 74uy; 128uy; 196uy; 222uy; 127uy; 43uy; 40uy; 152uy; 197uy|]
+    g.ToString() |> equal "96258006-c4ba-4a7f-80c4-de7f2b2898c5"
+
+[<Fact>]
+let ``test Convert byte array built from a list or seq to Guid works`` () =
+    let bytes = id [6uy; 128uy; 37uy; 150uy; 186uy; 196uy; 127uy; 74uy; 128uy; 196uy; 222uy; 127uy; 43uy; 40uy; 152uy; 197uy]
+    Guid(List.toArray bytes).ToString() |> equal "96258006-c4ba-4a7f-80c4-de7f2b2898c5"
+    Guid(Array.ofList bytes).ToString() |> equal "96258006-c4ba-4a7f-80c4-de7f2b2898c5"
+    Guid(Array.ofSeq (Seq.ofList bytes)).ToString() |> equal "96258006-c4ba-4a7f-80c4-de7f2b2898c5"
+
+[<Fact>]
+let ``test Guid.ToString works with formats`` () =
+    let g = Guid.Parse("96258006-c4ba-4a7f-80c4-de7f2b2898c5")
+    let g2 = Guid.Parse(id "96258006-c4ba-4a7f-80c4-de7f2b2898c5")
+
+    let testGuid (g: Guid) =
+        g.ToString() |> equal "96258006-c4ba-4a7f-80c4-de7f2b2898c5"
+        g.ToString("N") |> equal "96258006c4ba4a7f80c4de7f2b2898c5"
+        g.ToString("D") |> equal "96258006-c4ba-4a7f-80c4-de7f2b2898c5"
+        g.ToString("B") |> equal "{96258006-c4ba-4a7f-80c4-de7f2b2898c5}"
+        g.ToString("P") |> equal "(96258006-c4ba-4a7f-80c4-de7f2b2898c5)"
+        g.ToString("X") |> equal "{0x96258006,0xc4ba,0x4a7f,{0x80,0xc4,0xde,0x7f,0x2b,0x28,0x98,0xc5}}"
+
+    testGuid g
+    testGuid g2
+
+[<Fact>]
+let ``test Encoding.Unicode.GetString for range works with non-typed array`` () =
+    let bytes = toPlainArray [| 0x7Auy; 0x00uy; 0x61uy; 0x00uy; 0x06uy; 0x03uy; 0xFDuy; 0x01uy; 0xB2uy; 0x03uy; 0xFFuy; 0xD8uy; 0xFFuy; 0xDCuy |]
+    System.Text.Encoding.Unicode.GetString(bytes, 8, 6)
+    |> equal "\u03B2\uD8FF\uDCFF"
+
+[<Fact>]
+let ``test Encoding.UTF8.GetString for range works with non-typed array`` () =
+    let bytes = toPlainArray [| 0x7Auy; 0x61uy; 0xCCuy; 0x86uy; 0xC7uy; 0xBDuy; 0xCEuy; 0xB2uy; 0xF1uy; 0x8Fuy; 0xB3uy; 0xBFuy |]
+    System.Text.Encoding.UTF8.GetString(bytes, 6, 6)
+    |> equal "\u03B2\uD8FF\uDCFF"
+

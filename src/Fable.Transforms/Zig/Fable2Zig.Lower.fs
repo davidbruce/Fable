@@ -1625,6 +1625,12 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         TEnt(libRecordEnt ctx "Path" "DirectoryInfoOf", [])
     // (what `Parallel.For` gives: nothing here)
     | Fable.DeclaredType(ent, []) when ent.FullName = "System.Threading.Tasks.ParallelLoopResult" -> tVoid
+    // (a culture or a format provider: nothing, the invariant culture is the only one)
+    | Fable.DeclaredType(ent, []) when
+        ent.FullName = "System.Globalization.CultureInfo"
+        || ent.FullName = "System.IFormatProvider"
+        ->
+        tVoid
     // (`Comparer<'T>`, as `Comparer<'T>.Default` gives it: the IComparer it is used as)
     | Fable.DeclaredType(ent, [ item ]) when ent.FullName = "System.Collections.Generic.Comparer`1" ->
         mapType
@@ -10529,6 +10535,21 @@ and dotnetCall
     // this type here)
     | "System.Collections.Generic.Comparer`1", "Compare" when info.Args.Length = 2 ->
         dotnetCall ctx r "Microsoft.FSharp.Core.Operators" "Compare" { info with ThisArg = None } t
+    // (a format provider given to a number's, a date's or Convert's member: the culture is the
+    // invariant one here, as without it; see `isCulture`)
+    | ("System.Int32" | "System.Int64" | "System.Int16" | "System.Byte" | "System.SByte" | "System.UInt16" | "System.UInt32" | "System.UInt64" | "System.Double" | "System.Single" | "System.Decimal" | "System.Numerics.BigInteger" | "System.Convert" | "System.DateTime" | "System.DateTimeOffset" | "System.TimeSpan" | "System.DateOnly" | "System.TimeOnly"),
+      ("Parse" | "TryParse" | "ToString" | "ParseExact" | "TryParseExact") when info.Args |> List.exists isCulture ->
+        dotnetCall ctx r entity name { info with Args = info.Args |> List.filter (isCulture >> not) } t
+    | "System.Convert", m when
+        m.StartsWith("To", System.StringComparison.Ordinal)
+        && info.Args |> List.exists isCulture
+        ->
+        dotnetCall ctx r entity name { info with Args = info.Args |> List.filter (isCulture >> not) } t
+    // (a culture as a value: nothing here, the invariant culture is the only one)
+    | "System.Globalization.CultureInfo",
+      ("get_InvariantCulture" | "get_CurrentCulture" | "get_CurrentUICulture" | "get_InvariantUICulture") -> EUnit
+    | ("System.Double" | "System.Single"), ("Max" | "Min") when info.Args.Length = 2 ->
+        dotnetCall ctx r "System.Math" name info t
     | "Microsoft.FSharp.Control.FSharpAsync", "Parallel" when info.Args.Length = 2 ->
         libraryCall ctx r "Async" "parallelAllMax" info info.Args t
     | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Reduce" ->
@@ -11094,7 +11115,32 @@ and dotnetCall
                     Fable.Sequential [ Fable.Set(out, Fable.ValueSet, a.Type, op BinaryModulus, r); op BinaryDivide ]
                 | [], Fable.Tuple(_, isStruct) ->
                     Fable.Value(Fable.NewTuple([ op BinaryDivide; op BinaryModulus ], isStruct), r)
-                | _ -> fail r "the Zig target does not support this DivRem yet"
+                // (the contents of a ref cell given for the remainder, as F# passes `&r.contents`)
+                | [ Fable.Operation(Fable.Unary(UnaryAddressOf, Fable.Get(cell, Fable.FieldGet fi, _, _)), _, _, _) ], _
+                | [ Fable.Get(cell, Fable.FieldGet fi, _, _) ], _ ->
+                    Fable.Sequential
+                        [
+                            Fable.Set(cell, Fable.FieldSet fi.Name, a.Type, op BinaryModulus, r)
+                            op BinaryDivide
+                        ]
+                // (a ref cell given for the remainder: its contents)
+                | [ cell ], _ when
+                    (match unwrapNullness cell.Type with
+                     | Fable.DeclaredType(e, _) -> e.FullName = "Microsoft.FSharp.Core.FSharpRef`1"
+                     | _ -> false)
+                    ->
+                    Fable.Sequential
+                        [
+                            Fable.Set(cell, Fable.FieldSet "contents", a.Type, op BinaryModulus, r)
+                            op BinaryDivide
+                        ]
+                | _ ->
+                    let text = (sprintf "%A" rest).Replace("\n", " ")
+
+                    fail
+                        r
+                        "the Zig target does not support this DivRem yet (%s)"
+                        (text.Substring(0, min 300 text.Length))
 
             lw ctx (Fable.Let(ai, a, Fable.Let(bi, b, body)))
         | ("Microsoft.FSharp.Core.Operators" | "System.Numerics.BigInteger"),
@@ -11119,8 +11165,21 @@ and dotnetCall
             pure' "std.math.pow($R, $0, $1)" [ x; y ] (mapType ctx r x.Type)
         | ("Microsoft.FSharp.Core.Operators" | "System.Math"), "Round", [ x ] ->
             pure' "fable_rt.roundEven(@as($R, $0))" [ x ] (mapType ctx r x.Type)
-        | "System.Math", "Round", [ x; digits ] when isInt digits -> pure' "fable_rt.roundTo($0, $1)" [ x; digits ] tF64
+        | "System.Math", "Round", [ x; digits ] when isInt digits ->
+            rt "fable_rt.roundTo(@as($R, $0), $1)" [ x; digits ] (mapType ctx r x.Type)
+        | "System.Math", "Round", [ x; mode ] ->
+            rt "fable_rt.roundModeOnly(@as($R, $0), @as(i32, @intCast($1)))" [ x; mode ] (mapType ctx r x.Type)
+        | "System.Math", "Round", [ x; digits; mode ] ->
+            rt "fable_rt.roundMode(@as($R, $0), $1, @as(i32, @intCast($2)))" [ x; digits; mode ] (mapType ctx r x.Type)
         | "System.Math", "Log", [ x; b ] -> pure' "fable_rt.logBase($0, $1)" [ x; b ] tF64
+        | ("System.Math" | "System.Double" | "System.Single"), ("MaxMagnitude" | "MinMagnitude"), [ a; b ] ->
+            let f =
+                if name = "MaxMagnitude" then
+                    "maxMagnitude"
+                else
+                    "minMagnitude"
+
+            pure' $"fable_rt.%s{f}(@as($R, $0), $1)" [ a; b ] (mapType ctx r a.Type)
         | "System.Math", "Clamp", [ x; lo; hi ] ->
             rt "fable_rt.clamp(@as($R, $0), $1, $2)" [ x; lo; hi ] (mapType ctx r x.Type)
         | "System.Math", ("Max" | "Min"), [ a; b ] ->
@@ -11171,7 +11230,7 @@ and dotnetCall
             let ty = mapType ctx r t
 
             if isFloatTy ty then
-                rt "fable_rt.parseFloat($R, $0)" [ x ] ty
+                rt "fable_rt.parseFloatFs($R, $0)" [ x ] ty
             elif intBits ty > 0 then
                 rt "fable_rt.parseIntFs($R, $0)" [ x ] ty
             elif t = Fable.Boolean then

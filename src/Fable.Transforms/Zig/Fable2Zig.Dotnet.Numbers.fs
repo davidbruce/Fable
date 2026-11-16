@@ -72,6 +72,8 @@ let call
       "ToDecimal",
       [ x ] ->
         match x.Type with
+        // (F#'s `decimal s` reads an exponent; Convert.ToDecimal reads as Decimal.Parse)
+        | Fable.String when entity = "System.Convert" -> rt "fable_rt.decParse($0, false)" [ x ] tDec
         | Fable.String -> rt "fable_rt.decParse($0, true)" [ x ] tDec
         | _ when isDec x -> lw ctx x
         | _ -> rt $"fable_rt.decOf(%s{typedArg ctx r x 0})" [ x ] tDec
@@ -106,6 +108,11 @@ let call
         pure' "fable_rt.decRound($0, 0, true)" [ a ] tDec
     | ("System.Math" | "System.Decimal"), "Round", [ a; digits ] when isDec a && isInt digits ->
         pure' "fable_rt.decRound($0, $1, true)" [ a; digits ] tDec
+    // (with a MidpointRounding: an enum, its number)
+    | ("System.Math" | "System.Decimal"), "Round", [ a; mode ] when isDec a && not (isInt mode) ->
+        rt "fable_rt.decRoundMode($0, 0, @as(i32, @intCast($1)))" [ a; mode ] tDec
+    | ("System.Math" | "System.Decimal"), "Round", [ a; digits; mode ] when isDec a ->
+        rt "fable_rt.decRoundMode($0, $1, @as(i32, @intCast($2)))" [ a; digits; mode ] tDec
     | ("Microsoft.FSharp.Core.Operators" | "System.Math" | "System.Decimal"), ("Floor" | "Ceiling" | "Truncate"), [ a ] when
         isDec a
         ->
@@ -153,6 +160,13 @@ let call
     | "System.Numerics.BigInteger", "get_One", [] -> pure' "fable_rt.bigOf(@as(i32, 1))" [] tBig
     | "System.Numerics.BigInteger", "get_MinusOne", [] -> pure' "fable_rt.bigOf(@as(i32, -1))" [] tBig
     | "System.Numerics.BigInteger", "Parse", [ x ] -> rt "fable_rt.bigParse($0)" [ x ] tBig
+    | "System.Numerics.BigInteger", "GreatestCommonDivisor", [ a; b ] -> pure' "fable_rt.bigGcd($0, $1)" [ a; b ] tBig
+    | "System.Numerics.BigInteger", "Log2", [ x ] -> pure' "fable_rt.bigLog2($0)" [ x ] tBig
+    | "System.Numerics.BigInteger", "GetBitLength", [ x ] -> pure' "fable_rt.bigBitLength($0)" [ x ] (TPrim "i64")
+    | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked"), "PowInteger", [ x; n ] when
+        isDec x
+        ->
+        rt "fable_rt.decPown($0, $1)" [ x; n ] tDec
     | "System.Numerics.BigInteger", "Pow", [ x; n ]
     | ("Microsoft.FSharp.Core.Operators" | "Microsoft.FSharp.Core.Operators.Checked"), "PowInteger", [ x; n ] when
         isBig x

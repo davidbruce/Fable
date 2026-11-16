@@ -930,6 +930,22 @@ let call
                 (values |> Seq.map (lw ctx) |> List.ofSeq)
                 (fun xs -> EEmit($"fable_rt.format(.{{ %s{texts} }})", xs, tStr))
     // `string x`
+    // (a whole-number format, `B`, `X` or `D`, of a float or a decimal: .NET's FormatException,
+    // when the program runs)
+    | _, "ToString", [ x; Fable.Value(Fable.StringConstant net, _) ] when
+        net.Length >= 1
+        && net.Length <= 3
+        && "BbXxDd".Contains(string net.[0])
+        && (net.Length = 1 || System.Char.IsDigit net.[1])
+        && (
+            match x.Type with
+            | Fable.Number((Float16 | Float32 | Float64 | Decimal), _) -> true
+            | _ -> false
+        )
+        ->
+        ctx.State.UsesRuntime <- true
+
+        bindArgs ctx [ lw ctx x ] (fun _ -> ERt("fable_rt.formatSpecifierInvalid($R)", [], tStr))
     // `x.ToString("N2")` of a number: one of .NET's standard formats
     | _, "ToString", [ x; Fable.Value(Fable.StringConstant net, _) ] when
         (match x.Type with

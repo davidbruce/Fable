@@ -179,6 +179,42 @@ pub fn bigAbs(a: BigInt) BigInt {
     return bigFrom(m);
 }
 
+/// `BigInteger.GreatestCommonDivisor(a, b)`: never negative
+pub fn bigGcd(a: BigInt, b: BigInt) BigInt {
+    var x = a.value.clone() catch |e| bigOom(e);
+    defer x.deinit();
+    x.abs();
+    var y = b.value.clone() catch |e| bigOom(e);
+    defer y.deinit();
+    y.abs();
+    if (x.eqlZero()) return bigFrom(y.clone() catch |e| bigOom(e));
+    if (y.eqlZero()) return bigFrom(x.clone() catch |e| bigOom(e));
+    var m = bigEmpty();
+    m.gcd(&x, &y) catch |e| bigOom(e);
+    return bigFrom(m);
+}
+
+/// `BigInteger.Log2(x)`: the whole part of the base-2 logarithm (0 for zero and below)
+pub fn bigLog2(a: BigInt) BigInt {
+    if (!a.value.isPositive() or a.value.eqlZero()) return bigOf(@as(i32, 0));
+    return bigOf(@as(i64, @intCast(a.value.bitCountAbs() - 1)));
+}
+
+/// `x.GetBitLength()`: the bits of the shortest two's complement form, without its sign bit
+pub fn bigBitLength(a: BigInt) i64 {
+    if (a.value.eqlZero()) return 0;
+    if (a.value.isPositive()) return @intCast(a.value.bitCountAbs());
+    // (-x - 1 has the bits that -x needs besides its sign)
+    var m = a.value.clone() catch |e| bigOom(e);
+    defer m.deinit();
+    m.abs();
+    var one = Big.initSet(rt.allocator, 1) catch |e| bigOom(e);
+    defer one.deinit();
+    m.sub(&m, &one) catch |e| bigOom(e);
+    if (m.eqlZero()) return 0;
+    return @intCast(m.bitCountAbs());
+}
+
 /// `BigInteger.Pow(a, n)` and `pown a n`
 pub fn bigPow(a: BigInt, n: i32) Raised!BigInt {
     if (n < 0) return raise(ArgumentOutOfRangeException, str("The number must be greater than or equal to zero. (Parameter 'exponent')"));
@@ -224,7 +260,8 @@ pub fn bigText(a: BigInt) String {
 
 /// `BigInteger.Parse s`
 pub fn bigParse(s: String) Raised!BigInt {
-    const u = trimmed(s);
+    if (s == null) return raise(rt.ArgumentNullException, str("Value cannot be null. (Parameter 'value')"));
+    const u = rt.numberText(s);
     var buf = rt.allocator.alloc(u8, u.len) catch rt.oom();
     defer rt.allocator.free(buf);
     var n: usize = 0;

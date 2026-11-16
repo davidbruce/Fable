@@ -1171,3 +1171,248 @@ let ``test DateTime constructor with DateTimeKind generates proper enum referenc
 //     checkIsomorphism <| DateTime(2014, 10, 9, 13, 23, 30, DateTimeKind.Utc)
 //     checkIsomorphism <| DateTime(2014, 10, 9, 13, 23, 30, 500)
 //     checkIsomorphism <| DateTime(2014, 10, 9, 13, 23, 30, 500, DateTimeKind.Utc)
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+open System.Globalization
+
+[<Fact>]
+let ``test Creating DateTimeOffset from DateTime and back works`` () =
+    let d = DateTime(2014, 10, 9, 13, 23, 30, DateTimeKind.Utc)
+    let dto = DateTimeOffset(d)
+    let d' = dto.DateTime
+    d' |> equal d
+
+[<Fact>]
+let ``test Formatting DateTimeOffset works`` () =
+    let d = DateTime(2014, 10, 9, 13, 23, 30, DateTimeKind.Utc)
+    let dto = DateTimeOffset(d)
+    // dto.ToString() |> equal "2014-10-09 13:23:30 +00:00"
+    dto.ToString("HH:mm:ss", CultureInfo.InvariantCulture) |> equal "13:23:30"
+
+[<Fact>]
+let ``test DateTimeOffset.UtcDateTime works`` () =
+    let timeStr = "2016-07-07T01:00:00.000Z"
+    let dtOffset = System.DateTimeOffset.Parse timeStr
+    let dt = dtOffset.UtcDateTime
+    equal 7 dt.Day
+    equal 1 dt.Hour
+    equal 0 dt.Minute
+    equal DateTimeKind.Utc dt.Kind
+
+[<Fact>]
+let ``test DateTimeOffset.LocalDateTime works`` () =
+    let timeStr = "2016-07-07T01:00:00.000Z"
+    let dtOffset = System.DateTimeOffset.Parse timeStr
+    let dt = dtOffset.LocalDateTime
+    equal DateTimeKind.Local dt.Kind
+    let dt2 = DateTime.Parse(timeStr, CultureInfo.InvariantCulture).ToLocalTime()
+    equal dt2.Day dt.Day
+    equal dt2.Hour dt.Hour
+    equal dt2.Minute dt.Minute
+
+[<Fact>]
+let ``test DateTime constructors work`` () =
+    let d1 = DateTime(2014, 10, 9)
+    let d2 = DateTime(2014, 10, 9, 13, 23, 30)
+    let d3 = DateTime(2014, 10, 9, 13, 23, 30, DateTimeKind.Utc)
+    let d4 = DateTime(2014, 10, 9, 13, 23, 30, 500)
+    let d5 = DateTime(2014, 10, 9, 13, 23, 30, 500, DateTimeKind.Utc)
+    d1.Day + d2.Second + d3.Second + d4.Millisecond + d5.Millisecond
+    |> equal 1069
+
+[<Fact>]
+let ``test DateTime.IsLeapYear works`` () =
+    DateTime.IsLeapYear(2014) |> equal false
+    DateTime.IsLeapYear(2016) |> equal true
+
+[<Fact>]
+let ``test DateTime.Parse handles AM/PM designator correctly`` () =
+    // Time-only strings parse to clock fields that are timezone-independent
+    let d = DateTime.Parse("1:05:34 PM", CultureInfo.InvariantCulture)
+    d.Hour |> equal 13
+    d.Minute |> equal 5
+    d.Second |> equal 34
+    let d = DateTime.Parse("12:05 AM", CultureInfo.InvariantCulture)
+    d.Hour |> equal 0
+    d.Minute |> equal 5
+    let d = DateTime.Parse("12:05 PM", CultureInfo.InvariantCulture)
+    d.Hour |> equal 12
+    d.Minute |> equal 5
+
+[<Fact>]
+let ``test Parsing doesn't succeed for invalid dates`` () =
+    let invalidAmericanDate = "13/1/2020"
+    let r, _date = DateTime.TryParse(invalidAmericanDate, CultureInfo.InvariantCulture, DateTimeStyles.None)
+    r |> equal false
+
+[<Fact>]
+let ``test DateTime.DayOfWeek works`` () =
+    DateTime(2014, 10, 5).DayOfWeek |> equal DayOfWeek.Sunday
+    DateTime(2014, 10, 6).DayOfWeek |> equal DayOfWeek.Monday
+    DateTime(2014, 10, 7).DayOfWeek |> equal DayOfWeek.Tuesday
+    DateTime(2014, 10, 8).DayOfWeek |> equal DayOfWeek.Wednesday
+    DateTime(2014, 10, 9).DayOfWeek |> equal DayOfWeek.Thursday
+    DateTime(2014, 10, 10).DayOfWeek |> equal DayOfWeek.Friday
+    DateTime(2014, 10, 11).DayOfWeek |> equal DayOfWeek.Saturday
+
+[<Fact>]
+let ``test DateTime.AddMonths keeps last day when delta is a multiple of 12`` () =
+    let dt = DateTime(2020, 12, 31, 0, 0, 0, DateTimeKind.Utc).AddMonths(12)
+    dt.Year |> equal 2021
+    dt.Month |> equal 12
+    dt.Day |> equal 31
+
+[<Fact>]
+let ``test DateTime.AddTicks works`` () =
+    let test v expected =
+        let dt = DateTime(2014,9,12,0,0,0,DateTimeKind.Utc).AddTicks(v)
+        dt.Ticks
+        |> equal expected
+    let ticks = 635460768000000000L
+    test 100000L (ticks + 100000L)
+    test -100000L (ticks - 100000L)
+    test 0L ticks
+
+[<Fact>]
+let ``test DateTime Comparison works`` () =
+    let test (ms: float) expected =
+        let dt1 = DateTime(2014, 10, 9, 13, 23, 30, 234, DateTimeKind.Utc)
+        let dt2 = dt1.AddMilliseconds(ms)
+        let res1 = compare dt1 dt2
+        let res2 = dt1.CompareTo(dt2)
+        let res3 = DateTime.Compare(dt1, dt2)
+        equal true (res1 = res2 && res2 = res3)
+        equal expected res1
+    test 1000. -1
+    test -1000. 1
+    test 0. 0
+
+[<Fact>]
+let ``test DateTime GreaterThan works`` () =
+    let test (ms: float) expected =
+        let dt1 = DateTime(2014, 10, 9, 13, 23, 30, 234, DateTimeKind.Utc)
+        let dt2 = dt1.AddMilliseconds(ms)
+        dt1 > dt2 |> equal expected
+    test 1000. false
+    test -1000. true
+    test 0. false
+
+[<Fact>]
+let ``test DateTime LessThan works`` () =
+    let test (ms: float) expected =
+        let dt1 = DateTime(2014, 10, 9, 13, 23, 30, 234, DateTimeKind.Utc)
+        let dt2 = dt1.AddMilliseconds(ms)
+        dt1 < dt2 |> equal expected
+    test 1000. true
+    test -1000. false
+    test 0. false
+
+[<Fact>]
+let ``test DateTime Equality works`` () =
+    let test (ms: float) expected =
+        let dt1 = DateTime(2014, 10, 9, 13, 23, 30, 234, DateTimeKind.Utc)
+        let dt2 = dt1.AddMilliseconds(ms)
+        dt1 = dt2 |> equal expected
+    test 1000. false
+    test -1000. false
+    test 0. true
+
+[<Fact>]
+let ``test DateTime Inequality works`` () =
+    let test (ms: float) expected =
+        let dt1 = DateTime(2014, 10, 9, 13, 23, 30, 234, DateTimeKind.Utc)
+        let dt2 = dt1.AddMilliseconds(ms)
+        dt1 <> dt2 |> equal expected
+    test 1000. true
+    test -1000. true
+    test 0. false
+
+[<Fact>]
+let ``test DateTime TimeOfDay works`` () =
+    let d = System.DateTime(2014, 10, 9, 13, 23, 30, 1, System.DateTimeKind.Utc)
+    let t = d.TimeOfDay
+
+    t |> equal (TimeSpan(0, 13, 23, 30, 1))
+
+[<Fact>]
+let ``test Adding days to a local date works even if daylight saving time changes`` () =
+    let dt = DateTime(2019, 10, 20, 0, 0, 0, DateTimeKind.Local)
+    dt.AddDays(9.).Day |> equal 29
+
+[<Fact>]
+let ``test Using format strings should respect local time`` () =
+    let dt = DateTime.Parse("2025-01-01T00:00:00+0100")
+    let utc = dt.ToUniversalTime()
+    let str = utc.ToString("yyyy-MM-dd HH:mm")
+
+    str |> equal "2024-12-31 23:00"
+
+[<Fact>]
+let ``test DateTime.ToString without format is consistent across kinds`` () =
+    let local = DateTime(2020, 2, 20, 20, 20, 20, DateTimeKind.Local)
+    let utc = DateTime(2020, 2, 20, 20, 20, 20, DateTimeKind.Utc)
+    local.ToString() |> equal (utc.ToString())
+
+[<Fact>]
+let ``test DateTime %A format is consistent across kinds`` () =
+    let local = DateTime(2020, 2, 20, 20, 20, 20, DateTimeKind.Local)
+    let utc = DateTime(2020, 2, 20, 20, 20, 20, DateTimeKind.Utc)
+    sprintf "%A" local |> equal (sprintf "%A" utc)
+
+[<Fact>]
+let ``test DateTime keeps sub-millisecond ticks through SpecifyKind`` () =
+    let d = DateTime(638397614451234567L, DateTimeKind.Utc)
+    DateTime.SpecifyKind(d, DateTimeKind.Local).Ticks |> equal d.Ticks
+    // SpecifyKind must not mutate the value it was handed
+    d.Kind |> equal DateTimeKind.Utc
+
+[<Fact>]
+let ``test DateTime keeps sub-millisecond ticks through time zone conversion`` () =
+    let utc = DateTime(638397614451234567L, DateTimeKind.Utc)
+    let local = DateTime(638397614451234567L, DateTimeKind.Local)
+    // The offset is a whole number of minutes, so the sub-second remainder survives
+    utc.ToLocalTime().Ticks % 10_000L |> equal 4567L
+    local.ToUniversalTime().Ticks % 10_000L |> equal 4567L
+
+[<Fact>]
+let ``test DateTime round-trip format prints all seven tick digits`` () =
+    let d = DateTime(638397614451234567L, DateTimeKind.Utc)
+    d.ToString("O", CultureInfo.InvariantCulture) |> equal "2024-01-02T03:04:05.1234567Z"
+    d.ToString("fffffff", CultureInfo.InvariantCulture) |> equal "1234567"
+    d.ToString("FFFFFFF", CultureInfo.InvariantCulture) |> equal "1234567"
+    // "F" drops trailing zeros, "f" pads them
+    DateTime(2024, 1, 2, 3, 4, 5, 60).ToString("fffff", CultureInfo.InvariantCulture) |> equal "06000"
+    DateTime(2024, 1, 2, 3, 4, 5, 60).ToString("FFFFF", CultureInfo.InvariantCulture) |> equal "06"
+
+[<Fact>]
+let ``test DateTime.Parse recovers sub-millisecond ticks`` () =
+    DateTime.Parse("2009-06-15T13:45:30.6175425", CultureInfo.InvariantCulture).Ticks % 10_000_000L
+    |> equal 6175425L
+
+[<Fact>]
+let ``test DateTime.Add* accept fractional values and are tick-precise`` () =
+    let d = DateTime(2024, 1, 2, 3, 4, 5, 6, DateTimeKind.Utc)
+    let delta (x: DateTime) = x.Ticks - d.Ticks
+    d.AddDays(1.5) |> delta |> equal 1_296_000_000_000L
+    d.AddHours(0.5) |> delta |> equal 18_000_000_000L
+    d.AddMinutes(1.0 / 3.0) |> delta |> equal 200_000_000L
+    d.AddSeconds(0.0000001) |> delta |> equal 1L
+    d.AddMilliseconds(0.5) |> delta |> equal 5_000L
+    d.AddMilliseconds(0.4) |> delta |> equal 4_000L
+    d.AddMilliseconds(1.5) |> delta |> equal 15_000L
+
+[<Fact>]
+let ``test DateTime boundary values have the exact .NET tick counts`` () =
+    DateTime.MinValue.Ticks |> equal 0L
+    DateTime.MaxValue.Ticks |> equal 3155378975999999999L
+
+[<Fact>]
+let ``test DateTime.Now is representable as a whole number of ticks`` () =
+    // Temporal clocks are nanosecond-precise; a value carrying sub-tick
+    // precision would no longer equal its own tick count round-tripped.
+    let n = DateTime.Now
+    DateTime(n.Ticks, n.Kind) |> equal n
+    let u = DateTime.UtcNow
+    DateTime(u.Ticks, u.Kind) |> equal u
+

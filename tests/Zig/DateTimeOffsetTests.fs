@@ -583,3 +583,214 @@ let ``test Implicit conversion from DateTime preserves value`` () =
     dto.UtcDateTime.Hour |> equal 13
     dto.UtcDateTime.Minute |> equal 23
     dto.UtcDateTime.Second |> equal 30
+
+// ---- ported from tests/Js/Main (2026-11-16) ----
+
+
+
+
+open System.Globalization
+
+[<Fact>]
+let ``test DateTimeOffset.ToString without separator works`` () =
+    // See #1131
+    DateTimeOffset(2017, 9, 5, 0, 0, 0, TimeSpan.Zero).ToString("yyyyMM")
+    |> equal "201709"
+
+[<Fact>]
+let ``test DateTimeOffset.ToString with numeric format is padded`` () =
+    DateTimeOffset(1, 2, 3, 4, 5, 6, TimeSpan.Zero).ToString("yyyy-MM-ddTHH:mm:ss.fffffff")
+    |> equal "0001-02-03T04:05:06.0000000"
+
+[<Fact>]
+let ``test DateTimeOffset.ToString with Roundtrip format works for Utc`` () =
+    let str = DateTimeOffset(2014, 9, 11, 16, 37, 2, TimeSpan.Zero).ToString("O")
+    System.Text.RegularExpressions.Regex.Replace(str, "0{3,}", "000")
+    |> equal "2014-09-11T16:37:02.000+00:00"
+
+[<Fact>]
+let ``test DateTimeOffset constructors with DateTime work`` () =
+    let d1 = DateTime(2014, 10, 9, 13, 23, 30, DateTimeKind.Local)
+    let d1' = DateTimeOffset(d1)
+    equal d1.Year d1'.Year
+    equal d1.Day d1'.Day
+    equal d1.Hour d1'.Hour
+    let d2 = DateTime(2014, 10, 9, 13, 23, 30, DateTimeKind.Utc)
+    let d2' = DateTimeOffset(d1)
+    equal d2.Year d2'.Year
+    equal d2.Day d2'.Day
+    equal d2.Hour d2'.Hour
+
+[<Fact>]
+let ``test DateTimeOffset.Parse works`` () =
+    let d = DateTimeOffset.Parse("9/10/2014 1:50:34 PM")
+    d.Year |> equal 2014
+    d.Month + d.Day |> equal 19
+    d.Hour |> equal 13
+    d.Minute |> equal 50
+    d.Second |> equal 34
+
+[<Fact>]
+let ``test DateTimeOffset.Parse with time-only string works`` () =
+    // See #1045
+    let d = DateTimeOffset.Parse("13:50:34")
+    d.Hour + d.Minute + d.Second |> equal 97
+    let d = DateTimeOffset.Parse("1:5:34 AM")
+    d.Hour + d.Minute + d.Second |> equal 40
+    let d = DateTimeOffset.Parse("1:5:34 PM")
+    d.Hour + d.Minute + d.Second |> equal 52
+
+[<Fact>]
+let ``test DateTimeOffset.AddMonths keeps last day when delta is a multiple of 12`` () =
+    let dt = DateTimeOffset(2020, 12, 31, 0, 0, 0, TimeSpan.Zero).AddMonths(12)
+    dt.Year |> equal 2021
+    dt.Month |> equal 12
+    dt.Day |> equal 31
+
+[<Fact>]
+let ``test DateTimeOffset.AddYears keeps offset-local wall clock`` () =
+    let dt = DateTimeOffset(2020, 1, 1, 2, 0, 0, TimeSpan.FromHours 5.).AddYears(1)
+    dt.Year |> equal 2021
+    dt.Month |> equal 1
+    dt.Day |> equal 1
+    dt.Hour |> equal 2
+    dt.Offset |> equal (TimeSpan.FromHours 5.)
+
+[<Fact>]
+let ``test DateTimeOffset TimeOfDay works`` () =
+    let d = System.DateTimeOffset(2014, 10, 9, 13, 23, 30, 1, TimeSpan.Zero)
+    let t = d.TimeOfDay
+
+    t |> equal (TimeSpan(0, 13, 23, 30, 1))
+
+[<Fact>]
+let ``test Convert to same time`` () =
+    let source = DateTimeOffset(2007, 9, 1, 9, 30, 0, TimeSpan(-5, 0, 0))
+    let target = source.ToOffset(TimeSpan(-5, 0, 0))
+
+    let expected = source
+
+    target |> equal expected
+
+[<Fact>]
+let ``test Convert to UTC (0 offset)`` () =
+    let source = DateTimeOffset(2007, 9, 1, 9, 30, 0, TimeSpan(-5, 0, 0))
+    let target = source.ToOffset(TimeSpan.Zero)
+
+    let expected = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan(0, 0, 0))
+
+    target |> equal expected
+
+[<Fact>]
+let ``test Convert to 8 hours behind UTC`` () =
+    let source = DateTimeOffset(2007, 9, 1, 9, 30, 0, TimeSpan(-5, 0, 0))
+    let target = source.ToOffset(TimeSpan(-8, 0, 0))
+
+    let expected = DateTimeOffset(2007, 9, 1, 6, 30, 0, TimeSpan(-8, 0, 0))
+
+    target |> equal expected
+
+[<Fact>]
+let ``test Convert to 3 hours ahead of UTC`` () =
+    let source = DateTimeOffset(2007, 9, 1, 9, 30, 0, TimeSpan(-5, 0, 0))
+    let target = source.ToOffset(TimeSpan(3, 0, 0))
+
+    let expected = DateTimeOffset(2007, 9, 1, 17, 30, 0, TimeSpan(3, 0, 0))
+
+    target |> equal expected
+
+[<Fact>]
+let ``test Convert to 3 hours and 30 min ahead of UTC`` () =
+    let source = DateTimeOffset(2007, 9, 1, 9, 30, 0, TimeSpan(-5, 0, 0))
+    let target = source.ToOffset(TimeSpan(3, 30, 0))
+
+    let expected = DateTimeOffset(2007, 9, 1, 18, 0, 0, TimeSpan(3, 30, 0))
+
+    target |> equal expected
+
+[<Fact>]
+let ``test UTC: Convert to 5 hours behind UTC`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    let target = source.ToOffset(TimeSpan(-5, 0, 0))
+
+    let expected = DateTimeOffset(2007, 9, 1, 9, 30, 0, TimeSpan(-5, 0, 0))
+
+    target |> equal expected
+
+[<Fact>]
+let ``test UTC: Convert to UTC (0 offset)`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    let target = source.ToOffset(TimeSpan.Zero)
+
+    let expected = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan(0, 0, 0))
+
+    target |> equal expected
+
+[<Fact>]
+let ``test UTC: Convert to 8 hours behind UTC`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    let target = source.ToOffset(TimeSpan(-8, 0, 0))
+
+    let expected = DateTimeOffset(2007, 9, 1, 6, 30, 0, TimeSpan(-8, 0, 0))
+
+    target |> equal expected
+
+[<Fact>]
+let ``test UTC: Convert to 3 hours ahead of UTC`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    let target = source.ToOffset(TimeSpan(3, 0, 0))
+
+    let expected = DateTimeOffset(2007, 9, 1, 17, 30, 0, TimeSpan(3, 0, 0))
+
+    target |> equal expected
+
+[<Fact>]
+let ``test UTC: Convert to 3 hours and 30 min ahead of UTC`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    let target = source.ToOffset(TimeSpan(3, 30, 0))
+
+    let expected = DateTimeOffset(2007, 9, 1, 18, 0, 0, TimeSpan(3, 30, 0))
+
+    target |> equal expected
+
+[<Fact>]
+let ``test 14h offset doesn't throw exception`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    source.ToOffset(TimeSpan(14, 0, 0))
+    |> ignore
+
+[<Fact>]
+let ``test -14h offset doesn't throw exception`` () =
+    let source = DateTimeOffset(2007, 9, 1, 14, 30, 0, TimeSpan.Zero)
+    source.ToOffset(TimeSpan(-14, 0, 0))
+    |> ignore
+
+[<Fact>]
+let ``test DateTimeOffset round-trip format prints all seven tick digits`` () =
+    let d = DateTimeOffset(638397614451234567L, TimeSpan.Zero)
+    d.ToString("O", CultureInfo.InvariantCulture) |> equal "2024-01-02T03:04:05.1234567+00:00"
+
+[<Fact>]
+let ``test DateTimeOffset boundary values have the exact .NET tick counts`` () =
+    DateTimeOffset.MinValue.UtcTicks |> equal 0L
+    DateTimeOffset.MaxValue.UtcTicks |> equal 3155378975999999999L
+
+[<Fact>]
+let ``test DateTimeOffset keeps sub-millisecond ticks through construction`` () =
+    let d = DateTimeOffset(638397614451234567L, TimeSpan.Zero)
+    d.Ticks % 10_000L |> equal 4567L
+    d.ToOffset(TimeSpan.FromHours 2.0).UtcTicks |> equal d.UtcTicks
+
+[<Fact>]
+let ``test DateTimeOffset.Add* accept fractional values and are tick-precise`` () =
+    let d = DateTimeOffset(2024, 1, 2, 3, 4, 5, 6, TimeSpan.Zero)
+    d.AddDays(1.5).Ticks - d.Ticks |> equal 1_296_000_000_000L
+    d.AddMilliseconds(0.5).Ticks - d.Ticks |> equal 5_000L
+
+[<Fact>]
+let ``test DateTimeOffset.Now is representable as a whole number of ticks`` () =
+    let n = DateTimeOffset.Now
+    DateTimeOffset(n.Ticks, n.Offset) |> equal n
+    let u = DateTimeOffset.UtcNow
+    DateTimeOffset(u.Ticks, u.Offset) |> equal u
+
