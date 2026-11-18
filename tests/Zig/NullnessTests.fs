@@ -204,6 +204,41 @@ let ``test Unchecked.nonNull works`` () =
 
     equal (toUpper "hello") "HELLO"
 
+type NonNullDispChain =
+    | DEnd of System.IDisposable
+    | DNext of System.IDisposable * NonNullDispChain
+
+[<Fact>]
+let ``test TRMC non-null IDisposable union fallback and mid-raise cleanup`` () =
+    let mkDisp () =
+        { new System.IDisposable with
+            member _.Dispose() = () }
+
+    let rec build failAt n =
+        if n = failAt then
+            failwith "disp-boom"
+        elif n <= 0 then
+            DEnd(mkDisp ())
+        else
+            DNext(mkDisp (), build failAt (n - 1))
+
+    let rec count acc c =
+        match c with
+        | DEnd _ -> acc + 1
+        | DNext(_, r) -> count (acc + 1) r
+
+    let ok = build -1 3
+    equal (count 0 ok) 4
+
+    let caught =
+        try
+            build 1 3 |> ignore
+            false
+        with _ ->
+            true
+
+    equal caught true
+
 #if FABLE_COMPILER && !FABLE_COMPILER_ZIG // (Python interop)
 [<Fact>]
 let ``test Nullness works for interop with undefined`` () =

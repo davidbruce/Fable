@@ -454,6 +454,9 @@ let clean (args: CliArgs) language rootDir =
         seq {
             yield! IO.Directory.GetFiles(dir, "*" + fileExt)
             yield! IO.Directory.GetFiles(dir, "*" + fileExt + ".map")
+
+            if language = Zig then
+                yield! IO.Directory.GetFiles(dir, "*.facts.json")
         }
         |> Seq.iter (fun file ->
             IO.File.Delete(file)

@@ -1,4 +1,5 @@
 *.zig
+*.facts.json
 fable_modules/
 bin/
 obj/

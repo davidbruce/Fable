@@ -80,6 +80,8 @@ type Ctx =
         CaughtExn: Var option
         /// inside an `Obj` constructor: writes to fields of `Obj` use `objInitField`
         InCtor: bool
+        /// inside a `[<NoTailCalls>]` module or member: omit `$tc` / `tcode` on lowered helpers/closures
+        NoTailCalls: bool
     }
 
 /// Something that is called by name.

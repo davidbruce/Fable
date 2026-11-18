@@ -2309,3 +2309,32 @@ let ``test Loops in async work as on .NET, with or without awaits in their body`
     |> Async.RunSynchronously
 
     k |> equal 10
+
+[<Fact>]
+let ``test MailboxProcessor<unit>, AsyncReplyChannel<unit>, and TaskCompletionSource<unit> preserve unit arguments`` () =
+    let doneTcs = System.Threading.Tasks.TaskCompletionSource<unit>()
+
+    let mbUnit =
+        MailboxProcessor<unit>.Start(fun inbox ->
+            async {
+                do! inbox.Receive()
+                doneTcs.SetResult(())
+            }
+        )
+
+    mbUnit.Post(())
+    doneTcs.Task.Result |> equal ()
+
+    let mbReply =
+        MailboxProcessor<AsyncReplyChannel<unit>>.Start(fun inbox ->
+            async {
+                let! ch = inbox.Receive()
+                ch.Reply(())
+            }
+        )
+
+    mbReply.PostAndReply(fun ch -> ch) |> equal ()
+
+    let tcsTry = System.Threading.Tasks.TaskCompletionSource<unit>()
+    tcsTry.TrySetResult(()) |> equal true
+    tcsTry.Task.Result |> equal ()

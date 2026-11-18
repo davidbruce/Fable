@@ -2,6 +2,7 @@
 */obj/
 */fable_modules/
 */*.zig
+*/*.facts.json
 */bench-zig
 */bench-zig.o
 bench-zig*

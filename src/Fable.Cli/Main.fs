@@ -521,6 +521,7 @@ type FableCompilerState =
         LiteralChanges: string list
         FilesToCompile: string[]
         FilesToCompileSet: Set<string>
+        CurrentBatchFiles: Set<string>
         FilesCompiledInCycle: Set<string>
         FilesCheckedButNotCompiled: Set<string>
         FableFilesToCompileExpectedCount: int
@@ -557,6 +558,7 @@ type FableCompilerState =
             LiteralChanges = []
             FilesToCompile = filesToCompile
             FilesToCompileSet = set filesToCompile
+            CurrentBatchFiles = set filesToCompile
             FilesCompiledInCycle = set filesToCompile
             FilesCheckedButNotCompiled = Set.empty
             FableFilesToCompileExpectedCount = filesToCompile |> Array.filter isImplementationFile |> Array.length
@@ -635,6 +637,9 @@ and FableCompiler(checker: InteractiveChecker, projCracked: ProjectCracked, fabl
                 }
 
             let fableCompile state fileName =
+                if projCracked.CliArgs.CompilerOptions.Language = Zig then
+                    Fable.Transforms.Zig.Facts.markDispatched projCracked.ProjectFile fileName
+
                 let fableProj = state.FableProj
 
                 startInThreadPool
@@ -665,6 +670,60 @@ and FableCompiler(checker: InteractiveChecker, projCracked: ProjectCracked, fabl
 
                 { state with FilesCheckedButNotCompiled = Set.add fileName state.FilesCheckedButNotCompiled }
 
+            let seedPairsOf (sourceFiles: Fable.Compiler.File[]) (pathResolver: PathResolver) =
+                sourceFiles
+                |> Array.map (fun f ->
+                    f.NormalizedFullPath, getOutPath projCracked.CliArgs pathResolver f.NormalizedFullPath
+                )
+
+            let finishOrRunFactsBatch (state: FableCompilerState) =
+                let hasFSharpErrors =
+                    state.FSharpLogs |> Array.exists (fun l -> l.Severity = Severity.Error)
+
+                if
+                    projCracked.CliArgs.CompilerOptions.Language = Zig
+                    && state.HasFSharpCompilationFinished
+                    && Set.isEmpty state.FilesCheckedButNotCompiled
+                    && not hasFSharpErrors
+                then
+                    let sourceOrder = state.SourceFiles |> Array.map (fun f -> f.NormalizedFullPath)
+                    let validImplFiles = state.FableProj.ImplementationFiles |> Map.keys |> Set.ofSeq
+
+                    let stale =
+                        Fable.Transforms.Zig.Facts.nextStaleImporters
+                            projCracked.ProjectFile
+                            state.CurrentBatchFiles
+                            sourceOrder
+                            validImplFiles
+                        |> Array.filter isImplementationFile
+
+                    if not (Array.isEmpty stale) then
+                        Log.verbose (lazy $"Zig facts changed, recompiling {stale.Length} direct importer(s)")
+
+                        Fable.Transforms.Zig.Facts.beginBatch
+                            projCracked.ProjectFile
+                            stale
+                            (seedPairsOf state.SourceFiles state.PathResolver)
+
+                        let state =
+                            { state with
+                                FilesToCompile = stale
+                                FilesToCompileSet = set stale
+                                CurrentBatchFiles = set stale
+                                FilesCompiledInCycle = Set.union state.FilesCompiledInCycle (set stale)
+                                FableFilesToCompileExpectedCount =
+                                    state.FableFilesToCompileExpectedCount + stale.Length
+                                HasFSharpCompilationFinished = true
+                            }
+
+                        (state, stale) ||> Array.fold fableCompile
+                    else
+                        FableCompiler.CheckIfCompilationIsFinished(state)
+                        state
+                else
+                    FableCompiler.CheckIfCompilationIsFinished(state)
+                    state
+
             let rec loop state =
                 async {
                     match! agent.Receive() with
@@ -682,6 +741,12 @@ and FableCompiler(checker: InteractiveChecker, projCracked: ProjectCracked, fabl
                                        getSignatureDependents,
                                        replyChannel) ->
                         activeReplyChannel.Value <- Some replyChannel
+
+                        if projCracked.CliArgs.CompilerOptions.Language = Zig then
+                            Fable.Transforms.Zig.Facts.beginBatch
+                                projCracked.ProjectFile
+                                filesToCompile
+                                (seedPairsOf sourceFiles pathResolver)
 
                         let state =
                             FableCompilerState.Create(
@@ -775,6 +840,9 @@ and FableCompiler(checker: InteractiveChecker, projCracked: ProjectCracked, fabl
                             else
                                 state
 
+                        if projCracked.CliArgs.CompilerOptions.Language = Zig then
+                            Fable.Transforms.Zig.Facts.completeUndispatched projCracked.ProjectFile
+
                         let dependents =
                             if List.isEmpty state.SignatureChanges then
                                 [||]
@@ -783,7 +851,7 @@ and FableCompiler(checker: InteractiveChecker, projCracked: ProjectCracked, fabl
                                 |> Array.filter (fun file -> not (state.FilesCompiledInCycle.Contains file))
 
                         if Array.isEmpty dependents then
-                            FableCompiler.CheckIfCompilationIsFinished(state)
+                            let state = finishOrRunFactsBatch state
                             return! loop state
                         else
                             Log.verbose (
@@ -791,12 +859,19 @@ and FableCompiler(checker: InteractiveChecker, projCracked: ProjectCracked, fabl
                                     $"""Signature changed in {String.concat ", " (state.SignatureChanges |> List.map File.relPathToCurDir)}, recompiling {dependents.Length} dependent files"""
                             )
 
+                            if projCracked.CliArgs.CompilerOptions.Language = Zig then
+                                Fable.Transforms.Zig.Facts.beginBatch
+                                    projCracked.ProjectFile
+                                    dependents
+                                    (seedPairsOf state.SourceFiles state.PathResolver)
+
                             let state =
                                 { state with
                                     SignatureChanges = []
                                     LiteralChanges = []
                                     FilesToCompile = dependents
                                     FilesToCompileSet = set dependents
+                                    CurrentBatchFiles = set dependents
                                     FilesCompiledInCycle = Set.union state.FilesCompiledInCycle (set dependents)
                                     FableFilesToCompileExpectedCount =
                                         state.FableFilesToCompileExpectedCount
@@ -872,7 +947,7 @@ and FableCompiler(checker: InteractiveChecker, projCracked: ProjectCracked, fabl
 
                                             Console.SetCursorPosition(msg.Length, Console.CursorTop)
 
-                        FableCompiler.CheckIfCompilationIsFinished(state)
+                        let state = finishOrRunFactsBatch state
                         return! loop state
                 }
 

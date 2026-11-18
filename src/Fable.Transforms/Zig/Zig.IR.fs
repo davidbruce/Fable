@@ -329,6 +329,11 @@ type Proj =
     | PItem of int
     | PSome
 
+type ArgUse =
+    | UPlain
+    | UKeep
+    | UGive
+
 type IfaceSource =
     | ISrcValue of Expr
     | ISrcCaptures of Expr list
@@ -350,6 +355,12 @@ and [<NoEquality; NoComparison>] Expr =
     /// arguments, the values it captures (they are that function's first parameters), and its
     /// type
     | EClosure of string * Ty list * Expr list * Ty
+    /// stack-allocated known lambda passed to a non-escaping HOF parameter (captures borrowed)
+    | EKnown of string * Ty list * Expr list * Ty
+    /// explicit use marker ('p' / 'k' / 'g') recorded by Perceus on a call argument
+    | EUse of ArgUse * Expr
+    /// cross-file call whose result is assumed to borrow from parameter indices `indices` (acrossAssumed)
+    | EAssumedRet of indices: int list * call: Expr
     /// a fat-pointer interface value backed by a class Obj / boxed value, captures, or upcast sub-interface
     | EIface of Ty * IfaceSource * (string * (string * Ty list)) list
     /// method call through a fat-pointer interface: `iface` (borrowed), `slot`, `args` (owned), result type
@@ -442,6 +453,22 @@ type FnInfo =
         IsLocal: bool
         IsEntryPoint: bool
         Range: SourceLocation option
+        /// parameter index -> does this function parameter never escape (eligible for callK)?
+        mutable NoEscape: bool list
+        /// second Perceus pass body for `callK`, when `NoEscape` has at least one true
+        mutable BodyK: Expr option
+        /// (stored field keys, calls callback, calls unknown external store)
+        mutable StoreFacts: string list * bool * bool
+        /// Cross-file callees whose `PRNever` Raises fact this function relied on
+        mutable AssertedNoRaise: (string * Ty list) list
+        /// Cross-file callees whose `Stores` facts this function relied on: (callee, disjoint field keys, check_ext_store)
+        mutable AssertedStores: (string * string list * bool) list
+        /// Part 3: does this function need a full `$tc` entry?
+        mutable NeedsChain: bool
+        /// Part 3: cross-file callees whose runtime `f$chain` determines whether this function needs `$tcfull`
+        mutable PendingChainDeps: string list
+        /// Part 3: second Perceus pass body for `$tcbody`, when `NeedsChain` or `PendingChainDeps` is non-empty
+        mutable BodyTc: Expr option
     }
 
 let rec typeOf (e: Expr) : Ty =
@@ -453,6 +480,7 @@ let rec typeOf (e: Expr) : Ty =
     | ECallClo(_, _, t)
     | ECallVt(_, _, _, t)
     | EClosure(_, _, _, t)
+    | EKnown(_, _, _, t)
     | EIface(t, _, _)
     | ECallIface(_, _, _, t)
     | ECon(t, _, _, _)
@@ -465,6 +493,8 @@ let rec typeOf (e: Expr) : Ty =
     | ERaise(_, t)
     | ETry(_, _, _, t)
     | EDup(_, t) -> t
+    | EUse(_, x)
+    | EAssumedRet(_, x)
     | EOnRaise(x, _) -> typeOf x
     | EExnNew _ -> tExn
     | EUnit -> tVoid
@@ -486,6 +516,7 @@ let rec typeOf (e: Expr) : Ty =
 /// be replaced in the record at any later time.
 let rec touchesMutable (e: Expr) : bool =
     match e with
+    | EUse(_, x) -> touchesMutable x
     | EGet(x, proj, _) ->
         (match proj, typeOf x with
          | PField f, TEnt(ent, _)
@@ -519,6 +550,7 @@ let flatKids (e: Expr) : Expr list =
     | EEmit(_, xs, _)
     | ERt(_, xs, _)
     | EClosure(_, _, xs, _)
+    | EKnown(_, _, xs, _)
     | EExnNew(_, xs)
     | ECon(_, _, xs, _) -> xs
     | ECallClo(f, xs, _) -> f :: xs
@@ -529,6 +561,8 @@ let flatKids (e: Expr) : Expr list =
     | ECallIface(r, _, xs, _) -> r :: xs
     | EExnTest(x, _)
     | EExnGet(x, _, _, _)
+    | EUse(_, x)
+    | EAssumedRet(_, x)
     | EOnRaise(x, _)
     | ERaise(x, _)
     | EGet(x, _, _)
@@ -546,10 +580,13 @@ let withFlatKids (e: Expr) (xs: Expr list) : Expr =
     | EEmit(m, _, t), _ -> EEmit(m, xs, t)
     | ERt(m, _, t), _ -> ERt(m, xs, t)
     | EClosure(f, tys, _, t), _ -> EClosure(f, tys, xs, t)
+    | EKnown(f, tys, _, t), _ -> EKnown(f, tys, xs, t)
     | ECon(t, c, _, tok), _ -> ECon(t, c, xs, tok)
     | EExnNew(ent, _), _ -> EExnNew(ent, xs)
     | EExnTest(_, ent), [ x ] -> EExnTest(x, ent)
     | EExnGet(_, ent, f, t), [ x ] -> EExnGet(x, ent, f, t)
+    | EUse(u, _), [ x ] -> EUse(u, x)
+    | EAssumedRet(js, _), [ x ] -> EAssumedRet(js, x)
     | EOnRaise(_, ds), [ x ] -> EOnRaise(x, ds)
     | ERaise(_, t), [ x ] -> ERaise(x, t)
     | ECallClo(_, _, t), f :: rest -> ECallClo(f, rest, t)
@@ -601,6 +638,8 @@ let rec isPure (e: Expr) =
     | EPrim(_, xs, _) -> List.forall isPure xs
     // (a function value that captures nothing is a constant; one that captures allocates)
     | EClosure(_, _, xs, _) -> xs.IsEmpty
+    | EKnown(_, _, xs, _) -> List.forall isPure xs
+    | EUse(_, x) -> isPure x
     | EIface(_, ISrcCaptures [], _) -> true
     // (a constructor that allocates a cell is not pure)
     | ECon(TEnt({ Kind = KRefRecord }, _), _, _, _) -> false
@@ -647,8 +686,9 @@ let rec exists (pred: Expr -> bool) (e: Expr) : bool =
     )
 
 /// A name for the temporary that holds the value of `e`.
-let tempName (e: Expr) =
+let rec tempName (e: Expr) =
     match e with
+    | EAssumedRet(_, call) -> tempName call
     | ECall(f, _, _, _) -> f.Substring(f.LastIndexOf '.' + 1) + "_r"
     | ECon(_, c, _, _) when c <> "" -> c.ToLowerInvariant()
     | ECon(TTuple _, _, _, _) -> "tup"
@@ -773,6 +813,9 @@ type FileState() =
     member val EntDepth = 0 with get, set
     /// 1-arg curried lifted lambda name -> companion 2-arg flat function name (sharing the same captures)
     member val Curried2 = Dictionary<string, string>()
+    /// Opt-out of `$tc` / `tcode` emission for the whole file or specific functions (`[<NoTailCalls>]`)
+    member val NoTailCallsFile = false with get, set
+    member val NoTailCalls = HashSet<string>()
 
     member this.NewVar(baseName: string, ty: Ty, kind: VarKind, isMut: bool) : Var =
         varCounter <- varCounter + 1

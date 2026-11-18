@@ -52,6 +52,9 @@ let rec private go (known: Set<int>) (e: Expr) : Expr * Set<int> =
     | ECallClo(f, xs, ty) -> same (ECallClo(sub f, subs xs, ty))
     | ECallVt(f, self, xs, ty) -> same (ECallVt(sub f, sub self, subs xs, ty))
     | EClosure(f, tys, xs, ty) -> same (EClosure(f, tys, subs xs, ty))
+    | EKnown(f, tys, xs, ty) -> same (EKnown(f, tys, subs xs, ty))
+    | EUse(u, x) -> same (EUse(u, sub x))
+    | EAssumedRet(js, call) -> same (EAssumedRet(js, sub call))
     | EIface(ty, src, slots) ->
         let src' =
             match src with

@@ -8,6 +8,7 @@ open Fable.Transforms.Zig.IR
 
 type Dest =
     | DReturn
+    | DTcRet
     | DBreak of string
     | DDiscard
 
@@ -38,9 +39,25 @@ type Adapter =
         FnTy: Ty
         /// when true, `a0` is borrowed by the caller (used for class vtable and `ToString` adapters)
         BorrowFirst: bool
+        /// true if any live function-value or vtable site references this adapter's `tcode`
+        mutable NeedsTcode: bool
         /// the type parameters of the surrounding function that the types above mention: the
         /// adapter is generic in them
         Gens: string list
+    }
+
+/// A stack-allocated known lambda passed to a non-escaping `callK` HOF parameter.
+type KnownDecl =
+    {
+        Name: string
+        Target: string
+        Target2: string option
+        TypeArgs: Ty list
+        NCaptures: int
+        CaptureTys: Ty list
+        FnTy: Ty
+        Gens: string list
+        mutable NeedsToFunc: bool
     }
 
 type IfaceVtKind =
@@ -63,6 +80,10 @@ type SccInfo =
     {
         StateTypeName: string
         TagOf: Map<string, string>
+        /// tail recursion modulo cons inside a fused mutual-recursion state machine
+        Trmc: bool
+        /// empty-case / nullOf plug when an exception leaves the SCC mid-construction
+        Plug: string option
     }
 
 type Em =
@@ -84,8 +105,20 @@ type Em =
         TryLabels: Stack<string>
         /// the code of the function values made so far
         Adapters: Dictionary<string, Adapter>
+        /// stack-allocated known lambda descriptors made so far
+        Knowns: Dictionary<string, KnownDecl>
         /// static vtables of fat-pointer interfaces built so far
         IfaceVts: Dictionary<string, IfaceVt>
+        /// parameter IDs of this `callK` clone that have type `anytype`
+        KParams: Set<int>
+        /// true when emitting the body of a `$tcbody` entry point (`DTcRet` convention)
+        IsTc: bool
+        /// module aliases of imported F# files (`state.Imports.Values`)
+        FableAliases: HashSet<string>
+        /// same-file functions emitted without `$tc` / `$chain`
+        NoTcFns: HashSet<string>
+        /// functions explicitly opted out via `[<NoTailCalls>]` (or file-level `NoTailCallsFile`)
+        NoTailCalls: HashSet<string>
         mutable Counter: int
     }
 
@@ -155,6 +188,47 @@ let sigName (f: string) =
     | -1 -> $"@\"%s{topIdent f}$sig\""
     | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$sig\""
 
+/// The constant that states which parameters of a public function do not escape (`callK`).
+let noEscapeName (f: string) =
+    match f.IndexOf '.' with
+    | -1 -> $"@\"%s{topIdent f}$noescape\""
+    | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$noescape\""
+
+/// The constant that publishes a public function's field-sensitive store summary (`$stores`).
+let storesName (f: string) =
+    match f.IndexOf '.' with
+    | -1 -> $"@\"%s{topIdent f}$stores\""
+    | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$stores\""
+
+/// The constant that publishes whether a public function actually needs the tail-call chain (`$chain`).
+let chainName (f: string) =
+    match f.IndexOf '.' with
+    | -1 -> $"@\"%s{topIdent f}$chain\""
+    | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$chain\""
+
+/// Comptime check for whether a cross-file function publishes `$chain == true`.
+let extChainCheck (extF: string) =
+    match extF.IndexOf '.' with
+    | -1 -> chainName extF
+    | i ->
+        let m = extF.Substring(0, i)
+        let f = topIdent (extF.Substring(i + 1))
+        $"(@hasDecl(%s{m}, \"%s{f}$chain\") and %s{m}.@\"%s{f}$chain\")"
+
+let fnHasTcBody (fn: FnInfo) =
+    fn.NeedsChain || not fn.PendingChainDeps.IsEmpty
+
+let fnChainConstExpr (fn: FnInfo) =
+    if fn.NeedsChain then
+        "true"
+    elif fn.PendingChainDeps.IsEmpty then
+        "false"
+    else
+        fn.PendingChainDeps
+        |> List.distinct
+        |> List.map extChainCheck
+        |> String.concat " or "
+
 /// A function with its type arguments: a generic function is a Zig function from types to a
 /// namespace that holds the function itself, as `call`.
 let fnRef (f: string) (typeArgs: Ty list) =
@@ -166,11 +240,52 @@ let fnRef (f: string) (typeArgs: Ty list) =
         |> String.concat ", "
         |> sprintf "%s(%s).call" (callTarget f)
 
+let kRef (f: string) (typeArgs: Ty list) =
+    match typeArgs with
+    | [] ->
+        match f.IndexOf '.' with
+        | -1 -> $"@\"%s{topIdent f}$k\""
+        | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$k\""
+    | _ ->
+        typeArgs
+        |> List.map zigType
+        |> String.concat ", "
+        |> sprintf "%s(%s).callK" (callTarget f)
+
+let fnRefTc (f: string) (typeArgs: Ty list) =
+    match typeArgs with
+    | [] ->
+        match f.IndexOf '.' with
+        | -1 -> $"@\"%s{topIdent f}$tc\""
+        | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$tc\""
+    | _ ->
+        typeArgs
+        |> List.map zigType
+        |> String.concat ", "
+        |> sprintf "%s(%s).tc" (callTarget f)
+
+let fnTcBodyRef (f: string) (typeArgs: Ty list) =
+    match typeArgs with
+    | [] ->
+        match f.IndexOf '.' with
+        | -1 -> $"@\"%s{topIdent f}$tcbody\""
+        | i -> f.Substring(0, i + 1) + $"@\"%s{topIdent (f.Substring(i + 1))}$tcbody\""
+    | _ ->
+        typeArgs
+        |> List.map zigType
+        |> String.concat ", "
+        |> sprintf "%s(%s).tcbody" (callTarget f)
+
 /// The namespace of an adapter, where it is used.
 let adapterRef (a: Adapter) =
     match a.Gens with
     | [] -> a.Name
     | gens -> gens |> List.map genName |> String.concat ", " |> sprintf "%s(%s)" a.Name
+
+let knownRef (k: KnownDecl) =
+    match k.Gens with
+    | [] -> k.Name
+    | gens -> gens |> List.map genName |> String.concat ", " |> sprintf "%s(%s)" k.Name
 
 /// The static vtable of an interface made of a source of a kind with these slots (one per
 /// distinct interface, source and slots in the file)
@@ -262,14 +377,55 @@ let projAccess (t: Ty) (case: string) (field: string) (x: string) =
     | TEnt(e, _) when e.Kind = KRecord -> $"%s{x}.%s{fieldIdent field}"
     | _ -> $"%s{x}.%s{fieldIdent case}.%s{fieldIdent field}"
 
-/// Format a cross-file call concisely using `fable_rt.callM`/`callG` or `xcallM`/`xcallG`/`xcallPlain`.
-let rec private formatCrossCall
+/// Get or register a stack-allocated `KnownDecl` descriptor for a known closure expression.
+let rec private ensureKnownDecl (em: Em) (target: string) (typeArgs: Ty list) (caps: Expr list) (ty: Ty) : KnownDecl =
+    let target2 = resolveCurried2 em target typeArgs caps.Length ty
+    let capTys = caps |> List.map typeOf
+
+    let key =
+        "kn:"
+        + target
+        + "<"
+        + (typeArgs |> List.map tyKey |> String.concat ",")
+        + ">:"
+        + (capTys |> List.map tyKey |> String.concat ",")
+        + "->"
+        + tyKey ty
+        + (
+            match target2 with
+            | Some t2 -> "#2:" + t2
+            | None -> ""
+        )
+
+    match em.Knowns.TryGetValue key with
+    | true, k -> k
+    | _ ->
+        let k =
+            {
+                Name = $"@\"%s{cleanIdent target}$kn%d{em.Knowns.Count}\""
+                Target = target
+                Target2 = target2
+                TypeArgs = typeArgs
+                NCaptures = caps.Length
+                CaptureTys = capTys
+                FnTy = ty
+                Gens = freeGens (ty :: typeArgs @ capTys)
+                NeedsToFunc = false
+            }
+
+        em.Knowns[key] <- k
+        k
+
+/// Format a cross-file call concisely using `fable_rt.callM`/`callG`, `callHof*`, `callAssumed*`,
+/// or their `xcall*` / `xcallPlain` raising wrappers.
+and private formatCrossCall
     (em: Em)
     (f: string)
     (typeArgs: Ty list)
     (xs: Expr list)
     (t: Ty)
     (ds: Var list option)
+    (assumedFrom: int list option)
     : string option
     =
     let dot = f.IndexOf '.'
@@ -287,76 +443,81 @@ let rec private formatCrossCall
             | Some vs -> vs |> List.map (vname em) |> String.concat ", " |> sprintf ".{ %s }"
 
         if isManaged t || xs |> List.exists (typeOf >> isManaged) then
-            let usesChars =
+            let mutable hasKnown = false
+
+            let usesChars, args =
                 xs
                 |> List.map (fun x ->
-                    if not (isManaged (typeOf x)) then
-                        'p'
-                    else
-                        match x with
-                        | EDup(inner, _) when not (touchesMutable inner) -> 'k'
-                        | _ -> 'g'
-                )
-                |> Array.ofList
+                    match x with
+                    | EKnown(target, kTys, caps, cloTy) ->
+                        hasKnown <- true
+                        let kn = ensureKnownDecl em target kTys caps cloTy
+                        kn.NeedsToFunc <- true
+                        'g', ex em x
+                    | _ ->
+                        if hasKnownOrKArg em.KParams x then
+                            hasKnown <- true
 
-            let usesStr = System.String(usesChars)
-
-            let args =
-                xs
-                |> List.map (fun x ->
-                    if not (isManaged (typeOf x)) then
-                        ex em x
-                    else
                         match x with
-                        | EDup(inner, _) when not (touchesMutable inner) -> ex em inner
-                        | _ -> ex em x
+                        | EUse(UPlain, inner) -> 'p', ex em inner
+                        | EUse(UKeep, inner) -> 'k', ex em inner
+                        | EUse(UGive, inner) -> 'g', ex em inner
+                        | _ ->
+                            let u =
+                                if isManaged (typeOf x) then
+                                    'g'
+                                else
+                                    'p'
+
+                            u, ex em x
                 )
+                |> List.unzip
+
+            let usesStr = System.String(Array.ofList usesChars)
 
             let argsTuple =
                 match args with
                 | [] -> ".{}"
                 | _ -> args |> String.concat ", " |> sprintf ".{ %s }"
 
+            let assumedArg =
+                match assumedFrom with
+                | None -> ""
+                | Some [] -> ".{}, "
+                | Some js ->
+                    js
+                    |> List.sort
+                    |> List.map string<int>
+                    |> String.concat ", "
+                    |> sprintf ".{ %s }, "
+
+            let callMName, callGName, xcallMName, xcallGName =
+                if hasKnown && assumedFrom.IsSome then
+                    "callHofAssumedM", "callHofAssumedG", "xcallHofAssumedM", "xcallHofAssumedG"
+                elif hasKnown then
+                    "callHofM", "callHofG", "xcallHofM", "xcallHofG"
+                elif assumedFrom.IsSome then
+                    "callAssumedM", "callAssumedG", "xcallAssumedM", "xcallAssumedG"
+                else
+                    "callM", "callG", "xcallM", "xcallG"
+
+            let mkCall (mFn: string) (gFn: string) (dropsText: string) =
+                if typeArgs.IsEmpty then
+                    $"fable_rt.%s{mFn}(%s{modAlias}, \"%s{memberName}\", %s{assumedArg}\"%s{usesStr}\", %s{argsTuple}, %s{dropsText})"
+                else
+                    let gns =
+                        typeArgs
+                        |> List.map zigType
+                        |> String.concat ", "
+                        |> sprintf "%s.%s(%s)" modAlias memberName
+
+                    $"fable_rt.%s{gFn}(%s{gns}, %s{assumedArg}\"%s{usesStr}\", %s{argsTuple}, %s{dropsText})"
+
             match ds with
             | Some _ when canPlainTry em && em.Self.Raises = RAlways ->
-                if typeArgs.IsEmpty then
-                    Some
-                        $"(try fable_rt.xcallM(%s{modAlias}, \"%s{memberName}\", \"%s{usesStr}\", %s{argsTuple}, %s{errDrops}))"
-                else
-                    let gns =
-                        typeArgs
-                        |> List.map zigType
-                        |> String.concat ", "
-                        |> sprintf "%s.%s(%s)" modAlias memberName
-
-                    Some $"(try fable_rt.xcallG(%s{gns}, \"%s{usesStr}\", %s{argsTuple}, %s{errDrops}))"
-            | Some _ when canPlainTry em ->
-                let c =
-                    if typeArgs.IsEmpty then
-                        $"fable_rt.callM(%s{modAlias}, \"%s{memberName}\", \"%s{usesStr}\", %s{argsTuple}, %s{errDrops})"
-                    else
-                        let gns =
-                            typeArgs
-                            |> List.map zigType
-                            |> String.concat ", "
-                            |> sprintf "%s.%s(%s)" modAlias memberName
-
-                        $"fable_rt.callG(%s{gns}, \"%s{usesStr}\", %s{argsTuple}, %s{errDrops})"
-
-                // (whether it raises is known only when the Zig is compiled: `lift` makes an
-                // error union of what does not, of no errors, which `try` lets through)
-                Some $"(try fable_rt.lift(%s{c}))"
-            | _ ->
-                if typeArgs.IsEmpty then
-                    Some $"fable_rt.callM(%s{modAlias}, \"%s{memberName}\", \"%s{usesStr}\", %s{argsTuple}, .{{}})"
-                else
-                    let gns =
-                        typeArgs
-                        |> List.map zigType
-                        |> String.concat ", "
-                        |> sprintf "%s.%s(%s)" modAlias memberName
-
-                    Some $"fable_rt.callG(%s{gns}, \"%s{usesStr}\", %s{argsTuple}, .{{}})"
+                Some $"(try %s{mkCall xcallMName xcallGName errDrops})"
+            | Some _ when canPlainTry em -> Some $"(try fable_rt.lift(%s{mkCall callMName callGName errDrops}))"
+            | _ -> Some(mkCall callMName callGName ".{}")
         else
             match ds with
             | Some _ when canPlainTry em && em.Self.Raises = RAlways ->
@@ -374,12 +535,123 @@ and canPlainTry (em: Em) =
                } -> false
         | _ -> true
     )
+    && (
+        match em.Scc with
+        | Some {
+                   Trmc = true
+                   Plug = Some _
+               } -> false
+        | _ -> true
+    )
+
+and private hasKnownOrKArg (kParams: Set<int>) (e: Expr) =
+    match e with
+    | EKnown _ -> true
+    | EVar v -> kParams.Contains v.Id
+    | EUse(_, x) -> hasKnownOrKArg kParams x
+    | _ -> false
+
+and private extractUses (em: Em) (xs: Expr list) : string * string =
+    let usesChars, argTexts =
+        xs
+        |> List.map (fun x ->
+            match x with
+            | EUse(UPlain, inner) -> 'p', ex em inner
+            | EUse(UKeep, inner) -> 'k', ex em inner
+            | EUse(UGive, inner) -> 'g', ex em inner
+            | _ ->
+                let u =
+                    if isManaged (typeOf x) then
+                        'g'
+                    else
+                        'p'
+
+                u, ex em x
+        )
+        |> List.unzip
+
+    let usesStr = System.String(Array.ofList usesChars)
+
+    let argsTuple =
+        match argTexts with
+        | [] -> ".{}"
+        | _ -> argTexts |> String.concat ", " |> sprintf ".{ %s }"
+
+    usesStr, argsTuple
+
+and private resolveCurried2 (em: Em) (target: string) (typeArgs: Ty list) (nCaps: int) (ty: Ty) : string option =
+    match ty with
+    | TFn([ tyA ], TFn([ tyB ], tyR)) ->
+        match em.Curried2.TryGetValue target with
+        | true, t2 ->
+            match em.Fns.TryGetValue t2 with
+            | true, fn2 when fn2.Params.Length = nCaps + 2 ->
+                let inst =
+                    if fn2.TypeParams.Length = typeArgs.Length then
+                        Map.ofList (List.zip fn2.TypeParams typeArgs)
+                    else
+                        Map.empty
+
+                let rest2 = List.skip nCaps fn2.Params
+
+                if
+                    zigType (substTy inst rest2[0].Ty) = zigType tyA
+                    && zigType (substTy inst rest2[1].Ty) = zigType tyB
+                    && zigType (substTy inst fn2.Ret) = zigType tyR
+                then
+                    Some t2
+                else
+                    None
+            | _ -> None
+        | _ -> None
+    | _ -> None
+
+and private adapterForClosure
+    (adapters: Dictionary<string, Adapter>)
+    (target: string)
+    (target2: string option)
+    (typeArgs: Ty list)
+    (capTys: Ty list)
+    (ty: Ty)
+    : Adapter
+    =
+    let key =
+        target
+        + "<"
+        + (typeArgs |> List.map tyKey |> String.concat ",")
+        + ">"
+        + (
+            match target2 with
+            | Some t2 -> "#2:" + t2
+            | None -> ""
+        )
+
+    match adapters.TryGetValue key with
+    | true, a -> a
+    | _ ->
+        let a =
+            {
+                Name = $"@\"%s{target}$fn%d{adapters.Count}\""
+                Target = target
+                Target2 = target2
+                TypeArgs = typeArgs
+                NCaptures = capTys.Length
+                CaptureTys = capTys
+                FnTy = ty
+                BorrowFirst = false
+                NeedsTcode = false
+                Gens = freeGens (ty :: typeArgs @ capTys)
+            }
+
+        adapters[key] <- a
+        a
 
 and ex (em: Em) (e: Expr) : string =
     match e with
     | EVar v -> vname em v
     | ELit(s, _) -> s
     | EUnit -> "{}"
+    | EUse(_, x) -> ex em x
     | EPrim(op, xs, t) ->
         // (an operation of literals only would be computed by Zig without bounds, as
         // comptime_int: the first is given its type, so that it wraps as on .NET)
@@ -480,11 +752,26 @@ and ex (em: Em) (e: Expr) : string =
         | "conv", [ x ] -> $"fable_rt.conv(%s{zigType t}, @as(%s{zigType argT}, %s{x}))"
         | _ -> fail None "internal: unknown primitive %s/%d" op a.Length
     | ECall(f, typeArgs, xs, t) ->
-        match formatCrossCall em f typeArgs xs t None with
+        match formatCrossCall em f typeArgs xs t None None with
         | Some txt -> txt
         | None ->
             let args = xs |> List.map (ex em) |> String.concat ", "
-            $"%s{fnRef f typeArgs}(%s{args})"
+
+            let callee =
+                if xs |> List.exists (hasKnownOrKArg em.KParams) then
+                    kRef f typeArgs
+                else
+                    fnRef f typeArgs
+
+            $"%s{callee}(%s{args})"
+    | EAssumedRet(js, ECall(f, typeArgs, xs, t)) ->
+        match formatCrossCall em f typeArgs xs t None (Some js) with
+        | Some txt -> txt
+        | None -> ex em (ECall(f, typeArgs, xs, t))
+    | EAssumedRet(_, call) -> ex em call
+    | ECallClo(EVar v, xs, resTy) when em.KParams.Contains v.Id ->
+        let usesStr, argsTuple = extractUses em xs
+        $"fable_rt.invokeK(%s{zigType resTy}, %s{vname em v}, \"%s{usesStr}\", %s{argsTuple}, .{{}})"
     | ECallClo(f, xs, resTy) ->
         let fn = ex em f
 
@@ -542,82 +829,76 @@ and ex (em: Em) (e: Expr) : string =
             $"fable_rt.ifaceClosure(%s{zigType ifaceTy}, %s{ns}.Env, .{{ %s{inits} }}, &%s{ns}.vt)"
         | ISrcUpcast sub ->
             $"fable_rt.ifaceBox(%s{zigType ifaceTy}, %s{zigType (typeOf sub)}, %s{ex em sub}, &%s{ns}.vt)"
-    | EClosure(target, typeArgs, caps, ty) ->
-        let target2 =
-            match ty with
-            | TFn([ tyA ], TFn([ tyB ], tyR)) ->
-                match em.Curried2.TryGetValue target with
-                | true, t2 ->
-                    match em.Fns.TryGetValue t2 with
-                    | true, fn2 when fn2.Params.Length = caps.Length + 2 ->
-                        let inst =
-                            if fn2.TypeParams.Length = typeArgs.Length then
-                                Map.ofList (List.zip fn2.TypeParams typeArgs)
-                            else
-                                Map.empty
+    | EKnown(target, typeArgs, caps, ty) ->
+        let kn = ensureKnownDecl em target typeArgs caps ty
+        let ns = knownRef kn
 
-                        let rest2 = List.skip caps.Length fn2.Params
-
-                        if
-                            zigType (substTy inst rest2[0].Ty) = zigType tyA
-                            && zigType (substTy inst rest2[1].Ty) = zigType tyB
-                            && zigType (substTy inst fn2.Ret) = zigType tyR
-                        then
-                            Some t2
-                        else
-                            None
-                    | _ -> None
-                | _ -> None
-            | _ -> None
-
-        let key =
-            target
-            + "<"
-            + (typeArgs |> List.map tyKey |> String.concat ",")
-            + ">"
-            + (
-                match target2 with
-                | Some t2 -> "#2:" + t2
-                | None -> ""
-            )
-
-        let adapter =
-            match em.Adapters.TryGetValue key with
-            | true, a -> a
-            | _ ->
-                let a =
-                    {
-                        Name = $"@\"%s{target}$fn%d{em.Adapters.Count}\""
-                        Target = target
-                        Target2 = target2
-                        TypeArgs = typeArgs
-                        NCaptures = caps.Length
-                        CaptureTys = caps |> List.map typeOf
-                        FnTy = ty
-                        BorrowFirst = false
-                        Gens = freeGens (ty :: typeArgs @ (caps |> List.map typeOf))
-                    }
-
-                em.Adapters[key] <- a
-                a
-
-        let ns = adapterRef adapter
-
-        if adapter.Target2.IsSome then
-            if caps.IsEmpty then
-                $"%s{zigType ty}{{ .env = null, .code = %s{ns}.code, .code2 = %s{ns}.code2 }}"
-            else
-                let inits =
-                    caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
-
-                $"fable_rt.closure2(%s{zigType ty}, %s{ns}.Env, .{{ %s{inits} }}, %s{ns}.code, %s{ns}.code2)"
-        elif caps.IsEmpty then
-            $"%s{zigType ty}{{ .env = null, .code = %s{ns}.code }}"
+        if caps.IsEmpty then
+            $"%s{ns}{{}}"
         else
             let inits =
                 caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
 
-            $"fable_rt.closure(%s{zigType ty}, %s{ns}.Env, .{{ %s{inits} }}, %s{ns}.code)"
+            $"%s{ns}{{ .caps = .{{ %s{inits} }} }}"
+    | EClosure(target, typeArgs, caps, ty) ->
+        let target2 = resolveCurried2 em target typeArgs caps.Length ty
+
+        let adapter =
+            adapterForClosure em.Adapters target target2 typeArgs (caps |> List.map typeOf) ty
+
+        let ns = adapterRef adapter
+
+        let suppressTcode =
+            em.NoTailCalls.Contains em.Self.Name || em.NoTailCalls.Contains target
+
+        if suppressTcode then
+            if adapter.Target2.IsSome then
+                if caps.IsEmpty then
+                    $"%s{zigType ty}{{ .env = null, .code = %s{ns}.code, .code2 = %s{ns}.code2 }}"
+                else
+                    let inits =
+                        caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
+
+                    $"fable_rt.closure2(%s{zigType ty}, %s{ns}.Env, .{{ %s{inits} }}, %s{ns}.code, %s{ns}.code2)"
+            elif caps.IsEmpty then
+                $"%s{zigType ty}{{ .env = null, .code = %s{ns}.code }}"
+            else
+                let inits =
+                    caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
+
+                $"fable_rt.closure(%s{zigType ty}, %s{ns}.Env, .{{ %s{inits} }}, %s{ns}.code)"
+        else
+            adapter.NeedsTcode <- true
+
+            let paramTysStr =
+                match ty with
+                | TFn(argTys, _) -> argTys |> List.map zigType |> String.concat ", "
+                | _ -> ""
+
+            let tcodeExpr =
+                $"if (comptime fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})) &%s{ns}.tcode else null"
+
+            if adapter.Target2.IsSome then
+                let tcode2Expr =
+                    match ty with
+                    | TFn([ tyA ], TFn([ tyB ], _)) ->
+                        $"if (comptime fable_rt.fitsTailArgs(&.{{ %s{zigType tyA}, %s{zigType tyB} }})) &%s{ns}.tcode2 else null"
+                    | _ -> "null"
+
+                if caps.IsEmpty then
+                    $"%s{zigType ty}{{ .env = null, .code = %s{ns}.code, .code2 = %s{ns}.code2, .tcode = %s{tcodeExpr}, .tcode2 = %s{tcode2Expr} }}"
+                else
+                    let inits =
+                        caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
+
+                    $"fable_rt.closure2Tc(%s{zigType ty}, %s{ns}.Env, .{{ %s{inits} }}, %s{ns}.code, %s{ns}.code2, %s{tcodeExpr}, %s{tcode2Expr})"
+            elif caps.IsEmpty then
+                $"%s{zigType ty}{{ .env = null, .code = %s{ns}.code, .tcode = %s{tcodeExpr} }}"
+            else
+                let inits =
+                    caps |> List.mapi (fun i c -> $".c%d{i} = %s{ex em c}") |> String.concat ", "
+
+                $"fable_rt.closureTc(%s{zigType ty}, %s{ns}.Env, .{{ %s{inits} }}, %s{ns}.code, %s{tcodeExpr})"
     | EExnNew(ent, xs) ->
         let fields = caseFields (TEnt(ent, [])) ""
 
@@ -644,8 +925,28 @@ and ex (em: Em) (e: Expr) : string =
     // leaves, to the handler of the enclosing `try` or to its own caller.
     | EOnRaise(call, ds) ->
         match call with
+        | ECallClo(EVar v, xs, resTy) when em.KParams.Contains v.Id ->
+            let usesStr, argsTuple = extractUses em xs
+
+            if canPlainTry em && em.Self.Raises = RAlways then
+                let errDrops =
+                    match ds with
+                    | [] -> ".{}"
+                    | vs -> vs |> List.map (vname em) |> String.concat ", " |> sprintf ".{ %s }"
+
+                $"(try fable_rt.invokeK(%s{zigType resTy}, %s{vname em v}, \"%s{usesStr}\", %s{argsTuple}, %s{errDrops}))"
+            else
+                let edge = edgeText em ds
+                $"(fable_rt.invokeK(%s{zigType resTy}, %s{vname em v}, \"%s{usesStr}\", %s{argsTuple}, .{{}}) catch %s{edge})"
         | ECall(f, typeArgs, xs, t) when f.Contains "." && canPlainTry em ->
-            match formatCrossCall em f typeArgs xs t (Some ds) with
+            match formatCrossCall em f typeArgs xs t (Some ds) None with
+            | Some txt -> txt
+            | None ->
+                let c = ex em call
+                let edge = edgeText em ds
+                $"(fable_rt.lift(%s{c}) catch %s{edge})"
+        | EAssumedRet(js, ECall(f, typeArgs, xs, t)) when f.Contains "." && canPlainTry em ->
+            match formatCrossCall em f typeArgs xs t (Some ds) (Some js) with
             | Some txt -> txt
             | None ->
                 let c = ex em call
@@ -789,8 +1090,14 @@ and leaveText (em: Em) : string =
     if em.TryLabels.Count > 0 then
         $"break :%s{em.TryLabels.Peek()};"
     else
-        match em.Loop with
+        match em.Loop, em.Scc with
         | Some {
+                   Trmc = true
+                   Plug = Some plug
+               },
+          _
+        | _,
+          Some {
                    Trmc = true
                    Plug = Some plug
                } -> $"hole.* = %s{plug}; fable_rt.drop(result); return error.Raised;"
@@ -860,15 +1167,15 @@ let private countUses (id: int) (es: Expr list) =
     List.iter go es
     n
 
-/// `let r = self(args) in Case(..., r, ...)` at the end of a function: the cell is made first,
-/// with a hole where `r` goes, and the recursive call becomes the next turn of a loop that
-/// fills the hole.
-let trmcSite (self: string) (e: Expr) =
+/// `let r = target(args) in Case(..., r, ...)` at the end of a function or SCC arm:
+/// the cell is made first with a hole where `r` goes, and the call becomes the next turn of the
+/// loop that fills the hole.
+let trmcSiteOf (isTarget: string -> bool) (e: Expr) =
     match e with
     // (a recursive call that may raise needs no error edge of its own once it is the next
     // turn of the loop)
-    | ELet(r, (ECall(f, _, args, _) | EOnRaise(ECall(f, _, args, _), _)), ECon(conTy, case, conArgs, tok)) when
-        f = self && isHeapTy conTy && not conArgs.IsEmpty
+    | ELet(r, (ECall(f, tArgs, args, _) | EOnRaise(ECall(f, tArgs, args, _), _)), ECon(conTy, case, conArgs, tok)) when
+        isTarget f && isHeapTy conTy && not conArgs.IsEmpty
         ->
         let hits =
             conArgs
@@ -880,13 +1187,18 @@ let trmcSite (self: string) (e: Expr) =
             )
 
         match hits with
-        | [ (i, _) ] when countUses r.Id conArgs = 1 -> Some(args, conTy, case, conArgs, tok, i)
+        | [ (i, _) ] when countUses r.Id conArgs = 1 -> Some(f, tArgs, args, conTy, case, conArgs, tok, i)
         | _ -> None
     | _ -> None
+
+let trmcSite (self: string) (e: Expr) =
+    trmcSiteOf ((=) self) e
+    |> Option.map (fun (_, _, args, conTy, case, conArgs, tok, i) -> args, conTy, case, conArgs, tok, i)
 
 /// After a statement that has no value: leave through `dest` if that is where control goes.
 let finishUnit (em: Em) (ind: string) (dest: Dest) =
     match dest with
+    | DTcRet -> line em ind "return .{};"
     | DReturn when em.Loop.IsSome || em.Scc.IsSome -> line em ind "return;"
     | DBreak l -> line em ind $"break :%s{l} {{}};"
     | DReturn
@@ -1002,7 +1314,1016 @@ let rec alwaysRaises (e: Expr) : bool =
     | EIf(_, t, f, _) -> alwaysRaises t && alwaysRaises f
     | _ -> false
 
-let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
+let rec private peelDropSpine (targetVarId: int option) (e: Expr) : Var list option =
+    match e with
+    | EDrop(d, rest) -> peelDropSpine targetVarId rest |> Option.map (fun ds -> d :: ds)
+    | EVar v when targetVarId = Some v.Id -> Some []
+    | EUnit when targetVarId.IsNone -> Some []
+    | _ -> None
+
+let private peelTailCall (e: Expr) : (Expr * Var list) option =
+    match e with
+    | ELet(tmp, inner, body) -> peelDropSpine (Some tmp.Id) body |> Option.map (fun ds -> inner, ds)
+    | ESeq(inner, body) when isVoid (typeOf inner) -> peelDropSpine None body |> Option.map (fun ds -> inner, ds)
+    | _ -> Some(e, [])
+
+let rec private unwrapTailCallInfo (e: Expr) : Expr * int list option * bool =
+    match e with
+    | EDup(x, _) ->
+        let inner, assumed, _ = unwrapTailCallInfo x
+        inner, assumed, true
+    | EOnRaise(x, _) -> unwrapTailCallInfo x
+    | EAssumedRet(js, x) ->
+        let inner, prev, hadDup = unwrapTailCallInfo x
+
+        inner,
+        (if prev.IsSome then
+             prev
+         else
+             Some js),
+        hadDup
+    | _ -> e, None, false
+
+let private emitArgAsTcVal (em: Em) (x: Expr) : string =
+    match x with
+    | EKnown(target, kTys, caps, cloTy)
+    | EUse(_, EKnown(target, kTys, caps, cloTy)) ->
+        let kn = ensureKnownDecl em target kTys caps cloTy
+        kn.NeedsToFunc <- true
+        $"(%s{ex em x}).toFunc()"
+    | _ -> ex em x
+
+let private isSameFileTcTarget (em: Em) (inTrmc: bool) (g: string) (typeArgs: Ty list) (argCount: int) =
+    match em.Fns.TryGetValue g with
+    | true, gFn ->
+        not (em.NoTcFns.Contains g)
+        && fnHasTcBody gFn
+        && argCount = gFn.Params.Length
+        && (inTrmc
+            || (not (em.Loop.IsSome && g = em.Loop.Value.Self)
+                && not (
+                    em.Scc.IsSome
+                    && em.Scc.Value.TagOf.ContainsKey g
+                    && typeArgs = (em.Self.TypeParams |> List.map TGen)
+                )))
+    | _ -> false
+
+let private isExtTcAlias (aliases: HashSet<string>) (fns: Dictionary<string, FnInfo>) (f: string) =
+    if fns.ContainsKey f then
+        false
+    else
+        let dot = f.IndexOf '.'
+        dot > 0 && aliases.Contains(f.Substring(0, dot))
+
+type private TrmcTailInfo =
+    {
+        RetVar: Var
+        InnerCall: Expr
+        CallDrops: Var list
+        MidDrops: Var list
+        PostDrops: Var list
+        ConTy: Ty
+        Case: string
+        ConArgs: Expr list
+        Tok: Var option
+        HoleIdx: int
+        IsHeapUnion: bool
+        NonHoleConFv: Set<int>
+    }
+
+let rec private hasMutableOrCallExpr (e: Expr) =
+    match e with
+    | ECall _
+    | ECallClo _
+    | ECallVt _
+    | ECallIface _
+    | ERt _ -> true
+    | EVar v -> v.FMutable
+    | _ -> false
+
+let private peelTailTrmc (em: Em) (e: Expr) : TrmcTailInfo option =
+    if em.Self.RetFrom.IsSome then
+        None
+    else
+        match e with
+        | ELet(r, callPart, afterCall) ->
+            match peelTailCall callPart with
+            | None -> None
+            | Some(innerCall, callDrops) ->
+                let _, assumedFrom, hadDup = unwrapTailCallInfo innerCall
+
+                if assumedFrom.IsSome && not hadDup then
+                    None
+                else
+                    let rec peelMidDrops (x: Expr) =
+                        match x with
+                        | EDrop(d, rest) ->
+                            let ds, core = peelMidDrops rest
+                            d :: ds, core
+                        | _ -> [], x
+
+                    let midDrops, conCore = peelMidDrops afterCall
+
+                    let conOpt =
+                        match conCore with
+                        | ECon(conTy, case, conArgs, tok) -> Some(conTy, case, conArgs, tok, [])
+                        | ELet(conTmp, ECon(conTy, case, conArgs, tok), tailBody) ->
+                            peelDropSpine (Some conTmp.Id) tailBody
+                            |> Option.map (fun postDrops -> conTy, case, conArgs, tok, postDrops)
+                        | _ -> None
+
+                    match conOpt with
+                    | Some(TEnt(ent, _) as conTy, case, conArgs, tok, postDrops) when
+                        (ent.Kind = KHeapUnion || ent.Kind = KValueUnion) && not conArgs.IsEmpty
+                        ->
+                        let allDrops = callDrops @ midDrops @ postDrops
+
+                        if allDrops |> List.exists (fun d -> d.Id = r.Id) then
+                            None
+                        else
+                            let hits =
+                                conArgs
+                                |> List.indexed
+                                |> List.filter (fun (_, a) ->
+                                    match a with
+                                    | EVar v -> v.Id = r.Id
+                                    | _ -> false
+                                )
+
+                            match hits with
+                            | [ (holeIdx, _) ] when countUses r.Id conArgs = 1 ->
+                                let nonHoleSafe =
+                                    conArgs
+                                    |> List.indexed
+                                    |> List.forall (fun (j, a) ->
+                                        if j = holeIdx then
+                                            true
+                                        elif not (isFlat a) then
+                                            false
+                                        elif j > holeIdx then
+                                            Set.isEmpty (Set.intersect (fv a) em.Mutated)
+                                            && not (touchesMutable a)
+                                            && not (exists hasMutableOrCallExpr a)
+                                        else
+                                            true
+                                    )
+
+                                if nonHoleSafe then
+                                    let nonHoleConFv =
+                                        conArgs
+                                        |> List.indexed
+                                        |> List.choose (fun (j, a) ->
+                                            if j <> holeIdx then
+                                                Some(fv a)
+                                            else
+                                                None
+                                        )
+                                        |> Set.unionMany
+
+                                    Some
+                                        {
+                                            RetVar = r
+                                            InnerCall = innerCall
+                                            CallDrops = callDrops
+                                            MidDrops = midDrops
+                                            PostDrops = postDrops
+                                            ConTy = conTy
+                                            Case = case
+                                            ConArgs = conArgs
+                                            Tok = tok
+                                            HoleIdx = holeIdx
+                                            IsHeapUnion = ent.Kind = KHeapUnion
+                                            NonHoleConFv = nonHoleConFv
+                                        }
+                                else
+                                    None
+                            | _ -> None
+                    | _ -> None
+        | _ -> None
+
+let private classifyTailTc (em: Em) (e: Expr) =
+    match peelTailTrmc em e with
+    | Some trmc ->
+        let allDrops = trmc.CallDrops @ trmc.MidDrops @ trmc.PostDrops
+        Some(trmc.InnerCall, allDrops, Some trmc)
+    | None ->
+        match peelTailCall e with
+        | Some(inner, drops) -> Some(inner, drops, None)
+        | None -> None
+
+let private hasKParamInCall (kParams: Set<int>) (inner: Expr) : bool =
+    if kParams.IsEmpty then
+        false
+    else
+        let call, _, _ = unwrapTailCallInfo inner
+
+        match call with
+        | ECallClo(EVar v, _, _) when kParams.Contains v.Id -> true
+        | ECall(_, _, xs, _)
+        | ECallClo(_, xs, _)
+        | ECallVt(_, _, xs, _)
+        | ECallIface(_, _, xs, _) -> xs |> List.exists (hasKnownOrKArg kParams)
+        | _ -> false
+
+let private isTcBoundaryCall (em: Em) (inTrmc: bool) (inner: Expr) : bool =
+    if hasKParamInCall em.KParams inner then
+        false
+    else
+        let call, _, _ = unwrapTailCallInfo inner
+
+        match call with
+        | ECallClo(fExpr, _, _) ->
+            match fExpr with
+            | EVar v -> not (em.KParams.Contains v.Id)
+            | _ -> true
+        | ECallVt _
+        | ECallIface _ -> true
+        | ECall(g, typeArgs, xs, _) ->
+            isSameFileTcTarget em inTrmc g typeArgs xs.Length
+            || isExtTcAlias em.FableAliases em.Fns g
+        | _ -> false
+
+let private isTcBoundaryExpr (em: Em) (e: Expr) : bool =
+    if
+        em.NoTailCalls.Contains em.Self.Name
+        || (em.IsTc && not em.KParams.IsEmpty)
+        || em.TryLabels.Count > 0
+        || (not em.IsTc && em.Self.RetFrom.IsSome)
+    then
+        false
+    else
+        match classifyTailTc em e with
+        | None -> false
+        | Some(inner, _, trmcOpt) -> isTcBoundaryCall em trmcOpt.IsSome inner
+
+let private floatTrmcCall (em: Em) (r: Var) (callExpr: Expr) (afterCall: Expr) : Expr option =
+    let afterFv = fv afterCall
+
+    let rec step (x: Expr) : Expr option =
+        let cand = ELet(r, x, afterCall)
+
+        match peelTailTrmc em cand with
+        | Some t when isTcBoundaryCall em true t.InnerCall -> Some cand
+        | _ ->
+            match x with
+            | ELet(v, rhs, body) when v.Id <> r.Id && not (afterFv.Contains v.Id) ->
+                step body |> Option.map (fun res -> ELet(v, rhs, res))
+            | ESeq(a, body) -> step body |> Option.map (fun res -> ESeq(a, res))
+            | EDrop(d, body) when not (afterFv.Contains d.Id) -> step body |> Option.map (fun res -> EDrop(d, res))
+            | EUnpack(u, body) when u.Token.IsNone -> step body |> Option.map (fun res -> EUnpack(u, res))
+            | EPromote(v, body) -> step body |> Option.map (fun res -> EPromote(v, res))
+            | _ -> None
+
+    match peelTailTrmc em (ELet(r, callExpr, afterCall)) with
+    | Some t when isTcBoundaryCall em true t.InnerCall -> None
+    | _ -> step callExpr
+
+let private (|FloatedTrmc|_|) (em: Em) (dest: Dest) (e: Expr) : Expr option =
+    if
+        (dest = DTcRet || dest = DReturn)
+        && not (dest = DReturn && em.Self.RetFrom.IsSome)
+        && not (em.NoTailCalls.Contains em.Self.Name)
+        && not (em.IsTc && not em.KParams.IsEmpty)
+        && em.TryLabels.Count = 0
+        && not (em.Loop.IsSome && em.Loop.Value.Trmc)
+        && not (em.Scc.IsSome && em.Scc.Value.Trmc)
+    then
+        match e with
+        | ELet(r, callPart, afterCall) -> floatTrmcCall em r callPart afterCall
+        | _ -> None
+    else
+        None
+
+/// Emit a `$tc` tail jump (inside `DTcRet` `$tcbody`) or `$tc` boundary (at normal `DReturn`)
+/// when `e` ends in an unknown `ECallClo`, `ECallVt`, `ECallIface`, same-file `$tc`, or cross-file `$tc`
+/// (directly or wrapped inside a TRMC `KHeapUnion` / `KValueUnion` constructor hole).
+let rec private tryEmitTailTc (em: Em) (ind: string) (e: Expr) (dest: Dest) : bool =
+    if
+        (dest <> DTcRet && dest <> DReturn)
+        || (dest = DReturn && em.Self.RetFrom.IsSome)
+        || em.NoTailCalls.Contains em.Self.Name
+        || (em.IsTc && not em.KParams.IsEmpty)
+        || em.TryLabels.Count > 0
+        || (em.Loop.IsSome && em.Loop.Value.Trmc)
+        || (em.Scc.IsSome && em.Scc.Value.Trmc)
+    then
+        false
+    else
+        match classifyTailTc em e with
+        | None -> false
+        | Some(inner, _, _) when hasKParamInCall em.KParams inner -> false
+        | Some(inner, drops, trmcOpt) ->
+            let L = line em ind
+            let retZig = zigType em.Self.Ret
+            let voidRet = isVoid em.Self.Ret
+
+            let nonHoleConFv =
+                trmcOpt |> Option.map (fun t -> t.NonHoleConFv) |> Option.defaultValue Set.empty
+
+            let leaveOnErr () =
+                if dest = DTcRet then
+                    "return error.Raised;"
+                else
+                    match em.Self.Raises with
+                    | RNever -> "unreachable;"
+                    | RAlways -> leaveText em
+                    | RDepends _ ->
+                        $"if (comptime fable_rt.isRaised(%s{retType em.Self})) {{ %s{leaveText em} }} else {{ unreachable; }}"
+
+            let emitTrampolineRaised (tInd: string) (tresVar: string) =
+                let RL = line em tInd
+
+                match em.Self.Raises with
+                | RNever -> RL "unreachable;"
+                | RAlways ->
+                    if not voidRet then
+                        RL $"if (comptime fable_rt.canPlugRet(%s{retZig})) fable_rt.drop(%s{tresVar});"
+
+                    RL(leaveText em)
+                | RDepends _ ->
+                    RL $"if (comptime fable_rt.isRaised(%s{retType em.Self})) {{"
+
+                    if not voidRet then
+                        RL $"    if (comptime fable_rt.canPlugRet(%s{retZig})) fable_rt.drop(%s{tresVar});"
+
+                    RL $"    %s{leaveText em}"
+                    RL "} else {"
+                    RL "    unreachable;"
+                    RL "}"
+
+            let trmcPlugCond, emitTrmcTemps =
+                match trmcOpt with
+                | None -> "", (fun () -> None)
+                | Some t ->
+                    let conZig = zigType t.ConTy
+                    let fields = caseFields t.ConTy t.Case
+                    let _, holeFieldTy = fields[t.HoleIdx]
+                    let holeFieldZig = zigType holeFieldTy
+
+                    let cond =
+                        $" and fable_rt.canPlugRet(%s{holeFieldZig}) and fable_rt.canPlugRet(%s{conZig})"
+
+                    let emitTemps () =
+                        let tmpList =
+                            List.zip fields t.ConArgs
+                            |> List.mapi (fun i ((f, fTy), a) ->
+                                if i = t.HoleIdx then
+                                    f, fTy, None
+                                else
+                                    let tmp = freshName em ("trmc_" + cleanIdent f)
+                                    L $"const %s{tmp}: %s{zigType fTy} = %s{ex em a};"
+                                    f, fTy, Some tmp
+                            )
+
+                        Some(t, conZig, fields, tmpList)
+
+                    cond, emitTemps
+
+            let fieldInits (holeIdx: int) (conTemps: (string * Ty * string option) list) (holeVal: string) =
+                conTemps
+                |> List.mapi (fun i (f, _, tmpOpt) ->
+                    let v =
+                        if i = holeIdx then
+                            holeVal
+                        else
+                            Option.get tmpOpt
+
+                    $".%s{fieldIdent f} = %s{v}"
+                )
+                |> String.concat ", "
+
+            let emitTcJump
+                (trmcStateOpt: (TrmcTailInfo * string * (string * Ty) list * (string * Ty * string option) list) option)
+                (jInd: string)
+                (tcfnTarget: string)
+                (takeAddr: bool)
+                (paramTysStr: string)
+                (storeValsStr: string)
+                (selfPtr: string)
+                (selfOwned: bool)
+                =
+                let JL = line em jInd
+
+                let tcfnPtr =
+                    if takeAddr then
+                        "&" + tcfnTarget
+                    else
+                        tcfnTarget
+
+                match trmcStateOpt with
+                | None ->
+                    if dest = DTcRet then
+                        if paramTysStr <> "" then
+                            JL $"fable_rt.tailStore(&.{{ %s{paramTysStr} }}, ctx, .{{ %s{storeValsStr} }});"
+
+                        JL $"ctx.self = %s{selfPtr};"
+                        JL "ctx.self_owned = true;"
+                        JL $"return .{{ .func = %s{tcfnPtr}, .ret = ret }};"
+                    else
+                        let tctxVar = freshName em "tctx"
+                        let tresVar = freshName em "tcres"
+
+                        let resDeclTy =
+                            if voidRet then
+                                "u8"
+                            else
+                                retZig
+
+                        JL $"var %s{tctxVar}: fable_rt.TailCtx = undefined;"
+                        JL $"var %s{tresVar}: %s{resDeclTy} = undefined;"
+
+                        if paramTysStr <> "" then
+                            JL $"fable_rt.tailStore(&.{{ %s{paramTysStr} }}, &%s{tctxVar}, .{{ %s{storeValsStr} }});"
+
+                        JL $"%s{tctxVar}.self = %s{selfPtr};"
+
+                        let ownedLit =
+                            if selfOwned then
+                                "true"
+                            else
+                                "false"
+
+                        JL $"%s{tctxVar}.self_owned = %s{ownedLit};"
+                        JL $"if (%s{tcfnTarget}(&%s{tctxVar}, @ptrCast(&%s{tresVar})) == .raised) {{"
+                        emitTrampolineRaised (jInd + "    ") tresVar
+                        JL "}"
+
+                        if voidRet then
+                            JL "return;"
+                        else
+                            JL $"return %s{tresVar};"
+                | Some(t, conZig, fields, conTemps) ->
+                    let caseIdent = fieldIdent t.Case
+                    let holeFieldIdent = fieldIdent (fst fields[t.HoleIdx])
+                    let initStr = fieldInits t.HoleIdx conTemps "undefined"
+
+                    if t.IsHeapUnion then
+                        let cellVar = freshName em "trmc_cell"
+
+                        match t.Tok with
+                        | Some tk ->
+                            JL
+                                $"const %s{cellVar} = fable_rt.cellReuse(%s{conZig}, .%s{caseIdent}, &%s{vname em tk}, .{{ %s{initStr} }});"
+                        | None ->
+                            JL $"const %s{cellVar} = fable_rt.cell(%s{conZig}, .%s{caseIdent}, .{{ %s{initStr} }});"
+
+                        let nextRet = $"@ptrCast(&%s{cellVar}.%s{holeFieldIdent})"
+
+                        if dest = DTcRet then
+                            JL $"@as(*%s{conZig}, @ptrCast(@alignCast(ret))).* = .{{ .%s{caseIdent} = %s{cellVar} }};"
+
+                            if paramTysStr <> "" then
+                                JL $"fable_rt.tailStore(&.{{ %s{paramTysStr} }}, ctx, .{{ %s{storeValsStr} }});"
+
+                            JL $"ctx.self = %s{selfPtr};"
+                            JL "ctx.self_owned = true;"
+                            JL $"return .{{ .func = %s{tcfnPtr}, .ret = %s{nextRet} }};"
+                        else
+                            let tctxVar = freshName em "tctx"
+                            let tresVar = freshName em "tcres"
+                            JL $"var %s{tctxVar}: fable_rt.TailCtx = undefined;"
+                            JL $"const %s{tresVar}: %s{conZig} = .{{ .%s{caseIdent} = %s{cellVar} }};"
+
+                            if paramTysStr <> "" then
+                                JL
+                                    $"fable_rt.tailStore(&.{{ %s{paramTysStr} }}, &%s{tctxVar}, .{{ %s{storeValsStr} }});"
+
+                            JL $"%s{tctxVar}.self = %s{selfPtr};"
+
+                            let ownedLit =
+                                if selfOwned then
+                                    "true"
+                                else
+                                    "false"
+
+                            JL $"%s{tctxVar}.self_owned = %s{ownedLit};"
+                            JL $"if (%s{tcfnTarget}(&%s{tctxVar}, %s{nextRet}) == .raised) {{"
+                            emitTrampolineRaised (jInd + "    ") tresVar
+                            JL "}"
+                            JL $"return %s{tresVar};"
+                    else if dest = DTcRet then
+                        let retPtrVar = freshName em "ret_ptr"
+                        JL $"const %s{retPtrVar}: *%s{conZig} = @ptrCast(@alignCast(ret));"
+                        JL $"%s{retPtrVar}.* = .{{ .%s{caseIdent} = .{{ %s{initStr} }} }};"
+                        let nextRet = $"@ptrCast(&%s{retPtrVar}.%s{caseIdent}.%s{holeFieldIdent})"
+
+                        if paramTysStr <> "" then
+                            JL $"fable_rt.tailStore(&.{{ %s{paramTysStr} }}, ctx, .{{ %s{storeValsStr} }});"
+
+                        JL $"ctx.self = %s{selfPtr};"
+                        JL "ctx.self_owned = true;"
+                        JL $"return .{{ .func = %s{tcfnPtr}, .ret = %s{nextRet} }};"
+                    else
+                        let tctxVar = freshName em "tctx"
+                        let tresVar = freshName em "tcres"
+                        JL $"var %s{tctxVar}: fable_rt.TailCtx = undefined;"
+                        JL $"var %s{tresVar}: %s{conZig} = .{{ .%s{caseIdent} = .{{ %s{initStr} }} }};"
+                        let nextRet = $"@ptrCast(&%s{tresVar}.%s{caseIdent}.%s{holeFieldIdent})"
+
+                        if paramTysStr <> "" then
+                            JL $"fable_rt.tailStore(&.{{ %s{paramTysStr} }}, &%s{tctxVar}, .{{ %s{storeValsStr} }});"
+
+                        JL $"%s{tctxVar}.self = %s{selfPtr};"
+
+                        let ownedLit =
+                            if selfOwned then
+                                "true"
+                            else
+                                "false"
+
+                        JL $"%s{tctxVar}.self_owned = %s{ownedLit};"
+                        JL $"if (%s{tcfnTarget}(&%s{tctxVar}, %s{nextRet}) == .raised) {{"
+                        emitTrampolineRaised (jInd + "    ") tresVar
+                        JL "}"
+                        JL $"return %s{tresVar};"
+
+            let emitFallbackCall
+                (trmcStateOpt: (TrmcTailInfo * string * (string * Ty) list * (string * Ty * string option) list) option)
+                (fInd: string)
+                (rawCall: string)
+                (alwaysErrorUnion: bool)
+                (dupResult: bool)
+                =
+                let FL = line em fInd
+
+                match trmcStateOpt with
+                | None ->
+                    if
+                        alwaysErrorUnion
+                        && drops.IsEmpty
+                        && not dupResult
+                        && dest = DReturn
+                        && canPlainTry em
+                        && em.Self.Raises = RAlways
+                    then
+                        if voidRet then
+                            FL $"_ = try %s{rawCall};"
+                            FL "return;"
+                        else
+                            FL $"return try %s{rawCall};"
+                    else
+                        let rawVar = freshName em "tc_raw"
+                        let rVar = freshName em "tc_r"
+
+                        let dropErr =
+                            drops |> List.map (fun d -> dropCode (vname em d) + " ") |> String.concat ""
+
+                        FL $"const %s{rawVar} = %s{rawCall};"
+
+                        FL
+                            $"const %s{rVar} = if (comptime fable_rt.isRaised(@TypeOf(%s{rawVar}))) %s{rawVar} catch {{ %s{dropErr}%s{leaveOnErr ()} }} else %s{rawVar};"
+
+                        let resVar =
+                            if dupResult && not voidRet then
+                                let rv = freshName em "tc_res"
+                                FL $"const %s{rv} = %s{dupCode rVar};"
+                                rv
+                            else
+                                rVar
+
+                        for d in drops do
+                            FL(dropCode (vname em d))
+
+                        if dest = DTcRet then
+                            if voidRet then
+                                FL $"_ = %s{resVar};"
+                            else
+                                FL $"@as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = %s{resVar};"
+
+                            FL "return .{};"
+                        elif voidRet then
+                            FL $"_ = %s{resVar};"
+                            FL "return;"
+                        else
+                            FL $"return %s{resVar};"
+                | Some(t, conZig, _, conTemps) ->
+                    let conTmpDrops =
+                        conTemps
+                        |> List.choose (fun (_, fTy, tmpOpt) ->
+                            match tmpOpt with
+                            | Some tmp when isManaged fTy -> Some(dropCode tmp)
+                            | _ -> None
+                        )
+
+                    let allErrDrops =
+                        conTmpDrops @ (drops |> List.map (fun d -> dropCode (vname em d)))
+                        |> String.concat " "
+
+                    let errPrefix =
+                        if allErrDrops = "" then
+                            ""
+                        else
+                            allErrDrops + " "
+
+                    let rawVar = freshName em "tc_raw"
+                    let rVar = freshName em "tc_r"
+                    FL $"const %s{rawVar} = %s{rawCall};"
+
+                    FL
+                        $"const %s{rVar} = if (comptime fable_rt.isRaised(@TypeOf(%s{rawVar}))) %s{rawVar} catch {{ %s{errPrefix}%s{leaveOnErr ()} }} else %s{rawVar};"
+
+                    let holeVal =
+                        if dupResult then
+                            let hv = freshName em "tc_hole"
+                            let dupR = dupCode rVar
+                            FL $"const %s{hv} = %s{dupR};"
+                            hv
+                        else
+                            rVar
+
+                    let caseIdent = fieldIdent t.Case
+                    let builtVar = freshName em "tc_built"
+                    let initStr = fieldInits t.HoleIdx conTemps holeVal
+
+                    if t.IsHeapUnion then
+                        let cellVar = freshName em "tc_cell"
+
+                        match t.Tok with
+                        | Some tk ->
+                            FL
+                                $"const %s{cellVar} = fable_rt.cellReuse(%s{conZig}, .%s{caseIdent}, &%s{vname em tk}, .{{ %s{initStr} }});"
+                        | None ->
+                            FL $"const %s{cellVar} = fable_rt.cell(%s{conZig}, .%s{caseIdent}, .{{ %s{initStr} }});"
+
+                        FL $"const %s{builtVar}: %s{conZig} = .{{ .%s{caseIdent} = %s{cellVar} }};"
+                    else
+                        FL $"const %s{builtVar}: %s{conZig} = .{{ .%s{caseIdent} = .{{ %s{initStr} }} }};"
+
+                    for d in drops do
+                        FL(dropCode (vname em d))
+
+                    if dest = DTcRet then
+                        FL $"@as(*%s{conZig}, @ptrCast(@alignCast(ret))).* = %s{builtVar};"
+                        FL "return .{};"
+                    else
+                        FL $"return %s{builtVar};"
+
+            let recvPlan (recvExpr: Expr) (xs: Expr list) =
+                let moveId =
+                    match recvExpr with
+                    | EVar kv when
+                        drops |> List.exists (fun d -> d.Id = kv.Id)
+                        && not (nonHoleConFv.Contains kv.Id)
+                        && not (xs |> List.exists (fun x -> Set.contains kv.Id (fv x)))
+                        ->
+                        Some kv.Id
+                    | EGet(EVar kv, PSome, _) when
+                        drops |> List.exists (fun d -> d.Id = kv.Id)
+                        && not (nonHoleConFv.Contains kv.Id)
+                        && not (xs |> List.exists (fun x -> Set.contains kv.Id (fv x)))
+                        ->
+                        Some kv.Id
+                    | _ -> None
+
+                let rem =
+                    match moveId with
+                    | Some id -> drops |> List.filter (fun d -> d.Id <> id)
+                    | None -> drops
+
+                let canLend =
+                    dest = DReturn
+                    && moveId.IsNone
+                    && rem.IsEmpty
+                    && (
+                        match recvExpr with
+                        | EVar _ -> true
+                        | EGet(EVar _, (PField _ | PSome | PItem _ | PCase _), _) -> true
+                        | _ -> false
+                    )
+
+                moveId, rem, canLend
+
+            let callExpr, assumedFrom, hadDup = unwrapTailCallInfo inner
+            let inTrmc = trmcOpt.IsSome
+
+            match callExpr with
+            | ECallClo(fExpr, xs, _) ->
+                let trmcState = emitTrmcTemps ()
+
+                let isCurried2 =
+                    match typeOf fExpr, xs with
+                    | TFn([ _ ], TFn([ _ ], _)), [ _; _ ] -> true
+                    | _ -> false
+
+                let argTys =
+                    match isCurried2, typeOf fExpr with
+                    | true, TFn([ tyA ], TFn([ tyB ], _)) -> [ tyA; tyB ]
+                    | _ -> xs |> List.map typeOf
+
+                let argTysStr = argTys |> List.map zigType |> String.concat ", "
+                let moveSelfId, remDrops, canLendSelf = recvPlan fExpr xs
+
+                let fVar = freshName em "tc_f"
+                L $"const %s{fVar}: %s{zigType (typeOf fExpr)} = %s{ex em fExpr};"
+
+                let argVars =
+                    List.zip xs argTys
+                    |> List.mapi (fun i (x, ty) ->
+                        let av = freshName em $"tc_a%d{i}"
+                        L $"const %s{av}: %s{zigType ty} = %s{emitArgAsTcVal em x};"
+                        av
+                    )
+
+                let cloRetZig = zigType (typeOf callExpr)
+
+                let fallbackCall =
+                    if isCurried2 then
+                        $"fable_rt.apply2(%s{cloRetZig}, %s{fVar}, %s{argVars[0]}, %s{argVars[1]})"
+                    else
+                        let callArgs = $"%s{fVar}.env" :: argVars |> String.concat ", "
+                        $"%s{fVar}.code(%s{callArgs})"
+
+                let tcodeField =
+                    if isCurried2 then
+                        $"%s{fVar}.tcode2"
+                    else
+                        $"%s{fVar}.tcode"
+
+                let tcFnVar = freshName em "tcfn"
+                let fitsExpr = $"fable_rt.fitsTailArgs(&.{{ %s{argTysStr} }})%s{trmcPlugCond}"
+                let storeVals = argVars |> String.concat ", "
+                L $"if (comptime (%s{fitsExpr})) {{"
+                L $"    if (%s{tcodeField}) |%s{tcFnVar}| {{"
+
+                let selfPtr, selfOwned =
+                    match moveSelfId with
+                    | Some _ -> $"@ptrCast(%s{fVar}.env)", true
+                    | None when canLendSelf -> $"@ptrCast(%s{fVar}.env)", false
+                    | None ->
+                        let fOwn = freshName em "tc_fown"
+                        L $"        const %s{fOwn} = fable_rt.dup(%s{fVar});"
+                        $"@ptrCast(%s{fOwn}.env)", true
+
+                for d in remDrops do
+                    L("        " + dropCode (vname em d))
+
+                emitTcJump trmcState (ind + "        ") tcFnVar false argTysStr storeVals selfPtr selfOwned
+                L "    } else {"
+                emitFallbackCall trmcState (ind + "        ") fallbackCall true hadDup
+                L "    }"
+                L "} else {"
+                emitFallbackCall trmcState (ind + "    ") fallbackCall true hadDup
+                L "}"
+                true
+
+            | ECallVt(fExpr, sExpr, xs, _) ->
+                let trmcState = emitTrmcTemps ()
+                let argTys = xs |> List.map typeOf
+                let argTysStr = argTys |> List.map zigType |> String.concat ", "
+                let moveSelfId, remDrops, canLendSelf = recvPlan sExpr xs
+
+                let fVar = freshName em "tc_f"
+                L $"const %s{fVar}: %s{zigType (typeOf fExpr)} = %s{ex em fExpr};"
+                let sVar = freshName em "tc_s"
+                L $"const %s{sVar}: %s{zigType (typeOf sExpr)} = %s{ex em sExpr};"
+
+                let argVars =
+                    List.zip xs argTys
+                    |> List.mapi (fun i (x, ty) ->
+                        let av = freshName em $"tc_a%d{i}"
+                        L $"const %s{av}: %s{zigType ty} = %s{emitArgAsTcVal em x};"
+                        av
+                    )
+
+                let fallbackArgs = $"%s{fVar}.env" :: sVar :: argVars |> String.concat ", "
+                let fallbackCall = $"%s{fVar}.code(%s{fallbackArgs})"
+                let tcFnVar = freshName em "tcfn"
+                let fitsExpr = $"fable_rt.fitsTailArgs(&.{{ %s{argTysStr} }})%s{trmcPlugCond}"
+                let storeVals = argVars |> String.concat ", "
+
+                L $"if (comptime (%s{fitsExpr})) {{"
+                L $"    if (%s{fVar}.tcode) |%s{tcFnVar}| {{"
+
+                let selfPtr, selfOwned =
+                    match moveSelfId with
+                    | Some _ -> $"@ptrCast(%s{sVar})", true
+                    | None when canLendSelf -> $"@ptrCast(%s{sVar})", false
+                    | None ->
+                        let sOwn = freshName em "tc_sown"
+                        L $"        const %s{sOwn} = fable_rt.dup(%s{sVar});"
+                        $"@ptrCast(%s{sOwn})", true
+
+                for d in remDrops do
+                    L("        " + dropCode (vname em d))
+
+                emitTcJump trmcState (ind + "        ") tcFnVar false argTysStr storeVals selfPtr selfOwned
+                L "    } else {"
+                emitFallbackCall trmcState (ind + "        ") fallbackCall true hadDup
+                L "    }"
+                L "} else {"
+                emitFallbackCall trmcState (ind + "    ") fallbackCall true hadDup
+                L "}"
+                true
+
+            | ECallIface(rExpr, slot, xs, _) ->
+                let trmcState = emitTrmcTemps ()
+                let argTys = xs |> List.map typeOf
+                let argTysStr = argTys |> List.map zigType |> String.concat ", "
+                let moveSelfId, remDrops, canLendSelf = recvPlan rExpr xs
+
+                let rVar = freshName em "tc_r"
+                L $"const %s{rVar}: %s{zigType (typeOf rExpr)} = %s{ex em rExpr};"
+
+                let argVars =
+                    List.zip xs argTys
+                    |> List.mapi (fun i (x, ty) ->
+                        let av = freshName em $"tc_a%d{i}"
+                        L $"const %s{av}: %s{zigType ty} = %s{emitArgAsTcVal em x};"
+                        av
+                    )
+
+                let fallbackArgs = $"%s{rVar}.data" :: argVars |> String.concat ", "
+                let fallbackCall = $"%s{rVar}.vt.%s{fieldIdent slot}(%s{fallbackArgs})"
+                let tcFnVar = freshName em "tcfn"
+                let fitsExpr = $"fable_rt.fitsTailArgs(&.{{ %s{argTysStr} }})%s{trmcPlugCond}"
+                let storeVals = argVars |> String.concat ", "
+
+                L $"if (comptime (%s{fitsExpr})) {{"
+                L $"    if (%s{rVar}.vt.@\"%s{cleanIdent slot}$tc\") |%s{tcFnVar}| {{"
+
+                let selfPtr, selfOwned =
+                    match moveSelfId with
+                    | Some _ -> $"%s{rVar}.data", true
+                    | None when canLendSelf -> $"%s{rVar}.data", false
+                    | None ->
+                        let rOwn = freshName em "tc_rown"
+                        L $"        const %s{rOwn} = fable_rt.dup(%s{rVar});"
+                        $"%s{rOwn}.data", true
+
+                for d in remDrops do
+                    L("        " + dropCode (vname em d))
+
+                emitTcJump trmcState (ind + "        ") tcFnVar false argTysStr storeVals selfPtr selfOwned
+                L "    } else {"
+                emitFallbackCall trmcState (ind + "        ") fallbackCall true hadDup
+                L "    }"
+                L "} else {"
+                emitFallbackCall trmcState (ind + "    ") fallbackCall true hadDup
+                L "}"
+                true
+
+            | ECall(g, typeArgs, xs, _) when isSameFileTcTarget em inTrmc g typeArgs xs.Length ->
+                let trmcState = emitTrmcTemps ()
+                let gFn = em.Fns[g]
+
+                let inst =
+                    if gFn.TypeParams.Length = typeArgs.Length then
+                        Map.ofList (List.zip gFn.TypeParams typeArgs)
+                    else
+                        Map.empty
+
+                let gParamTys = gFn.Params |> List.map (fun p -> substTy inst p.Ty |> zigType)
+
+                let paramTysStr = String.concat ", " gParamTys
+
+                let comptimeCond =
+                    if gFn.NeedsChain then
+                        $"fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})%s{trmcPlugCond}"
+                    else
+                        $"%s{chainName g} and fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})%s{trmcPlugCond}"
+
+                L $"if (comptime (%s{comptimeCond})) {{"
+                let TI = ind + "    "
+                let TL = line em TI
+                let movedIds = HashSet<int>()
+
+                let tcArgVars =
+                    xs
+                    |> List.mapi (fun i x ->
+                        let pMode = gFn.Modes[i]
+                        let av = freshName em $"tc_a%d{i}"
+
+                        let laterUses vId =
+                            xs |> List.skip (i + 1) |> List.exists (fun y -> Set.contains vId (fv y))
+
+                        let rawText = emitArgAsTcVal em x
+
+                        let moved =
+                            pMode = MBorrowed
+                            && (
+                                match x with
+                                | EVar v when
+                                    drops |> List.exists (fun d -> d.Id = v.Id)
+                                    && not (nonHoleConFv.Contains v.Id)
+                                    && not (movedIds.Contains v.Id)
+                                    && not (laterUses v.Id)
+                                    ->
+                                    movedIds.Add v.Id |> ignore
+                                    true
+                                | _ -> false
+                            )
+
+                        let isKnownArg =
+                            match x with
+                            | EKnown _
+                            | EUse(_, EKnown _) -> true
+                            | _ -> false
+
+                        if pMode = MBorrowed && not moved && not isKnownArg then
+                            TL $"const %s{av}: %s{gParamTys[i]} = %s{dupCode rawText};"
+                        else
+                            TL $"const %s{av}: %s{gParamTys[i]} = %s{rawText};"
+
+                        av
+                    )
+
+                for d in drops do
+                    if not (movedIds.Contains d.Id) then
+                        TL(dropCode (vname em d))
+
+                let storeVals = String.concat ", " tcArgVars
+                let gTcRef = fnRefTc g typeArgs
+                emitTcJump trmcState TI gTcRef true paramTysStr storeVals "null" true
+
+                L "} else {"
+
+                let rawCallee =
+                    if xs |> List.exists (hasKnownOrKArg em.KParams) then
+                        kRef g typeArgs
+                    else
+                        fnRef g typeArgs
+
+                let rawArgs = xs |> List.map (ex em) |> String.concat ", "
+                let rawCall = $"%s{rawCallee}(%s{rawArgs})"
+                emitFallbackCall trmcState (ind + "    ") rawCall false gFn.RetFrom.IsSome
+                L "}"
+                true
+
+            | ECall(extF, typeArgs, xs, resTy) when isExtTcAlias em.FableAliases em.Fns extF ->
+                let trmcState = emitTrmcTemps ()
+                let extParamTys = xs |> List.map (typeOf >> zigType)
+                let paramTysStr = String.concat ", " extParamTys
+
+                let fitsExpr =
+                    $"%s{extChainCheck extF} and fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})%s{trmcPlugCond}"
+
+                L $"if (comptime (%s{fitsExpr})) {{"
+                let TI = ind + "    "
+                let TL = line em TI
+                let movedIds = HashSet<int>()
+
+                let tcArgVars =
+                    xs
+                    |> List.mapi (fun i x ->
+                        let av = freshName em $"tc_a%d{i}"
+
+                        let laterUses vId =
+                            xs |> List.skip (i + 1) |> List.exists (fun y -> Set.contains vId (fv y))
+
+                        let needsDup =
+                            match x with
+                            | EUse(UKeep, inner) when isManaged (typeOf inner) ->
+                                let moved =
+                                    match inner with
+                                    | EVar v when
+                                        drops |> List.exists (fun d -> d.Id = v.Id)
+                                        && not (nonHoleConFv.Contains v.Id)
+                                        && not (movedIds.Contains v.Id)
+                                        && not (laterUses v.Id)
+                                        ->
+                                        movedIds.Add v.Id |> ignore
+                                        true
+                                    | _ -> false
+
+                                not moved
+                            | _ -> false
+
+                        let rawText = emitArgAsTcVal em x
+
+                        let argExpr =
+                            if needsDup then
+                                dupCode rawText
+                            else
+                                rawText
+
+                        TL $"const %s{av}: %s{extParamTys[i]} = %s{argExpr};"
+                        av
+                    )
+
+                for d in drops do
+                    if not (movedIds.Contains d.Id) then
+                        TL(dropCode (vname em d))
+
+                let storeVals = String.concat ", " tcArgVars
+                let extTcRef = fnRefTc extF typeArgs
+                emitTcJump trmcState TI extTcRef true paramTysStr storeVals "null" true
+
+                L "} else {"
+
+                let fallbackCall =
+                    match formatCrossCall em extF typeArgs xs resTy None assumedFrom with
+                    | Some s -> s
+                    | None ->
+                        let rawArgs = xs |> List.map (ex em) |> String.concat ", "
+                        $"%s{fnRef extF typeArgs}(%s{rawArgs})"
+
+                emitFallbackCall trmcState (ind + "    ") fallbackCall false hadDup
+                L "}"
+                true
+
+            | _ -> false
+
+and stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
     let L = line em ind
 
     let block (rhs: Expr) (openLine: string -> string) =
@@ -1013,7 +2334,12 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
         L "};"
 
     match e with
-    | ELet _ when dest = DReturn && em.Loop.IsSome && (trmcSite em.Loop.Value.Self e).IsSome ->
+    | ELet _ when
+        dest = DReturn
+        && em.Loop.IsSome
+        && em.Loop.Value.Trmc
+        && (trmcSite em.Loop.Value.Self e).IsSome
+        ->
         let (args, conTy, case, conArgs, tok, holeIdx) =
             (trmcSite em.Loop.Value.Self e).Value
 
@@ -1044,6 +2370,80 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
         L $"hole.* = .{{ .%s{c} = %s{cell} }};"
         L $"hole = &%s{cell}.%s{fieldIdent (fst fields[holeIdx])};"
         emitTailJump em ind args
+    | ELet _ when
+        dest = DReturn
+        && em.Scc.IsSome
+        && em.Scc.Value.Trmc
+        && em.TryLabels.Count = 0
+        && (
+            match trmcSiteOf em.Scc.Value.TagOf.ContainsKey e with
+            | Some(g, tArgs, args, _, _, _, _, _) ->
+                tArgs = (em.Self.TypeParams |> List.map TGen)
+                && args.Length = em.Fns[g].Params.Length
+            | None -> false
+        )
+        ->
+        let scc = em.Scc.Value
+
+        let (g, _, args, conTy, case, conArgs, tok, holeIdx) =
+            (trmcSiteOf scc.TagOf.ContainsKey e).Value
+
+        let t = zigType conTy
+        let c = fieldIdent case
+        let fields = caseFields conTy case
+        // evaluate non-hole constructor fields and callee arguments before mutating `hole` or `_st`
+        let conTemps =
+            List.zip fields conArgs
+            |> List.mapi (fun i ((f, fTy), a) ->
+                if i = holeIdx then
+                    f, None
+                else
+                    let tmp = freshName em ("trmc_" + cleanIdent f)
+                    L $"const %s{tmp}: %s{zigType fTy} = %s{ex em a};"
+                    f, Some tmp
+            )
+
+        let argTemps =
+            List.zip em.Fns[g].Params args
+            |> List.mapi (fun i (p, a) ->
+                let tmp = freshName em ("next_" + cleanIdent p.Base)
+                L $"const %s{tmp}: %s{zigType p.Ty} = %s{ex em a};"
+                i, tmp
+            )
+
+        let inits =
+            conTemps
+            |> List.map (fun (f, tmpOpt) ->
+                let value = defaultArg tmpOpt "undefined"
+                $".%s{fieldIdent f} = %s{value}"
+            )
+            |> String.concat ", "
+
+        let cell = freshName em "cell"
+
+        match tok with
+        | Some tk -> L $"const %s{cell} = fable_rt.cellReuse(%s{t}, .%s{c}, &%s{vname em tk}, .{{ %s{inits} }});"
+        | None -> L $"const %s{cell} = fable_rt.cell(%s{t}, .%s{c}, .{{ %s{inits} }});"
+
+        L "// link the new cell into the hole, then transition to the next SCC state"
+        L $"hole.* = .{{ .%s{c} = %s{cell} }};"
+        L $"hole = &%s{cell}.%s{fieldIdent (fst fields[holeIdx])};"
+        let tag = scc.TagOf[g]
+
+        if argTemps.IsEmpty then
+            L $"_st = .%s{tag};"
+        else
+            let stInits =
+                argTemps
+                |> List.map (fun (i, tmp) -> $".a%d{i} = %s{tmp}")
+                |> String.concat ", "
+
+            L $"const _next: %s{scc.StateTypeName} = .{{ .%s{tag} = .{{ %s{stInits} }} }};"
+            L "_st = _next;"
+
+        L "continue :tail;"
+    | FloatedTrmc em dest floated -> stmt em ind floated dest
+    | _ when tryEmitTailTc em ind e dest -> ()
     // (a value that always raises: the raise, and nothing after it, which could not run)
     | ELet(_, rhs, _) when alwaysRaises rhs -> stmt em ind rhs DDiscard
     | ELet(v, rhs, body) ->
@@ -1087,12 +2487,15 @@ let rec stmt (em: Em) (ind: string) (e: Expr) (dest: Dest) : unit =
     | EIf(_, t, f, _) when
         isSimpleIf e
         && dest <> DDiscard
+        && dest <> DTcRet
         && not (
             dest = DReturn
             && (em.Loop.IsSome
                 || em.Scc.IsSome
                 || (tailTarget em t).IsSome
-                || (tailTarget em f).IsSome)
+                || (tailTarget em f).IsSome
+                || isTcBoundaryExpr em t
+                || isTcBoundaryExpr em f)
         )
         ->
         emitValue em ind e dest
@@ -1304,6 +2707,45 @@ and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
         | _ -> L(ex em e + ";")
 
     match dest with
+    | DTcRet ->
+        let retZig = zigType em.Self.Ret
+
+        match em.Loop, em.Scc, e with
+        | Some loop, _, (ECall(f, _, args, _) | EOnRaise(ECall(f, _, args, _), _)) when f = loop.Self ->
+            emitTailJump em ind args
+        | Some loop, _, _ when loop.Trmc ->
+            L $"hole.* = %s{ex em e};"
+            L $"@as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = result;"
+            L "return .{};"
+        | _, Some scc, (ECall(g, tArgs, args, _) | EOnRaise(ECall(g, tArgs, args, _), [])) when
+            em.TryLabels.Count = 0
+            && tArgs = (em.Self.TypeParams |> List.map TGen)
+            && scc.TagOf.ContainsKey g
+            ->
+            let tag = scc.TagOf[g]
+
+            if args.IsEmpty then
+                L $"_st = .%s{tag};"
+            else
+                let inits =
+                    args |> List.mapi (fun i a -> $".a%d{i} = %s{ex em a}") |> String.concat ", "
+
+                L $"const _next: %s{scc.StateTypeName} = .{{ .%s{tag} = .{{ %s{inits} }} }};"
+                L "_st = _next;"
+
+            L "continue :tail;"
+        | _, Some scc, _ when scc.Trmc ->
+            L $"hole.* = %s{ex em e};"
+            L $"@as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = result;"
+            L "return .{};"
+        | _ when tryEmitTailTc em ind e DTcRet -> ()
+        | _ ->
+            if isVoid em.Self.Ret then
+                effect ()
+                L "return .{};"
+            else
+                L $"@as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = %s{ex em e};"
+                L "return .{};"
     | DReturn ->
         match em.Loop, em.Scc, e with
         | Some loop, _, (ECall(f, _, args, _) | EOnRaise(ECall(f, _, args, _), _)) when f = loop.Self ->
@@ -1328,6 +2770,9 @@ and emitValue (em: Em) (ind: string) (e: Expr) (dest: Dest) =
                 L "_st = _next;"
 
             L "continue :tail;"
+        | _, Some scc, _ when scc.Trmc ->
+            L $"hole.* = %s{ex em e};"
+            L "return result;"
         | _ when (tailTarget em e).IsSome -> L $"return %s{(tailTarget em e).Value};"
         | _ ->
             if isVoid (typeOf e) then
@@ -1448,6 +2893,111 @@ let private storedInto (body: Expr) : Set<int> =
 let private hasManaged (fn: FnInfo) =
     isManaged fn.Ret || fn.Params |> List.exists (fun p -> isManaged p.Ty)
 
+let private formatSigValue (fn: FnInfo) =
+    let borrows =
+        match fn.Modes with
+        | [] -> ".{}"
+        | modes ->
+            modes
+            |> List.map (fun m ->
+                if m = MBorrowed then
+                    "true"
+                else
+                    "false"
+            )
+            |> String.concat ", "
+            |> sprintf ".{ %s }"
+
+    let resultBorrowed =
+        if fn.RetFrom.IsSome then
+            "true"
+        else
+            "false"
+
+    let resultFrom =
+        match fn.RetFrom with
+        | None
+        | Some [] -> ".{}"
+        | Some js ->
+            js
+            |> List.sort
+            |> List.map string<int>
+            |> String.concat ", "
+            |> sprintf ".{ %s }"
+
+    $".{{ .borrows = %s{borrows}, .result_borrowed = %s{resultBorrowed}, .result_from = %s{resultFrom} }}"
+
+let private zigStrLit (s: string) =
+    let esc = s.Replace("\\", "\\\\").Replace("\"", "\\\"")
+    $"\"%s{esc}\""
+
+let private formatStoresValue (fn: FnInfo) =
+    let fields, cb, ext = fn.StoreFacts
+
+    let fieldsTuple =
+        match fields |> List.sort with
+        | [] -> ".{}"
+        | fs -> fs |> List.map zigStrLit |> String.concat ", " |> sprintf ".{ %s }"
+
+    let bStr (b: bool) =
+        if b then
+            "true"
+        else
+            "false"
+
+    $".{{ .fields = %s{fieldsTuple}, .calls_callback = %s{bStr cb}, .calls_ext_store = %s{bStr ext} }}"
+
+let private formatFactAssertions (fns: FnInfo list) : string =
+    let noRaiseStmts =
+        fns
+        |> Seq.collect (fun fn -> fn.AssertedNoRaise)
+        |> Seq.distinctBy (fun (f, tys) -> f + "<" + (tys |> List.map tyKey |> String.concat ",") + ">")
+        |> Seq.map (fun (f, tys) -> $"        fable_rt.assertNoRaise(%s{fnRef f tys});")
+        |> List.ofSeq
+
+    let storeStmts =
+        fns
+        |> Seq.collect (fun fn -> fn.AssertedStores)
+        |> Seq.groupBy (fun (extFn, _, _) -> extFn)
+        |> Seq.choose (fun (extFn, items) ->
+            match extFn.IndexOf '.' with
+            | -1 -> None
+            | dot ->
+                let modAlias = extFn.Substring(0, dot)
+                let memberName = topIdent (extFn.Substring(dot + 1))
+
+                let fields =
+                    items
+                    |> Seq.collect (fun (_, fs, _) -> fs)
+                    |> Set.ofSeq
+                    |> Set.toList
+                    |> List.sort
+
+                let checkExt = items |> Seq.exists (fun (_, _, c) -> c)
+
+                let fieldsTuple =
+                    match fields with
+                    | [] -> ".{}"
+                    | fs -> fs |> List.map zigStrLit |> String.concat ", " |> sprintf ".{ %s }"
+
+                let extFlag =
+                    if checkExt then
+                        "true"
+                    else
+                        "false"
+
+                Some
+                    $"        fable_rt.assertNoStore(%s{modAlias}, %s{zigStrLit memberName}, %s{fieldsTuple}, %s{extFlag});"
+        )
+        |> List.ofSeq
+
+    let stmts = noRaiseStmts @ storeStmts
+
+    if stmts.IsEmpty then
+        ""
+    else
+        "    comptime {\n" + String.concat "\n" stmts + "\n    }\n"
+
 /// The runtime's `cell` is inlined, so the work Zig does at compile time for each counts against
 /// the function's quota of backward branches: a literal of many cells, a 9 by 9 list of lists,
 /// runs out of it; and so does each inlined `dup` and `drop` (a state machine fusing many
@@ -1477,170 +3027,426 @@ let branchQuota (bodyText: string) : string =
 let private currentArenas =
     new System.Threading.ThreadLocal<Dictionary<string, int> ref>(fun () -> ref (Dictionary<string, int>()))
 
+/// Emit a thin `$tc` adapter around an ordinary synchronous function whose body cannot enter an
+/// unbounded tail chain (`NeedsChain = false`).
+let private emitThinTc
+    (out: StringBuilder)
+    (indent: string)
+    (fnNameZig: string)
+    (visibility: string)
+    (targetFn: string)
+    (fn: FnInfo)
+    =
+    let L (s: string) = out.AppendLine(indent + s) |> ignore
+    let paramTys = fn.Params |> List.map (fun p -> zigType p.Ty)
+    let paramTysStr = String.concat ", " paramTys
+    let retZig = zigType fn.Ret
+    let voidRet = isVoid fn.Ret
+
+    let borrowedIdx =
+        fn.Modes
+        |> List.indexed
+        |> List.choose (fun (i, m) ->
+            if m = MBorrowed then
+                Some i
+            else
+                None
+        )
+
+    let ctxParam =
+        if fn.Params.IsEmpty then
+            "_: *fable_rt.TailCtx"
+        else
+            "ctx: *fable_rt.TailCtx"
+
+    L $"%s{visibility}fn %s{fnNameZig}(%s{ctxParam}, ret: *anyopaque) fable_rt.TailStatus {{"
+
+    if fn.Params.IsEmpty then
+        L $"    const raw = %s{targetFn}();"
+
+        if voidRet then
+            L "    const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {"
+            L $"        fable_rt.plugRet(%s{retZig}, ret);"
+            L "        return .raised;"
+            L "    } else raw;"
+            L "    _ = r;"
+            L "    return .ok;"
+        else
+            L "    const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {"
+            L $"        fable_rt.plugRet(%s{retZig}, ret);"
+            L "        return .raised;"
+            L "    } else raw;"
+
+            let resExpr =
+                if fn.RetFrom.IsSome then
+                    dupCode "r"
+                else
+                    "r"
+
+            L $"    const res = %s{resExpr};"
+            L $"    @as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = res;"
+            L "    return .ok;"
+    else
+        L $"    if (comptime fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})) {{"
+        L $"        const _tca = fable_rt.tailLoad(&.{{ %s{paramTysStr} }}, ctx);"
+        let args = fn.Params |> List.mapi (fun i _ -> $"_tca[%d{i}]") |> String.concat ", "
+        L $"        const raw = %s{targetFn}(%s{args});"
+
+        if voidRet then
+            L "        const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {"
+
+            for i in borrowedIdx do
+                L("            " + dropCode $"_tca[%d{i}]")
+
+            L $"            fable_rt.plugRet(%s{retZig}, ret);"
+            L "            return .raised;"
+            L "        } else raw;"
+            L "        _ = r;"
+
+            for i in borrowedIdx do
+                L("        " + dropCode $"_tca[%d{i}]")
+
+            L "        return .ok;"
+        else
+            L "        const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {"
+
+            for i in borrowedIdx do
+                L("            " + dropCode $"_tca[%d{i}]")
+
+            L $"            fable_rt.plugRet(%s{retZig}, ret);"
+            L "            return .raised;"
+            L "        } else raw;"
+
+            let resExpr =
+                if fn.RetFrom.IsSome then
+                    dupCode "r"
+                else
+                    "r"
+
+            L $"        const res = %s{resExpr};"
+
+            for i in borrowedIdx do
+                L("        " + dropCode $"_tca[%d{i}]")
+
+            L $"        @as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = res;"
+            L "        return .ok;"
+
+        L "    } else {"
+        L "        unreachable;"
+        L "    }"
+
+    L "}"
+
 let emitFunction
     (out: StringBuilder)
     (rootNames: HashSet<string>)
+    (fableAliases: HashSet<string>)
+    (noTcFns: HashSet<string>)
+    (noTailCalls: HashSet<string>)
     (adapters: Dictionary<string, Adapter>)
+    (knowns: Dictionary<string, KnownDecl>)
     (ifaceVts: Dictionary<string, IfaceVt>)
     (fns: Dictionary<string, FnInfo>)
     (curried2: Dictionary<string, string>)
+    (noTc: bool)
     (fn: FnInfo)
     =
-    // Is there a self call, or `let r = self(..) in Case(.., r, ..)`, where the function ends?
-    let sites = tailSites fn.Body
+    let renderBody (body: Expr) (kParamIds: Set<int>) (isTc: bool) =
+        // Is there a self call, or `let r = self(..) in Case(.., r, ..)`, where the function ends?
+        let sites = tailSites body
 
-    let selfTail =
-        sites
-        |> List.exists (
-            function
-            | ECall(f, _, _, _)
-            | EOnRaise(ECall(f, _, _, _), _) -> f = fn.Name
-            | _ -> false
-        )
+        let selfTail =
+            sites
+            |> List.exists (
+                function
+                | ECall(f, _, _, _)
+                | EOnRaise(ECall(f, _, _, _), _) -> f = fn.Name
+                | _ -> false
+            )
 
-    // (When the function can be left by an exception, what it has built so far must be
-    // droppable: that takes a value without fields to put in the hole.)
-    let plug =
-        allCases fn.Ret
-        |> List.tryFind (fun c -> isHeapTy fn.Ret && (caseFields fn.Ret c).IsEmpty)
-        |> Option.map (fun c -> $"@as(%s{zigType fn.Ret}, .%s{fieldIdent c})")
+        // (When the function can be left by an exception, what it has built so far must be
+        // droppable: a field-less case if any, otherwise `fable_rt.nullOf(R)` behind `hasNull(R)`.)
+        let plug =
+            allCases fn.Ret
+            |> List.tryFind (fun c -> isHeapTy fn.Ret && (caseFields fn.Ret c).IsEmpty)
+            |> Option.map (fun c -> $"@as(%s{zigType fn.Ret}, .%s{fieldIdent c})")
 
-    let trmc =
-        sites |> List.exists (fun s -> (trmcSite fn.Name s).IsSome)
-        && (fn.Raises = RNever || plug.IsSome)
+        let hasTrmcSite =
+            not isTc
+            && fn.RetFrom.IsNone
+            && (sites |> List.exists (fun s -> (trmcSite fn.Name s).IsSome))
 
-    let reassigned =
-        sites
-        |> List.collect (fun s ->
-            let args =
-                match s, trmcSite fn.Name s with
-                | _, Some(a, _, _, _, _, _) -> a
-                | (ECall(f, _, a, _) | EOnRaise(ECall(f, _, a, _), _)), _ when f = fn.Name -> a
-                | _ -> []
+        let trmc = hasTrmcSite && (fn.Raises = RNever || plug.IsSome)
+        let splitHasNull = hasTrmcSite && fn.Raises <> RNever && plug.IsNone
 
-            if args.IsEmpty then
-                []
-            else
-                List.zip fn.Params args
-                |> List.choose (fun (p, a) ->
-                    match a with
-                    | EVar v when v.Id = p.Id -> None
-                    | _ -> Some p.Id
+        let reassignedFor (useTrmc: bool) =
+            sites
+            |> List.collect (fun s ->
+                let args =
+                    match
+                        s,
+                        (if useTrmc then
+                             trmcSite fn.Name s
+                         else
+                             None)
+                    with
+                    | _, Some(a, _, _, _, _, _) -> a
+                    | (ECall(f, _, a, _) | EOnRaise(ECall(f, _, a, _), _)), _ when f = fn.Name -> a
+                    | _ -> []
+
+                if args.IsEmpty then
+                    []
+                else
+                    List.zip fn.Params args
+                    |> List.choose (fun (p, a) ->
+                        match a with
+                        | EVar v when v.Id = p.Id -> None
+                        | _ -> Some p.Id
+                    )
+            )
+            |> Set.ofList
+
+        let mutatedIds =
+            // (a variable whose address is taken to be assigned through is a `var` too)
+            let addressed = HashSet<int>()
+
+            exists
+                (fun x ->
+                    match x with
+                    | EAddr(EVar v, false) -> addressed.Add v.Id |> ignore
+                    | _ -> ()
+
+                    false
                 )
-        )
-        |> Set.ofList
+                body
+            |> ignore
 
-    let loop =
-        if selfTail || trmc then
-            Some
+            Set.unionMany [ assignedIn body; storedInto body; Set.ofSeq addressed ]
+
+        let sigReassigned = reassignedFor (trmc || splitHasNull)
+        let paramUsed = HashSet(rootNames)
+
+        if isTc then
+            paramUsed.Add "ctx" |> ignore
+            paramUsed.Add "ret" |> ignore
+
+        let paramLocalNames = Dictionary<int, string>()
+
+        let allocName (baseStr: string) =
+            let b =
+                let c = cleanIdent baseStr
+
+                if isReservedIdent c then
+                    c + "_"
+                else
+                    c
+
+            let mutable cand = b
+            let mutable i = 1
+
+            while paramUsed.Contains cand do
+                cand <- $"%s{b}_%d{i}"
+                i <- i + 1
+
+            paramUsed.Add cand |> ignore
+            cand
+
+        let ps =
+            fn.Params
+            |> List.map (fun p ->
+                let n = allocName p.Base
+                paramLocalNames[p.Id] <- n
+
+                let sigName =
+                    if sigReassigned.Contains p.Id then
+                        allocName (n + "_in")
+                    else
+                        n
+
+                sigName, n, p
+            )
+
+        let emitVariant (useTrmc: bool) (plugOpt: string option) (baseInd: string) =
+            let brReassigned = reassignedFor useTrmc
+
+            let brLoop =
+                if selfTail || useTrmc then
+                    Some
+                        {
+                            Self = fn.Name
+                            Params = fn.Params
+                            Trmc = useTrmc
+                            Plug = plugOpt
+                        }
+                else
+                    None
+
+            let namesDict = Dictionary<int, string>()
+
+            for kv in paramLocalNames do
+                namesDict[kv.Key] <- kv.Value
+
+            let em =
                 {
-                    Self = fn.Name
-                    Params = fn.Params
-                    Trmc = trmc
-                    Plug = plug
+                    Out = StringBuilder()
+                    Names = namesDict
+                    Used = HashSet(paramUsed)
+                    Mutated = mutatedIds
+                    Loop = brLoop
+                    Scc = None
+                    Self = fn
+                    Fns = fns
+                    Curried2 = curried2
+                    TryLabels = Stack()
+                    Adapters = adapters
+                    Knowns = knowns
+                    IfaceVts = ifaceVts
+                    KParams = kParamIds
+                    IsTc = isTc
+                    FableAliases = fableAliases
+                    NoTcFns = noTcFns
+                    NoTailCalls = noTailCalls
+                    CanTail =
+                        not isTc
+                        && kParamIds.IsEmpty
+                        && not useTrmc
+                        && fn.Raises = RNever
+                        && not (
+                            exists
+                                (function
+                                | EUnpack(u, _) -> u.Token.IsSome
+                                | _ -> false)
+                                body
+                        )
+                    Counter = 0
                 }
+
+            for (s, n, p) in ps do
+                if s <> n then
+                    if brReassigned.Contains p.Id then
+                        line em baseInd $"var %s{n} = %s{s};"
+                    elif splitHasNull then
+                        line em baseInd $"const %s{n} = %s{s};"
+
+            let retDest =
+                if isTc then
+                    DTcRet
+                else
+                    DReturn
+
+            match brLoop with
+            | Some l ->
+                if l.Trmc then
+                    line em baseInd $"var result: %s{zigType fn.Ret} = undefined;"
+                    line em baseInd $"var hole: *%s{zigType fn.Ret} = &result;"
+
+                line em baseInd "tail: while (true) {"
+                stmt em (baseInd + "    ") body retDest
+                line em baseInd "}"
+            | None -> stmt em baseInd body retDest
+
+            let raw = dropUnreadPaths (em.Out.ToString())
+
+            let raw =
+                if splitHasNull then
+                    let extraUnused =
+                        ps
+                        |> List.choose (fun (s, n, p) ->
+                            if s <> n && not (brReassigned.Contains p.Id) then
+                                Some n
+                            else
+                                None
+                        )
+
+                    let unusedLocal = ensureUsed extraUnused raw
+                    unusedLocal.Replace("    _ = ", baseInd + "_ = ") + raw
+                else
+                    raw
+
+            if raw.Contains "fable_stack.alloc(" then
+                $"%s{baseInd}var fable_stack: fable_rt.StackAlloc = .{{}};\n%s{baseInd}defer fable_stack.deinit();\n"
+                + raw
+            else
+                raw
+
+        let bodyText =
+            if splitHasNull then
+                let retZig = zigType fn.Ret
+                let trmcBranch = emitVariant true (Some $"fable_rt.nullOf(%s{retZig})") "        "
+                let plainBranch = emitVariant false None "        "
+                $"    if (comptime fable_rt.hasNull(%s{retZig})) {{\n%s{trmcBranch}    }} else {{\n%s{plainBranch}    }}\n"
+            else
+                emitVariant trmc plug "    "
+
+        // `[<StackArena(bytes)>]`: the function's cells come from a buffer on its stack
+        let bodyText =
+            match currentArenas.Value.Value.TryGetValue fn.Name with
+            | true, bytes ->
+                $"    var fable_arena_buffer: [%d{bytes}]u8 align(16) = undefined;\n"
+                + "    var fable_arena_fba = std.heap.FixedBufferAllocator.init(&fable_arena_buffer);\n"
+                + "    var fable_arena: fable_rt.Arena = undefined;\n"
+                + "    fable_rt.arenaEnter(&fable_arena, &fable_arena_fba);\n"
+                + "    defer fable_rt.arenaLeave(&fable_arena);\n"
+                + bodyText
+            | _ -> bodyText
+
+        let factAsserts = formatFactAssertions [ fn ]
+        let bodyText = factAsserts + branchQuota (factAsserts + bodyText) + bodyText
+
+        let sigParams =
+            ps
+            |> List.map (fun (s, _, p) ->
+                if kParamIds.Contains p.Id then
+                    $"%s{s}: anytype"
+                else
+                    $"%s{s}: %s{zigType p.Ty}"
+            )
+            |> String.concat ", "
+
+        let usedNames =
+            let pNames = ps |> List.map (fun (s, _, _) -> s)
+
+            if isTc then
+                "ctx" :: "ret" :: pNames
+            else
+                pNames
+
+        let unused = ensureUsed usedNames bodyText
+        selfTail, (trmc || splitHasNull), sigParams, bodyText, unused
+
+    let selfTail, trmc, sigParams, bodyText, unused = renderBody fn.Body Set.empty false
+
+    let kVariant =
+        fn.BodyK
+        |> Option.map (fun bodyK ->
+            let kParamIds =
+                List.zip fn.Params fn.NoEscape
+                |> List.choose (fun (p, isK) ->
+                    if isK then
+                        Some p.Id
+                    else
+                        None
+                )
+                |> Set.ofList
+
+            let _, _, kSigParams, kBodyText, kUnused = renderBody bodyK kParamIds false
+            kSigParams, kBodyText, kUnused
+        )
+
+    let tcVariant =
+        if not noTc && fnHasTcBody fn then
+            fn.BodyTc
+            |> Option.map (fun bodyTc ->
+                let _, _, tcParamDecls, tcBodyText, tcUnused = renderBody bodyTc Set.empty true
+                tcParamDecls, tcBodyText, tcUnused
+            )
         else
             None
 
-    let em =
-        {
-            Out = StringBuilder()
-            Names = Dictionary()
-            Used = HashSet(rootNames)
-            Mutated =
-                // (a variable whose address is taken to be assigned through is a `var` too)
-                let addressed = HashSet<int>()
+    let paramTysStr =
+        fn.Params |> List.map (fun p -> zigType p.Ty) |> String.concat ", "
 
-                exists
-                    (fun x ->
-                        match x with
-                        | EAddr(EVar v, false) -> addressed.Add v.Id |> ignore
-                        | _ -> ()
-
-                        false
-                    )
-                    fn.Body
-                |> ignore
-
-                Set.unionMany [ assignedIn fn.Body; storedInto fn.Body; Set.ofSeq addressed ]
-            Loop = loop
-            Scc = None
-            Self = fn
-            Fns = fns
-            Curried2 = curried2
-            TryLabels = Stack()
-            CanTail =
-                not trmc
-                && fn.Raises = RNever
-                && not (
-                    exists
-                        (function
-                        | EUnpack(u, _) -> u.Token.IsSome
-                        | _ -> false)
-                        fn.Body
-                )
-            Adapters = adapters
-            IfaceVts = ifaceVts
-            Counter = 0
-        }
-
-    let ps =
-        fn.Params
-        |> List.map (fun p ->
-            let n = vname em p
-
-            let sigName =
-                if reassigned.Contains p.Id then
-                    freshName em (n + "_in")
-                else
-                    n
-
-            sigName, n, p
-        )
-
-    for (s, n, _) in ps do
-        if s <> n then
-            line em "    " $"var %s{n} = %s{s};"
-
-    match loop with
-    | Some l ->
-        if l.Trmc then
-            line em "    " $"var result: %s{zigType fn.Ret} = undefined;"
-            line em "    " $"var hole: *%s{zigType fn.Ret} = &result;"
-
-        line em "    " "tail: while (true) {"
-        stmt em "        " fn.Body DReturn
-        line em "    " "}"
-    | None -> stmt em "    " fn.Body DReturn
-
-    let bodyText = dropUnreadPaths (em.Out.ToString())
-
-    // `NativePtr.stackalloc`: memory of the function, given up when it returns
-    let bodyText =
-        if bodyText.Contains "fable_stack.alloc(" then
-            "    var fable_stack: fable_rt.StackAlloc = .{};\n    defer fable_stack.deinit();\n"
-            + bodyText
-        else
-            bodyText
-
-    // `[<StackArena(bytes)>]`: the function's cells come from a buffer on its stack
-    let bodyText =
-        match currentArenas.Value.Value.TryGetValue fn.Name with
-        | true, bytes ->
-            $"    var fable_arena_buffer: [%d{bytes}]u8 align(16) = undefined;\n"
-            + "    var fable_arena_fba = std.heap.FixedBufferAllocator.init(&fable_arena_buffer);\n"
-            + "    var fable_arena: fable_rt.Arena = undefined;\n"
-            + "    fable_rt.arenaEnter(&fable_arena, &fable_arena_fba);\n"
-            + "    defer fable_rt.arenaLeave(&fable_arena);\n"
-            + bodyText
-        | _ -> bodyText
-
-    let bodyText = branchQuota bodyText + bodyText
-
-    let sigParams =
-        ps
-        |> List.map (fun (s, _, p) -> $"%s{s}: %s{zigType p.Ty}")
-        |> String.concat ", "
+    let retZig = zigType fn.Ret
 
     let modes =
         List.zip fn.Params fn.Modes
@@ -1671,7 +3477,40 @@ let emitFunction
         else
             "pub "
 
-    let unused = ensureUsed (ps |> List.map (fun (s, _, _) -> s)) bodyText
+    let emitFullTcFn (fnNameZig: string) (targetBody: string) (fnVis: string) =
+        out.AppendLine($"%s{fnVis}fn %s{fnNameZig}(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {{")
+        |> ignore
+
+        if fn.Params.IsEmpty then
+            out
+                .AppendLine($"    const _next = %s{targetBody}(ctx, ret) catch {{")
+                .AppendLine($"        fable_rt.plugRet(%s{retZig}, ret);")
+                .AppendLine("        return .raised;")
+                .AppendLine("    };")
+                .AppendLine("    if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{ ctx, _next.ret });")
+                .AppendLine("    return .ok;")
+                .AppendLine("}")
+            |> ignore
+        else
+            let loadArgs =
+                fn.Params |> List.mapi (fun i _ -> $"_tca[%d{i}]") |> String.concat ", "
+
+            out
+                .AppendLine($"    if (comptime fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})) {{")
+                .AppendLine($"        const _tca = fable_rt.tailLoad(&.{{ %s{paramTysStr} }}, ctx);")
+                .AppendLine($"        const _next = %s{targetBody}(ctx, ret, %s{loadArgs}) catch {{")
+                .AppendLine($"            fable_rt.plugRet(%s{retZig}, ret);")
+                .AppendLine("            return .raised;")
+                .AppendLine("        };")
+                .AppendLine(
+                    "        if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{ ctx, _next.ret });"
+                )
+                .AppendLine("        return .ok;")
+                .AppendLine("    } else {")
+                .AppendLine("        unreachable;")
+                .AppendLine("    }")
+                .AppendLine("}")
+            |> ignore
 
     match fn.TypeParams with
     | [] ->
@@ -1681,6 +3520,45 @@ let emitFunction
             .Append(bodyText)
             .AppendLine("}")
         |> ignore
+
+        match kVariant with
+        | Some(kSigParams, kBodyText, kUnused) ->
+            out
+                .AppendLine($"%s{visibility}fn @\"%s{topIdent fn.Name}$k\"(%s{kSigParams}) %s{retType fn} {{")
+                .Append(kUnused)
+                .Append(kBodyText)
+                .AppendLine("}")
+            |> ignore
+        | None -> ()
+
+        match tcVariant with
+        | Some(tcParamDecls, tcBodyText, tcUnused) ->
+            let tcSig =
+                if tcParamDecls = "" then
+                    "ctx: *fable_rt.TailCtx, ret: *anyopaque"
+                else
+                    $"ctx: *fable_rt.TailCtx, ret: *anyopaque, %s{tcParamDecls}"
+
+            out
+                .AppendLine($"fn @\"%s{topIdent fn.Name}$tcbody\"(%s{tcSig}) fable_rt.Raised!fable_rt.TailNext {{")
+                .Append(tcUnused)
+                .Append(tcBodyText)
+                .AppendLine("}")
+            |> ignore
+
+            if fn.NeedsChain then
+                emitFullTcFn $"@\"%s{topIdent fn.Name}$tc\"" $"@\"%s{topIdent fn.Name}$tcbody\"" visibility
+            else
+                emitFullTcFn $"@\"%s{topIdent fn.Name}$tcfull\"" $"@\"%s{topIdent fn.Name}$tcbody\"" ""
+                emitThinTc out "" $"@\"%s{topIdent fn.Name}$tcthin\"" "" (topIdent fn.Name) fn
+
+                out.AppendLine(
+                    $"%s{visibility}const @\"%s{topIdent fn.Name}$tc\" = if (%s{chainName fn.Name}) @\"%s{topIdent fn.Name}$tcfull\" else @\"%s{topIdent fn.Name}$tcthin\";"
+                )
+                |> ignore
+        | None when not fn.IsLocal && not noTc ->
+            emitThinTc out "" $"@\"%s{topIdent fn.Name}$tc\"" visibility (topIdent fn.Name) fn
+        | None -> ()
     | typeParams ->
         // A generic function: a Zig function from its type arguments to a namespace that holds
         // the function, so that `name(i32).call` is an ordinary function.
@@ -1701,13 +3579,29 @@ let emitFunction
 
         // (a function lifted out of a generic one has its type parameters, and may not use
         // them all)
+        let kCombined =
+            match kVariant with
+            | Some(ks, kb, _) -> $"%s{ks} %s{kb}"
+            | None -> ""
+
+        let tcCombined =
+            match tcVariant with
+            | Some(ts, tb, _) -> $"%s{ts} %s{tb}"
+            | None -> ""
+
         let signature = $"%s{sigParams} %s{retType fn}"
 
         let discards =
             typeParams
             |> List.filter (fun g ->
                 let name = genName g
-                not (bodyText.Contains name || signature.Contains name)
+
+                not (
+                    bodyText.Contains name
+                    || signature.Contains name
+                    || kCombined.Contains name
+                    || tcCombined.Contains name
+                )
             )
             |> List.map (fun g -> $"    _ = %s{genName g};\n")
             |> String.concat ""
@@ -1718,52 +3612,143 @@ let emitFunction
             else
                 ""
 
+        let noEscDecl =
+            if kVariant.IsSome && not fn.IsLocal then
+                $"        pub const noescape = %s{noEscapeName fn.Name};\n"
+            else
+                ""
+
         out
             .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{comptimeParams}) type {{")
             .Append(discards)
             .AppendLine("    return struct {")
             .Append(sigDecl)
+            .Append(noEscDecl)
             .AppendLine($"        pub fn call(%s{sigParams}) %s{retType fn} {{")
             .Append(indented unused)
             .Append(indented bodyText)
             .AppendLine("        }")
-            .AppendLine("    };")
-            .AppendLine("}")
         |> ignore
 
-    // What the function borrows, for the calls from other files.
-    if hasManaged fn && not fn.IsLocal then
-        let borrows =
-            match fn.Modes with
-            | [] -> ".{}"
-            | modes ->
-                modes
-                |> List.map (fun m ->
-                    if m = MBorrowed then
-                        "true"
-                    else
-                        "false"
-                )
-                |> String.concat ", "
-                |> sprintf ".{ %s }"
+        match kVariant with
+        | Some(kSigParams, kBodyText, kUnused) ->
+            out
+                .AppendLine($"        pub fn callK(%s{kSigParams}) %s{retType fn} {{")
+                .Append(indented kUnused)
+                .Append(indented kBodyText)
+                .AppendLine("        }")
+            |> ignore
+        | None -> ()
 
-        let resultBorrowed =
-            if fn.RetFrom.IsSome then
-                "true"
+        match tcVariant with
+        | Some(tcParamDecls, tcBodyText, tcUnused) ->
+            let tcSig =
+                if tcParamDecls = "" then
+                    "ctx: *fable_rt.TailCtx, ret: *anyopaque"
+                else
+                    $"ctx: *fable_rt.TailCtx, ret: *anyopaque, %s{tcParamDecls}"
+
+            out
+                .AppendLine($"        pub fn tcbody(%s{tcSig}) fable_rt.Raised!fable_rt.TailNext {{")
+                .Append(indented tcUnused)
+                .Append(indented tcBodyText)
+                .AppendLine("        }")
+            |> ignore
+
+            let tcSb = StringBuilder()
+
+            let tcSigHeader =
+                if fn.NeedsChain then
+                    "        pub fn tc(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {"
+                else
+                    "        fn tcfull(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {"
+
+            if fn.Params.IsEmpty then
+                tcSb
+                    .AppendLine(tcSigHeader)
+                    .AppendLine("            const _next = tcbody(ctx, ret) catch {")
+                    .AppendLine($"                fable_rt.plugRet(%s{retZig}, ret);")
+                    .AppendLine("                return .raised;")
+                    .AppendLine("            };")
+                    .AppendLine(
+                        "            if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{ ctx, _next.ret });"
+                    )
+                    .AppendLine("            return .ok;")
+                    .AppendLine("        }")
+                |> ignore
             else
-                "false"
+                let loadArgs =
+                    fn.Params |> List.mapi (fun i _ -> $"_tca[%d{i}]") |> String.concat ", "
 
-        out.AppendLine(
-            $"pub const %s{sigName fn.Name} = .{{ .borrows = %s{borrows}, .result_borrowed = %s{resultBorrowed} }};"
-        )
+                tcSb
+                    .AppendLine(tcSigHeader)
+                    .AppendLine($"            if (comptime fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})) {{")
+                    .AppendLine($"                const _tca = fable_rt.tailLoad(&.{{ %s{paramTysStr} }}, ctx);")
+                    .AppendLine($"                const _next = tcbody(ctx, ret, %s{loadArgs}) catch {{")
+                    .AppendLine($"                    fable_rt.plugRet(%s{retZig}, ret);")
+                    .AppendLine("                    return .raised;")
+                    .AppendLine("                };")
+                    .AppendLine(
+                        "                if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{ ctx, _next.ret });"
+                    )
+                    .AppendLine("                return .ok;")
+                    .AppendLine("            } else {")
+                    .AppendLine("                unreachable;")
+                    .AppendLine("            }")
+                    .AppendLine("        }")
+                |> ignore
+
+            out.Append(tcSb.ToString()) |> ignore
+
+            if not fn.NeedsChain then
+                emitThinTc out "        " "tcthin" "" "call" fn
+
+                out.AppendLine($"        pub const tc = if (%s{chainName fn.Name}) tcfull else tcthin;")
+                |> ignore
+        | None when not fn.IsLocal && not noTc -> emitThinTc out "        " "tc" "pub " "call" fn
+        | None -> ()
+
+        out.AppendLine("    };").AppendLine("}") |> ignore
+
+    // What the function borrows and stores, for the calls from other files.
+    if hasManaged fn && not fn.IsLocal then
+        out.AppendLine($"pub const %s{sigName fn.Name} = %s{formatSigValue fn};")
         |> ignore
+
+    if not fn.IsLocal then
+        out.AppendLine($"pub const %s{storesName fn.Name} = %s{formatStoresValue fn};")
+        |> ignore
+
+    if not noTc && (not fn.IsLocal || fnHasTcBody fn) then
+        out.AppendLine($"%s{visibility}const %s{chainName fn.Name}: bool = %s{fnChainConstExpr fn};")
+        |> ignore
+
+    if kVariant.IsSome && not fn.IsLocal then
+        let noEs =
+            fn.NoEscape
+            |> List.map (fun b ->
+                if b then
+                    "true"
+                else
+                    "false"
+            )
+            |> String.concat ", "
+            |> sprintf ".{ %s }"
+
+        out.AppendLine($"pub const %s{noEscapeName fn.Name} = %s{noEs};") |> ignore
 
     out.AppendLine() |> ignore
 
 /// The code of a function value. A function value owns its arguments and its result, and what
 /// it captured stays in its environment; the function it calls may have been inferred to
 /// borrow some of that, so this is where the two are brought together.
-let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapter) =
+let emitAdapter
+    (out: StringBuilder)
+    (fableAliases: HashSet<string>)
+    (noTcFns: HashSet<string>)
+    (fns: Dictionary<string, FnInfo>)
+    (a: Adapter)
+    =
     let argTys, ret =
         match a.FnTy with
         | TFn(args, ret) -> args, ret
@@ -1985,6 +3970,421 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
 
     line "}"
 
+    if a.NeedsTcode && not a.BorrowFirst then
+        let emitTcodeFn (tcFnName: string) (target: string) (tArgTys: Ty list) (tRetTy: Ty) =
+            let tParamTysStr = tArgTys |> List.map zigType |> String.concat ", "
+            let tRetZig = zigType tRetTy
+            let tVoidRet = isVoid tRetTy
+            line $"pub fn %s{tcFnName}(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {{"
+            line $"    if (comptime fable_rt.fitsTailArgs(&.{{ %s{tParamTysStr} }})) {{"
+            line $"        const _tca = fable_rt.tailLoad(&.{{ %s{tParamTysStr} }}, ctx);"
+            line "        const _ts = fable_rt.takeSelfBorrowed(ctx);"
+            line "        const env: ?*fable_rt.Env = @ptrCast(@alignCast(_ts.ptr));"
+
+            let emitTcBodyDispatch (fn: FnInfo) (pad: string) =
+                let inst =
+                    if fn.TypeParams.Length = a.TypeArgs.Length then
+                        Map.ofList (List.zip fn.TypeParams a.TypeArgs)
+                    else
+                        Map.empty
+
+                let capParams = List.take a.NCaptures fn.Params
+
+                let capArgs =
+                    if a.NCaptures > 0 then
+                        line $"%s{pad}const c = fable_rt.captured(Env, env);"
+
+                        capParams
+                        |> List.mapi (fun i p ->
+                            let capTy = substTy inst p.Ty
+                            let cv = $"_tc_cap%d{i}"
+
+                            if isManaged capTy then
+                                let dupCap = dupCode $"c.c%d{i}"
+                                line $"%s{pad}const %s{cv}: %s{zigType capTy} = %s{dupCap};"
+                            else
+                                line $"%s{pad}const %s{cv}: %s{zigType capTy} = c.c%d{i};"
+
+                            cv
+                        )
+                    else
+                        []
+
+                line $"%s{pad}if (_ts.owned) fable_rt.dropEnv(env);"
+                let loadArgs = tArgTys |> List.mapi (fun i _ -> $"_tca[%d{i}]")
+                let allArgs = capArgs @ loadArgs |> String.concat ", "
+
+                line $"%s{pad}const _next = %s{fnTcBodyRef target a.TypeArgs}(ctx, ret, %s{allArgs}) catch {{"
+                line $"%s{pad}    fable_rt.plugRet(%s{tRetZig}, ret);"
+                line $"%s{pad}    return .raised;"
+                line $"%s{pad}}};"
+                line $"%s{pad}if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{{ ctx, _next.ret }});"
+                line $"%s{pad}return .ok;"
+
+            let emitKnownNonTc (fn: FnInfo) (pad: string) =
+                if a.NCaptures > 0 then
+                    line $"%s{pad}const c = fable_rt.captured(Env, env);"
+
+                let captured, rest = List.splitAt a.NCaptures (List.zip fn.Params fn.Modes)
+
+                let capArgs =
+                    captured
+                    |> List.mapi (fun i (_, m) ->
+                        if m = MOwned then
+                            dupCode $"c.c%d{i}"
+                        else
+                            $"c.c%d{i}"
+                    )
+
+                let callArgs = tArgTys |> List.mapi (fun i _ -> $"_tca[%d{i}]")
+                let args = capArgs @ callArgs |> String.concat ", "
+
+                let dropAfter =
+                    List.zip callArgs rest
+                    |> List.choose (fun (n, (_, m)) ->
+                        if m = MBorrowed then
+                            Some n
+                        else
+                            None
+                    )
+
+                line $"%s{pad}const raw = %s{fnRef target a.TypeArgs}(%s{args});"
+                line $"%s{pad}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+
+                for d in dropAfter do
+                    line ($"%s{pad}    " + dropCode d)
+
+                line $"%s{pad}    if (_ts.owned) fable_rt.dropEnv(env);"
+                line $"%s{pad}    fable_rt.plugRet(%s{tRetZig}, ret);"
+                line $"%s{pad}    return .raised;"
+                line $"%s{pad}}} else raw;"
+
+                if tVoidRet then
+                    line $"%s{pad}_ = r;"
+
+                    for d in dropAfter do
+                        line ($"%s{pad}" + dropCode d)
+
+                    line $"%s{pad}if (_ts.owned) fable_rt.dropEnv(env);"
+                    line $"%s{pad}return .ok;"
+                else
+                    let resExpr =
+                        if fn.RetFrom.IsSome then
+                            dupCode "r"
+                        else
+                            "r"
+
+                    line $"%s{pad}const res = %s{resExpr};"
+
+                    for d in dropAfter do
+                        line ($"%s{pad}" + dropCode d)
+
+                    line $"%s{pad}if (_ts.owned) fable_rt.dropEnv(env);"
+                    line $"%s{pad}@as(*%s{tRetZig}, @ptrCast(@alignCast(ret))).* = res;"
+                    line $"%s{pad}return .ok;"
+
+            match fns.TryGetValue target with
+            | true, fn when not (noTcFns.Contains target) && fnHasTcBody fn ->
+                if fn.NeedsChain then
+                    emitTcBodyDispatch fn "        "
+                else
+                    line $"        if (comptime %s{chainName target}) {{"
+                    emitTcBodyDispatch fn "            "
+                    line "        } else {"
+                    emitKnownNonTc fn "            "
+                    line "        }"
+            | true, fn -> emitKnownNonTc fn "        "
+            | _ ->
+                let emitExtFallback (pad: string) =
+                    if a.NCaptures > 0 then
+                        line $"%s{pad}const c = fable_rt.captured(Env, env);"
+
+                    let tuple (items: string list) =
+                        match items with
+                        | [] -> ".{}"
+                        | _ -> items |> String.concat ", " |> sprintf ".{ %s }"
+
+                    let capArgs = a.CaptureTys |> List.mapi (fun i _ -> $"c.c%d{i}")
+                    let callArgs = tArgTys |> List.mapi (fun i _ -> $"_tca[%d{i}]")
+
+                    let callExpr =
+                        if
+                            isManaged tRetTy
+                            || tArgTys |> List.exists isManaged
+                            || a.CaptureTys |> List.exists isManaged
+                        then
+                            let uses =
+                                (a.CaptureTys
+                                 |> List.map (fun t ->
+                                     if isManaged t then
+                                         ".keep"
+                                     else
+                                         ".plain"
+                                 ))
+                                @ (tArgTys
+                                   |> List.map (fun t ->
+                                       if isManaged t then
+                                           ".give"
+                                       else
+                                           ".plain"
+                                   ))
+
+                            $"fable_rt.across(%s{fnRef target a.TypeArgs}, %s{sigName target}, %s{tuple uses}, %s{tuple (capArgs @ callArgs)})"
+                        else
+                            let args = capArgs @ callArgs |> String.concat ", "
+                            $"%s{fnRef target a.TypeArgs}(%s{args})"
+
+                    line $"%s{pad}const raw = %s{callExpr};"
+                    line $"%s{pad}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+                    line $"%s{pad}    if (_ts.owned) fable_rt.dropEnv(env);"
+                    line $"%s{pad}    fable_rt.plugRet(%s{tRetZig}, ret);"
+                    line $"%s{pad}    return .raised;"
+                    line $"%s{pad}}} else raw;"
+
+                    if tVoidRet then
+                        line $"%s{pad}_ = r;"
+                    else
+                        line $"%s{pad}@as(*%s{tRetZig}, @ptrCast(@alignCast(ret))).* = r;"
+
+                    line $"%s{pad}if (_ts.owned) fable_rt.dropEnv(env);"
+                    line $"%s{pad}return .ok;"
+
+                if isExtTcAlias fableAliases fns target then
+                    let allParamTysStr =
+                        a.CaptureTys @ tArgTys |> List.map zigType |> String.concat ", "
+
+                    line
+                        $"        if (comptime (%s{extChainCheck target} and fable_rt.fitsTailArgs(&.{{ %s{allParamTysStr} }}))) {{"
+
+                    let capArgs =
+                        if a.NCaptures > 0 then
+                            line "            const c = fable_rt.captured(Env, env);"
+
+                            a.CaptureTys
+                            |> List.mapi (fun i capTy ->
+                                let cv = $"_tc_cap%d{i}"
+
+                                if isManaged capTy then
+                                    let dupCap = dupCode $"c.c%d{i}"
+                                    line $"            const %s{cv}: %s{zigType capTy} = %s{dupCap};"
+                                else
+                                    line $"            const %s{cv}: %s{zigType capTy} = c.c%d{i};"
+
+                                cv
+                            )
+                        else
+                            []
+
+                    line "            if (_ts.owned) fable_rt.dropEnv(env);"
+                    let loadArgs = tArgTys |> List.mapi (fun i _ -> $"_tca[%d{i}]")
+                    let allArgs = capArgs @ loadArgs |> String.concat ", "
+
+                    if allParamTysStr <> "" then
+                        line $"            fable_rt.tailStore(&.{{ %s{allParamTysStr} }}, ctx, .{{ %s{allArgs} }});"
+
+                    line
+                        $"            return @call(fable_rt.tail_call, &%s{fnRefTc target a.TypeArgs}, .{{ ctx, ret }});"
+
+                    line "        } else {"
+                    emitExtFallback "            "
+                    line "        }"
+                else
+                    emitExtFallback "        "
+
+            line "    } else {"
+            line "        unreachable;"
+            line "    }"
+            line "}"
+
+        emitTcodeFn "tcode" a.Target argTys ret
+
+        match a.Target2, a.FnTy with
+        | Some t2, TFn([ tyA ], TFn([ tyB ], tyR)) -> emitTcodeFn "tcode2" t2 [ tyA; tyB ] tyR
+        | _ -> ()
+    elif a.NeedsTcode then
+        let thisTy, restArgTys =
+            match argTys with
+            | t :: rs -> t, rs
+            | [] -> fail None "internal: borrow-first adapter without self parameter"
+
+        let thisZig = zigType thisTy
+        let restParamTysStr = restArgTys |> List.map zigType |> String.concat ", "
+        let retZig = zigType ret
+        let voidRet = isVoid ret
+
+        line "pub fn tcode(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {"
+
+        let emitVtTcodeBody (pad: string) =
+            let loadArgs = restArgTys |> List.mapi (fun i _ -> $"_tca[%d{i}]")
+            let dupSelf = dupCode "self"
+            let dropSelf = dropCode "self"
+            line $"%s{pad}const _ts = fable_rt.takeSelfBorrowed(ctx);"
+            line $"%s{pad}const self: %s{thisZig} = @ptrCast(@alignCast(_ts.ptr.?));"
+
+            let emitTcBodyVt (p: string) =
+                line $"%s{p}const _self_own: %s{thisZig} = if (_ts.owned) self else %s{dupSelf};"
+                let allArgs = "_self_own" :: loadArgs |> String.concat ", "
+                line $"%s{p}const _next = %s{fnTcBodyRef a.Target a.TypeArgs}(ctx, ret, %s{allArgs}) catch {{"
+                line $"%s{p}    fable_rt.plugRet(%s{retZig}, ret);"
+                line $"%s{p}    return .raised;"
+                line $"%s{p}}};"
+                line $"%s{p}if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{{ ctx, _next.ret }});"
+                line $"%s{p}return .ok;"
+
+            let emitKnownNonTcVt (fn: FnInfo) (p: string) =
+                match List.zip fn.Params fn.Modes with
+                | (_, thisMode) :: restModes ->
+                    let a0 =
+                        if thisMode = MOwned then
+                            $"if (_ts.owned) self else %s{dupSelf}"
+                        else
+                            "self"
+
+                    let args = a0 :: loadArgs |> String.concat ", "
+
+                    let dropAfter =
+                        List.zip loadArgs restModes
+                        |> List.choose (fun (n, (_, m)) ->
+                            if m = MBorrowed then
+                                Some n
+                            else
+                                None
+                        )
+
+                    let selfDropLine =
+                        if thisMode <> MOwned && isManaged thisTy then
+                            Some $"if (_ts.owned) %s{dropSelf}"
+                        else
+                            None
+
+                    line $"%s{p}const raw = %s{fnRef a.Target a.TypeArgs}(%s{args});"
+                    line $"%s{p}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+
+                    for d in dropAfter do
+                        line ($"%s{p}    " + dropCode d)
+
+                    Option.iter (fun s -> line $"%s{p}    %s{s}") selfDropLine
+                    line $"%s{p}    fable_rt.plugRet(%s{retZig}, ret);"
+                    line $"%s{p}    return .raised;"
+                    line $"%s{p}}} else raw;"
+
+                    if voidRet then
+                        line $"%s{p}_ = r;"
+
+                        for d in dropAfter do
+                            line ($"%s{p}" + dropCode d)
+
+                        Option.iter (fun s -> line $"%s{p}%s{s}") selfDropLine
+                        line $"%s{p}return .ok;"
+                    else
+                        let resExpr =
+                            if fn.RetFrom.IsSome then
+                                dupCode "r"
+                            else
+                                "r"
+
+                        line $"%s{p}const res = %s{resExpr};"
+
+                        for d in dropAfter do
+                            line ($"%s{p}" + dropCode d)
+
+                        Option.iter (fun s -> line $"%s{p}%s{s}") selfDropLine
+                        line $"%s{p}@as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = res;"
+                        line $"%s{p}return .ok;"
+                | [] -> fail None "internal: vtable method `%s` has no self parameter" a.Target
+
+            match fns.TryGetValue a.Target with
+            | true, fn when not (noTcFns.Contains a.Target) && fnHasTcBody fn ->
+                if fn.NeedsChain then
+                    emitTcBodyVt pad
+                else
+                    line $"%s{pad}if (comptime %s{chainName a.Target}) {{"
+                    emitTcBodyVt (pad + "    ")
+                    line $"%s{pad}}} else {{"
+                    emitKnownNonTcVt fn (pad + "    ")
+                    line $"%s{pad}}}"
+            | true, fn -> emitKnownNonTcVt fn pad
+            | _ ->
+                let emitExtFallbackVt (p: string) =
+                    let tuple (items: string list) =
+                        match items with
+                        | [] -> ".{}"
+                        | _ -> items |> String.concat ", " |> sprintf ".{ %s }"
+
+                    let callExpr =
+                        if isManaged ret || argTys |> List.exists isManaged then
+                            let uses =
+                                (if isManaged thisTy then
+                                     ".keep"
+                                 else
+                                     ".plain")
+                                :: (restArgTys
+                                    |> List.map (fun t ->
+                                        if isManaged t then
+                                            ".give"
+                                        else
+                                            ".plain"
+                                    ))
+
+                            let usesTuple = tuple uses
+                            let argsTuple = tuple ("self" :: loadArgs)
+                            $"fable_rt.across(%s{fnRef a.Target a.TypeArgs}, %s{sigName a.Target}, %s{usesTuple}, %s{argsTuple})"
+                        else
+                            let args = "self" :: loadArgs |> String.concat ", "
+                            $"%s{fnRef a.Target a.TypeArgs}(%s{args})"
+
+                    let selfDrop =
+                        if isManaged thisTy then
+                            Some $"if (_ts.owned) %s{dropSelf}"
+                        else
+                            None
+
+                    line $"%s{p}const raw = %s{callExpr};"
+                    line $"%s{p}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+                    Option.iter (fun s -> line $"%s{p}    %s{s}") selfDrop
+                    line $"%s{p}    fable_rt.plugRet(%s{retZig}, ret);"
+                    line $"%s{p}    return .raised;"
+                    line $"%s{p}}} else raw;"
+
+                    if voidRet then
+                        line $"%s{p}_ = r;"
+                    else
+                        line $"%s{p}@as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = r;"
+
+                    Option.iter (fun s -> line $"%s{p}%s{s}") selfDrop
+                    line $"%s{p}return .ok;"
+
+                if isExtTcAlias fableAliases fns a.Target then
+                    let fullParamTysStr = argTys |> List.map zigType |> String.concat ", "
+
+                    line
+                        $"%s{pad}if (comptime (%s{extChainCheck a.Target} and fable_rt.fitsTailArgs(&.{{ %s{fullParamTysStr} }}))) {{"
+
+                    line $"%s{pad}    const _self_own: %s{thisZig} = if (_ts.owned) self else %s{dupSelf};"
+                    let allArgs = "_self_own" :: loadArgs |> String.concat ", "
+                    line $"%s{pad}    fable_rt.tailStore(&.{{ %s{fullParamTysStr} }}, ctx, .{{ %s{allArgs} }});"
+
+                    line
+                        $"%s{pad}    return @call(fable_rt.tail_call, &%s{fnRefTc a.Target a.TypeArgs}, .{{ ctx, ret }});"
+
+                    line $"%s{pad}}} else {{"
+                    emitExtFallbackVt (pad + "    ")
+                    line $"%s{pad}}}"
+                else
+                    emitExtFallbackVt pad
+
+        if restArgTys.IsEmpty then
+            emitVtTcodeBody "    "
+        else
+            line $"    if (comptime fable_rt.fitsTailArgs(&.{{ %s{restParamTysStr} }})) {{"
+            line $"        const _tca = fable_rt.tailLoad(&.{{ %s{restParamTysStr} }}, ctx);"
+            emitVtTcodeBody "        "
+            line "    } else {"
+            line "        unreachable;"
+            line "    }"
+
+        line "}"
+
     if a.Gens.IsEmpty then
         out.AppendLine("};") |> ignore
     else
@@ -1992,8 +4392,312 @@ let emitAdapter (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (a: Adapt
 
     out.AppendLine() |> ignore
 
+/// Emit a stack-allocated `Known` lambda struct descriptor for `callK` / `callHof`.
+let emitKnownDecl
+    (out: StringBuilder)
+    (fns: Dictionary<string, FnInfo>)
+    (noTcFile: bool)
+    (noTailCalls: HashSet<string>)
+    (adapters: Dictionary<string, Adapter>)
+    (k: KnownDecl)
+    =
+    let argTys, ret =
+        match k.FnTy with
+        | TFn(args, ret) -> args, ret
+        | _ -> fail None "internal: not a function type"
+
+    let ps =
+        argTys |> List.mapi (fun i t -> $"a%d{i}: %s{zigType t}") |> String.concat ", "
+
+    let pNames = argTys |> List.mapi (fun i _ -> $"a%d{i}")
+
+    let selfParam =
+        if pNames.IsEmpty then
+            "self: *const @This()"
+        else
+            "self: *const @This(), " + ps
+
+    let line (text: string) = out.AppendLine(text) |> ignore
+
+    match k.Gens with
+    | [] -> line $"const %s{k.Name} = struct {{"
+    | gens ->
+        let comptimeParams =
+            gens
+            |> List.map (fun g -> $"comptime %s{genName g}: type")
+            |> String.concat ", "
+
+        line $"fn %s{k.Name}(%s{comptimeParams}) type {{"
+        line "    return struct {"
+
+    let ind =
+        if k.Gens.IsEmpty then
+            "    "
+        else
+            "        "
+
+    let line (text: string) = line (ind + text)
+
+    line "pub const fable_known = {};"
+    line $"pub const FuncType = %s{zigType k.FnTy};"
+
+    if k.NCaptures > 0 then
+        let capFields =
+            match fns.TryGetValue k.Target with
+            | true, fn ->
+                let inst =
+                    if fn.TypeParams.Length = k.TypeArgs.Length then
+                        Map.ofList (List.zip fn.TypeParams k.TypeArgs)
+                    else
+                        Map.empty
+
+                fn.Params
+                |> List.take k.NCaptures
+                |> List.mapi (fun i p -> $"c%d{i}: %s{zigType (substTy inst p.Ty)}")
+            | _ -> k.CaptureTys |> List.mapi (fun i t -> $"c%d{i}: %s{zigType t}")
+
+        let capDecls = capFields |> String.concat ", "
+        line $"caps: struct {{ %s{capDecls} }},"
+
+    let boolTuple (ms: Mode list) =
+        match ms with
+        | [] -> ".{}"
+        | _ ->
+            ms
+            |> List.map (fun m ->
+                if m = MBorrowed then
+                    "true"
+                else
+                    "false"
+            )
+            |> String.concat ", "
+            |> sprintf ".{ %s }"
+
+    match fns.TryGetValue k.Target with
+    | true, fn ->
+        let captured, rest = List.splitAt k.NCaptures (List.zip fn.Params fn.Modes)
+        line $"pub const borrows = %s{boolTuple (rest |> List.map snd)};"
+
+        let rb =
+            if fn.RetFrom.IsSome then
+                "true"
+            else
+                "false"
+
+        line $"pub const result_borrowed = %s{rb};"
+
+        let targetRef = fnRef k.Target k.TypeArgs
+
+        line $"pub inline fn call(%s{selfParam}) @typeInfo(@TypeOf(%s{targetRef})).@\"fn\".return_type.? {{"
+
+        if k.NCaptures = 0 then
+            line "    _ = self;"
+
+        let capturedArgs =
+            captured
+            |> List.mapi (fun i (_, m) ->
+                if m = MOwned then
+                    dupCode $"self.caps.c%d{i}"
+                else
+                    $"self.caps.c%d{i}"
+            )
+
+        let callArgs = capturedArgs @ pNames |> String.concat ", "
+        line $"    return %s{targetRef}(%s{callArgs});"
+        line "}"
+
+        match k.Target2, k.FnTy with
+        | Some t2, TFn([ tyA ], TFn([ tyB ], _)) ->
+            match fns.TryGetValue t2 with
+            | true, fn2 ->
+                let captured2, rest2 = List.splitAt k.NCaptures (List.zip fn2.Params fn2.Modes)
+                line $"pub const borrows2 = %s{boolTuple (rest2 |> List.map snd)};"
+
+                let rb2 =
+                    if fn2.RetFrom.IsSome then
+                        "true"
+                    else
+                        "false"
+
+                line $"pub const result_borrowed2 = %s{rb2};"
+
+                let target2Ref = fnRef t2 k.TypeArgs
+
+                line
+                    $"pub inline fn call2(self: *const @This(), a0: %s{zigType tyA}, a1: %s{zigType tyB}) @typeInfo(@TypeOf(%s{target2Ref})).@\"fn\".return_type.? {{"
+
+                if k.NCaptures = 0 then
+                    line "    _ = self;"
+
+                let capturedArgs2 =
+                    captured2
+                    |> List.mapi (fun i (_, m) ->
+                        if m = MOwned then
+                            dupCode $"self.caps.c%d{i}"
+                        else
+                            $"self.caps.c%d{i}"
+                    )
+
+                let callArgs2 = capturedArgs2 @ [ "a0"; "a1" ] |> String.concat ", "
+                line $"    return %s{target2Ref}(%s{callArgs2});"
+                line "}"
+            | _ -> ()
+        | _ -> ()
+    | _ ->
+        let falseBorrows =
+            match argTys with
+            | [] -> ".{}"
+            | _ -> argTys |> List.map (fun _ -> "false") |> String.concat ", " |> sprintf ".{ %s }"
+
+        line $"pub const borrows = %s{falseBorrows};"
+        line "pub const result_borrowed = false;"
+        let targetRef = fnRef k.Target k.TypeArgs
+
+        line $"pub inline fn call(%s{selfParam}) @typeInfo(@TypeOf(%s{targetRef})).@\"fn\".return_type.? {{"
+
+        if k.NCaptures = 0 then
+            line "    _ = self;"
+
+        let capturedArgs = k.CaptureTys |> List.mapi (fun i _ -> $"self.caps.c%d{i}")
+
+        if
+            isManaged ret
+            || argTys |> List.exists isManaged
+            || k.CaptureTys |> List.exists isManaged
+        then
+            let uses =
+                (k.CaptureTys
+                 |> List.map (fun t ->
+                     if isManaged t then
+                         ".keep"
+                     else
+                         ".plain"
+                 ))
+                @ (argTys
+                   |> List.map (fun t ->
+                       if isManaged t then
+                           ".give"
+                       else
+                           ".plain"
+                   ))
+                |> String.concat ", "
+                |> sprintf ".{ %s }"
+
+            let allArgs = capturedArgs @ pNames
+
+            let argsTuple =
+                match allArgs with
+                | [] -> ".{}"
+                | _ -> allArgs |> String.concat ", " |> sprintf ".{ %s }"
+
+            line $"    return fable_rt.across(%s{targetRef}, %s{sigName k.Target}, %s{uses}, %s{argsTuple});"
+        else
+            let argList = String.concat ", " (capturedArgs @ pNames)
+            line $"    return %s{targetRef}(%s{argList});"
+
+        line "}"
+
+    if k.NeedsToFunc then
+        let adapter =
+            adapterForClosure adapters k.Target k.Target2 k.TypeArgs k.CaptureTys k.FnTy
+
+        let ans = adapterRef adapter
+        let suppressTcode = noTcFile || noTailCalls.Contains k.Target
+        line "pub fn toFunc(self: @This()) FuncType {"
+
+        if suppressTcode then
+            if k.NCaptures = 0 then
+                line "    _ = self;"
+
+                if adapter.Target2.IsSome then
+                    line $"    return .{{ .env = null, .code = %s{ans}.code, .code2 = %s{ans}.code2 }};"
+                else
+                    line $"    return .{{ .env = null, .code = %s{ans}.code }};"
+            else
+                let inits =
+                    k.CaptureTys
+                    |> List.mapi (fun i t ->
+                        let v =
+                            if isManaged t then
+                                dupCode $"self.caps.c%d{i}"
+                            else
+                                $"self.caps.c%d{i}"
+
+                        $".c%d{i} = %s{v}"
+                    )
+                    |> String.concat ", "
+
+                if adapter.Target2.IsSome then
+                    line
+                        $"    return fable_rt.closure2(FuncType, %s{ans}.Env, .{{ %s{inits} }}, %s{ans}.code, %s{ans}.code2);"
+                else
+                    line $"    return fable_rt.closure(FuncType, %s{ans}.Env, .{{ %s{inits} }}, %s{ans}.code);"
+        else
+            adapter.NeedsTcode <- true
+            let paramTysStr = argTys |> List.map zigType |> String.concat ", "
+
+            let tcodeExpr =
+                $"if (comptime fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})) &%s{ans}.tcode else null"
+
+            if k.NCaptures = 0 then
+                line "    _ = self;"
+
+                if adapter.Target2.IsSome then
+                    let tcode2Expr =
+                        match k.FnTy with
+                        | TFn([ tyA ], TFn([ tyB ], _)) ->
+                            $"if (comptime fable_rt.fitsTailArgs(&.{{ %s{zigType tyA}, %s{zigType tyB} }})) &%s{ans}.tcode2 else null"
+                        | _ -> "null"
+
+                    line
+                        $"    return .{{ .env = null, .code = %s{ans}.code, .code2 = %s{ans}.code2, .tcode = %s{tcodeExpr}, .tcode2 = %s{tcode2Expr} }};"
+                else
+                    line $"    return .{{ .env = null, .code = %s{ans}.code, .tcode = %s{tcodeExpr} }};"
+            else
+                let inits =
+                    k.CaptureTys
+                    |> List.mapi (fun i t ->
+                        let v =
+                            if isManaged t then
+                                dupCode $"self.caps.c%d{i}"
+                            else
+                                $"self.caps.c%d{i}"
+
+                        $".c%d{i} = %s{v}"
+                    )
+                    |> String.concat ", "
+
+                if adapter.Target2.IsSome then
+                    let tcode2Expr =
+                        match k.FnTy with
+                        | TFn([ tyA ], TFn([ tyB ], _)) ->
+                            $"if (comptime fable_rt.fitsTailArgs(&.{{ %s{zigType tyA}, %s{zigType tyB} }})) &%s{ans}.tcode2 else null"
+                        | _ -> "null"
+
+                    line
+                        $"    return fable_rt.closure2Tc(FuncType, %s{ans}.Env, .{{ %s{inits} }}, %s{ans}.code, %s{ans}.code2, %s{tcodeExpr}, %s{tcode2Expr});"
+                else
+                    line
+                        $"    return fable_rt.closureTc(FuncType, %s{ans}.Env, .{{ %s{inits} }}, %s{ans}.code, %s{tcodeExpr});"
+
+        line "}"
+
+    if k.Gens.IsEmpty then
+        out.AppendLine("};") |> ignore
+    else
+        out.AppendLine("    };").AppendLine("}") |> ignore
+
+    out.AppendLine() |> ignore
+
 /// Emit a static vtable struct (and optional captured `Env`) for a fat-pointer interface.
-let emitIfaceVt (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (vt: IfaceVt) =
+let emitIfaceVt
+    (out: StringBuilder)
+    (fableAliases: HashSet<string>)
+    (noTcFile: bool)
+    (noTcFns: HashSet<string>)
+    (fns: Dictionary<string, FnInfo>)
+    (vt: IfaceVt)
+    =
     let line (text: string) = out.AppendLine(text) |> ignore
 
     match vt.Gens with
@@ -2286,9 +4990,598 @@ let emitIfaceVt (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (vt: Ifac
 
         line "}"
 
+        if not noTcFile then
+            let tcWrapperName = $"@\"slot_%d{slotIdx}_%s{cleanIdent slotName}$tc\""
+            let retZig = zigType ret
+            let voidRet = isVoid ret
+            let argTysStr = argTys |> List.map zigType |> String.concat ", "
+            let loadArgs = ps |> List.mapi (fun i _ -> $"_tca[%d{i}]")
+
+            let emitFailTailStatus (pad: string) (extraDrop: string option) =
+                Option.iter (fun s -> line $"%s{pad}%s{s}") extraDrop
+                line $"%s{pad}fable_rt.plugRet(%s{retZig}, ret);"
+                line $"%s{pad}return .raised;"
+
+            let emitOkTailStatus (pad: string) (resIdent: string) (dropsAfter: string list) (extraDrop: string option) =
+                if voidRet then
+                    line $"%s{pad}_ = %s{resIdent};"
+                else
+                    line $"%s{pad}const _tc_res = %s{resIdent};"
+
+                for d in dropsAfter do
+                    line ($"%s{pad}" + dropCode d)
+
+                Option.iter (fun s -> line $"%s{pad}%s{s}") extraDrop
+
+                if not voidRet then
+                    line $"%s{pad}@as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = _tc_res;"
+
+                line $"%s{pad}return .ok;"
+
+            let emitKnownBody
+                (pad: string)
+                (capArgsOwned: string list)
+                (capArgsForDirect: (string * Mode) list)
+                (selfDropOpt: string option)
+                =
+                let emitDirectFn (fn: FnInfo) (p: string) =
+                    let directCaps =
+                        capArgsForDirect
+                        |> List.map (fun (expr, m) ->
+                            if m = MOwned then
+                                dupCode expr
+                            else
+                                expr
+                        )
+
+                    let allArgs = directCaps @ loadArgs |> String.concat ", "
+                    let argModes = fn.Modes |> List.skip capArgsForDirect.Length
+
+                    let dropAfter =
+                        List.zip loadArgs argModes
+                        |> List.choose (fun (n, m) ->
+                            if m = MBorrowed then
+                                Some n
+                            else
+                                None
+                        )
+
+                    line $"%s{p}const raw = %s{fnRef targetFn typeArgs}(%s{allArgs});"
+                    line $"%s{p}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+
+                    for d in dropAfter do
+                        line ($"%s{p}    " + dropCode d)
+
+                    emitFailTailStatus (p + "    ") selfDropOpt
+                    line $"%s{p}}} else raw;"
+
+                    let resExpr =
+                        if fn.RetFrom.IsSome && not voidRet then
+                            dupCode "r"
+                        else
+                            "r"
+
+                    if fn.RetFrom.IsSome && not voidRet then
+                        line $"%s{p}const r_own = %s{resExpr};"
+                        emitOkTailStatus p "r_own" dropAfter selfDropOpt
+                    else
+                        emitOkTailStatus p "r" dropAfter selfDropOpt
+
+                let emitTcBodyCall (p: string) =
+                    let capVars =
+                        capArgsOwned
+                        |> List.mapi (fun i expr ->
+                            let cv = $"_tc_cap%d{i}"
+                            line $"%s{p}const %s{cv} = %s{expr};"
+                            cv
+                        )
+
+                    Option.iter (fun s -> line $"%s{p}%s{s}") selfDropOpt
+                    let allArgs = capVars @ loadArgs |> String.concat ", "
+                    line $"%s{p}const _next = %s{fnTcBodyRef targetFn typeArgs}(ctx, ret, %s{allArgs}) catch {{"
+                    line $"%s{p}    fable_rt.plugRet(%s{retZig}, ret);"
+                    line $"%s{p}    return .raised;"
+                    line $"%s{p}}};"
+                    line $"%s{p}if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{{ ctx, _next.ret }});"
+                    line $"%s{p}return .ok;"
+
+                match fns.TryGetValue targetFn with
+                | true, fn when not (noTcFns.Contains targetFn) && fnHasTcBody fn ->
+                    if fn.NeedsChain then
+                        emitTcBodyCall pad
+                    else
+                        line $"%s{pad}if (comptime %s{chainName targetFn}) {{"
+                        emitTcBodyCall (pad + "    ")
+                        line $"%s{pad}}} else {{"
+                        emitDirectFn fn (pad + "    ")
+                        line $"%s{pad}}}"
+                | true, fn -> emitDirectFn fn pad
+                | _ -> fail None "internal: expected same-file fn"
+
+            let emitWithArgs (bodyFn: string -> unit) =
+                if argTys.IsEmpty then
+                    bodyFn "    "
+                else
+                    line $"    if (comptime fable_rt.fitsTailArgs(&.{{ %s{argTysStr} }})) {{"
+                    line $"        const _tca = fable_rt.tailLoad(&.{{ %s{argTysStr} }}, ctx);"
+                    bodyFn "        "
+                    line "    } else {"
+                    line "        unreachable;"
+                    line "    }"
+
+            line $"fn %s{tcWrapperName}(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {{"
+
+            match vt.Kind with
+            | IVtUpcast subTy ->
+                line "    const _ts = fable_rt.takeSelfBorrowed(ctx);"
+                line $"    const sub = fable_rt.boxed(%s{zigType subTy}, @ptrCast(@alignCast(_ts.ptr.?))).value;"
+                line $"    if (sub.vt.@\"%s{cleanIdent targetFn}$tc\") |tcfn| {{"
+                line "        _ = fable_rt.dup(sub);"
+                line "        if (_ts.owned) fable_rt.obj_iface_meta.drop(_ts.ptr);"
+                line "        ctx.self = sub.data;"
+                line "        ctx.self_owned = true;"
+                line "        return @call(fable_rt.tail_call, tcfn, .{ ctx, ret });"
+                line "    }"
+
+                emitWithArgs (fun pad ->
+                    let callArgs = "sub.data" :: loadArgs |> String.concat ", "
+                    let selfDrop = Some "if (_ts.owned) fable_rt.obj_iface_meta.drop(_ts.ptr);"
+                    line $"%s{pad}const raw = sub.vt.%s{fieldIdent targetFn}(%s{callArgs});"
+                    line $"%s{pad}const r = raw catch {{"
+                    emitFailTailStatus (pad + "    ") selfDrop
+                    line $"%s{pad}}};"
+                    emitOkTailStatus pad "r" [] selfDrop
+                )
+            | IVtObj ->
+                line "    const _ts = fable_rt.takeSelfBorrowed(ctx);"
+                line "    const self: fable_rt.Obj = @ptrCast(@alignCast(_ts.ptr.?));"
+
+                emitWithArgs (fun pad ->
+                    let dropSelf = dropCode "self"
+                    let dupSelf = dupCode "self"
+                    let dupR = dupCode "r"
+                    let selfDrop = Some $"if (_ts.owned) %s{dropSelf}"
+
+                    match fns.TryGetValue targetFn with
+                    | true, fn ->
+                        let thisMode =
+                            match fn.Modes with
+                            | m :: _ -> m
+                            | [] -> fail None "internal: object interface method `%s` has no self parameter" targetFn
+
+                        let ownSelfArg = $"if (_ts.owned) self else %s{dupSelf}"
+
+                        if not (noTcFns.Contains targetFn) && fnHasTcBody fn then
+                            if fn.NeedsChain then
+                                line $"%s{pad}const _self_own: fable_rt.Obj = %s{ownSelfArg};"
+                                let allArgs = "_self_own" :: loadArgs |> String.concat ", "
+
+                                line
+                                    $"%s{pad}const _next = %s{fnTcBodyRef targetFn typeArgs}(ctx, ret, %s{allArgs}) catch {{"
+
+                                line $"%s{pad}    fable_rt.plugRet(%s{retZig}, ret);"
+                                line $"%s{pad}    return .raised;"
+                                line $"%s{pad}}};"
+
+                                line
+                                    $"%s{pad}if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{{ ctx, _next.ret }});"
+
+                                line $"%s{pad}return .ok;"
+                            else
+                                line $"%s{pad}if (comptime %s{chainName targetFn}) {{"
+                                line $"%s{pad}    const _self_own: fable_rt.Obj = %s{ownSelfArg};"
+                                let allArgs = "_self_own" :: loadArgs |> String.concat ", "
+
+                                line
+                                    $"%s{pad}    const _next = %s{fnTcBodyRef targetFn typeArgs}(ctx, ret, %s{allArgs}) catch {{"
+
+                                line $"%s{pad}        fable_rt.plugRet(%s{retZig}, ret);"
+                                line $"%s{pad}        return .raised;"
+                                line $"%s{pad}    }};"
+
+                                line
+                                    $"%s{pad}    if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{{ ctx, _next.ret }});"
+
+                                line $"%s{pad}    return .ok;"
+                                line $"%s{pad}}} else {{"
+
+                                let a0 =
+                                    if thisMode = MOwned then
+                                        ownSelfArg
+                                    else
+                                        "self"
+
+                                let directDrop =
+                                    if thisMode = MOwned then
+                                        None
+                                    else
+                                        selfDrop
+
+                                let dropAfter =
+                                    List.zip loadArgs (List.tail fn.Modes)
+                                    |> List.choose (fun (n, m) ->
+                                        if m = MBorrowed then
+                                            Some n
+                                        else
+                                            None
+                                    )
+
+                                let args = a0 :: loadArgs |> String.concat ", "
+                                line $"%s{pad}    const raw = %s{fnRef targetFn typeArgs}(%s{args});"
+                                line $"%s{pad}    const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+
+                                for d in dropAfter do
+                                    line ($"%s{pad}        " + dropCode d)
+
+                                emitFailTailStatus (pad + "        ") directDrop
+                                line $"%s{pad}    }} else raw;"
+
+                                if fn.RetFrom.IsSome && not voidRet then
+                                    line $"%s{pad}    const r_own = %s{dupR};"
+                                    emitOkTailStatus (pad + "    ") "r_own" dropAfter directDrop
+                                else
+                                    emitOkTailStatus (pad + "    ") "r" dropAfter directDrop
+
+                                line $"%s{pad}}}"
+                        else
+                            let a0 =
+                                if thisMode = MOwned then
+                                    ownSelfArg
+                                else
+                                    "self"
+
+                            let directDrop =
+                                if thisMode = MOwned then
+                                    None
+                                else
+                                    selfDrop
+
+                            let dropAfter =
+                                List.zip loadArgs (List.tail fn.Modes)
+                                |> List.choose (fun (n, m) ->
+                                    if m = MBorrowed then
+                                        Some n
+                                    else
+                                        None
+                                )
+
+                            let args = a0 :: loadArgs |> String.concat ", "
+                            line $"%s{pad}const raw = %s{fnRef targetFn typeArgs}(%s{args});"
+                            line $"%s{pad}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+
+                            for d in dropAfter do
+                                line ($"%s{pad}    " + dropCode d)
+
+                            emitFailTailStatus (pad + "    ") directDrop
+                            line $"%s{pad}}} else raw;"
+
+                            if fn.RetFrom.IsSome && not voidRet then
+                                line $"%s{pad}const r_own = %s{dupR};"
+                                emitOkTailStatus pad "r_own" dropAfter directDrop
+                            else
+                                emitOkTailStatus pad "r" dropAfter directDrop
+                    | _ ->
+                        let uses =
+                            ".keep"
+                            :: (argTys
+                                |> List.map (fun t ->
+                                    if isManaged t then
+                                        ".give"
+                                    else
+                                        ".plain"
+                                ))
+
+                        let usesTuple = tuple uses
+                        let argsTuple = tuple ("self" :: loadArgs)
+
+                        let callExpr =
+                            $"fable_rt.across(%s{fnRef targetFn typeArgs}, %s{sigName targetFn}, %s{usesTuple}, %s{argsTuple})"
+
+                        let emitExtFallbackObj (p: string) =
+                            line $"%s{p}const raw = %s{callExpr};"
+                            line $"%s{p}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+                            emitFailTailStatus (p + "    ") selfDrop
+                            line $"%s{p}}} else raw;"
+                            emitOkTailStatus p "r" [] selfDrop
+
+                        if isExtTcAlias fableAliases fns targetFn then
+                            let fullParamTysStr =
+                                ("fable_rt.Obj" :: (argTys |> List.map zigType)) |> String.concat ", "
+
+                            line
+                                $"%s{pad}if (comptime (%s{extChainCheck targetFn} and fable_rt.fitsTailArgs(&.{{ %s{fullParamTysStr} }}))) {{"
+
+                            line $"%s{pad}    const _self_own: fable_rt.Obj = if (_ts.owned) self else %s{dupSelf};"
+                            let allArgs = "_self_own" :: loadArgs |> String.concat ", "
+
+                            line
+                                $"%s{pad}    fable_rt.tailStore(&.{{ %s{fullParamTysStr} }}, ctx, .{{ %s{allArgs} }});"
+
+                            line
+                                $"%s{pad}    return @call(fable_rt.tail_call, &%s{fnRefTc targetFn typeArgs}, .{{ ctx, ret }});"
+
+                            line $"%s{pad}}} else {{"
+                            emitExtFallbackObj (pad + "    ")
+                            line $"%s{pad}}}"
+                        else
+                            emitExtFallbackObj pad
+                )
+            | IVtBox valTy ->
+                let valZ = zigType valTy
+                let dupR = dupCode "r"
+                line "    const _ts = fable_rt.takeSelfBorrowed(ctx);"
+                line $"    const box_ptr = fable_rt.boxed(%s{valZ}, @ptrCast(@alignCast(_ts.ptr.?)));"
+
+                emitWithArgs (fun pad ->
+                    let boxDrop = Some "if (_ts.owned) fable_rt.box_iface_meta.drop(_ts.ptr);"
+
+                    match fns.TryGetValue targetFn with
+                    | true, fn ->
+                        let inst =
+                            if fn.TypeParams.Length = typeArgs.Length then
+                                Map.ofList (List.zip fn.TypeParams typeArgs)
+                            else
+                                Map.empty
+
+                        match List.zip fn.Params fn.Modes with
+                        | (thisParam, thisMode) :: rest ->
+                            let thisIsPtr =
+                                match substTy inst thisParam.Ty with
+                                | TPtr _ -> true
+                                | _ -> false
+
+                            if thisIsPtr then
+                                let args = "&box_ptr.value" :: loadArgs |> String.concat ", "
+
+                                let dropAfter =
+                                    List.zip loadArgs rest
+                                    |> List.choose (fun (n, (_, m)) ->
+                                        if m = MBorrowed then
+                                            Some n
+                                        else
+                                            None
+                                    )
+
+                                line $"%s{pad}const raw = %s{fnRef targetFn typeArgs}(%s{args});"
+                                line $"%s{pad}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+
+                                for d in dropAfter do
+                                    line ($"%s{pad}    " + dropCode d)
+
+                                emitFailTailStatus (pad + "    ") boxDrop
+                                line $"%s{pad}}} else raw;"
+
+                                if fn.RetFrom.IsSome && not voidRet then
+                                    line $"%s{pad}const r_own = %s{dupR};"
+                                    emitOkTailStatus pad "r_own" dropAfter boxDrop
+                                else
+                                    emitOkTailStatus pad "r" dropAfter boxDrop
+                            else
+                                let ownValExpr =
+                                    if isManaged valTy then
+                                        dupCode "box_ptr.value"
+                                    else
+                                        "box_ptr.value"
+
+                                emitKnownBody pad [ ownValExpr ] [ "box_ptr.value", thisMode ] boxDrop
+                        | [] -> fail None "internal: boxed interface method `%s` has no self parameter" targetFn
+                    | _ ->
+                        let target = fnRef targetFn typeArgs
+                        line $"%s{pad}const SelfP = @typeInfo(@TypeOf(%s{target})).@\"fn\".param_types[0].?;"
+                        line $"%s{pad}if (comptime SelfP == *%s{valZ} or SelfP == *const %s{valZ}) {{"
+
+                        let ptrCall =
+                            if isManaged ret || argTys |> List.exists isManaged then
+                                let ptrUses =
+                                    ".plain"
+                                    :: (argTys
+                                        |> List.map (fun t ->
+                                            if isManaged t then
+                                                ".give"
+                                            else
+                                                ".plain"
+                                        ))
+
+                                let ptrUsesTuple = tuple ptrUses
+                                let ptrArgsTuple = tuple ("&box_ptr.value" :: loadArgs)
+                                $"fable_rt.across(%s{target}, %s{sigName targetFn}, %s{ptrUsesTuple}, %s{ptrArgsTuple})"
+                            else
+                                let args = "&box_ptr.value" :: loadArgs |> String.concat ", "
+                                $"%s{target}(%s{args})"
+
+                        line $"%s{pad}    const raw = %s{ptrCall};"
+                        line $"%s{pad}    const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+                        emitFailTailStatus (pad + "        ") boxDrop
+                        line $"%s{pad}    }} else raw;"
+                        emitOkTailStatus (pad + "    ") "r" [] boxDrop
+                        line $"%s{pad}}} else {{"
+
+                        let emitBoxValFallback (p: string) =
+                            let valCall =
+                                if isManaged valTy || isManaged ret || argTys |> List.exists isManaged then
+                                    let valUses =
+                                        (if isManaged valTy then
+                                             ".keep"
+                                         else
+                                             ".plain")
+                                        :: (argTys
+                                            |> List.map (fun t ->
+                                                if isManaged t then
+                                                    ".give"
+                                                else
+                                                    ".plain"
+                                            ))
+
+                                    let valUsesTuple = tuple valUses
+                                    let valArgsTuple = tuple ("box_ptr.value" :: loadArgs)
+                                    $"fable_rt.across(%s{target}, %s{sigName targetFn}, %s{valUsesTuple}, %s{valArgsTuple})"
+                                else
+                                    let args = "box_ptr.value" :: loadArgs |> String.concat ", "
+                                    $"%s{target}(%s{args})"
+
+                            line $"%s{p}const raw = %s{valCall};"
+                            line $"%s{p}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+                            emitFailTailStatus (p + "    ") boxDrop
+                            line $"%s{p}}} else raw;"
+                            emitOkTailStatus p "r" [] boxDrop
+
+                        if isExtTcAlias fableAliases fns targetFn then
+                            let fullParamTysStr = valTy :: argTys |> List.map zigType |> String.concat ", "
+
+                            line
+                                $"%s{pad}    if (comptime (%s{extChainCheck targetFn} and fable_rt.fitsTailArgs(&.{{ %s{fullParamTysStr} }}))) {{"
+
+                            let ownValExpr =
+                                if isManaged valTy then
+                                    dupCode "box_ptr.value"
+                                else
+                                    "box_ptr.value"
+
+                            line $"%s{pad}        const _val_own: %s{valZ} = %s{ownValExpr};"
+                            Option.iter (fun s -> line $"%s{pad}        %s{s}") boxDrop
+                            let allArgs = "_val_own" :: loadArgs |> String.concat ", "
+
+                            line
+                                $"%s{pad}        fable_rt.tailStore(&.{{ %s{fullParamTysStr} }}, ctx, .{{ %s{allArgs} }});"
+
+                            line
+                                $"%s{pad}        return @call(fable_rt.tail_call, &%s{fnRefTc targetFn typeArgs}, .{{ ctx, ret }});"
+
+                            line $"%s{pad}    }} else {{"
+                            emitBoxValFallback (pad + "        ")
+                            line $"%s{pad}    }}"
+                        else
+                            emitBoxValFallback (pad + "    ")
+
+                        line $"%s{pad}}}"
+                )
+            | IVtCaptures capTys ->
+                line "    const _ts = fable_rt.takeSelfBorrowed(ctx);"
+
+                if capTys.IsEmpty then
+                    line "    _ = _ts;"
+                else
+                    line "    const c = fable_rt.captured(Env, @ptrCast(@alignCast(_ts.ptr.?)));"
+
+                emitWithArgs (fun pad ->
+                    let envDrop =
+                        if capTys.IsEmpty then
+                            None
+                        else
+                            Some "if (_ts.owned) fable_rt.env_iface_meta.drop(_ts.ptr);"
+
+                    match fns.TryGetValue targetFn with
+                    | true, fn ->
+                        let capModes = List.take capTys.Length fn.Modes
+
+                        let ownedCaps =
+                            List.zip capTys (List.indexed capModes)
+                            |> List.map (fun (capTy, (i, _)) ->
+                                if isManaged capTy then
+                                    dupCode $"c.c%d{i}"
+                                else
+                                    $"c.c%d{i}"
+                            )
+
+                        let directCaps = capModes |> List.mapi (fun i m -> $"c.c%d{i}", m)
+
+                        emitKnownBody pad ownedCaps directCaps envDrop
+                    | _ ->
+                        let capArgs = capTys |> List.mapi (fun i _ -> $"c.c%d{i}")
+
+                        let emitCapExtFallback (p: string) =
+                            let callExpr =
+                                if
+                                    isManaged ret
+                                    || argTys |> List.exists isManaged
+                                    || capTys |> List.exists isManaged
+                                then
+                                    let uses =
+                                        (capTys
+                                         |> List.map (fun t ->
+                                             if isManaged t then
+                                                 ".keep"
+                                             else
+                                                 ".plain"
+                                         ))
+                                        @ (argTys
+                                           |> List.map (fun t ->
+                                               if isManaged t then
+                                                   ".give"
+                                               else
+                                                   ".plain"
+                                           ))
+
+                                    $"fable_rt.across(%s{fnRef targetFn typeArgs}, %s{sigName targetFn}, %s{tuple uses}, %s{tuple (capArgs @ loadArgs)})"
+                                else
+                                    let args = capArgs @ loadArgs |> String.concat ", "
+                                    $"%s{fnRef targetFn typeArgs}(%s{args})"
+
+                            line $"%s{p}const raw = %s{callExpr};"
+                            line $"%s{p}const r = if (comptime fable_rt.isRaised(@TypeOf(raw))) raw catch {{"
+                            emitFailTailStatus (p + "    ") envDrop
+                            line $"%s{p}}} else raw;"
+                            emitOkTailStatus p "r" [] envDrop
+
+                        if isExtTcAlias fableAliases fns targetFn then
+                            let fullParamTysStr = capTys @ argTys |> List.map zigType |> String.concat ", "
+
+                            let tcCond =
+                                if fullParamTysStr = "" then
+                                    extChainCheck targetFn
+                                else
+                                    $"%s{extChainCheck targetFn} and fable_rt.fitsTailArgs(&.{{ %s{fullParamTysStr} }})"
+
+                            line $"%s{pad}if (comptime (%s{tcCond})) {{"
+
+                            let ownedCaps =
+                                capTys
+                                |> List.mapi (fun i capTy ->
+                                    let cv = $"_tc_cap%d{i}"
+
+                                    let capExpr =
+                                        if isManaged capTy then
+                                            let dupCap = dupCode $"c.c%d{i}"
+                                            dupCap
+                                        else
+                                            $"c.c%d{i}"
+
+                                    line $"%s{pad}        const %s{cv}: %s{zigType capTy} = %s{capExpr};"
+                                    cv
+                                )
+
+                            Option.iter (fun s -> line $"%s{pad}    %s{s}") envDrop
+
+                            if fullParamTysStr <> "" then
+                                let allArgs = ownedCaps @ loadArgs |> String.concat ", "
+
+                                line
+                                    $"%s{pad}    fable_rt.tailStore(&.{{ %s{fullParamTysStr} }}, ctx, .{{ %s{allArgs} }});"
+
+                            line
+                                $"%s{pad}    return @call(fable_rt.tail_call, &%s{fnRefTc targetFn typeArgs}, .{{ ctx, ret }});"
+
+                            line $"%s{pad}}} else {{"
+                            emitCapExtFallback (pad + "    ")
+                            line $"%s{pad}}}"
+                        else
+                            emitCapExtFallback pad
+                )
+
+            line "}"
+
     let vtSlots =
         vt.Slots
         |> List.mapi (fun i (slotName, _) -> $".%s{fieldIdent slotName} = @\"slot_%d{i}_%s{cleanIdent slotName}\"")
+
+    let vtTcSlots =
+        if noTcFile then
+            []
+        else
+            vt.Slots
+            |> List.mapi (fun i (slotName, _) ->
+                $".@\"%s{cleanIdent slotName}$tc\" = &@\"slot_%d{i}_%s{cleanIdent slotName}$tc\""
+            )
 
     let metaExpr =
         match vt.Kind with
@@ -2298,7 +5591,9 @@ let emitIfaceVt (out: StringBuilder) (fns: Dictionary<string, FnInfo>) (vt: Ifac
         | IVtCaptures _ -> "&fable_rt.env_iface_meta"
         | IVtUpcast subTy -> $"fable_rt.upcastIfaceMeta(%s{zigType subTy})"
 
-    let vtFields = $".@\"$meta\" = %s{metaExpr}" :: vtSlots |> String.concat ", "
+    let vtFields =
+        $".@\"$meta\" = %s{metaExpr}" :: (vtSlots @ vtTcSlots) |> String.concat ", "
+
     line $"const Vt = @typeInfo(@FieldType(%s{zigType vt.IfaceTy}, \"vt\")).pointer.child;"
     line $"const vt: Vt = .{{ %s{vtFields} }};"
 
@@ -2346,6 +5641,42 @@ let emitFile (state: FileState) : string =
     currentArenas.Value.Value <- state.Arenas
     let out = StringBuilder()
     let rootNames = HashSet<string>([ "result"; "hole"; "tail"; "env" ])
+    let fableAliases = HashSet<string>(state.Imports.Values)
+    let specialNoTc = HashSet<string>()
+
+    for (n, _) in state.Exports do
+        specialNoTc.Add n |> ignore
+
+    for (_, n) in state.Tests do
+        specialNoTc.Add n |> ignore
+
+    for (_, _, n) in state.Values do
+        specialNoTc.Add n |> ignore
+
+    for e in state.Ents.Values do
+        match e.Hooks with
+        | Some(destroy, dupOpt) ->
+            specialNoTc.Add destroy |> ignore
+            Option.iter (fun d -> specialNoTc.Add d |> ignore) dupOpt
+        | None -> ()
+
+    for fn in state.Fns do
+        if fn.IsEntryPoint then
+            specialNoTc.Add fn.Name |> ignore
+
+    let noTailCalls =
+        if state.NoTailCallsFile then
+            let s = HashSet<string>()
+
+            for fn in state.Fns do
+                s.Add fn.Name |> ignore
+
+            s
+        else
+            HashSet<string>(state.NoTailCalls)
+
+    for n in noTailCalls do
+        specialNoTc.Add n |> ignore
 
     for (name, _, _) in state.Consts do
         rootNames.Add(topIdent name) |> ignore
@@ -2478,8 +5809,12 @@ let emitFile (state: FileState) : string =
             )
             |> ignore
         | KIface ->
+            let methods = snd e.Cases.Head
+
             let ifaceFields =
-                "@\"$meta\": *const fable_rt.IfaceMeta" :: fields (snd e.Cases.Head)
+                ("@\"$meta\": *const fable_rt.IfaceMeta" :: fields methods)
+                @ (methods
+                   |> List.map (fun (m, _) -> $"@\"%s{cleanIdent m}$tc\": ?fable_rt.TailFn = null"))
                 |> String.concat ", "
 
             match e.TypeParams with
@@ -2640,6 +5975,7 @@ let emitFile (state: FileState) : string =
     out.AppendLine("}").AppendLine() |> ignore
 
     let adapters = Dictionary<string, Adapter>()
+    let knowns = Dictionary<string, KnownDecl>()
     let ifaceVts = Dictionary<string, IfaceVt>()
     let fns = Dictionary<string, FnInfo>()
 
@@ -2659,7 +5995,15 @@ let emitFile (state: FileState) : string =
     for fn in state.Fns do
         let rec collectTail (e: Expr) =
             match e with
-            | ELet(_, (ECall _ | EOnRaise(ECall _, _)), ECon _) -> Set.empty
+            | ELet(_, (ECall _ | EOnRaise(ECall _, _)), ECon _) ->
+                match trmcSiteOf fns.ContainsKey e with
+                | Some(g, tArgs, args, _, _, _, _, _) when
+                    fn.RetFrom.IsNone
+                    && tArgs = (fn.TypeParams |> List.map TGen)
+                    && args.Length = fns[g].Params.Length
+                    ->
+                    Set.singleton g
+                | _ -> Set.empty
             | ELet(_, rhs, _) when alwaysRaises rhs -> Set.empty
             | ELet(_, _, b)
             | EDrop(_, b)
@@ -2733,7 +6077,6 @@ let emitFile (state: FileState) : string =
             |> List.forall (fun fn ->
                 not (state.Arenas.ContainsKey fn.Name)
                 && fn.RetFrom.IsNone
-                && (trmcSite fn.Name fn.Body).IsNone
                 && fn.TypeParams = rep.TypeParams
                 && zigType fn.Ret = repRet
                 && retType fn = repRetText
@@ -2766,6 +6109,11 @@ let emitFile (state: FileState) : string =
     let emitScc (scc: FnInfo list) (sccBase: string) (tagMap: Map<string, string>) =
         let rep = scc.Head
         let generic = not rep.TypeParams.IsEmpty
+        let retZig = zigType rep.Ret
+
+        let sccNeedsChain =
+            scc
+            |> List.exists (fun fn -> not (specialNoTc.Contains fn.Name) && fnHasTcBody fn)
 
         let stateTypeLocal =
             if generic then
@@ -2773,11 +6121,23 @@ let emitFile (state: FileState) : string =
             else
                 $"@\"%s{topIdent sccBase}$State\""
 
-        let sccInfo =
-            {
-                StateTypeName = stateTypeLocal
-                TagOf = tagMap
-            }
+        let isSccTrmcSite (fn: FnInfo) (e: Expr) =
+            match trmcSiteOf tagMap.ContainsKey e with
+            | Some(g, tArgs, args, _, _, _, _, _) ->
+                tArgs = (fn.TypeParams |> List.map TGen) && args.Length = fns[g].Params.Length
+            | None -> false
+
+        let anyTrmc =
+            scc
+            |> List.exists (fun fn -> fn.RetFrom.IsNone && (tailSites fn.Body |> List.exists (isSccTrmcSite fn)))
+
+        let plug =
+            allCases rep.Ret
+            |> List.tryFind (fun c -> isHeapTy rep.Ret && (caseFields rep.Ret c).IsEmpty)
+            |> Option.map (fun c -> $"@as(%s{retZig}, .%s{fieldIdent c})")
+
+        let trmc = anyTrmc && (rep.Raises = RNever || plug.IsSome)
+        let splitHasNull = anyTrmc && rep.Raises <> RNever && plug.IsNone
 
         let variantDecls =
             scc
@@ -2795,7 +6155,15 @@ let emitFile (state: FileState) : string =
                     $"%s{tag}: struct {{ %s{fs} }},"
             )
 
-        let arms =
+        let buildArms (isTc: bool) (useTrmc: bool) (plugOpt: string option) =
+            let sccInfo =
+                {
+                    StateTypeName = stateTypeLocal
+                    TagOf = tagMap
+                    Trmc = useTrmc
+                    Plug = plugOpt
+                }
+
             scc
             |> List.map (fun fn ->
                 let tag = tagMap[fn.Name]
@@ -2804,12 +6172,26 @@ let emitFile (state: FileState) : string =
                 emUsed.Add "_args" |> ignore
                 emUsed.Add "_next" |> ignore
 
+                if isTc then
+                    emUsed.Add "ctx" |> ignore
+                    emUsed.Add "ret" |> ignore
+
+                if useTrmc then
+                    emUsed.Add "result" |> ignore
+                    emUsed.Add "hole" |> ignore
+
+                let armBodyExpr =
+                    if isTc then
+                        defaultArg fn.BodyTc fn.Body
+                    else
+                        fn.Body
+
                 let em =
                     {
                         Out = StringBuilder()
                         Names = Dictionary()
                         Used = emUsed
-                        Mutated = Set.union (assignedIn fn.Body) (storedInto fn.Body)
+                        Mutated = Set.union (assignedIn armBodyExpr) (storedInto armBodyExpr)
                         Loop = None
                         Scc = Some sccInfo
                         Self = fn
@@ -2818,7 +6200,13 @@ let emitFile (state: FileState) : string =
                         CanTail = false
                         TryLabels = Stack()
                         Adapters = adapters
+                        Knowns = knowns
                         IfaceVts = ifaceVts
+                        KParams = Set.empty
+                        IsTc = isTc
+                        FableAliases = fableAliases
+                        NoTcFns = specialNoTc
+                        NoTailCalls = noTailCalls
                         Counter = 0
                     }
 
@@ -2839,7 +6227,15 @@ let emitFile (state: FileState) : string =
                         name
                     )
 
-                stmt em "" fn.Body DReturn
+                stmt
+                    em
+                    ""
+                    armBodyExpr
+                    (if isTc then
+                         DTcRet
+                     else
+                         DReturn)
+
                 let rawBody = dropUnreadPaths (em.Out.ToString())
                 let unusedText = ensureUsed paramNames rawBody
 
@@ -2852,9 +6248,113 @@ let emitFile (state: FileState) : string =
             )
 
         let retTxt = retType rep
+        let sccAsserts = formatFactAssertions scc
 
-        let quota =
-            branchQuota (arms |> List.map (fun (_, _, t) -> t) |> String.concat "\n")
+        let armsPair =
+            if splitHasNull then
+                Some(buildArms false true (Some $"fable_rt.nullOf(%s{retZig})"), buildArms false false None)
+            else
+                None
+
+        let singleArms =
+            if splitHasNull then
+                []
+            else
+                buildArms
+                    false
+                    trmc
+                    (if trmc && rep.Raises <> RNever then
+                         plug
+                     else
+                         None)
+
+        let allArmsText =
+            match armsPair with
+            | Some(trmcArms, plainArms) -> (trmcArms @ plainArms) |> List.map (fun (_, _, t) -> t) |> String.concat "\n"
+            | None -> singleArms |> List.map (fun (_, _, t) -> t) |> String.concat "\n"
+
+        let tcArmsPair =
+            if sccNeedsChain && splitHasNull then
+                Some(buildArms true true (Some $"fable_rt.nullOf(%s{retZig})"), buildArms true false None)
+            else
+                None
+
+        let tcSingleArms =
+            if sccNeedsChain && not splitHasNull then
+                buildArms
+                    true
+                    trmc
+                    (if trmc && rep.Raises <> RNever then
+                         plug
+                     else
+                         None)
+            else
+                []
+
+        let allTcArmsText =
+            match tcArmsPair with
+            | Some(trmcArms, plainArms) -> (trmcArms @ plainArms) |> List.map (fun (_, _, t) -> t) |> String.concat "\n"
+            | None -> tcSingleArms |> List.map (fun (_, _, t) -> t) |> String.concat "\n"
+
+        let quota = branchQuota (sccAsserts + "\n" + allArmsText)
+
+        let tcQuota =
+            if sccNeedsChain then
+                branchQuota (sccAsserts + "\n" + allTcArmsText)
+            else
+                ""
+
+        let appendLoop (baseInd: string) (isTc: bool) (useTrmc: bool) (arms: (string * bool * string) list) =
+            if isTc then
+                let armsCombined = arms |> List.map (fun (_, _, t) -> t) |> String.concat "\n"
+                let tcUnused = ensureUsed [ "ctx"; "ret" ] armsCombined
+
+                for l in tcUnused.Split('\n') do
+                    if l <> "" then
+                        out.AppendLine(baseInd + l.TrimStart()) |> ignore
+
+            if useTrmc then
+                out
+                    .AppendLine($"%s{baseInd}var result: %s{retZig} = undefined;")
+                    .AppendLine($"%s{baseInd}var hole: *%s{retZig} = &result;")
+                |> ignore
+
+            let hasLoop = arms |> List.exists (fun (_, _, t) -> t.Contains "continue :tail;")
+
+            let switchInd =
+                if hasLoop then
+                    baseInd + "    "
+                else
+                    baseInd
+
+            if hasLoop then
+                out
+                    .AppendLine($"%s{baseInd}var _st = init_st;")
+                    .AppendLine($"%s{baseInd}tail: while (true) {{")
+                    .AppendLine($"%s{switchInd}switch (_st) {{")
+                |> ignore
+            else
+                out.AppendLine($"%s{switchInd}switch (init_st) {{") |> ignore
+
+            for (tag, hasArgs, armBody) in arms do
+                let pat =
+                    if hasArgs then
+                        $"%s{switchInd}    .%s{tag} => |_args| {{"
+                    else
+                        $"%s{switchInd}    .%s{tag} => {{"
+
+                out.AppendLine(pat) |> ignore
+
+                for lineTxt in armBody.Split('\n') do
+                    if lineTxt <> "" then
+                        out.AppendLine(switchInd + "        " + lineTxt) |> ignore
+
+                out.AppendLine($"%s{switchInd}    }},") |> ignore
+
+            out.AppendLine($"%s{switchInd}}}") |> ignore
+
+            if hasLoop then
+                out.AppendLine($"%s{baseInd}}}") |> ignore
 
         if generic then
             let comptimeParams =
@@ -2867,13 +6367,30 @@ let emitFile (state: FileState) : string =
                 + "\n"
                 + retTxt
                 + "\n"
-                + (arms |> List.map (fun (_, _, t) -> t) |> String.concat "\n")
+                + sccAsserts
+                + "\n"
+                + allArmsText
+                + "\n"
+                + allTcArmsText
 
             let discards =
                 rep.TypeParams
                 |> List.filter (fun g -> not (allText.Contains(genName g)))
                 |> List.map (fun g -> $"    _ = %s{genName g};\n")
                 |> String.concat ""
+
+            let indentedAsserts =
+                if sccAsserts = "" then
+                    ""
+                else
+                    sccAsserts.Split('\n')
+                    |> Array.map (fun l ->
+                        if l = "" then
+                            ""
+                        else
+                            "        " + l
+                    )
+                    |> String.concat "\n"
 
             out
                 .AppendLine($"fn %s{topIdent sccBase}(%s{comptimeParams}) type {{")
@@ -2888,35 +6405,46 @@ let emitFile (state: FileState) : string =
             out
                 .AppendLine("        };")
                 .AppendLine($"        pub fn run(init_st: State) %s{retTxt} {{")
+                .Append(indentedAsserts)
                 .Append(quota)
-                .AppendLine("            var _st = init_st;")
-                .AppendLine("            tail: while (true) {")
-                .AppendLine("                switch (_st) {")
             |> ignore
 
-            for (tag, hasArgs, armBody) in arms do
-                let pat =
-                    if hasArgs then
-                        $"            .%s{tag} => |_args| {{"
-                    else
-                        $"            .%s{tag} => {{"
+            match armsPair with
+            | Some(trmcArms, plainArms) ->
+                out.AppendLine($"            if (comptime fable_rt.hasNull(%s{retZig})) {{")
+                |> ignore
 
-                out.AppendLine($"    %s{pat}") |> ignore
+                appendLoop "                " false true trmcArms
+                out.AppendLine("            } else {") |> ignore
+                appendLoop "                " false false plainArms
+                out.AppendLine("            }") |> ignore
+            | None -> appendLoop "            " false trmc singleArms
 
-                for lineTxt in armBody.Split('\n') do
-                    if lineTxt <> "" then
-                        out.AppendLine("                    " + lineTxt) |> ignore
+            out.AppendLine("        }") |> ignore
 
-                out.AppendLine("                },") |> ignore
+            if sccNeedsChain then
+                out
+                    .AppendLine(
+                        "        pub fn tcbody(ctx: *fable_rt.TailCtx, ret: *anyopaque, init_st: State) fable_rt.Raised!fable_rt.TailNext {"
+                    )
+                    .Append(indentedAsserts)
+                    .Append(tcQuota)
+                |> ignore
 
-            out
-                .AppendLine("                }")
-                .AppendLine("            }")
-                .AppendLine("        }")
-                .AppendLine("    };")
-                .AppendLine("}")
-                .AppendLine()
-            |> ignore
+                match tcArmsPair with
+                | Some(trmcArms, plainArms) ->
+                    out.AppendLine($"            if (comptime fable_rt.hasNull(%s{retZig})) {{")
+                    |> ignore
+
+                    appendLoop "                " true true trmcArms
+                    out.AppendLine("            } else {") |> ignore
+                    appendLoop "                " true false plainArms
+                    out.AppendLine("            }") |> ignore
+                | None -> appendLoop "            " true trmc tcSingleArms
+
+                out.AppendLine("        }") |> ignore
+
+            out.AppendLine("    };").AppendLine("}").AppendLine() |> ignore
         else
             out.AppendLine($"const %s{stateTypeLocal} = union(enum) {{") |> ignore
 
@@ -2926,31 +6454,42 @@ let emitFile (state: FileState) : string =
             out
                 .AppendLine("};")
                 .AppendLine($"fn %s{topIdent sccBase}(init_st: %s{stateTypeLocal}) %s{retTxt} {{")
+                .Append(sccAsserts)
                 .Append(quota)
-                .AppendLine("    var _st = init_st;")
-                .AppendLine("    tail: while (true) {")
-                .AppendLine("        switch (_st) {")
             |> ignore
 
-            for (tag, hasArgs, armBody) in arms do
-                let pat =
-                    if hasArgs then
-                        $"            .%s{tag} => |_args| {{"
-                    else
-                        $"            .%s{tag} => {{"
+            match armsPair with
+            | Some(trmcArms, plainArms) ->
+                out.AppendLine($"    if (comptime fable_rt.hasNull(%s{retZig})) {{") |> ignore
+                appendLoop "        " false true trmcArms
+                out.AppendLine("    } else {") |> ignore
+                appendLoop "        " false false plainArms
+                out.AppendLine("    }") |> ignore
+            | None -> appendLoop "    " false trmc singleArms
 
-                out.AppendLine(pat) |> ignore
+            out.AppendLine("}").AppendLine() |> ignore
 
-                for lineTxt in armBody.Split('\n') do
-                    if lineTxt <> "" then
-                        out.AppendLine("                " + lineTxt) |> ignore
+            if sccNeedsChain then
+                out
+                    .AppendLine(
+                        $"fn @\"%s{topIdent sccBase}$tcbody\"(ctx: *fable_rt.TailCtx, ret: *anyopaque, init_st: %s{stateTypeLocal}) fable_rt.Raised!fable_rt.TailNext {{"
+                    )
+                    .Append(sccAsserts)
+                    .Append(tcQuota)
+                |> ignore
 
-                out.AppendLine("            },") |> ignore
+                match tcArmsPair with
+                | Some(trmcArms, plainArms) ->
+                    out.AppendLine($"    if (comptime fable_rt.hasNull(%s{retZig})) {{") |> ignore
+                    appendLoop "        " true true trmcArms
+                    out.AppendLine("    } else {") |> ignore
+                    appendLoop "        " true false plainArms
+                    out.AppendLine("    }") |> ignore
+                | None -> appendLoop "    " true trmc tcSingleArms
 
-            out.AppendLine("        }").AppendLine("    }").AppendLine("}").AppendLine()
-            |> ignore
+                out.AppendLine("}").AppendLine() |> ignore
 
-    let emitSccMemberWrapper (fn: FnInfo) (sccBase: string) (tagMap: Map<string, string>) =
+    let emitSccMemberWrapper (noTc: bool) (fn: FnInfo) (sccBase: string) (tagMap: Map<string, string>) =
         let used = HashSet(rootNames)
         let names = Dictionary<int, string>()
 
@@ -3029,6 +6568,11 @@ let emitFile (state: FileState) : string =
             | false, RDepends _ ->
                 $"if (comptime fable_rt.isRaised(@TypeOf(%s{dispatchCall}))) return try %s{dispatchCall} else return %s{dispatchCall};"
 
+        let paramTysStr =
+            fn.Params |> List.map (fun p -> zigType p.Ty) |> String.concat ", "
+
+        let retZig = zigType fn.Ret
+
         if generic then
             let comptimeParams =
                 fn.TypeParams
@@ -3049,9 +6593,74 @@ let emitFile (state: FileState) : string =
                 .AppendLine($"            const _init: %s{stateRef} = %s{initVal};")
                 .AppendLine($"            %s{tailStmt}")
                 .AppendLine("        }")
-                .AppendLine("    };")
-                .AppendLine("}")
             |> ignore
+
+            if not noTc && fnHasTcBody fn then
+                let tcSig =
+                    if sigParams = "" then
+                        "ctx: *fable_rt.TailCtx, ret: *anyopaque"
+                    else
+                        $"ctx: *fable_rt.TailCtx, ret: *anyopaque, %s{sigParams}"
+
+                let tcDispatch = $"%s{topIdent sccBase}(%s{tArgs}).tcbody(ctx, ret, _init)"
+
+                let tcEntryHeader =
+                    if fn.NeedsChain then
+                        "        pub fn tc(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {"
+                    else
+                        "        fn tcfull(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {"
+
+                out
+                    .AppendLine($"        pub fn tcbody(%s{tcSig}) fable_rt.Raised!fable_rt.TailNext {{")
+                    .AppendLine($"            const _init: %s{stateRef} = %s{initVal};")
+                    .AppendLine($"            return %s{tcDispatch};")
+                    .AppendLine("        }")
+                |> ignore
+
+                if fn.Params.IsEmpty then
+                    out
+                        .AppendLine(tcEntryHeader)
+                        .AppendLine("            const _next = tcbody(ctx, ret) catch {")
+                        .AppendLine($"                fable_rt.plugRet(%s{retZig}, ret);")
+                        .AppendLine("                return .raised;")
+                        .AppendLine("            };")
+                        .AppendLine(
+                            "            if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{ ctx, _next.ret });"
+                        )
+                        .AppendLine("            return .ok;")
+                        .AppendLine("        }")
+                    |> ignore
+                else
+                    let loadArgs =
+                        fn.Params |> List.mapi (fun i _ -> $"_tca[%d{i}]") |> String.concat ", "
+
+                    out
+                        .AppendLine(tcEntryHeader)
+                        .AppendLine($"            if (comptime fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})) {{")
+                        .AppendLine($"                const _tca = fable_rt.tailLoad(&.{{ %s{paramTysStr} }}, ctx);")
+                        .AppendLine($"                const _next = tcbody(ctx, ret, %s{loadArgs}) catch {{")
+                        .AppendLine($"                    fable_rt.plugRet(%s{retZig}, ret);")
+                        .AppendLine("                    return .raised;")
+                        .AppendLine("                };")
+                        .AppendLine(
+                            "                if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{ ctx, _next.ret });"
+                        )
+                        .AppendLine("                return .ok;")
+                        .AppendLine("            } else {")
+                        .AppendLine("                unreachable;")
+                        .AppendLine("            }")
+                        .AppendLine("        }")
+                    |> ignore
+
+                if not fn.NeedsChain then
+                    emitThinTc out "        " "tcthin" "" "call" fn
+
+                    out.AppendLine($"        pub const tc = if (%s{chainName fn.Name}) tcfull else tcthin;")
+                    |> ignore
+            elif not fn.IsLocal && not noTc then
+                emitThinTc out "        " "tc" "pub " "call" fn
+
+            out.AppendLine("    };").AppendLine("}") |> ignore
         else
             out
                 .AppendLine($"%s{visibility}fn %s{topIdent fn.Name}(%s{sigParams}) %s{retType fn} {{")
@@ -3060,43 +6669,113 @@ let emitFile (state: FileState) : string =
                 .AppendLine("}")
             |> ignore
 
-        if hasManaged fn && not fn.IsLocal then
-            let borrows =
-                match fn.Modes with
-                | [] -> ".{}"
-                | modes ->
-                    modes
-                    |> List.map (fun m ->
-                        if m = MBorrowed then
-                            "true"
-                        else
-                            "false"
-                    )
-                    |> String.concat ", "
-                    |> sprintf ".{ %s }"
+            if not noTc && fnHasTcBody fn then
+                let tcSig =
+                    if sigParams = "" then
+                        "ctx: *fable_rt.TailCtx, ret: *anyopaque"
+                    else
+                        $"ctx: *fable_rt.TailCtx, ret: *anyopaque, %s{sigParams}"
 
-            let resultBorrowed =
-                if fn.RetFrom.IsSome then
-                    "true"
+                let tcDispatch = $"@\"%s{topIdent sccBase}$tcbody\"(ctx, ret, _init)"
+
+                out
+                    .AppendLine($"fn @\"%s{topIdent fn.Name}$tcbody\"(%s{tcSig}) fable_rt.Raised!fable_rt.TailNext {{")
+                    .AppendLine($"    const _init: %s{stateRef} = %s{initVal};")
+                    .AppendLine($"    return %s{tcDispatch};")
+                    .AppendLine("}")
+                |> ignore
+
+                let tcEntryHeader =
+                    if fn.NeedsChain then
+                        $"%s{visibility}fn @\"%s{topIdent fn.Name}$tc\"(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {{"
+                    else
+                        $"fn @\"%s{topIdent fn.Name}$tcfull\"(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {{"
+
+                if fn.Params.IsEmpty then
+                    out
+                        .AppendLine(tcEntryHeader)
+                        .AppendLine($"    const _next = @\"%s{topIdent fn.Name}$tcbody\"(ctx, ret) catch {{")
+                        .AppendLine($"        fable_rt.plugRet(%s{retZig}, ret);")
+                        .AppendLine("        return .raised;")
+                        .AppendLine("    };")
+                        .AppendLine(
+                            "    if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{ ctx, _next.ret });"
+                        )
+                        .AppendLine("    return .ok;")
+                        .AppendLine("}")
+                    |> ignore
                 else
-                    "false"
+                    let loadArgs =
+                        fn.Params |> List.mapi (fun i _ -> $"_tca[%d{i}]") |> String.concat ", "
 
-            out.AppendLine(
-                $"pub const %s{sigName fn.Name} = .{{ .borrows = %s{borrows}, .result_borrowed = %s{resultBorrowed} }};"
-            )
+                    out
+                        .AppendLine(tcEntryHeader)
+                        .AppendLine($"    if (comptime fable_rt.fitsTailArgs(&.{{ %s{paramTysStr} }})) {{")
+                        .AppendLine($"        const _tca = fable_rt.tailLoad(&.{{ %s{paramTysStr} }}, ctx);")
+                        .AppendLine(
+                            $"        const _next = @\"%s{topIdent fn.Name}$tcbody\"(ctx, ret, %s{loadArgs}) catch {{"
+                        )
+                        .AppendLine($"            fable_rt.plugRet(%s{retZig}, ret);")
+                        .AppendLine("            return .raised;")
+                        .AppendLine("        };")
+                        .AppendLine(
+                            "        if (_next.func) |tcfn| return @call(fable_rt.tail_call, tcfn, .{ ctx, _next.ret });"
+                        )
+                        .AppendLine("        return .ok;")
+                        .AppendLine("    } else {")
+                        .AppendLine("        unreachable;")
+                        .AppendLine("    }")
+                        .AppendLine("}")
+                    |> ignore
+
+                if not fn.NeedsChain then
+                    emitThinTc out "" $"@\"%s{topIdent fn.Name}$tcthin\"" "" (topIdent fn.Name) fn
+
+                    out.AppendLine(
+                        $"%s{visibility}const @\"%s{topIdent fn.Name}$tc\" = if (%s{chainName fn.Name}) @\"%s{topIdent fn.Name}$tcfull\" else @\"%s{topIdent fn.Name}$tcthin\";"
+                    )
+                    |> ignore
+            elif not fn.IsLocal && not noTc then
+                emitThinTc out "" $"@\"%s{topIdent fn.Name}$tc\"" visibility (topIdent fn.Name) fn
+
+        if hasManaged fn && not fn.IsLocal then
+            out.AppendLine($"pub const %s{sigName fn.Name} = %s{formatSigValue fn};")
+            |> ignore
+
+        if not fn.IsLocal then
+            out.AppendLine($"pub const %s{storesName fn.Name} = %s{formatStoresValue fn};")
+            |> ignore
+
+        if not noTc && (not fn.IsLocal || fnHasTcBody fn) then
+            out.AppendLine($"%s{visibility}const %s{chainName fn.Name}: bool = %s{fnChainConstExpr fn};")
             |> ignore
 
         out.AppendLine() |> ignore
 
     for fn in state.Fns do
         try
+            let noTc = specialNoTc.Contains fn.Name
+
             match sccByMember.TryGetValue fn.Name with
             | true, (scc, sccBase, tagMap) ->
                 if emittedSccs.Add sccBase then
                     emitScc scc sccBase tagMap
 
-                emitSccMemberWrapper fn sccBase tagMap
-            | _ -> emitFunction out rootNames adapters ifaceVts fns state.Curried2 fn
+                emitSccMemberWrapper noTc fn sccBase tagMap
+            | _ ->
+                emitFunction
+                    out
+                    rootNames
+                    fableAliases
+                    specialNoTc
+                    noTailCalls
+                    adapters
+                    knowns
+                    ifaceVts
+                    fns
+                    state.Curried2
+                    noTc
+                    fn
         with ZigError(msg, None) ->
             raise (ZigError(msg, fn.Range))
 
@@ -3115,10 +6794,12 @@ let emitFile (state: FileState) : string =
                     |> String.concat ""
 
                 let xs = args |> List.mapi (fun i _ -> $", a%d{i}") |> String.concat ""
+                let retZig = zigType ret
+                let voidRet = isVoid ret
 
                 out
                     .AppendLine(
-                        $"%s{indent}fn %s{topIdent name}(env: ?*fable_rt.Env, this: fable_rt.Obj%s{ps}) fable_rt.Raised!%s{zigType ret} {{"
+                        $"%s{indent}fn %s{topIdent name}(env: ?*fable_rt.Env, this: fable_rt.Obj%s{ps}) fable_rt.Raised!%s{retZig} {{"
                     )
                     .AppendLine($"%s{indent}    _ = env;")
                     .AppendLine(
@@ -3128,6 +6809,76 @@ let emitFile (state: FileState) : string =
                     .AppendLine($"%s{indent}    return f.code(f.env, fable_rt.dup(this)%s{xs});")
                     .AppendLine($"%s{indent}}}")
                 |> ignore
+
+                if not state.NoTailCallsFile then
+                    let restTysStr = args |> List.map zigType |> String.concat ", "
+
+                    let callArgTysStr =
+                        ("fable_rt.Obj" :: (args |> List.map zigType)) |> String.concat ", "
+
+                    let loadTcaArgs = args |> List.mapi (fun i _ -> $"_tca[%d{i}]")
+                    let fallbackArgs = loadTcaArgs |> List.map (fun s -> ", " + s) |> String.concat ""
+                    let storeCallArgs = ("this_tc" :: loadTcaArgs) |> String.concat ", "
+
+                    let emitThunkTcBody (bInd: string) =
+                        out
+                            .AppendLine($"%s{bInd}const _ts = fable_rt.takeSelfBorrowed(ctx);")
+                            .AppendLine($"%s{bInd}const this: fable_rt.Obj = @ptrCast(@alignCast(_ts.ptr.?));")
+                            .AppendLine(
+                                $"%s{bInd}const f = fable_rt.dup(fable_rt.objPart(%s{zigType partPtr}, &[_]type{{ %s{parts} }}, this).%s{fieldIdent field});"
+                            )
+                            .AppendLine($"%s{bInd}if (comptime fable_rt.fitsTailArgs(&.{{ %s{callArgTysStr} }})) {{")
+                            .AppendLine($"%s{bInd}    if (f.tcode) |tcfn| {{")
+                            .AppendLine($"%s{bInd}        const this_tc = if (_ts.owned) this else fable_rt.dup(this);")
+                            .AppendLine(
+                                $"%s{bInd}        fable_rt.tailStore(&.{{ %s{callArgTysStr} }}, ctx, .{{ %s{storeCallArgs} }});"
+                            )
+                            .AppendLine($"%s{bInd}        ctx.self = f.env;")
+                            .AppendLine($"%s{bInd}        ctx.self_owned = true;")
+                            .AppendLine($"%s{bInd}        return @call(fable_rt.tail_call, tcfn, .{{ ctx, ret }});")
+                            .AppendLine($"%s{bInd}    }}")
+                            .AppendLine($"%s{bInd}}}")
+                            .AppendLine($"%s{bInd}defer fable_rt.drop(f);")
+                            .AppendLine($"%s{bInd}const this_own = if (_ts.owned) this else fable_rt.dup(this);")
+                            .AppendLine($"%s{bInd}const raw = f.code(f.env, this_own%s{fallbackArgs});")
+                            .AppendLine($"%s{bInd}const r = raw catch {{")
+                            .AppendLine($"%s{bInd}    fable_rt.plugRet(%s{retZig}, ret);")
+                            .AppendLine($"%s{bInd}    return .raised;")
+                            .AppendLine($"%s{bInd}}};")
+                        |> ignore
+
+                        if voidRet then
+                            out.AppendLine($"%s{bInd}_ = r;").AppendLine($"%s{bInd}return .ok;") |> ignore
+                        else
+                            out
+                                .AppendLine($"%s{bInd}@as(*%s{retZig}, @ptrCast(@alignCast(ret))).* = r;")
+                                .AppendLine($"%s{bInd}return .ok;")
+                            |> ignore
+
+                    out.AppendLine(
+                        $"%s{indent}fn @\"%s{topIdent name}$tc\"(ctx: *fable_rt.TailCtx, ret: *anyopaque) fable_rt.TailStatus {{"
+                    )
+                    |> ignore
+
+                    if args.IsEmpty then
+                        emitThunkTcBody (indent + "    ")
+                    else
+                        out
+                            .AppendLine($"%s{indent}    if (comptime fable_rt.fitsTailArgs(&.{{ %s{restTysStr} }})) {{")
+                            .AppendLine(
+                                $"%s{indent}        const _tca = fable_rt.tailLoad(&.{{ %s{restTysStr} }}, ctx);"
+                            )
+                        |> ignore
+
+                        emitThunkTcBody (indent + "        ")
+
+                        out
+                            .AppendLine($"%s{indent}    }} else {{")
+                            .AppendLine($"%s{indent}        unreachable;")
+                            .AppendLine($"%s{indent}    }}")
+                        |> ignore
+
+                    out.AppendLine($"%s{indent}}}") |> ignore
             | _ -> ()
 
         // (an object expression's class: each member calls the function value the object holds;
@@ -3165,11 +6916,19 @@ let emitFile (state: FileState) : string =
                         CaptureTys = []
                         FnTy = fnTy
                         BorrowFirst = true
+                        NeedsTcode = not state.NoTailCallsFile
                         Gens = d.TypeParams
                     }
 
                 adapters[key] <- a
                 a
+
+        let restFits (fnTy: Ty) =
+            match fnTy with
+            | TFn(_ :: restArgs, _) ->
+                let restTys = restArgs |> List.map zigType |> String.concat ", "
+                Some $"fable_rt.fitsTailArgs(&.{{ %s{restTys} }})"
+            | _ -> None
 
         let tables =
             d.Tables
@@ -3183,10 +6942,29 @@ let emitFile (state: FileState) : string =
                         |> List.map (fun (slot, target, typeArgs, fnTy) ->
                             if target.StartsWith("@raw:", System.StringComparison.Ordinal) then
                                 // (a function of this file with the calling convention of a function value)
-                                $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{topIdent (target.Substring 5)} }}"
+                                let rawName = topIdent (target.Substring 5)
+
+                                if state.NoTailCallsFile then
+                                    $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{rawName} }}"
+                                else
+                                    let tcodeField =
+                                        match restFits fnTy with
+                                        | Some cond -> $"if (%s{cond}) &@\"%s{rawName}$tc\" else null"
+                                        | None -> "null"
+
+                                    $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{rawName}, .tcode = %s{tcodeField} }}"
                             else
                                 let adapter = adapterFor target typeArgs fnTy
-                                $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{adapterRef adapter}.code }}"
+
+                                if state.NoTailCallsFile then
+                                    $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{adapterRef adapter}.code }}"
+                                else
+                                    let tcodeField =
+                                        match restFits fnTy with
+                                        | Some cond -> $"if (%s{cond}) &%s{adapterRef adapter}.tcode else null"
+                                        | None -> "null"
+
+                                    $".%s{fieldIdent slot} = %s{zigType fnTy}{{ .env = null, .code = %s{adapterRef adapter}.code, .tcode = %s{tcodeField} }}"
                         )
                         |> String.concat ", "
 
@@ -3269,11 +7047,14 @@ let emitFile (state: FileState) : string =
             out.AppendLine($"pub const %s{topIdent d.TypeName}: fable_rt.ObjType = %s{value};")
             |> ignore
 
+    for k in knowns.Values do
+        emitKnownDecl out fns state.NoTailCallsFile noTailCalls adapters k
+
     for a in adapters.Values do
-        emitAdapter out fns a
+        emitAdapter out fableAliases specialNoTc fns a
 
     for vt in ifaceVts.Values do
-        emitIfaceVt out fns vt
+        emitIfaceVt out fableAliases state.NoTailCallsFile specialNoTc fns vt
 
     // (a file that uses async: at the end of each test, the work it started and left waiting
     // is run on, so that it finishes within the test)

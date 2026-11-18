@@ -338,7 +338,16 @@ let rec skipWhile<'T> (predicate: 'T -> bool) (list: 'T list) : 'T list =
     | _ -> list
 
 let partition<'T> (predicate: 'T -> bool) (list: 'T list) : 'T list * 'T list =
-    filter predicate list, filter (fun x -> not (predicate x)) list
+    let rec go trues falses xs =
+        match xs with
+        | [] -> reverse trues, reverse falses
+        | x :: rest ->
+            if predicate x then
+                go (x :: trues) falses rest
+            else
+                go trues (x :: falses) rest
+
+    go [] [] list
 
 let indexed<'T> (list: 'T list) : (int * 'T) list = mapIndexed (fun i x -> (i, x)) list
 
@@ -396,15 +405,50 @@ let sortWith<'T> (comparer: 'T -> 'T -> int) (list: 'T list) : 'T list =
 
     all (map (fun x -> [ x ]) list)
 
+let private mergeSortByKey<'Key, 'T when 'Key: comparison>
+    (desc: bool)
+    (projection: 'T -> 'Key)
+    (list: 'T list)
+    : 'T list
+    =
+    let rec merge (a: 'T list) (b: 'T list) : 'T list =
+        match a, b with
+        | [], rest -> rest
+        | rest, [] -> rest
+        | x :: restA, y :: restB ->
+            let cmp =
+                if desc then
+                    compare (projection y) (projection x)
+                else
+                    compare (projection x) (projection y)
+
+            if cmp <= 0 then
+                x :: merge restA b
+            else
+                y :: merge a restB
+
+    let rec pairs (lists: 'T list list) : 'T list list =
+        match lists with
+        | a :: b :: rest -> merge a b :: pairs rest
+        | _ -> lists
+
+    let rec all (lists: 'T list list) : 'T list =
+        match lists with
+        | [] -> []
+        | [ one ] -> one
+        | _ -> all (pairs lists)
+
+    all (map (fun x -> [ x ]) list)
+
 let sort<'T when 'T: comparison> (list: 'T list) : 'T list = sortWith (fun a b -> compare a b) list
 
 let sortBy<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (list: 'T list) : 'T list =
-    sortWith (fun a b -> compare (projection a) (projection b)) list
+    mergeSortByKey false projection list
 
 let sortDescending<'T when 'T: comparison> (list: 'T list) : 'T list = sortWith (fun a b -> compare b a) list
 
 let sortByDescending<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (list: 'T list) : 'T list =
-    sortWith (fun a b -> compare (projection b) (projection a)) list
+    mergeSortByKey true projection list
 
 let private emptySequence () =
     invalidArg "list" "The input sequence was empty."
@@ -441,29 +485,35 @@ let maxBy<'T, 'U when 'U: comparison> (projection: 'T -> 'U) (list: 'T list) : '
     match list with
     | [] -> emptySequence ()
     | first :: rest ->
-        fold
-            (fun best x ->
-                if compare (projection x) (projection best) > 0 then
-                    x
+        let rec go (best: 'T) (bestKey: 'U) (xs: 'T list) : 'T =
+            match xs with
+            | [] -> best
+            | x :: tail ->
+                let k = projection x
+
+                if compare k bestKey > 0 then
+                    go x k tail
                 else
-                    best
-            )
-            first
-            rest
+                    go best bestKey tail
+
+        go first (projection first) rest
 
 let minBy<'T, 'U when 'U: comparison> (projection: 'T -> 'U) (list: 'T list) : 'T =
     match list with
     | [] -> emptySequence ()
     | first :: rest ->
-        fold
-            (fun best x ->
-                if compare (projection x) (projection best) < 0 then
-                    x
+        let rec go (best: 'T) (bestKey: 'U) (xs: 'T list) : 'T =
+            match xs with
+            | [] -> best
+            | x :: tail ->
+                let k = projection x
+
+                if compare k bestKey < 0 then
+                    go x k tail
                 else
-                    best
-            )
-            first
-            rest
+                    go best bestKey tail
+
+        go first (projection first) rest
 
 // ---- by key ----
 
@@ -483,8 +533,27 @@ let distinctBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (list: 'T 
 
 /// The groups in the order their keys first appear, the items of each in their order.
 let groupBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (list: 'T list) : ('Key * 'T list) list =
-    let keys = distinct (map projection list)
-    map (fun key -> (key, filter (fun x -> projection x = key) list)) keys
+    let rec tag (xs: 'T list) : ('Key * 'T) list =
+        match xs with
+        | [] -> []
+        | x :: rest -> (projection x, x) :: tag rest
+
+    let tagged = tag list
+    let keys = distinct (map fst tagged)
+
+    map
+        (fun key ->
+            (key,
+             choose
+                 (fun (k, x) ->
+                     if k = key then
+                         Some x
+                     else
+                         None
+                 )
+                 tagged)
+        )
+        keys
 
 let countBy<'Key, 'T when 'Key: equality> (projection: 'T -> 'Key) (list: 'T list) : ('Key * int) list =
     map (fun (key: 'Key, items: 'T list) -> (key, length items)) (groupBy projection list)

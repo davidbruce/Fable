@@ -21,6 +21,7 @@ src/quicktest-beam/**/*.erl
 src/quicktest-beam/src/*.src
 src/quicktest-beam/rebar.config
 src/quicktest-zig/**/*.zig
+src/quicktest-zig/**/*.facts.json
 **/fable_modules/**
 
 ## Ignore Visual Studio temporary files, build results, and

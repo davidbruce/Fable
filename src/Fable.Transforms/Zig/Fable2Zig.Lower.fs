@@ -1494,11 +1494,16 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
 
                 let onRaise = ESeq(closeWalk (), ERaise(EVar exV, tVoid))
 
-                ELet(
-                    walk,
-                    ECallClo(EGet(source, PField "fable_seq", TFn([ tVoid ], walkTy)), [ EUnit ], walkTy),
-                    ESeq(ETry(loop, exV, onRaise, tVoid), closeWalk ())
-                )
+                bindArgs
+                    ctx
+                    [ source ]
+                    (fun xs ->
+                        ELet(
+                            walk,
+                            ECallClo(EGet(xs.Head, PField "fable_seq", TFn([ tVoid ], walkTy)), [ EUnit ], walkTy),
+                            ESeq(ETry(loop, exV, onRaise, tVoid), closeWalk ())
+                        )
+                    )
             | _ ->
                 // a string, by index
                 let s = ctx.State.NewVar("text", tStr, VLocal, false)
@@ -5550,7 +5555,18 @@ and liftGroup
                 IsLocal = true
                 IsEntryPoint = false
                 Range = body.Range
+                NoEscape = []
+                BodyK = None
+                StoreFacts = [], false, false
+                AssertedNoRaise = []
+                AssertedStores = []
+                NeedsChain = false
+                PendingChainDeps = []
+                BodyTc = None
             }
+
+        if ctx.NoTailCalls then
+            ctx.State.NoTailCalls.Add fn.FnName |> ignore
 
     fns
 
@@ -6656,19 +6672,9 @@ and dotnetCall
                     | _ -> info
                 | _ -> info
 
-            let fallback args' =
-                match libraryFunction entity name with
-                | Some(file, fn) -> libraryCall ctx r file fn info args' t
-                | None -> fail r "the Zig target does not support %s.%s yet" entity name
-
-            match
-                if entity = "Microsoft.FSharp.Collections.ListModule" then
-                    trySpecListHof ctx r name args t fallback
-                else
-                    None
-            with
-            | Some lowered -> lowered
-            | None -> fallback args
+            match libraryFunction entity name with
+            | Some(file, fn) -> libraryCall ctx r file fn info args t
+            | None -> fail r "the Zig target does not support %s.%s yet" entity name
 
 /// The item type of a cell type of one type argument.
 and itemOf (x: Expr) : Ty =
@@ -7216,16 +7222,42 @@ and libraryCall
             | _ -> lw ctx arg
         | _ -> lw ctx arg
 
-    // (a unit argument is not given to the library function, but what computes it runs, in its
-    // place: `async { return raise e }` raises)
+    // (a unit argument is not given to the library function, unless it instantiates a generic
+    // type parameter like `ReplyChannel<'R>.Reply(())` or `MailboxProcessor<'Msg>.Post(())`, where
+    // Zig still has that parameter; otherwise what computes it runs in its place:
+    // `async { return raise e }` raises)
     let isPlainUnit (arg: Fable.Expr) =
         match arg with
         | Fable.Value(Fable.UnitConstant, _)
         | Fable.IdentExpr _ -> true
         | _ -> false
 
-    let kept = args |> List.filter (fun arg -> not (isUnit arg.Type && isPlainUnit arg))
+    let sigArgGeneric =
+        let aligned =
+            if info.SignatureArgTypes.Length = args.Length then
+                info.SignatureArgTypes |> List.map Some
+            elif info.ThisArg.IsSome && info.SignatureArgTypes.Length + 1 = args.Length then
+                None :: (info.SignatureArgTypes |> List.map Some)
+            else
+                args |> List.map (fun _ -> None)
 
+        aligned
+        |> List.map (
+            function
+            | Some(Fable.GenericParam _) -> true
+            | _ -> false
+        )
+
+    let dropUnitFlags =
+        List.zip args sigArgGeneric
+        |> List.map (fun (arg, isGenParam) -> isUnit arg.Type && (args.Length = 1 || not isGenParam))
+
+    let keptEntries =
+        List.zip args dropUnitFlags
+        |> List.filter (fun (arg, dropUnit) -> not (dropUnit && isPlainUnit arg))
+
+    let kept = keptEntries |> List.map fst
+    let keptDropFlags = keptEntries |> List.map snd
     let lowered = kept |> List.map lowerArg
 
     bindArgs
@@ -7233,13 +7265,13 @@ and libraryCall
         lowered
         (fun xs ->
             let given =
-                List.zip kept xs
-                |> List.filter (fun (arg, _) -> not (isUnit arg.Type))
+                List.zip keptDropFlags xs
+                |> List.filter (fun (dropUnit, _) -> not dropUnit)
                 |> List.map snd
 
             let effects =
-                List.zip kept xs
-                |> List.filter (fun (arg, _) -> isUnit arg.Type)
+                List.zip keptDropFlags xs
+                |> List.filter (fun (dropUnit, _) -> dropUnit)
                 |> List.map snd
 
             let call =
@@ -7438,7 +7470,18 @@ and private addSpecLoop
             IsLocal = true
             IsEntryPoint = false
             Range = r
+            NoEscape = []
+            BodyK = None
+            StoreFacts = [], false, false
+            AssertedNoRaise = []
+            AssertedStores = []
+            NeedsChain = false
+            PendingChainDeps = []
+            BodyTc = None
         }
+
+    if ctx.NoTailCalls then
+        ctx.State.NoTailCalls.Add fnName |> ignore
 
     fnName, typeArgs
 
@@ -7460,386 +7503,32 @@ and trySpecListHof
         None
     else
         match name, args with
-        | "Initialize", [ n; f ] when canSpecFnExpr ctx f ->
-            let outListTy = mapType ctx r t
-
-            match listElem outListTy with
-            | Some outElem ->
-                let nonNeg = isKnownNonNeg ctx n
-                let lenIr = lw ctx n
-                let lenV = ctx.State.NewVar("len", tI32, VLocal, false)
-                let lenId = AST.makeTypedIdent n.Type $"len$%d{lenV.Id}"
-                let fIr = lw ctx f
-
-                match tryExtractSpec ctx 1 [ tI32 ] outElem fIr with
-                | Some(preBinds, (capParams, caps, callSpec)) ->
-                    let iV = ctx.State.NewVar("i", tI32, VParam, false)
-                    let nV = ctx.State.NewVar("n", tI32, VParam, false)
-
-                    let fnName, typeArgs =
-                        addSpecLoop
-                            ctx
-                            r
-                            "list_init"
-                            capParams
-                            [ iV; nV ]
-                            outListTy
-                            (fun self tArgs _ ->
-                                let yV = ctx.State.NewVar("y", outElem, VLocal, false)
-                                let nextIV = ctx.State.NewVar("next", tI32, VLocal, false)
-                                let tailV = ctx.State.NewVar("tail", outListTy, VLocal, false)
-
-                                EIf(
-                                    EPrim("eq", [ EVar iV; EVar nV ], tBool),
-                                    ECon(outListTy, "Empty", [], None),
-                                    ELet(
-                                        yV,
-                                        callSpec [ EVar iV ],
-                                        ELet(
-                                            nextIV,
-                                            EPrim("add", [ EVar iV; ELit("1", tI32) ], tI32),
-                                            ELet(
-                                                tailV,
-                                                ECall(
-                                                    self,
-                                                    tArgs,
-                                                    (capParams |> List.map EVar) @ [ EVar nextIV; EVar nV ],
-                                                    outListTy
-                                                ),
-                                                ECon(outListTy, "Cons", [ EVar yV; EVar tailV ], None)
-                                            )
-                                        )
-                                    ),
-                                    outListTy
-                                )
-                            )
-
-                    let callExpr =
-                        ECall(fnName, typeArgs, caps @ [ ELit("0", tI32); EVar lenV ], outListTy)
-
-                    let body =
-                        if nonNeg then
-                            callExpr
-                        else
-                            ctx.State.UsesRuntime <- true
-
-                            let negCheck =
-                                EIf(
-                                    EPrim("lt", [ EVar lenV; ELit("0", tI32) ], tBool),
-                                    ERt("@as(fable_rt.Raised!void, fable_rt.countNegative($0))", [ EVar lenV ], tVoid),
-                                    EUnit,
-                                    tVoid
-                                )
-
-                            ESeq(negCheck, callExpr)
-
-                    let wrapped = List.foldBack (fun (v, x) acc -> ELet(v, x, acc)) preBinds body
-                    Some(ELet(lenV, lenIr, wrapped))
-                | None ->
-                    ctx.Vars[lenId.Name] <- lenV
-
-                    try
-                        Some(
-                            ELet(
-                                lenV,
-                                lenIr,
-                                withLoweredExpr ctx f.Type "fn" fIr (fun fId -> fallback [ Fable.IdentExpr lenId; fId ])
-                            )
-                        )
-                    finally
-                        ctx.Vars.Remove lenId.Name |> ignore
-            | None -> None
-
-        | ("Map" | "MapIndexed" | "Filter" | "Where" | "Choose"), [ f; xs ] when canSpecFnExpr ctx f ->
-            let outListTy = mapType ctx r t
+        | "SumBy", [ f; xs ] when canSpecFnExpr ctx f ->
             let inListTy = mapType ctx r xs.Type
-
-            match listElem inListTy, listElem outListTy with
-            | Some inElem, Some outElem ->
-                let arity, specArgTys, specRetTy =
-                    match name with
-                    | "Map" -> 1, [ inElem ], outElem
-                    | "MapIndexed" -> 2, [ tI32; inElem ], outElem
-                    | "Filter"
-                    | "Where" -> 1, [ inElem ], tBool
-                    | "Choose" -> 1, [ inElem ], TOpt outElem
-                    | _ -> 1, [ inElem ], outElem
-
-                let fIr = lw ctx f
-
-                match tryExtractSpec ctx arity specArgTys specRetTy fIr with
-                | Some(preBinds, (capParams, caps, callSpec)) ->
-                    let fnName, typeArgs, initArgs =
-                        match name with
-                        | "Map" ->
-                            let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-
-                            let n, tArgs =
-                                addSpecLoop
-                                    ctx
-                                    r
-                                    "list_map"
-                                    capParams
-                                    [ restV ]
-                                    outListTy
-                                    (fun self tArgs _ ->
-                                        let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                        let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                        let yV = ctx.State.NewVar("y", outElem, VLocal, false)
-                                        let mappedV = ctx.State.NewVar("mapped", outListTy, VLocal, false)
-
-                                        EIf(
-                                            ETest(EVar restV, "Empty", inListTy),
-                                            ECon(outListTy, "Empty", [], None),
-                                            ELet(
-                                                headV,
-                                                EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                ELet(
-                                                    tailV,
-                                                    EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                    ELet(
-                                                        yV,
-                                                        callSpec [ EVar headV ],
-                                                        ELet(
-                                                            mappedV,
-                                                            ECall(
-                                                                self,
-                                                                tArgs,
-                                                                (capParams |> List.map EVar) @ [ EVar tailV ],
-                                                                outListTy
-                                                            ),
-                                                            ECon(outListTy, "Cons", [ EVar yV; EVar mappedV ], None)
-                                                        )
-                                                    )
-                                                )
-                                            ),
-                                            outListTy
-                                        )
-                                    )
-
-                            n, tArgs, (fun xsVar -> [ xsVar ])
-                        | "MapIndexed" ->
-                            let iV = ctx.State.NewVar("i", tI32, VParam, false)
-                            let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-
-                            let n, tArgs =
-                                addSpecLoop
-                                    ctx
-                                    r
-                                    "list_mapi"
-                                    capParams
-                                    [ iV; restV ]
-                                    outListTy
-                                    (fun self tArgs _ ->
-                                        let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                        let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                        let yV = ctx.State.NewVar("y", outElem, VLocal, false)
-                                        let nextIV = ctx.State.NewVar("next", tI32, VLocal, false)
-                                        let mappedV = ctx.State.NewVar("mapped", outListTy, VLocal, false)
-
-                                        EIf(
-                                            ETest(EVar restV, "Empty", inListTy),
-                                            ECon(outListTy, "Empty", [], None),
-                                            ELet(
-                                                headV,
-                                                EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                ELet(
-                                                    tailV,
-                                                    EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                    ELet(
-                                                        yV,
-                                                        callSpec [ EVar iV; EVar headV ],
-                                                        ELet(
-                                                            nextIV,
-                                                            EPrim("add", [ EVar iV; ELit("1", tI32) ], tI32),
-                                                            ELet(
-                                                                mappedV,
-                                                                ECall(
-                                                                    self,
-                                                                    tArgs,
-                                                                    (capParams |> List.map EVar)
-                                                                    @ [ EVar nextIV; EVar tailV ],
-                                                                    outListTy
-                                                                ),
-                                                                ECon(
-                                                                    outListTy,
-                                                                    "Cons",
-                                                                    [ EVar yV; EVar mappedV ],
-                                                                    None
-                                                                )
-                                                            )
-                                                        )
-                                                    )
-                                                )
-                                            ),
-                                            outListTy
-                                        )
-                                    )
-
-                            n, tArgs, (fun xsVar -> [ ELit("0", tI32); xsVar ])
-                        | "Filter"
-                        | "Where" ->
-                            let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-
-                            let n, tArgs =
-                                addSpecLoop
-                                    ctx
-                                    r
-                                    "list_filter"
-                                    capParams
-                                    [ restV ]
-                                    outListTy
-                                    (fun self tArgs _ ->
-                                        let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                        let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                        let keepV = ctx.State.NewVar("keep", tBool, VLocal, false)
-                                        let filteredV = ctx.State.NewVar("filtered", outListTy, VLocal, false)
-
-                                        let tailCall =
-                                            ECall(
-                                                self,
-                                                tArgs,
-                                                (capParams |> List.map EVar) @ [ EVar tailV ],
-                                                outListTy
-                                            )
-
-                                        EIf(
-                                            ETest(EVar restV, "Empty", inListTy),
-                                            ECon(outListTy, "Empty", [], None),
-                                            ELet(
-                                                headV,
-                                                EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                ELet(
-                                                    tailV,
-                                                    EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                    ELet(
-                                                        keepV,
-                                                        callSpec [ EVar headV ],
-                                                        EIf(
-                                                            EVar keepV,
-                                                            ELet(
-                                                                filteredV,
-                                                                tailCall,
-                                                                ECon(
-                                                                    outListTy,
-                                                                    "Cons",
-                                                                    [ EVar headV; EVar filteredV ],
-                                                                    None
-                                                                )
-                                                            ),
-                                                            tailCall,
-                                                            outListTy
-                                                        )
-                                                    )
-                                                )
-                                            ),
-                                            outListTy
-                                        )
-                                    )
-
-                            n, tArgs, (fun xsVar -> [ xsVar ])
-                        | _ ->
-                            // "Choose"
-                            let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-                            let optOutTy = TOpt outElem
-
-                            let n, tArgs =
-                                addSpecLoop
-                                    ctx
-                                    r
-                                    "list_choose"
-                                    capParams
-                                    [ restV ]
-                                    outListTy
-                                    (fun self tArgs _ ->
-                                        let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                        let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                        let resV = ctx.State.NewVar("chosen", optOutTy, VLocal, false)
-                                        let yV = ctx.State.NewVar("y", outElem, VLocal, false)
-                                        let chosenTailV = ctx.State.NewVar("tail_out", outListTy, VLocal, false)
-
-                                        let tailCall =
-                                            ECall(
-                                                self,
-                                                tArgs,
-                                                (capParams |> List.map EVar) @ [ EVar tailV ],
-                                                outListTy
-                                            )
-
-                                        EIf(
-                                            ETest(EVar restV, "Empty", inListTy),
-                                            ECon(outListTy, "Empty", [], None),
-                                            ELet(
-                                                headV,
-                                                EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                ELet(
-                                                    tailV,
-                                                    EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                    ELet(
-                                                        resV,
-                                                        callSpec [ EVar headV ],
-                                                        EIf(
-                                                            ETest(EVar resV, "None", optOutTy),
-                                                            tailCall,
-                                                            ELet(
-                                                                yV,
-                                                                EGet(EVar resV, PSome, outElem),
-                                                                ELet(
-                                                                    chosenTailV,
-                                                                    tailCall,
-                                                                    ECon(
-                                                                        outListTy,
-                                                                        "Cons",
-                                                                        [ EVar yV; EVar chosenTailV ],
-                                                                        None
-                                                                    )
-                                                                )
-                                                            ),
-                                                            outListTy
-                                                        )
-                                                    )
-                                                )
-                                            ),
-                                            outListTy
-                                        )
-                                    )
-
-                            n, tArgs, (fun xsVar -> [ xsVar ])
-
-                    let xsIr = coerceTy ctx inListTy (lw ctx xs)
-
-                    let callExpr =
-                        bindArgs ctx [ xsIr ] (fun ys -> ECall(fnName, typeArgs, caps @ initArgs ys.Head, outListTy))
-
-                    Some(List.foldBack (fun (v, x) acc -> ELet(v, x, acc)) preBinds callExpr)
-                | None -> Some(withLoweredExpr ctx f.Type "fn" fIr (fun fId -> fallback [ fId; xs ]))
-            | _ -> None
-
-        | "Fold", [ f; state; xs ] when canSpecFnExpr ctx f ->
-            let stateTy = mapType ctx r t
-            let inListTy = mapType ctx r xs.Type
+            let outTy = mapType ctx r t
 
             match listElem inListTy with
-            | Some inElem ->
+            | Some inElem when intBits outTy > 0 || isFloatTy outTy ->
                 let fIr = lw ctx f
 
-                match tryExtractSpec ctx 2 [ stateTy; inElem ] stateTy fIr with
+                match tryExtractSpec ctx 1 [ inElem ] outTy fIr with
                 | Some(preBinds, (capParams, caps, callSpec)) ->
-                    let accV = ctx.State.NewVar("acc", stateTy, VParam, false)
+                    let accV = ctx.State.NewVar("acc", outTy, VParam, false)
                     let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
 
                     let fnName, typeArgs =
                         addSpecLoop
                             ctx
                             r
-                            "list_fold"
+                            "list_sumBy"
                             capParams
                             [ accV; restV ]
-                            stateTy
+                            outTy
                             (fun self tArgs _ ->
                                 let headV = ctx.State.NewVar("head", inElem, VLocal, false)
                                 let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                let nextV = ctx.State.NewVar("next", stateTy, VLocal, false)
+                                let valV = ctx.State.NewVar("v", outTy, VLocal, false)
+                                let nextV = ctx.State.NewVar("next", outTy, VLocal, false)
 
                                 EIf(
                                     ETest(EVar restV, "Empty", inListTy),
@@ -7851,349 +7540,36 @@ and trySpecListHof
                                             tailV,
                                             EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
                                             ELet(
-                                                nextV,
-                                                callSpec [ EVar accV; EVar headV ],
-                                                ECall(
-                                                    self,
-                                                    tArgs,
-                                                    (capParams |> List.map EVar) @ [ EVar nextV; EVar tailV ],
-                                                    stateTy
+                                                valV,
+                                                callSpec [ EVar headV ],
+                                                ELet(
+                                                    nextV,
+                                                    EPrim("add", [ EVar accV; EVar valV ], outTy),
+                                                    ECall(
+                                                        self,
+                                                        tArgs,
+                                                        (capParams |> List.map EVar) @ [ EVar nextV; EVar tailV ],
+                                                        outTy
+                                                    )
                                                 )
                                             )
                                         )
                                     ),
-                                    stateTy
+                                    outTy
                                 )
                             )
 
-                    let stateIr = coerceTy ctx stateTy (lw ctx state)
                     let xsIr = coerceTy ctx inListTy (lw ctx xs)
 
                     let callExpr =
                         bindArgs
                             ctx
-                            [ stateIr; xsIr ]
-                            (fun ys -> ECall(fnName, typeArgs, caps @ [ ys[0]; ys[1] ], stateTy))
+                            [ xsIr ]
+                            (fun ys -> ECall(fnName, typeArgs, caps @ [ ELit("0", outTy); ys.Head ], outTy))
 
                     Some(List.foldBack (fun (v, x) acc -> ELet(v, x, acc)) preBinds callExpr)
-                | None -> Some(withLoweredExpr ctx f.Type "fn" fIr (fun fId -> fallback [ fId; state; xs ]))
-            | None -> None
-
-        | ("Iterate" | "IterateIndexed" | "Exists" | "ForAll" | "TryFind" | "SumBy"), [ f; xs ] when canSpecFnExpr ctx f ->
-            let inListTy = mapType ctx r xs.Type
-            let outTy = mapType ctx r t
-
-            match listElem inListTy with
-            | Some inElem ->
-                let shape =
-                    match name with
-                    | "Iterate" -> Some(1, [ inElem ], tVoid)
-                    | "IterateIndexed" -> Some(2, [ tI32; inElem ], tVoid)
-                    | "Exists"
-                    | "ForAll" -> Some(1, [ inElem ], tBool)
-                    | "TryFind" ->
-                        match outTy with
-                        | TOpt elem when zigType elem = zigType inElem -> Some(1, [ inElem ], tBool)
-                        | _ -> None
-                    | "SumBy" when intBits outTy > 0 || isFloatTy outTy -> Some(1, [ inElem ], outTy)
-                    | _ -> None
-
-                match shape with
-                | Some(arity, specArgTys, specRetTy) ->
-                    let fIr = lw ctx f
-
-                    match tryExtractSpec ctx arity specArgTys specRetTy fIr with
-                    | Some(preBinds, (capParams, caps, callSpec)) ->
-                        let fnName, typeArgs, retTy, initArgs =
-                            match name with
-                            | "Iterate" ->
-                                let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-
-                                let n, tArgs =
-                                    addSpecLoop
-                                        ctx
-                                        r
-                                        "list_iter"
-                                        capParams
-                                        [ restV ]
-                                        tVoid
-                                        (fun self tArgs _ ->
-                                            let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                            let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-
-                                            EIf(
-                                                ETest(EVar restV, "Empty", inListTy),
-                                                EUnit,
-                                                ELet(
-                                                    headV,
-                                                    EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                    ELet(
-                                                        tailV,
-                                                        EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                        ESeq(
-                                                            callSpec [ EVar headV ],
-                                                            ECall(
-                                                                self,
-                                                                tArgs,
-                                                                (capParams |> List.map EVar) @ [ EVar tailV ],
-                                                                tVoid
-                                                            )
-                                                        )
-                                                    )
-                                                ),
-                                                tVoid
-                                            )
-                                        )
-
-                                n, tArgs, tVoid, (fun xsVar -> [ xsVar ])
-                            | "IterateIndexed" ->
-                                let iV = ctx.State.NewVar("i", tI32, VParam, false)
-                                let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-
-                                let n, tArgs =
-                                    addSpecLoop
-                                        ctx
-                                        r
-                                        "list_iteri"
-                                        capParams
-                                        [ iV; restV ]
-                                        tVoid
-                                        (fun self tArgs _ ->
-                                            let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                            let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                            let nextIV = ctx.State.NewVar("next", tI32, VLocal, false)
-
-                                            EIf(
-                                                ETest(EVar restV, "Empty", inListTy),
-                                                EUnit,
-                                                ELet(
-                                                    headV,
-                                                    EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                    ELet(
-                                                        tailV,
-                                                        EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                        ESeq(
-                                                            callSpec [ EVar iV; EVar headV ],
-                                                            ELet(
-                                                                nextIV,
-                                                                EPrim("add", [ EVar iV; ELit("1", tI32) ], tI32),
-                                                                ECall(
-                                                                    self,
-                                                                    tArgs,
-                                                                    (capParams |> List.map EVar)
-                                                                    @ [ EVar nextIV; EVar tailV ],
-                                                                    tVoid
-                                                                )
-                                                            )
-                                                        )
-                                                    )
-                                                ),
-                                                tVoid
-                                            )
-                                        )
-
-                                n, tArgs, tVoid, (fun xsVar -> [ ELit("0", tI32); xsVar ])
-                            | "Exists" ->
-                                let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-
-                                let n, tArgs =
-                                    addSpecLoop
-                                        ctx
-                                        r
-                                        "list_exists"
-                                        capParams
-                                        [ restV ]
-                                        tBool
-                                        (fun self tArgs _ ->
-                                            let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                            let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                            let condV = ctx.State.NewVar("hit", tBool, VLocal, false)
-
-                                            EIf(
-                                                ETest(EVar restV, "Empty", inListTy),
-                                                ELit("false", tBool),
-                                                ELet(
-                                                    headV,
-                                                    EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                    ELet(
-                                                        tailV,
-                                                        EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                        ELet(
-                                                            condV,
-                                                            callSpec [ EVar headV ],
-                                                            EIf(
-                                                                EVar condV,
-                                                                ELit("true", tBool),
-                                                                ECall(
-                                                                    self,
-                                                                    tArgs,
-                                                                    (capParams |> List.map EVar) @ [ EVar tailV ],
-                                                                    tBool
-                                                                ),
-                                                                tBool
-                                                            )
-                                                        )
-                                                    )
-                                                ),
-                                                tBool
-                                            )
-                                        )
-
-                                n, tArgs, tBool, (fun xsVar -> [ xsVar ])
-                            | "ForAll" ->
-                                let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-
-                                let n, tArgs =
-                                    addSpecLoop
-                                        ctx
-                                        r
-                                        "list_forall"
-                                        capParams
-                                        [ restV ]
-                                        tBool
-                                        (fun self tArgs _ ->
-                                            let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                            let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                            let condV = ctx.State.NewVar("ok", tBool, VLocal, false)
-
-                                            EIf(
-                                                ETest(EVar restV, "Empty", inListTy),
-                                                ELit("true", tBool),
-                                                ELet(
-                                                    headV,
-                                                    EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                    ELet(
-                                                        tailV,
-                                                        EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                        ELet(
-                                                            condV,
-                                                            callSpec [ EVar headV ],
-                                                            EIf(
-                                                                EVar condV,
-                                                                ECall(
-                                                                    self,
-                                                                    tArgs,
-                                                                    (capParams |> List.map EVar) @ [ EVar tailV ],
-                                                                    tBool
-                                                                ),
-                                                                ELit("false", tBool),
-                                                                tBool
-                                                            )
-                                                        )
-                                                    )
-                                                ),
-                                                tBool
-                                            )
-                                        )
-
-                                n, tArgs, tBool, (fun xsVar -> [ xsVar ])
-                            | "TryFind" ->
-                                let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-
-                                let n, tArgs =
-                                    addSpecLoop
-                                        ctx
-                                        r
-                                        "list_tryFind"
-                                        capParams
-                                        [ restV ]
-                                        outTy
-                                        (fun self tArgs _ ->
-                                            let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                            let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                            let condV = ctx.State.NewVar("hit", tBool, VLocal, false)
-
-                                            EIf(
-                                                ETest(EVar restV, "Empty", inListTy),
-                                                ECon(outTy, "None", [], None),
-                                                ELet(
-                                                    headV,
-                                                    EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                    ELet(
-                                                        tailV,
-                                                        EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                        ELet(
-                                                            condV,
-                                                            callSpec [ EVar headV ],
-                                                            EIf(
-                                                                EVar condV,
-                                                                ECon(outTy, "Some", [ EVar headV ], None),
-                                                                ECall(
-                                                                    self,
-                                                                    tArgs,
-                                                                    (capParams |> List.map EVar) @ [ EVar tailV ],
-                                                                    outTy
-                                                                ),
-                                                                outTy
-                                                            )
-                                                        )
-                                                    )
-                                                ),
-                                                outTy
-                                            )
-                                        )
-
-                                n, tArgs, outTy, (fun xsVar -> [ xsVar ])
-                            | _ ->
-                                // "SumBy"
-                                let accV = ctx.State.NewVar("acc", outTy, VParam, false)
-                                let restV = ctx.State.NewVar("rest", inListTy, VParam, false)
-
-                                let n, tArgs =
-                                    addSpecLoop
-                                        ctx
-                                        r
-                                        "list_sumBy"
-                                        capParams
-                                        [ accV; restV ]
-                                        outTy
-                                        (fun self tArgs _ ->
-                                            let headV = ctx.State.NewVar("head", inElem, VLocal, false)
-                                            let tailV = ctx.State.NewVar("tail", inListTy, VLocal, false)
-                                            let valV = ctx.State.NewVar("v", outTy, VLocal, false)
-                                            let nextV = ctx.State.NewVar("next", outTy, VLocal, false)
-
-                                            EIf(
-                                                ETest(EVar restV, "Empty", inListTy),
-                                                EVar accV,
-                                                ELet(
-                                                    headV,
-                                                    EGet(EVar restV, PCase("Cons", "Head"), inElem),
-                                                    ELet(
-                                                        tailV,
-                                                        EGet(EVar restV, PCase("Cons", "Tail"), inListTy),
-                                                        ELet(
-                                                            valV,
-                                                            callSpec [ EVar headV ],
-                                                            ELet(
-                                                                nextV,
-                                                                EPrim("add", [ EVar accV; EVar valV ], outTy),
-                                                                ECall(
-                                                                    self,
-                                                                    tArgs,
-                                                                    (capParams |> List.map EVar)
-                                                                    @ [ EVar nextV; EVar tailV ],
-                                                                    outTy
-                                                                )
-                                                            )
-                                                        )
-                                                    )
-                                                ),
-                                                outTy
-                                            )
-                                        )
-
-                                n, tArgs, outTy, (fun xsVar -> [ ELit("0", outTy); xsVar ])
-
-                        let xsIr = coerceTy ctx inListTy (lw ctx xs)
-
-                        let callExpr =
-                            bindArgs ctx [ xsIr ] (fun ys -> ECall(fnName, typeArgs, caps @ initArgs ys.Head, retTy))
-
-                        Some(List.foldBack (fun (v, x) acc -> ELet(v, x, acc)) preBinds callExpr)
-                    | None -> Some(withLoweredExpr ctx f.Type "fn" fIr (fun fId -> fallback [ fId; xs ]))
-                | None -> None
-            | None -> None
+                | None -> Some(withLoweredExpr ctx f.Type "fn" fIr (fun fId -> fallback [ fId; xs ]))
+            | _ -> None
         | _ -> None
 
 and trySpecArrayHof
@@ -9095,6 +8471,7 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
             OutTuples = Dictionary()
             CaughtExn = None
             InCtor = false
+            NoTailCalls = state.NoTailCallsFile
         }
 
     let report (r: SourceLocation option) (msg: string) =
@@ -9732,10 +9109,37 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                 | None -> false
             )
 
+        let hasNoTailCallsAtt (atts: Fable.Attribute seq) =
+            atts
+            |> Seq.exists (fun a -> a.Entity.FullName.EndsWith("NoTailCallsAttribute", System.StringComparison.Ordinal))
+
+        let mutable localNoTailCalls = hasNoTailCallsAtt info.Attributes
+
+        if localNoTailCalls then
+            state.NoTailCalls.Add d.Name |> ignore
+
+        let rootModule = com.GetRootModule(com.CurrentFile) |> fst
+
+        let rec checkDeclaringEnt (entRefOpt: Fable.EntityRef option) =
+            match entRefOpt |> Option.bind com.TryGetEntity with
+            | Some ent ->
+                if hasNoTailCallsAtt ent.Attributes then
+                    if ent.IsFSharpModule && ent.FullName = rootModule then
+                        state.NoTailCallsFile <- true
+                    else
+                        localNoTailCalls <- true
+                        state.NoTailCalls.Add d.Name |> ignore
+
+                checkDeclaringEnt ent.DeclaringEntity
+            | None -> ()
+
+        checkDeclaringEnt info.DeclaringEntity
+
         let ctx =
             { newCtx d.Name with
                 TypeParams = typeParams
                 InCtor = inObjCtor
+                NoTailCalls = state.NoTailCallsFile || localNoTailCalls
             }
 
         // (an erased implementation: its own type parameters, and those Fable names in its types
@@ -9788,6 +9192,14 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                                 IsLocal = false
                                 IsEntryPoint = false
                                 Range = d.Body.Range
+                                NoEscape = []
+                                BodyK = None
+                                StoreFacts = [], false, false
+                                AssertedNoRaise = []
+                                AssertedStores = []
+                                NeedsChain = false
+                                PendingChainDeps = []
+                                BodyTc = None
                             }
                 | _ -> () // its type was rejected above
             else
@@ -9901,6 +9313,14 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                         IsLocal = false
                         IsEntryPoint = entry
                         Range = d.Body.Range
+                        NoEscape = []
+                        BodyK = None
+                        StoreFacts = [], false, false
+                        AssertedNoRaise = []
+                        AssertedStores = []
+                        NeedsChain = false
+                        PendingChainDeps = []
+                        BodyTc = None
                     }
         with
         // (an `inline` member: F# puts its body in at each use, which compile on their own; its

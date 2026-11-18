@@ -588,9 +588,102 @@ module Beam =
 module Zig =
     open Fable.Transforms.Zig
 
+    let private resolveImportPath
+        (cliArgs: CliArgs)
+        pathResolver
+        (sourcePath: string)
+        (targetPath: string)
+        (path: string)
+        =
+        let projDir = IO.Path.GetDirectoryName(cliArgs.ProjectFile)
+        let fileExt = cliArgs.CompilerOptions.FileExtension
+
+        let dirOf (file: string) =
+            Path.normalizeFullPath (IO.Path.GetDirectoryName(file))
+
+        // (the library itself is compiled with `.` as its directory; a package, `std`,
+        // has none)
+        let sameDir =
+            IO.Path.GetDirectoryName(path) = "."
+            || (IO.Path.GetDirectoryName(path) <> "" && dirOf sourcePath = dirOf path)
+
+        let relPath =
+            if sameDir && not (path.EndsWith(".fs", StringComparison.Ordinal)) then
+                "./" + IO.Path.GetFileName(path)
+            else
+                Imports.getImportPath pathResolver sourcePath targetPath projDir cliArgs.OutDir path
+
+        if
+            relPath.EndsWith(".fs", StringComparison.Ordinal)
+            || relPath.EndsWith(".fsx", StringComparison.Ordinal)
+        then
+            Path.ChangeExtension(relPath, fileExt)
+        else
+            relPath
+
+    let private resolveImportTargets
+        (com: Compiler)
+        (cliArgs: CliArgs)
+        pathResolver
+        (targetPath: string)
+        (imports: System.Collections.Generic.Dictionary<string, string>)
+        : Facts.ImportTarget list
+        =
+        let sourcePath = com.CurrentFile
+        let sourceDir = IO.Path.GetDirectoryName(sourcePath)
+        let targetDir = IO.Path.GetDirectoryName(targetPath)
+
+        let sourceSet = com.SourceFiles |> Array.map Facts.normalizeFsPath |> Set.ofArray
+
+        [
+            for kv in imports do
+                let rawPath = kv.Key
+                let alias = kv.Value
+                let relZig = resolveImportPath cliArgs pathResolver sourcePath targetPath rawPath
+
+                let zigPath =
+                    if IO.Path.IsPathRooted relZig then
+                        Path.normalizeFullPath relZig
+                    else
+                        Path.normalizeFullPath (IO.Path.Combine(targetDir, relZig))
+
+                let fsOpt =
+                    let absSource =
+                        if IO.Path.IsPathRooted rawPath then
+                            rawPath
+                        else
+                            IO.Path.Combine(sourceDir, rawPath)
+
+                    if
+                        rawPath.EndsWith(".fs", StringComparison.OrdinalIgnoreCase)
+                        || rawPath.EndsWith(".fsx", StringComparison.OrdinalIgnoreCase)
+                    then
+                        let nf = Facts.normalizeFsPath absSource
+
+                        if sourceSet.Contains nf then
+                            Some nf
+                        else
+                            None
+                    elif rawPath.EndsWith(".zig", StringComparison.OrdinalIgnoreCase) then
+                        // When compiling `Fable.Library.Zig` itself, `getLibPath` refers to sibling `<Mod>.zig` of `<Mod>.fs`.
+                        let nf = Facts.normalizeFsPath (Path.ChangeExtension(absSource, ".fs"))
+
+                        if sourceSet.Contains nf then
+                            Some nf
+                        else
+                            None
+                    else
+                        None
+
+                {
+                    Facts.ImportTarget.Alias = alias
+                    Facts.ImportTarget.FsPath = fsOpt
+                    Facts.ImportTarget.ZigPath = zigPath
+                }
+        ]
+
     type ZigWriter(com: Compiler, cliArgs: CliArgs, pathResolver, targetPath: string) =
         let sourcePath = com.CurrentFile
-        let fileExt = cliArgs.CompilerOptions.FileExtension
         let stream = new IO.StreamWriter(targetPath)
 
         interface Printer.Writer with
@@ -599,25 +692,8 @@ module Zig =
 
             // `@import` takes the path of the other file relative to this one
             member _.MakeImportPath(path) =
-                let projDir = IO.Path.GetDirectoryName(cliArgs.ProjectFile)
-
-                let dirOf (file: string) =
-                    Path.normalizeFullPath (IO.Path.GetDirectoryName(file))
-
-                // (the library itself is compiled with `.` as its directory; a package, `std`,
-                // has none)
-                let sameDir =
-                    IO.Path.GetDirectoryName(path) = "."
-                    || (IO.Path.GetDirectoryName(path) <> "" && dirOf sourcePath = dirOf path)
-
                 let original = path
-
-                let path =
-                    // (a file of the runtime library that uses another: they stay side by side)
-                    if sameDir && not (path.EndsWith(".fs", StringComparison.Ordinal)) then
-                        "./" + IO.Path.GetFileName(path)
-                    else
-                        Imports.getImportPath pathResolver sourcePath targetPath projDir cliArgs.OutDir path
+                let resolved = resolveImportPath cliArgs pathResolver sourcePath targetPath path
 
                 // (a Zig file of the program's, `[<Import(..., "./native.zig")>]`: Zig imports only
                 // files under the module's root, so it is copied to where its path from the output
@@ -636,7 +712,7 @@ module Zig =
                         |> Path.normalizeFullPath
 
                     let target =
-                        IO.Path.Combine(IO.Path.GetDirectoryName(targetPath), path)
+                        IO.Path.Combine(IO.Path.GetDirectoryName(targetPath), resolved)
                         |> Path.normalizeFullPath
 
                     if
@@ -648,13 +724,7 @@ module Zig =
                         IO.Directory.CreateDirectory(IO.Path.GetDirectoryName target) |> ignore
                         IO.File.Copy(from, target, true)
 
-                if
-                    path.EndsWith(".fs", StringComparison.Ordinal)
-                    || path.EndsWith(".fsx", StringComparison.Ordinal)
-                then
-                    Path.ChangeExtension(path, fileExt)
-                else
-                    path
+                resolved
 
             member _.AddSourceMapping(_, _, _, _, _, _) = ()
 
@@ -665,14 +735,52 @@ module Zig =
 
     let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPath: string) =
         async {
-            let file =
-                FSharp2Fable.Compiler.transformFile com
-                |> FableTransforms.transformFile com
-                |> Compiler.transformFile com
+            let projFile = cliArgs.ProjectFile
+            let normFile = Facts.normalizeFsPath com.CurrentFile
+            let mutable published = false
 
-            if not (isSilent || ZigPrinter.isEmpty file) then
-                use writer = new ZigWriter(com, cliArgs, pathResolver, outPath)
-                do! ZigPrinter.run writer file
+            try
+                let lowered =
+                    FSharp2Fable.Compiler.transformFile com
+                    |> FableTransforms.transformFile com
+                    |> Compiler.lowerOnBigStack com
+
+                let targets =
+                    resolveImportTargets com cliArgs pathResolver outPath lowered.State.Imports
+
+                let directFsImports = targets |> List.choose (fun t -> t.FsPath) |> List.distinct
+
+                let! importFacts = Facts.awaitImports projFile normFile targets |> Async.AwaitTask
+
+                let file, fileFactsOpt =
+                    Compiler.inferAndEmitOnBigStack
+                        lowered
+                        projFile
+                        outPath
+                        targets
+                        directFsImports
+                        importFacts
+                        (fun f ->
+                            published <- true
+
+                            let imps =
+                                match f with
+                                | Some ff -> ff.Imports
+                                | None -> directFsImports
+
+                            Facts.publish projFile normFile f imps
+                        )
+
+                if not (isSilent || ZigPrinter.isEmpty file) then
+                    use writer = new ZigWriter(com, cliArgs, pathResolver, outPath)
+                    do! ZigPrinter.run writer file
+
+                    match fileFactsOpt with
+                    | Some ff -> Facts.tryWriteSidecarFile outPath ff
+                    | None -> ()
+            finally
+                if not published then
+                    Facts.publish projFile normFile None []
         }
 
 let compileFile (com: Compiler) (cliArgs: CliArgs) pathResolver isSilent (outPath: string) =

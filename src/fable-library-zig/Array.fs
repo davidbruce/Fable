@@ -128,10 +128,25 @@ let pick<'T, 'U> (chooser: 'T -> 'U option) (array: 'T[]) : 'U =
     | None -> notFound ()
 
 let choose<'T, 'U> (chooser: 'T -> 'U option) (array: 'T[]) : 'U[] =
-    Array.ofList (List.choose chooser (Array.toList array))
+    let mutable acc = []
+
+    for i in 0 .. array.Length - 1 do
+        match chooser array.[i] with
+        | Some y -> acc <- y :: acc
+        | None -> ()
+
+    Array.ofList (List.reverse acc)
 
 let collect<'T, 'U> (mapping: 'T -> 'U[]) (array: 'T[]) : 'U[] =
-    Array.ofList (List.collect (fun x -> Array.toList (mapping x)) (Array.toList array))
+    let mutable acc = []
+
+    for i in 0 .. array.Length - 1 do
+        let ys = mapping array.[i]
+
+        for j in 0 .. ys.Length - 1 do
+            acc <- ys.[j] :: acc
+
+    Array.ofList (List.reverse acc)
 
 let concat<'T> (arrays: 'T[] list) : 'T[] =
     Array.ofList (List.collect Array.toList arrays)
@@ -188,27 +203,35 @@ let maxBy<'T, 'U when 'U: comparison> (projection: 'T -> 'U) (array: 'T[]) : 'T 
     if array.Length = 0 then
         emptyArray ()
 
-    reduce
-        (fun a b ->
-            if compare (projection b) (projection a) > 0 then
-                b
-            else
-                a
-        )
-        array
+    let mutable best = array.[0]
+    let mutable bestKey = projection best
+
+    for i = 1 to array.Length - 1 do
+        let x = array.[i]
+        let k = projection x
+
+        if compare k bestKey > 0 then
+            best <- x
+            bestKey <- k
+
+    best
 
 let minBy<'T, 'U when 'U: comparison> (projection: 'T -> 'U) (array: 'T[]) : 'T =
     if array.Length = 0 then
         emptyArray ()
 
-    reduce
-        (fun a b ->
-            if compare (projection b) (projection a) < 0 then
-                b
-            else
-                a
-        )
-        array
+    let mutable best = array.[0]
+    let mutable bestKey = projection best
+
+    for i = 1 to array.Length - 1 do
+        let x = array.[i]
+        let k = projection x
+
+        if compare k bestKey < 0 then
+            best <- x
+            bestKey <- k
+
+    best
 
 #if FABLE_COMPILER
 [<Fable.Core.Emit("try fable_rt.arraySortWith($0, $1)")>]
@@ -350,7 +373,18 @@ let forAll2<'T1, 'T2> (predicate: 'T1 -> 'T2 -> bool) (array1: 'T1[]) (array2: '
     not (exists2 (fun a b -> not (predicate a b)) array1 array2)
 
 let partition<'T> (predicate: 'T -> bool) (array: 'T[]) : 'T[] * 'T[] =
-    Array.filter predicate array, Array.filter (fun x -> not (predicate x)) array
+    let mutable trues = []
+    let mutable falses = []
+
+    for i in 0 .. array.Length - 1 do
+        let x = array.[i]
+
+        if predicate x then
+            trues <- x :: trues
+        else
+            falses <- x :: falses
+
+    Array.ofList (List.reverse trues), Array.ofList (List.reverse falses)
 
 let take<'T> (count: int) (array: 'T[]) : 'T[] =
     if count < 0 then

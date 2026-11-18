@@ -5,6 +5,7 @@
 /// when nothing else is ready), `Async.Parallel` interleaves the computations at their waits, and
 /// a cancellation is seen where .NET looks for it, at the next bind or step of a loop. What a
 /// computation gives, raises and the order of its effects are .NET's.
+[<Fable.Library.Zig.Global.NoTailCalls>]
 module Fable.Library.Zig.Async
 
 open Fable.Library.Zig.Seq

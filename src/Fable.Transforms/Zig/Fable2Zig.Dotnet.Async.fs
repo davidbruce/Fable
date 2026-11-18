@@ -404,7 +404,7 @@ let call
             | _, x :: _ -> itemOf x.Type
             | _ -> Fable.Unit
 
-        let call fn (typeArgs: Fable.Type list) xs =
+        let callWithSig sigTys fn (typeArgs: Fable.Type list) xs =
             libraryCall
                 ctx
                 r
@@ -412,12 +412,14 @@ let call
                 fn
                 { info with
                     GenericArgs = typeArgs
-                    SignatureArgTypes = []
+                    SignatureArgTypes = sigTys
                     MemberRef = None
                     ThisArg = None
                 }
                 xs
                 t
+
+        let call fn (typeArgs: Fable.Type list) xs = callWithSig [] fn typeArgs xs
 
         // (an optional argument left out: None)
         let opt (ty: Fable.Type) (x: Fable.Expr option) =
@@ -452,11 +454,13 @@ let call
             | [] -> false
 
         match entity, name, args with
-        | _, "Reply", [ c; v ] -> call "replyChannelReply" [ msg ] [ c; v ]
+        | _, "Reply", [ c; v ] ->
+            callWithSig [ c.Type; Fable.GenericParam("'R", false, []) ] "replyChannelReply" [ msg ] [ c; v ]
         | _, ".ctor", body :: rest -> call "mailboxCreate" [ msg ] [ body; opt tokenType (List.tryHead rest) ]
         | _, "Start", [ mb ] when isMailboxThis -> call "mailboxStart" [ msg ] [ mb ]
         | _, "Start", body :: rest -> call "mailboxStartNew" [ msg ] [ body; opt tokenType (List.tryHead rest) ]
-        | _, "Post", [ mb; m ] -> call "mailboxPost" [ msg ] [ mb; m ]
+        | _, "Post", [ mb; m ] ->
+            callWithSig [ mb.Type; Fable.GenericParam("'Msg", false, []) ] "mailboxPost" [ msg ] [ mb; m ]
         | _, "get_CurrentQueueLength", [ mb ] -> call "mailboxQueueLength" [ msg ] [ mb ]
         | _, "Receive", mb :: rest -> call "mailboxReceive" [ msg ] [ mb; opt intType (List.tryHead rest) ]
         | _, "TryReceive", mb :: rest -> call "mailboxTryReceive" [ msg ] [ mb; opt intType (List.tryHead rest) ]
@@ -486,7 +490,7 @@ let call
             | Fable.DeclaredType(_, [ item ]) -> item
             | _ -> Fable.Unit
 
-        let call fn xs =
+        let callWithSig sigTys fn xs =
             libraryCall
                 ctx
                 r
@@ -494,17 +498,24 @@ let call
                 fn
                 { info with
                     GenericArgs = [ item ]
-                    SignatureArgTypes = []
+                    SignatureArgTypes = sigTys
                     MemberRef = None
                     ThisArg = None
                 }
                 xs
                 t
 
+        let call fn xs = callWithSig [] fn xs
+
         match name, args with
         | ".ctor", _ -> call "sourceCreate" [ Fable.Value(Fable.UnitConstant, None) ]
         | "get_Task", [ s ] -> call "sourceTask" [ s ]
-        | ("SetResult" | "TrySetResult" | "SetException" | "TrySetException"), [ s; x ] ->
+        | ("SetResult" | "TrySetResult"), [ s; x ] ->
+            callWithSig
+                [ s.Type; Fable.GenericParam("'T", false, []) ]
+                (name.Substring(0, 1).ToLowerInvariant() + name.Substring 1)
+                [ s; x ]
+        | ("SetException" | "TrySetException"), [ s; x ] ->
             call (name.Substring(0, 1).ToLowerInvariant() + name.Substring 1) [ s; x ]
         | ("SetCanceled" | "TrySetCanceled"), s :: _ ->
             call (name.Substring(0, 1).ToLowerInvariant() + name.Substring 1) [ s ]

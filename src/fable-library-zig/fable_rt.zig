@@ -134,6 +134,8 @@ pub const Stats = struct {
     copies: i64 = 0,
 };
 
+pub const EnvDropState = struct { depth: u32 = 0, queue: std.ArrayList(*Env) = .empty };
+
 /// What belongs to one thread: its counters, its cycle collector and the exception it is
 /// passing up. A value is owned by the thread that made it (counts are not atomic), so each
 /// thread has all of this for itself. (Plain globals where there is one thread or no
@@ -149,6 +151,7 @@ pub const thread = if (sgc.per_thread) struct {
     pub threadlocal var null_arrays: std.ArrayList(NullArray) = .empty;
     pub threadlocal var async_state: ?*ObjHeader = null;
     pub threadlocal var arena: ?*Arena = null;
+    pub threadlocal var env_drop: EnvDropState = .{};
 } else struct {
     pub var stats: Stats = .{};
     pub var collector: sgc.Gc = undefined;
@@ -162,6 +165,7 @@ pub const thread = if (sgc.per_thread) struct {
     pub var null_arrays: std.ArrayList(NullArray) = .empty;
     pub var async_state: ?*ObjHeader = null;
     pub var arena: ?*Arena = null;
+    pub var env_drop: EnvDropState = .{};
 };
 
 /// A null array of a type whose arrays the collector follows, kept until the collector goes
@@ -1403,6 +1407,7 @@ pub fn isCellPtr(comptime T: type) bool {
 
 /// Does a value of this type hold references to cells? (Does not look through a cell.)
 pub fn isManaged(comptime T: type) bool {
+    if (comptime isKnown(T)) return false;
     if (T == String) return true;
     if (comptime isResource(T)) return true;
     if (isCellPtr(T)) return true;
@@ -1504,9 +1509,7 @@ pub fn drop(x: anytype) void {
     const T = @TypeOf(x);
     if (comptime !isManaged(T)) return;
     if (comptime isFunc(T)) {
-        if (x.env) |e| {
-            if (releaseIsLast(e)) e.destroy(e);
-        }
+        dropEnv(x.env);
         return;
     }
     if (comptime isIface(T)) {
@@ -2192,11 +2195,24 @@ pub fn Anon24(comptime names: [24][]const u8) type {
 }
 
 fn ifaceVtStruct(comptime N: usize, comptime names: [N][]const u8, comptime types: [N]type) type {
+    const FieldAttr = std.builtin.Type.Struct.FieldAttributes;
     const meta_name: [1][]const u8 = .{"$meta"};
-    const all_names = meta_name ++ names;
     const meta_type: [1]type = .{*const IfaceMeta};
-    const all_types = meta_type ++ types;
-    return @Struct(.auto, null, &all_names, &all_types, &@splat(.{}));
+    const meta_attr: [1]FieldAttr = .{.{}};
+    var tc_names: [N][]const u8 = undefined;
+    var tc_types: [N]type = undefined;
+    var tc_attrs: [N]FieldAttr = undefined;
+    const default_null: ?TailFn = null;
+    for (0..N) |i| {
+        tc_names[i] = names[i] ++ "$tc";
+        tc_types[i] = ?TailFn;
+        tc_attrs[i] = .{ .default_value_ptr = @ptrCast(&default_null) };
+    }
+    const base_attrs: [N]FieldAttr = @splat(.{});
+    const all_names = meta_name ++ names ++ tc_names;
+    const all_types = meta_type ++ types ++ tc_types;
+    const all_attrs = meta_attr ++ base_attrs ++ tc_attrs;
+    return @Struct(.auto, null, &all_names, &all_types, &all_attrs);
 }
 
 pub fn IfaceAnon0() type {
@@ -6165,6 +6181,7 @@ pub fn holdsCyclic(comptime T: type) bool {
         },
         .optional => |o| return holdsCyclic(o.child),
         .@"struct" => |s| {
+            if (@hasDecl(T, "fable_known")) return false;
             if (@hasDecl(T, "fable_func")) return functions_in_cycles;
             if (@hasDecl(T, "fable_iface")) return functions_in_cycles;
             inline for (s.field_types) |F| {
@@ -6491,6 +6508,185 @@ pub const tail_call: std.builtin.CallModifier = if (builtin.zig_backend == .stag
     .wasm32, .wasm64 => false,
     else => true,
 }) .always_tail else .auto;
+
+/// Maximum packed size and alignment of arguments carried through a uniform `$tc` tail call.
+pub const tail_args_cap: usize = 128;
+pub const tail_args_align: usize = 16;
+
+/// Buffer passed along a tail-call chain from the chain's boundary frame.
+pub const TailCtx = struct {
+    self: ?*anyopaque = null,
+    self_owned: bool = true,
+    args: [tail_args_cap]u8 align(tail_args_align) = undefined,
+};
+
+pub const TailStatus = enum(u8) { ok, raised };
+pub const TailFn = *const fn (ctx: *TailCtx, ret: *anyopaque) TailStatus;
+
+/// Next hop returned by a full `$tcbody` so its frame defers run before the `musttail` jump.
+pub const TailNext = struct {
+    func: ?TailFn = null,
+    ret: *anyopaque = undefined,
+};
+
+fn tailLayout(comptime Params: []const type) struct { offsets: [Params.len]usize, size: usize, align_val: usize } {
+    @setEvalBranchQuota(100_000);
+    var offsets: [Params.len]usize = undefined;
+    var off: usize = 0;
+    var max_align: usize = 1;
+    for (Params, 0..) |P, i| {
+        if (@sizeOf(P) == 0) {
+            offsets[i] = 0;
+        } else {
+            const a = @alignOf(P);
+            if (a > max_align) max_align = a;
+            off = std.mem.alignForward(usize, off, a);
+            offsets[i] = off;
+            off += @sizeOf(P);
+        }
+    }
+    return .{ .offsets = offsets, .size = off, .align_val = max_align };
+}
+
+pub fn fitsTailArgs(comptime Params: []const type) bool {
+    const L = comptime tailLayout(Params);
+    return L.size <= tail_args_cap and L.align_val <= tail_args_align;
+}
+
+pub fn TailArgs(comptime Params: []const type) type {
+    return @Tuple(Params);
+}
+
+pub inline fn tailStore(comptime Params: []const type, ctx: *TailCtx, vals: anytype) void {
+    const L = comptime tailLayout(Params);
+    comptime {
+        if (L.size > tail_args_cap or L.align_val > tail_args_align) {
+            @compileError("fable: tail call arguments exceed TailCtx buffer");
+        }
+    }
+    inline for (Params, 0..) |P, i| {
+        if (comptime @sizeOf(P) != 0) {
+            @as(*P, @ptrCast(@alignCast(&ctx.args[L.offsets[i]]))).* = vals[i];
+        }
+    }
+}
+
+fn zeroSizedVal(comptime P: type) P {
+    if (P == void) return {};
+    return switch (@typeInfo(P)) {
+        .@"union" => |u| @unionInit(P, u.field_names[0], zeroSizedVal(u.field_types[0])),
+        .@"struct" => |s| blk: {
+            var z: P = undefined;
+            for (s.field_names, 0..) |fname, i| {
+                @field(z, fname) = zeroSizedVal(s.field_types[i]);
+            }
+            break :blk z;
+        },
+        .@"enum" => @enumFromInt(0),
+        .array => |a| @splat(zeroSizedVal(a.child)),
+        else => undefined,
+    };
+}
+
+pub inline fn tailLoad(comptime Params: []const type, ctx: *const TailCtx) @Tuple(Params) {
+    const L = comptime tailLayout(Params);
+    var out: @Tuple(Params) = undefined;
+    inline for (Params, 0..) |P, i| {
+        if (comptime @sizeOf(P) == 0) {
+            out[i] = comptime zeroSizedVal(P);
+        } else {
+            out[i] = @as(*const P, @ptrCast(@alignCast(&ctx.args[L.offsets[i]]))).*;
+        }
+    }
+    return out;
+}
+
+pub inline fn takeSelf(ctx: *TailCtx) ?*anyopaque {
+    const s = ctx.self;
+    ctx.self = null;
+    ctx.self_owned = true;
+    return s;
+}
+
+pub inline fn takeSelfBorrowed(ctx: *TailCtx) struct { ptr: ?*anyopaque, owned: bool } {
+    const s = ctx.self;
+    const own = ctx.self_owned;
+    ctx.self = null;
+    ctx.self_owned = true;
+    return .{ .ptr = s, .owned = own };
+}
+
+noinline fn enqueueEnvDrop(st: *EnvDropState, e: *Env) void {
+    st.queue.append(bookkeeping(), e) catch oom();
+}
+
+noinline fn drainEnvQueue(st: *EnvDropState) void {
+    while (st.queue.items.len > 0) {
+        const idx = st.queue.items.len - 1;
+        const next_e = st.queue.items[idx];
+        st.queue.items.len = idx;
+        var cur: ?*Env = next_e.destroy(next_e);
+        while (cur) |e| {
+            if (!releaseIsLast(e)) break;
+            cur = e.destroy(e);
+        }
+    }
+    st.queue.deinit(bookkeeping());
+    st.queue = .empty;
+}
+
+noinline fn dropEnvSlow(first: *Env) void {
+    const st = &thread.env_drop;
+    if (st.depth >= 64) {
+        enqueueEnvDrop(st, first);
+        return;
+    }
+    st.depth += 1;
+    var cur: ?*Env = first.destroy(first);
+    while (cur) |e| {
+        if (!releaseIsLast(e)) break;
+        cur = e.destroy(e);
+    }
+    if (st.depth == 1 and st.queue.capacity != 0) drainEnvQueue(st);
+    st.depth -= 1;
+}
+
+pub inline fn dropEnv(env: ?*Env) void {
+    const first = env orelse return;
+    if (!releaseIsLast(first)) return;
+    dropEnvSlow(first);
+}
+
+fn emptyUnionField(comptime T: type) ?[]const u8 {
+    const ti = @typeInfo(T);
+    if (ti != .@"union") return null;
+    const u = ti.@"union";
+    if (u.tag_type == null) return null;
+    for (u.field_names, u.field_types) |name, F| {
+        if (F == void) return name;
+    }
+    return null;
+}
+
+/// Whether `*ret` can be filled with a droppable sentinel on a `$tc` raise.
+pub fn canPlugRet(comptime R: type) bool {
+    return comptime blk: {
+        if (@sizeOf(R) == 0) break :blk false;
+        if (emptyUnionField(R) != null) break :blk true;
+        break :blk hasNull(R);
+    };
+}
+
+/// Fill `*ret` with an empty case or `nullOf(R)` when a `$tc` callee raises.
+pub fn plugRet(comptime R: type, ret: *anyopaque) void {
+    if (comptime @sizeOf(R) == 0) return;
+    const p: *R = @ptrCast(@alignCast(ret));
+    if (comptime emptyUnionField(R)) |name| {
+        p.* = @unionInit(R, name, {});
+    } else if (comptime hasNull(R)) {
+        p.* = nullOf(R);
+    }
+}
 
 /// Where `printf` and `eprintf` send their text, as UTF-8. A program may replace them (a
 /// freestanding one has to: there they do nothing).
@@ -6883,7 +7079,7 @@ pub const Env = struct {
     @"$rc": u32 = 1,
     /// the collector's header of this environment, if what it captured can be part of a cycle
     gc: ?*sgc.Hdr = null,
-    destroy: *const fn (*Env) void,
+    destroy: *const fn (*Env) ?*Env,
     /// marks what the function captured shared (see `markShared`)
     share: *const fn (*Env) Raised!void,
     /// (see `withStage`) the function's first stage, its number of arguments and its type
@@ -6911,6 +7107,7 @@ pub fn Func(comptime Code: type) type {
             pub const fable_func = {};
             env: ?*Env,
             code: Code,
+            tcode: ?TailFn = null,
         };
     }
     return struct {
@@ -6918,11 +7115,17 @@ pub fn Func(comptime Code: type) type {
         env: ?*Env,
         code: Code,
         code2: ?Code2 = null,
+        tcode: ?TailFn = null,
+        tcode2: ?TailFn = null,
     };
 }
 
 pub fn isFunc(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "fable_func");
+}
+
+pub fn isKnown(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "fable_known");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -7001,10 +7204,7 @@ fn envIfaceRetain(d: ?*anyopaque) void {
     if (d) |p| retain(@as(*Env, @ptrCast(@alignCast(p))));
 }
 fn envIfaceDrop(d: ?*anyopaque) void {
-    if (d) |p| {
-        const e: *Env = @ptrCast(@alignCast(p));
-        if (releaseIsLast(e)) e.destroy(e);
-    }
+    if (d) |p| dropEnv(@ptrCast(@alignCast(p)));
 }
 fn envIfaceShare(d: ?*anyopaque) Raised!void {
     if (d) |p| {
@@ -7194,6 +7394,8 @@ fn IfaceAdapter(comptime I: type, comptime SI: type) type {
             for (@typeInfo(Vt).@"struct".field_names) |name| {
                 if (std.mem.eql(u8, name, "$meta")) {
                     v.@"$meta" = &env_iface_meta;
+                } else if (std.mem.endsWith(u8, name, "$tc")) {
+                    @field(v, name) = null;
                 } else {
                     @field(v, name) = Thunk(name).f;
                 }
@@ -7375,10 +7577,37 @@ pub fn EnvOf(comptime Captures: type) type {
         hdr: GcHdr(cyclic) = undefined,
         captures: Captures,
 
-        pub fn destroy(header: *Env) void {
+        const cap_info = @typeInfo(Captures).@"struct";
+        const tail_field: ?usize = blk: {
+            var found: ?usize = null;
+            for (cap_info.field_types, 0..) |F, i| {
+                if (isFunc(F) or isIface(F)) found = i;
+            }
+            break :blk found;
+        };
+
+        pub fn destroy(header: *Env) ?*Env {
             const self: *Self = @alignCast(@fieldParentPtr("header", header));
-            drop(self.captures);
+            inline for (cap_info.field_names, 0..) |name, i| {
+                if (comptime (tail_field == null or tail_field.? != i)) {
+                    drop(@field(self.captures, name));
+                }
+            }
+            const next: ?*Env = if (comptime tail_field) |i| blk: {
+                const fv = @field(self.captures, cap_info.field_names[i]);
+                const F = cap_info.field_types[i];
+                if (comptime isFunc(F)) {
+                    break :blk fv.env;
+                } else {
+                    if (fv.vt.@"$meta" == &env_iface_meta) {
+                        break :blk if (fv.data) |p| @ptrCast(@alignCast(p)) else null;
+                    }
+                    fv.vt.@"$meta".drop(fv.data);
+                    break :blk null;
+                }
+            } else null;
             free(self);
+            return next;
         }
 
         pub fn share(header: *Env) Raised!void {
@@ -7400,6 +7629,35 @@ pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captu
     }
     if (track) thread.stats.allocs += 1;
     return .{ .env = &e.header, .code = code };
+}
+
+/// A function value that owns `captures` and carries a `$tc` tail entry.
+pub inline fn closureTc(
+    comptime F: type,
+    comptime Captures: type,
+    captures: Captures,
+    code: @FieldType(F, "code"),
+    tcode: ?TailFn,
+) F {
+    var f = closure(F, Captures, captures, code);
+    f.tcode = tcode;
+    return f;
+}
+
+/// A curried 2-argument function value that owns `captures` and carries `$tc` / `tcode2` entries.
+pub inline fn closure2Tc(
+    comptime F: type,
+    comptime Captures: type,
+    captures: Captures,
+    code: @FieldType(F, "code"),
+    code2: Code2Of(@FieldType(F, "code")),
+    tcode: ?TailFn,
+    tcode2: ?TailFn,
+) F {
+    var f = closure2(F, Captures, captures, code, code2);
+    f.tcode = tcode;
+    f.tcode2 = tcode2;
+    return f;
 }
 
 /// A curried 2-argument function value that owns `captures` and carries a direct 2-arg entry point.
@@ -7785,6 +8043,441 @@ pub inline fn xcallPlain(
         };
     } else {
         return raw;
+    }
+}
+
+/// Cross-file call in the let-bound owner case where the caller assumes the result borrows from
+/// `assumed_from` parameter indices without dup'ing the result. Verifies `sig.result_from`,
+/// `sig.result_borrowed`, `sig.borrows`, and `'k'` uses at Zig compile time.
+pub inline fn acrossAssumed(
+    comptime f: anytype,
+    comptime sig: anytype,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+    @setEvalBranchQuota(1_000_000);
+    comptime {
+        if (!@hasField(@TypeOf(sig), "result_from") or !sig.result_borrowed or sig.result_from.len != assumed_from.len) {
+            @compileError("fable: stale cross-file RetFrom facts; recompile caller");
+        } else {
+            for (0..assumed_from.len) |k| {
+                const idx = assumed_from[k];
+                if (sig.result_from[k] != idx or !sig.borrows[idx] or uses[idx] != 'k') {
+                    @compileError("fable: stale cross-file RetFrom facts; recompile caller");
+                }
+            }
+        }
+    }
+    var a: std.meta.ArgsTuple(@TypeOf(f)) = undefined;
+    inline for (uses, 0..) |u, i| {
+        a[i] = if (u == 'k' and !sig.borrows[i]) dup(args[i]) else args[i];
+    }
+    const raw = @call(.auto, f, a);
+    const r = if (comptime isRaised(@TypeOf(raw))) raw catch |err| {
+        inline for (uses, 0..) |u, i| {
+            if (u == 'g' and sig.borrows[i]) drop(args[i]);
+        }
+        inline for (err_drops) |d| drop(d);
+        return err;
+    } else raw;
+    inline for (uses, 0..) |u, i| {
+        if (u == 'g' and sig.borrows[i]) drop(args[i]);
+    }
+    return r;
+}
+
+pub inline fn callAssumedM(
+    comptime M: type,
+    comptime name: []const u8,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(@field(M, name))).@"fn".return_type.? {
+    if (!@hasDecl(M, name ++ "$sig")) {
+        @compileError("fable: stale or missing $sig for assumed-borrowed call " ++ name ++ "; recompile caller");
+    }
+    return acrossAssumed(@field(M, name), @field(M, name ++ "$sig"), assumed_from, uses, args, err_drops);
+}
+
+pub inline fn callAssumedG(
+    comptime G: type,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(G.call)).@"fn".return_type.? {
+    if (!@hasDecl(G, "sig")) {
+        @compileError("fable: stale or missing sig for assumed-borrowed generic call; recompile caller");
+    }
+    return acrossAssumed(G.call, G.sig, assumed_from, uses, args, err_drops);
+}
+
+pub inline fn xcallAssumedM(
+    comptime M: type,
+    comptime name: []const u8,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) Raised!UnwrapRaised(@typeInfo(@TypeOf(@field(M, name))).@"fn".return_type.?) {
+    return callAssumedM(M, name, assumed_from, uses, args, err_drops);
+}
+
+pub inline fn xcallAssumedG(
+    comptime G: type,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) Raised!UnwrapRaised(@typeInfo(@TypeOf(G.call)).@"fn".return_type.?) {
+    return callAssumedG(G, assumed_from, uses, args, err_drops);
+}
+
+/// Compile-time guard asserting that a cross-file callee inferred as `RNever` still cannot raise.
+pub fn assertNoRaise(comptime f: anytype) void {
+    const Ret = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+    if (comptime isRaised(Ret)) {
+        @compileError("fable: stale cross-file Raises facts; recompile caller");
+    }
+}
+
+/// Compile-time guard asserting that a cross-file callee's `$stores` remain disjoint from `disjoint_fields`,
+/// make no indirect callback, and (when `check_ext_store` holds) make no unknown external store.
+pub fn assertNoStore(
+    comptime M: type,
+    comptime name: []const u8,
+    comptime disjoint_fields: anytype,
+    comptime check_ext_store: bool,
+) void {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        if (!@hasDecl(M, name ++ "$stores")) {
+            @compileError("fable: stale cross-file Stores facts; recompile caller");
+        }
+        const s = @field(M, name ++ "$stores");
+        if (s.calls_callback or (check_ext_store and s.calls_ext_store)) {
+            @compileError("fable: stale cross-file Stores facts; recompile caller");
+        }
+        for (disjoint_fields) |df| {
+            for (s.fields) |sf| {
+                if (std.mem.eql(u8, df, sf)) {
+                    @compileError("fable: stale cross-file Stores facts; recompile caller");
+                }
+            }
+        }
+    }
+}
+
+inline fn acrossHof(
+    comptime target: anytype,
+    comptime k_target: anytype,
+    comptime has_k: bool,
+    comptime sig: anytype,
+    comptime noescape: anytype,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(target)).@"fn".return_type.? {
+    @setEvalBranchQuota(1_000_000);
+    const has_sig = @TypeOf(sig) != @TypeOf(null);
+    const has_noesc = @TypeOf(noescape) != @TypeOf(null);
+    const is_assumed = @TypeOf(assumed_from) != @TypeOf(null);
+    comptime {
+        if (is_assumed) {
+            if (!has_sig or !@hasField(@TypeOf(sig), "result_from") or !sig.result_borrowed or sig.result_from.len != assumed_from.len) {
+                @compileError("fable: stale cross-file RetFrom facts; recompile caller");
+            } else {
+                for (0..assumed_from.len) |k| {
+                    const idx = assumed_from[k];
+                    if (sig.result_from[k] != idx or !sig.borrows[idx] or uses[idx] != 'k' or isKnown(@TypeOf(args[idx]))) {
+                        @compileError("fable: stale cross-file RetFrom facts; recompile caller");
+                    }
+                }
+            }
+        }
+    }
+    const use_k = comptime blk: {
+        if (!has_k or !has_noesc) break :blk false;
+        for (0..args.len) |i| {
+            if (isKnown(@TypeOf(args[i])) and noescape[i]) break :blk true;
+        }
+        break :blk false;
+    };
+    const TargetFn = @typeInfo(@TypeOf(target)).@"fn";
+    const RawRet = TargetFn.return_type.?;
+    const arg_types = comptime blk: {
+        var ts: [args.len]type = undefined;
+        for (0..args.len) |i| {
+            const T = @TypeOf(args[i]);
+            if (isKnown(T)) {
+                const keep_k = use_k and has_noesc and noescape[i];
+                ts[i] = if (keep_k) T else T.FuncType;
+            } else {
+                // `target` never uses `anytype`, so `param_types[i]` coerces `comptime_int`/`comptime_float` literals to concrete runtime types.
+                ts[i] = TargetFn.param_types[i] orelse T;
+            }
+        }
+        break :blk ts;
+    };
+    var a: @Tuple(&arg_types) = undefined;
+    inline for (0..args.len) |i| {
+        const T = @TypeOf(args[i]);
+        if (comptime isKnown(T)) {
+            if (comptime use_k and has_noesc and noescape[i]) {
+                a[i] = args[i];
+            } else {
+                a[i] = args[i].toFunc();
+            }
+        } else {
+            const borrows_i = if (comptime has_sig) sig.borrows[i] else false;
+            a[i] = if (uses[i] == 'k' and !borrows_i) dup(args[i]) else args[i];
+        }
+    }
+    const raw: RawRet = if (comptime use_k) @call(.auto, k_target, a) else @call(.auto, target, a);
+    const r = if (comptime isRaised(RawRet)) raw catch |err| {
+        inline for (0..args.len) |i| {
+            const borrows_i = if (comptime has_sig) sig.borrows[i] else false;
+            if (comptime isKnown(@TypeOf(args[i]))) {
+                if (comptime !(use_k and has_noesc and noescape[i]) and borrows_i) drop(a[i]);
+            } else {
+                if (uses[i] == 'g' and borrows_i) drop(a[i]);
+            }
+        }
+        inline for (err_drops) |d| drop(d);
+        return err;
+    } else raw;
+    const result_borrowed = if (comptime has_sig) sig.result_borrowed else false;
+    const result = if (comptime is_assumed) r else if (result_borrowed) dup(r) else r;
+    inline for (0..args.len) |i| {
+        const borrows_i = if (comptime has_sig) sig.borrows[i] else false;
+        if (comptime isKnown(@TypeOf(args[i]))) {
+            if (comptime !(use_k and has_noesc and noescape[i]) and borrows_i) drop(a[i]);
+        } else {
+            if (uses[i] == 'g' and borrows_i) drop(a[i]);
+        }
+    }
+    return result;
+}
+
+/// Cross-file call where one or more arguments may be stack-allocated `Known` lambdas:
+/// dispatches to `M.<name>$k` when `noescape[i]` holds for those arguments, otherwise falls back to
+/// `toFunc()` on `M.<name>` while reconciling borrowing via `$sig`.
+pub inline fn callHofM(
+    comptime M: type,
+    comptime name: []const u8,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(@field(M, name))).@"fn".return_type.? {
+    const has_k = comptime @hasDecl(M, name ++ "$k") and @hasDecl(M, name ++ "$noescape");
+    const k_target = if (comptime has_k) @field(M, name ++ "$k") else {};
+    const noescape = if (comptime has_k) @field(M, name ++ "$noescape") else null;
+    const sig = if (comptime @hasDecl(M, name ++ "$sig")) @field(M, name ++ "$sig") else null;
+    return acrossHof(@field(M, name), k_target, has_k, sig, noescape, null, uses, args, err_drops);
+}
+
+/// Generic cross-file counterpart to `callHofM`, dispatching to `NS.callK` when `NS.noescape`
+/// permits and falling back to `toFunc()` + `NS.call` otherwise.
+pub inline fn callHofG(
+    comptime NS: type,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(NS.call)).@"fn".return_type.? {
+    const has_k = comptime @hasDecl(NS, "callK") and @hasDecl(NS, "noescape");
+    const k_target = if (comptime has_k) NS.callK else {};
+    const noescape = if (comptime has_k) NS.noescape else null;
+    const sig = if (comptime @hasDecl(NS, "sig")) NS.sig else null;
+    return acrossHof(NS.call, k_target, has_k, sig, noescape, null, uses, args, err_drops);
+}
+
+/// Raising wrapper for `callHofM` returning `Raised!R`.
+pub inline fn xcallHofM(
+    comptime M: type,
+    comptime name: []const u8,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) Raised!UnwrapRaised(@typeInfo(@TypeOf(@field(M, name))).@"fn".return_type.?) {
+    return callHofM(M, name, uses, args, err_drops);
+}
+
+/// Raising wrapper for `callHofG` returning `Raised!R`.
+pub inline fn xcallHofG(
+    comptime NS: type,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) Raised!UnwrapRaised(@typeInfo(@TypeOf(NS.call)).@"fn".return_type.?) {
+    return callHofG(NS, uses, args, err_drops);
+}
+
+/// Cross-file HOF call in the let-bound owner case where the caller assumes the result borrows
+/// from `assumed_from` parameter indices without dup'ing the result.
+pub inline fn callHofAssumedM(
+    comptime M: type,
+    comptime name: []const u8,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(@field(M, name))).@"fn".return_type.? {
+    const has_k = comptime @hasDecl(M, name ++ "$k") and @hasDecl(M, name ++ "$noescape");
+    const k_target = if (comptime has_k) @field(M, name ++ "$k") else {};
+    const noescape = if (comptime has_k) @field(M, name ++ "$noescape") else null;
+    const sig = if (comptime @hasDecl(M, name ++ "$sig")) @field(M, name ++ "$sig") else null;
+    return acrossHof(@field(M, name), k_target, has_k, sig, noescape, assumed_from, uses, args, err_drops);
+}
+
+/// Generic cross-file counterpart to `callHofAssumedM`.
+pub inline fn callHofAssumedG(
+    comptime NS: type,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) @typeInfo(@TypeOf(NS.call)).@"fn".return_type.? {
+    const has_k = comptime @hasDecl(NS, "callK") and @hasDecl(NS, "noescape");
+    const k_target = if (comptime has_k) NS.callK else {};
+    const noescape = if (comptime has_k) NS.noescape else null;
+    const sig = if (comptime @hasDecl(NS, "sig")) NS.sig else null;
+    return acrossHof(NS.call, k_target, has_k, sig, noescape, assumed_from, uses, args, err_drops);
+}
+
+/// Raising wrapper for `callHofAssumedM` returning `Raised!R`.
+pub inline fn xcallHofAssumedM(
+    comptime M: type,
+    comptime name: []const u8,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) Raised!UnwrapRaised(@typeInfo(@TypeOf(@field(M, name))).@"fn".return_type.?) {
+    return callHofAssumedM(M, name, assumed_from, uses, args, err_drops);
+}
+
+/// Raising wrapper for `callHofAssumedG` returning `Raised!R`.
+pub inline fn xcallHofAssumedG(
+    comptime NS: type,
+    comptime assumed_from: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) Raised!UnwrapRaised(@typeInfo(@TypeOf(NS.call)).@"fn".return_type.?) {
+    return callHofAssumedG(NS, assumed_from, uses, args, err_drops);
+}
+
+/// Call a function parameter `k` inside a specialized `callK` HOF: when `k` is a stack-allocated
+/// `Known` lambda, invoke it directly while reconciling `uses` against its `$sig` (`borrows` /
+/// `result_borrowed`, and `call2` for curried 2-arg lambdas); otherwise fall back to indirect
+/// `Func` invocation.
+pub fn InvokeKRet(comptime R: type, comptime K: type, comptime n_args: usize) type {
+    if (isKnown(K)) {
+        const CallFn = @typeInfo(@TypeOf(K.call)).@"fn";
+        if (n_args == 2 and CallFn.param_types.len == 2) {
+            if (@hasDecl(K, "call2")) {
+                const R2 = @typeInfo(@TypeOf(K.call2)).@"fn".return_type.?;
+                return if (isRaised(R2)) Raised!R else error{}!R;
+            }
+            return Raised!R;
+        }
+        const R1 = CallFn.return_type.?;
+        return if (isRaised(R1)) Raised!R else error{}!R;
+    }
+    return Raised!R;
+}
+
+pub inline fn invokeK(
+    comptime R: type,
+    k: anytype,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) InvokeKRet(R, @TypeOf(k), args.len) {
+    @setEvalBranchQuota(1_000_000);
+    const K = @TypeOf(k);
+    if (comptime isKnown(K)) {
+        const CallFn = @typeInfo(@TypeOf(K.call)).@"fn";
+        if (comptime args.len == 2 and CallFn.param_types.len == 2) {
+            if (comptime @hasDecl(K, "call2")) {
+                var a: std.meta.ArgsTuple(@TypeOf(K.call2)) = undefined;
+                a[0] = &k;
+                inline for (uses, 0..) |u, i| {
+                    a[i + 1] = if (u == 'k' and !K.borrows2[i]) dup(args[i]) else args[i];
+                }
+                const raw = @call(.auto, K.call2, a);
+                const r = if (comptime isRaised(@TypeOf(raw))) raw catch |err| {
+                    inline for (uses, 0..) |u, i| {
+                        if (u == 'g' and K.borrows2[i]) drop(args[i]);
+                    }
+                    inline for (err_drops) |d| drop(d);
+                    return err;
+                } else raw;
+                const result = if (K.result_borrowed2) dup(r) else r;
+                inline for (uses, 0..) |u, i| {
+                    if (u == 'g' and K.borrows2[i]) drop(args[i]);
+                }
+                return result;
+            } else {
+                const a0 = if (uses[0] == 'k' and !K.borrows[0]) dup(args[0]) else args[0];
+                const raw1 = K.call(&k, a0);
+                const g_raw = if (comptime isRaised(@TypeOf(raw1))) raw1 catch |err| {
+                    if (uses[0] == 'g' and K.borrows[0]) drop(args[0]);
+                    if (uses[1] == 'g') drop(args[1]);
+                    inline for (err_drops) |d| drop(d);
+                    return err;
+                } else raw1;
+                const g = if (K.result_borrowed) dup(g_raw) else g_raw;
+                if (uses[0] == 'g' and K.borrows[0]) drop(args[0]);
+                defer drop(g);
+                const a1 = if (uses[1] == 'k') dup(args[1]) else args[1];
+                return g.code(g.env, a1) catch |err| {
+                    inline for (err_drops) |d| drop(d);
+                    return err;
+                };
+            }
+        }
+        var a: std.meta.ArgsTuple(@TypeOf(K.call)) = undefined;
+        a[0] = &k;
+        inline for (uses, 0..) |u, i| {
+            a[i + 1] = if (u == 'k' and !K.borrows[i]) dup(args[i]) else args[i];
+        }
+        const raw = @call(.auto, K.call, a);
+        const r = if (comptime isRaised(@TypeOf(raw))) raw catch |err| {
+            inline for (uses, 0..) |u, i| {
+                if (u == 'g' and K.borrows[i]) drop(args[i]);
+            }
+            inline for (err_drops) |d| drop(d);
+            return err;
+        } else raw;
+        const result = if (K.result_borrowed) dup(r) else r;
+        inline for (uses, 0..) |u, i| {
+            if (u == 'g' and K.borrows[i]) drop(args[i]);
+        }
+        return result;
+    } else {
+        const Fn = @typeInfo(@typeInfo(@FieldType(K, "code")).pointer.child).@"fn";
+        if (comptime args.len == 2 and Fn.param_types.len == 2) {
+            const a0 = if (uses[0] == 'k') dup(args[0]) else args[0];
+            const a1 = if (uses[1] == 'k') dup(args[1]) else args[1];
+            return apply2(R, k, a0, a1) catch |err| {
+                inline for (err_drops) |d| drop(d);
+                return err;
+            };
+        }
+        var a: std.meta.ArgsTuple(@typeInfo(@FieldType(K, "code")).pointer.child) = undefined;
+        a[0] = k.env;
+        inline for (uses, 0..) |u, i| {
+            a[i + 1] = if (u == 'k') dup(args[i]) else args[i];
+        }
+        return @call(.auto, k.code, a) catch |err| {
+            inline for (err_drops) |d| drop(d);
+            return err;
+        };
     }
 }
 
@@ -9644,4 +10337,595 @@ test "an array that does not fit raises OutOfMemoryException" {
     const e = take();
     try std.testing.expectEqualStrings("System.OutOfMemoryException", e.type.name);
     drop(e);
+}
+
+test "invokeK: Known 1-arg, curried 2-arg with/without call2, borrowing, error drops, and Func fallback" {
+    const before = thread.stats;
+    {
+        const s_prefix = strConcat(str("pre:"), str(""));
+        defer drop(s_prefix);
+
+        const KLen = struct {
+            pub const fable_known = {};
+            caps: struct { c0: String },
+            pub const borrows = .{true};
+            pub const result_borrowed = false;
+            pub inline fn call(self: *const @This(), x: String) i32 {
+                return @as(i32, @intCast(unitsOf(self.caps.c0).len + unitsOf(x).len));
+            }
+        };
+
+        const item1 = strConcat(str("ab"), str("c"));
+        defer drop(item1);
+        const r_keep = try invokeK(i32, KLen{ .caps = .{ .c0 = s_prefix } }, "k", .{item1}, .{});
+        try std.testing.expectEqual(@as(i32, 7), r_keep);
+
+        const item2 = strConcat(str("de"), str("fg"));
+        const r_give = try invokeK(i32, KLen{ .caps = .{ .c0 = s_prefix } }, "g", .{item2}, .{});
+        try std.testing.expectEqual(@as(i32, 8), r_give);
+
+        const Inner = Func(*const fn (?*Env, String) Raised!i32);
+        const Caps = struct { base: i32 };
+        const CurriedImpl = struct {
+            fn inner(env: ?*Env, b: String) Raised!i32 {
+                defer drop(b);
+                const c = captured(Caps, env);
+                return c.base + @as(i32, @intCast(unitsOf(b).len));
+            }
+            fn stage1(a: i32) Inner {
+                return closure(Inner, Caps, .{ .base = a }, inner);
+            }
+        };
+        const KCurried2 = struct {
+            pub const fable_known = {};
+            caps: struct { c0: i32 },
+            pub const borrows = .{false};
+            pub const result_borrowed = false;
+            pub const borrows2 = .{ false, true };
+            pub const result_borrowed2 = false;
+            pub inline fn call(self: *const @This(), a: i32) Inner {
+                return CurriedImpl.stage1(self.caps.c0 + a);
+            }
+            pub inline fn call2(self: *const @This(), a: i32, b: String) i32 {
+                return self.caps.c0 + a + @as(i32, @intCast(unitsOf(b).len));
+            }
+        };
+        const KCurried1 = struct {
+            pub const fable_known = {};
+            caps: struct { c0: i32 },
+            pub const borrows = .{false};
+            pub const result_borrowed = false;
+            pub inline fn call(self: *const @This(), a: i32) Inner {
+                return CurriedImpl.stage1(self.caps.c0 + a);
+            }
+        };
+        const KRaise1 = struct {
+            pub const fable_known = {};
+            pub const borrows = .{true};
+            pub const result_borrowed = false;
+            pub inline fn call(_: *const @This(), x: String) Raised!Inner {
+                _ = x;
+                return raise(ArgumentException, str("boom1"));
+            }
+        };
+
+        const item3 = strConcat(str("x"), str("yz"));
+        const allocs_before = thread.stats.allocs;
+        try std.testing.expectEqual(@as(i32, 18), try invokeK(i32, KCurried2{ .caps = .{ .c0 = 10 } }, "pg", .{ @as(i32, 5), item3 }, .{}));
+        try std.testing.expectEqual(allocs_before, thread.stats.allocs);
+
+        const item4 = strConcat(str("w"), str("xyz"));
+        try std.testing.expectEqual(@as(i32, 19), try invokeK(i32, KCurried1{ .caps = .{ .c0 = 10 } }, "pg", .{ @as(i32, 5), item4 }, .{}));
+
+        const held = strConcat(str("he"), str("ld"));
+        const arg_a = strConcat(str("aa"), str("a"));
+        const arg_b = strConcat(str("bb"), str("b"));
+        try std.testing.expectError(error.Raised, invokeK(i32, KRaise1{}, "gg", .{ arg_a, arg_b }, .{held}));
+        drop(take());
+
+        // Ordinary Func fallback
+        const Fn1 = Func(*const fn (?*Env, String) Raised!i32);
+        const f_fallback: Fn1 = .{ .env = null, .code = struct {
+            fn f(_: ?*Env, s: String) Raised!i32 {
+                defer drop(s);
+                return @as(i32, @intCast(unitsOf(s).len));
+            }
+        }.f };
+        defer drop(f_fallback);
+        try std.testing.expectEqual(@as(i32, 3), try invokeK(i32, f_fallback, "k", .{item1}, .{}));
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "callHofM and callHofG: callK dispatch, noescape mixed args, toFunc fallback with borrow/own" {
+    const before = thread.stats;
+    {
+        const s_cap = strConcat(str("pre:"), str(""));
+        defer drop(s_cap);
+
+        const Fn1 = Func(*const fn (?*Env, String) Raised!i32);
+        const Caps = struct { c0: String };
+        const Kn1 = struct {
+            pub const fable_known = {};
+            pub const FuncType = Fn1;
+            caps: struct { c0: String },
+            pub const borrows = .{true};
+            pub const result_borrowed = false;
+            pub inline fn call(self: *const @This(), x: String) i32 {
+                return @as(i32, @intCast(unitsOf(self.caps.c0).len + unitsOf(x).len));
+            }
+            pub fn toFunc(self: @This()) FuncType {
+                const Adapter = struct {
+                    fn code(env: ?*Env, a0: String) Raised!i32 {
+                        defer drop(a0);
+                        const c = captured(Caps, env);
+                        return @as(i32, @intCast(unitsOf(c.c0).len + unitsOf(a0).len));
+                    }
+                };
+                return closure(FuncType, Caps, .{ .c0 = dup(self.caps.c0) }, Adapter.code);
+            }
+        };
+
+        const Mod = struct {
+            pub fn withK(f: Fn1, s: String) Raised!i32 {
+                defer drop(f);
+                return f.code(f.env, s);
+            }
+            pub fn @"withK$k"(f: anytype, s: String) Raised!i32 {
+                return invokeK(i32, f, "g", .{s}, .{});
+            }
+            pub const @"withK$sig" = .{ .borrows = .{ false, false }, .result_borrowed = false };
+            pub const @"withK$noescape" = .{ true, false };
+
+            pub fn escBorrow(f: Fn1, s: String) Raised!i32 {
+                return f.code(f.env, s);
+            }
+            pub const @"escBorrow$sig" = .{ .borrows = .{ true, false }, .result_borrowed = false };
+
+            pub fn escOwn(f: Fn1, s: String) Raised!i32 {
+                defer drop(f);
+                return f.code(f.env, s);
+            }
+            pub const @"escOwn$sig" = .{ .borrows = .{ false, false }, .result_borrowed = false };
+
+            pub fn escRaise(f: Fn1, s: String) Raised!i32 {
+                _ = f;
+                drop(s);
+                return raise(ArgumentException, str("boom-hof"));
+            }
+            pub const @"escRaise$sig" = .{ .borrows = .{ true, false }, .result_borrowed = false };
+
+            pub fn gen(comptime T: type) type {
+                _ = T;
+                return struct {
+                    pub const sig = .{ .borrows = .{ true, false }, .result_borrowed = false };
+                    pub const noescape = .{ true, false };
+                    pub fn call(f: Fn1, s: String) Raised!i32 {
+                        return f.code(f.env, s);
+                    }
+                    pub fn callK(f: anytype, s: String) Raised!i32 {
+                        return invokeK(i32, f, "g", .{s}, .{});
+                    }
+                };
+            }
+        };
+
+        const k_val = Kn1{ .caps = .{ .c0 = s_cap } };
+
+        // No-escape module call: 0 heap env allocs beyond string arg
+        const s1 = strConcat(str("ab"), str("c"));
+        const a0 = thread.stats.allocs;
+        try std.testing.expectEqual(@as(i32, 7), try xcallHofM(Mod, "withK", "gg", .{ k_val, s1 }, .{}));
+        try std.testing.expectEqual(a0, thread.stats.allocs);
+
+        // No-escape generic call: 0 heap env allocs
+        const s2 = strConcat(str("de"), str("fg"));
+        const a1 = thread.stats.allocs;
+        try std.testing.expectEqual(@as(i32, 8), try callHofG(Mod.gen(String), "gg", .{ k_val, s2 }, .{}));
+        try std.testing.expectEqual(a1, thread.stats.allocs);
+
+        // Escaping callK-less module HOFs: toFunc() fallback (borrows=true and borrows=false), plus error unwind drop
+        const s3 = strConcat(str("hi"), str(""));
+        try std.testing.expectEqual(@as(i32, 6), try callHofM(Mod, "escBorrow", "gg", .{ k_val, s3 }, .{}));
+
+        const s4 = strConcat(str("jk"), str("l"));
+        try std.testing.expectEqual(@as(i32, 7), try callHofM(Mod, "escOwn", "gg", .{ k_val, s4 }, .{}));
+
+        const s5 = strConcat(str("mn"), str("o"));
+        const held = strConcat(str("he"), str("ld"));
+        try std.testing.expectError(error.Raised, xcallHofM(Mod, "escRaise", "gg", .{ k_val, s5 }, .{held}));
+        drop(take());
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "acrossAssumed: borrowed return without dup, generic form, empty result_from, and raise cleanup" {
+    const before = thread.stats;
+    {
+        const s_owned = strConcat(str("hello "), str("world"));
+        defer drop(s_owned);
+
+        const s_extra = strConcat(str("ex"), str("tra"));
+
+        const Mod = struct {
+            pub fn idStr(s: String, n: i32) String {
+                _ = n;
+                return s;
+            }
+            pub const @"idStr$sig" = .{ .borrows = .{ true, false }, .result_borrowed = true, .result_from = .{0} };
+
+            pub fn constStr(s: String) String {
+                _ = s;
+                return str("lit");
+            }
+            pub const @"constStr$sig" = .{ .borrows = .{true}, .result_borrowed = true, .result_from = .{} };
+
+            pub fn borrowAndRaise(s: String) Raised!String {
+                _ = s;
+                return raise(ArgumentException, str("boom-assumed"));
+            }
+            pub const @"borrowAndRaise$sig" = .{ .borrows = .{true}, .result_borrowed = true, .result_from = .{0} };
+
+            pub fn gen(comptime T: type) type {
+                _ = T;
+                return struct {
+                    pub fn call(x: String, drop_me: String) String {
+                        _ = drop_me;
+                        return x;
+                    }
+                    pub const sig = .{ .borrows = .{ true, true }, .result_borrowed = true, .result_from = .{0} };
+                };
+            }
+        };
+
+        // Module callAssumedM: 0 RC dups and 0 allocs on borrowed result
+        const b0 = thread.stats;
+        const r1 = callAssumedM(Mod, "idStr", .{0}, "kp", .{ s_owned, @as(i32, 42) }, .{});
+        try std.testing.expect(strEql(s_owned, r1));
+        try std.testing.expectEqual(b0.allocs, thread.stats.allocs);
+        try std.testing.expectEqual(b0.dups, thread.stats.dups);
+
+        // Empty result_from = .{}
+        const r2 = callAssumedM(Mod, "constStr", .{}, "k", .{s_owned}, .{});
+        try std.testing.expect(strEql(str("lit"), r2));
+
+        // Generic callAssumedG with one 'k' borrowed source and one 'g' borrowed dead arg
+        const r3 = callAssumedG(Mod.gen(String), .{0}, "kg", .{ s_owned, s_extra }, .{});
+        try std.testing.expect(strEql(s_owned, r3));
+
+        // Raise edge drops err_drops even though source arg is 'k'
+        const s_err_drop = strConcat(str("drop"), str("me"));
+        try std.testing.expectError(error.Raised, xcallAssumedM(Mod, "borrowAndRaise", .{0}, "k", .{s_owned}, .{s_err_drop}));
+        drop(take());
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "assertNoRaise and assertNoStore: valid non-raising and field-disjoint store assertions" {
+    const Mod = struct {
+        pub fn pureAdd(a: i32, b: i32) i32 {
+            return a +% b;
+        }
+        pub const @"pureAdd$stores" = .{ .fields = .{}, .calls_callback = false, .calls_ext_store = false };
+
+        pub fn setB() void {}
+        pub const @"setB$stores" = .{ .fields = .{"Mod.Box|B"}, .calls_callback = false, .calls_ext_store = false };
+
+        pub fn genPure(comptime T: type) type {
+            return struct {
+                pub fn call(x: T) T {
+                    return x;
+                }
+            };
+        }
+    };
+    comptime {
+        assertNoRaise(Mod.pureAdd);
+        assertNoRaise(Mod.genPure(i32).call);
+        assertNoStore(Mod, "pureAdd", .{"Mod.Box|A"}, true);
+        assertNoStore(Mod, "setB", .{"Mod.Box|A"}, true);
+        assertNoStore(Mod, "setB", .{}, true);
+    }
+    try std.testing.expectEqual(@as(i32, 5), Mod.pureAdd(2, 3));
+}
+
+test "TailCtx, fitsTailArgs, tailStore/tailLoad, takeSelf, dropEnv, plugRet and chained TailFn" {
+    const before = thread.stats;
+    {
+        const Big = struct { data: [136]u8 };
+        comptime {
+            try std.testing.expect(fitsTailArgs(&.{ i32, String, void, ?i64 }));
+            try std.testing.expect(!fitsTailArgs(&.{Big}));
+            try std.testing.expect(canPlugRet(List(String)));
+            try std.testing.expect(!canPlugRet(void));
+            try std.testing.expect(!canPlugRet(Obj));
+        }
+
+        const s_arg = strConcat(str("he"), str("llo"));
+        const Caps = struct { prefix: String };
+        const Chain = struct {
+            fn step1(ctx: *TailCtx, ret: *anyopaque) TailStatus {
+                const a = tailLoad(&.{ i32, String }, ctx);
+                const ts = takeSelfBorrowed(ctx);
+                const env: ?*Env = @ptrCast(@alignCast(ts.ptr));
+                const c = captured(Caps, env);
+                const joined = strConcat(c.prefix, a[1]);
+                drop(a[1]);
+                if (ts.owned) dropEnv(env);
+                if (a[0] <= 0) {
+                    @as(*String, @ptrCast(@alignCast(ret))).* = joined;
+                    return .ok;
+                }
+                tailStore(&.{ i32, String }, ctx, .{ a[0] - 1, joined });
+                ctx.self = null;
+                ctx.self_owned = true;
+                return @call(tail_call, step2, .{ ctx, ret });
+            }
+            fn step2(ctx: *TailCtx, ret: *anyopaque) TailStatus {
+                const a = tailLoad(&.{ i32, String }, ctx);
+                if (a[0] == 1) {
+                    drop(a[1]);
+                    _ = raise(ArgumentException, str("tc-boom")) catch {};
+                    plugRet(String, ret);
+                    return .raised;
+                }
+                tailStore(&.{ String }, ctx, .{a[1]});
+                ctx.self = null;
+                return @call(tail_call, step3, .{ ctx, ret });
+            }
+            fn step3(ctx: *TailCtx, ret: *anyopaque) TailStatus {
+                const a = tailLoad(&.{String}, ctx);
+                @as(*String, @ptrCast(@alignCast(ret))).* = a[0];
+                return .ok;
+            }
+        };
+
+        const Fn1 = Func(*const fn (?*Env, i32, String) Raised!String);
+        const f = closureTc(Fn1, Caps, .{ .prefix = dup(s_arg) }, struct {
+            fn c(_: ?*Env, n: i32, s: String) Raised!String {
+                _ = n;
+                return s;
+            }
+        }.c, &Chain.step1);
+        drop(s_arg);
+
+        var ctx: TailCtx = undefined;
+        var res: String = undefined;
+        const arg2 = strConcat(str("!"), str("?"));
+        tailStore(&.{ i32, String }, &ctx, .{ @as(i32, 1), arg2 });
+        ctx.self = @ptrCast(f.env);
+        ctx.self_owned = false; // lent from caller: f remains alive with rc=1
+        try std.testing.expectEqual(TailStatus.ok, f.tcode.?(&ctx, @ptrCast(&res)));
+        try std.testing.expect(strEql(str("hello!?"), res));
+        drop(res);
+
+        // Error path with plugRet leaves res droppable
+        var ctx_err: TailCtx = undefined;
+        var res_err: String = undefined;
+        const arg_err = strConcat(str("x"), str("y"));
+        tailStore(&.{ i32, String }, &ctx_err, .{ @as(i32, 2), arg_err });
+        ctx_err.self = @ptrCast(f.env); // moves f's remaining env ownership
+        ctx_err.self_owned = true;
+        try std.testing.expectEqual(TailStatus.raised, f.tcode.?(&ctx_err, @ptrCast(&res_err)));
+        drop(take());
+        drop(res_err);
+
+        // plugRet on List(String) writes .Empty without allocating or leaking
+        var list_plug: List(String) = undefined;
+        plugRet(List(String), @ptrCast(&list_plug));
+        drop(list_plug);
+
+        // Zero-sized non-void parameters (e.g. 1-case fieldless union) round-trip through tailStore/tailLoad
+        const Single = union(enum) { Only };
+        var ctx_z: TailCtx = .{};
+        tailStore(&.{ Single, i32, void }, &ctx_z, .{ Single.Only, @as(i32, 7), {} });
+        const loaded_z = tailLoad(&.{ Single, i32, void }, &ctx_z);
+        try std.testing.expect(loaded_z[0] == .Only);
+        try std.testing.expectEqual(@as(i32, 7), loaded_z[1]);
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "Iface $tc slots, IfaceAdapter nulls $tc, and cross-iface tail chain" {
+    const before = thread.stats;
+    {
+        const IA = Iface(IfaceAnon1(.{"Step"}).of(*const fn (?*anyopaque, i32, *const anyopaque) Raised!i32));
+        const IBoxed = Iface(struct {
+            @"$meta": *const IfaceMeta,
+            Boxed: *const fn (?*anyopaque, Any) Raised!Any,
+            @"Boxed$tc": ?TailFn = null,
+        });
+        const IConc = Iface(struct {
+            @"$meta": *const IfaceMeta,
+            Boxed: *const fn (?*anyopaque, i32) Raised!i32,
+            @"Boxed$tc": ?TailFn = null,
+        });
+
+        const VtA = @typeInfo(@FieldType(IA, "vt")).pointer.child;
+        // Defaulted $tc field on IfaceAnon starts null
+        const default_vt: VtA = .{
+            .@"$meta" = &empty_iface_meta,
+            .Step = struct {
+                fn f(_: ?*anyopaque, x: i32, _: *const anyopaque) Raised!i32 {
+                    return x;
+                }
+            }.f,
+        };
+        try std.testing.expect(default_vt.@"Step$tc" == null);
+
+        // Chaining through interface Step$tc slots with self_owned=false and self_owned=true
+        const Caps = struct { tag: String };
+        const Node = struct {
+            fn callNorm(d: ?*anyopaque, n: i32, other: *const anyopaque) Raised!i32 {
+                _ = d;
+                _ = n;
+                _ = other;
+                return 0;
+            }
+            fn stepTc(ctx: *TailCtx, ret: *anyopaque) TailStatus {
+                const a = tailLoad(&.{ i32, *const anyopaque }, ctx);
+                const ts = takeSelfBorrowed(ctx);
+                const env: ?*Env = @ptrCast(@alignCast(ts.ptr));
+                if (ts.owned) dropEnv(env);
+                if (a[0] <= 0) {
+                    @as(*i32, @ptrCast(@alignCast(ret))).* = 99;
+                    return .ok;
+                }
+                const nxt: *const IA = @ptrCast(@alignCast(a[1]));
+                const nxt_own = dup(nxt.*);
+                tailStore(&.{ i32, *const anyopaque }, ctx, .{ a[0] - 1, a[1] });
+                ctx.self = nxt_own.data;
+                ctx.self_owned = true;
+                return @call(tail_call, nxt.vt.@"Step$tc".?, .{ ctx, ret });
+            }
+            const vt: VtA = .{
+                .@"$meta" = &env_iface_meta,
+                .Step = &callNorm,
+                .@"Step$tc" = &stepTc,
+            };
+        };
+
+        const s = strConcat(str("if"), str("ace"));
+        const ia = ifaceClosure(IA, Caps, .{ .tag = s }, &Node.vt);
+        defer drop(ia);
+
+        var tctx: TailCtx = undefined;
+        var res: i32 = undefined;
+        tailStore(&.{ i32, *const anyopaque }, &tctx, .{ @as(i32, 3), @as(*const anyopaque, @ptrCast(&ia)) });
+        tctx.self = ia.data;
+        tctx.self_owned = false;
+        try std.testing.expectEqual(TailStatus.ok, ia.vt.@"Step$tc".?(&tctx, @ptrCast(&res)));
+        try std.testing.expectEqual(@as(i32, 99), res);
+
+        // IfaceAdapter zeroes $tc fields cleanly
+        const BoxedVt = @typeInfo(@FieldType(IBoxed, "vt")).pointer.child;
+        const boxed_vt: BoxedVt = .{
+            .@"$meta" = &empty_iface_meta,
+            .Boxed = struct {
+                fn f(_: ?*anyopaque, x: Any) Raised!Any {
+                    return x;
+                }
+            }.f,
+        };
+        const ib: IBoxed = .{ .data = null, .vt = &boxed_vt };
+        const ic = ifaceAdapt(IConc, ib);
+        defer drop(ic);
+        try std.testing.expect(ic.vt.@"Boxed$tc" == null);
+        try std.testing.expectEqual(@as(i32, 42), try ic.vt.Boxed(ic.data, 42));
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "callHofAssumedM and callHofAssumedG: Known lambda + borrowed RetFrom without dup" {
+    const before = thread.stats;
+    {
+        const s_owned = strConcat(str("hello "), str("assumed"));
+        defer drop(s_owned);
+
+        const F = Func(*const fn (?*Env, String) Raised!bool);
+        const K = struct {
+            pub const fable_known = {};
+            pub const FuncType = F;
+            pub const sig = .{ .borrows = .{ true, true }, .result_borrowed = false };
+            cap: i32,
+            pub inline fn call(self: *const @This(), x: String) Raised!bool {
+                return strLength(x) > self.cap;
+            }
+            fn adapter(env: ?*Env, x: String) Raised!bool {
+                const c = captured(struct { cap: i32 }, env);
+                defer drop(x);
+                return strLength(x) > c.cap;
+            }
+            pub fn toFunc(self: @This()) F {
+                return closure(F, struct { cap: i32 }, .{ .cap = self.cap }, adapter);
+            }
+        };
+
+        const Mod = struct {
+            pub fn checkOrFallback(k: F, s: String) Raised!String {
+                defer drop(k);
+                _ = try k.code(k.env, dup(s));
+                return s;
+            }
+            pub fn @"checkOrFallback$k"(k: anytype, s: String) Raised!String {
+                if (try k.call(s)) return s;
+                return s;
+            }
+            pub const @"checkOrFallback$sig" = .{ .borrows = .{ false, true }, .result_borrowed = true, .result_from = .{1} };
+            pub const @"checkOrFallback$noescape" = .{ true, false };
+
+            pub fn pickEsc(k: F, s: String) Raised!String {
+                _ = try k.code(k.env, dup(s));
+                return s;
+            }
+            pub const @"pickEsc$sig" = .{ .borrows = .{ true, true }, .result_borrowed = true, .result_from = .{1} };
+
+            pub fn raiseAfter(k: F, s: String) Raised!String {
+                defer drop(k);
+                _ = s;
+                return raise(ArgumentException, str("boom-hof-assumed"));
+            }
+            pub const @"raiseAfter$sig" = .{ .borrows = .{ false, true }, .result_borrowed = true, .result_from = .{1} };
+
+            pub fn gen(comptime T: type) type {
+                _ = T;
+                return struct {
+                    pub fn call(k: F, s: String) Raised!String {
+                        defer drop(k);
+                        _ = try k.code(k.env, dup(s));
+                        return s;
+                    }
+                    pub fn callK(k: anytype, s: String) Raised!String {
+                        _ = try k.call(s);
+                        return s;
+                    }
+                    pub const sig = .{ .borrows = .{ false, true }, .result_borrowed = true, .result_from = .{1} };
+                    pub const noescape = .{ true, false };
+                };
+            }
+        };
+
+        const b0 = thread.stats;
+        const r1 = try xcallHofAssumedM(Mod, "checkOrFallback", .{1}, "gk", .{ K{ .cap = 3 }, s_owned }, .{});
+        try std.testing.expect(strEql(s_owned, r1));
+        try std.testing.expectEqual(b0.allocs, thread.stats.allocs);
+        try std.testing.expectEqual(b0.dups, thread.stats.dups);
+
+        const r2 = try xcallHofAssumedM(Mod, "pickEsc", .{1}, "gk", .{ K{ .cap = 3 }, s_owned }, .{});
+        try std.testing.expect(strEql(s_owned, r2));
+
+        const r3 = try xcallHofAssumedG(Mod.gen(String), .{1}, "gk", .{ K{ .cap = 3 }, s_owned }, .{});
+        try std.testing.expect(strEql(s_owned, r3));
+
+        const s_err = strConcat(str("err"), str("drop"));
+        try std.testing.expectError(error.Raised, xcallHofAssumedM(Mod, "raiseAfter", .{1}, "gk", .{ K{ .cap = 3 }, s_owned }, .{s_err}));
+        drop(take());
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+}
+
+test "dropEnv: deep 150k multi-capture closure chain frees in O(1) stack" {
+    const before = thread.stats;
+    {
+        const F = Func(*const fn (?*Env, i32) Raised!i32);
+        const Caps = struct { c0: F, c1: F };
+        const H = struct {
+            fn base(_: ?*Env, x: i32) Raised!i32 {
+                return x + 10;
+            }
+            fn step(env: ?*Env, x: i32) Raised!i32 {
+                const c = captured(Caps, env);
+                if (x >= 0) return c.c0.code(c.c0.env, x + 1);
+                return c.c1.code(c.c1.env, x);
+            }
+        };
+        const leaf: F = .{ .env = null, .code = H.base };
+        var cur: F = leaf;
+        for (0..150_000) |_| {
+            cur = closure(F, Caps, .{ .c0 = cur, .c1 = dup(leaf) }, H.step);
+        }
+        defer drop(cur);
+        try std.testing.expectEqual(@as(i32, 9), try cur.code(cur.env, -1));
+    }
+    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
 }

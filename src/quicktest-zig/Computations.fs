@@ -131,6 +131,32 @@ let run () : int =
     let mutable started = 0
     async { started <- started + 1 } |> Async.StartImmediate
 
+    let unitDoneTcs = System.Threading.Tasks.TaskCompletionSource<unit>()
+
+    let mbUnit =
+        MailboxProcessor<unit>.Start(fun inbox ->
+            async {
+                do! inbox.Receive()
+                unitDoneTcs.SetResult(())
+            }
+        )
+
+    mbUnit.Post(())
+    let unitTcsRes = unitDoneTcs.Task.Result
+
+    let mbReplyUnit =
+        MailboxProcessor<AsyncReplyChannel<unit>>.Start(fun inbox ->
+            async {
+                let! ch = inbox.Receive()
+                ch.Reply(())
+            }
+        )
+
+    let unitReplyRes = mbReplyUnit.PostAndReply(fun ch -> ch)
+    let unitTryTcs = System.Threading.Tasks.TaskCompletionSource<unit>()
+    let unitTryOk = unitTryTcs.TrySetResult(())
+    let unitTryRes = unitTryTcs.Task.Result
+
     let failed =
         same
             "Some 3|None|(3, [\"first\"; \"second\"])"
@@ -168,6 +194,7 @@ let run () : int =
              + raised
              + "|"
              + string started)
+        + check (unitTcsRes = () && unitReplyRes = () && unitTryOk && unitTryRes = ())
 
     printfn "computations: %d" failed
 
