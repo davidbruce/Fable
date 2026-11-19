@@ -28,7 +28,7 @@ pub const interface_version: i32 = 12;
 
 /// Where cells come from. A program may set this before it allocates anything.
 pub var allocator: std.mem.Allocator = if (@hasDecl(root, "fable_oom_hook"))
-    .{ .ptr = @constCast(@ptrCast(&base_allocator)), .vtable = &OomHooked.vtable }
+    .{ .ptr = @ptrCast(@constCast(&base_allocator)), .vtable = &OomHooked.vtable }
 else
     base_allocator;
 
@@ -71,6 +71,16 @@ pub const oom_catchable: bool = blk: {
     if (!@hasDecl(root, "$cycles")) break :blk true;
     const c = root.@"$cycles";
     if (@hasField(@TypeOf(c), "oom_catch")) break :blk c.oom_catch;
+    break :blk true;
+};
+
+/// Does any file in the program use `[<StackArena>]`? When false, `alloc()` compiles
+/// straight to `allocator` with zero per-allocation thread-local checks.
+pub const uses_arena: bool = blk: {
+    if (builtin.is_test) break :blk true;
+    if (!@hasDecl(root, "$cycles")) break :blk true;
+    const c = root.@"$cycles";
+    if (@hasField(@TypeOf(c), "uses_arena")) break :blk c.uses_arena;
     break :blk true;
 };
 
@@ -136,6 +146,17 @@ pub const Stats = struct {
 
 pub const EnvDropState = struct { depth: u32 = 0, queue: std.ArrayList(*Env) = .empty };
 
+pub const ShareFail = enum { none, stack_arena, cyclic_structure };
+
+pub const ShareProbe = struct {
+    seen: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    reason: ShareFail = .none,
+
+    pub fn deinit(self: *ShareProbe) void {
+        self.seen.deinit(bookkeeping());
+    }
+};
+
 /// What belongs to one thread: its counters, its cycle collector and the exception it is
 /// passing up. A value is owned by the thread that made it (counts are not atomic), so each
 /// thread has all of this for itself. (Plain globals where there is one thread or no
@@ -152,6 +173,9 @@ pub const thread = if (sgc.per_thread) struct {
     pub threadlocal var async_state: ?*ObjHeader = null;
     pub threadlocal var arena: ?*Arena = null;
     pub threadlocal var env_drop: EnvDropState = .{};
+    pub threadlocal var share_probe: ?*ShareProbe = null;
+    pub threadlocal var transfer_env: bool = false;
+    pub threadlocal var transfer_saw_gc: bool = false;
 } else struct {
     pub var stats: Stats = .{};
     pub var collector: sgc.Gc = undefined;
@@ -166,15 +190,28 @@ pub const thread = if (sgc.per_thread) struct {
     pub var async_state: ?*ObjHeader = null;
     pub var arena: ?*Arena = null;
     pub var env_drop: EnvDropState = .{};
+    pub var share_probe: ?*ShareProbe = null;
+    pub var transfer_env: bool = false;
+    pub var transfer_saw_gc: bool = false;
 };
 
 /// A null array of a type whose arrays the collector follows, kept until the collector goes
 pub const NullArray = struct { cell: *anyopaque, free: *const fn (*anyopaque) void };
 
 /// Where the runtime's own bookkeeping (the collector's, the table of weak references) comes
-/// from: the allocator, unless a stack arena stands in for it now.
+/// from: `thread.book`, else `allocator` directly (never a stack arena).
 pub fn bookkeeping() std.mem.Allocator {
-    return thread.book orelse (arena_base orelse allocator);
+    return thread.book orelse allocator;
+}
+
+/// Allocator for F# heap cells and managed buffers: routes into the current thread's
+/// `[<StackArena>]` at zero cost when the program uses stack arenas (`uses_arena`),
+/// otherwise returns `allocator` directly with no synchronization overhead.
+pub inline fn alloc() std.mem.Allocator {
+    if (comptime uses_arena) {
+        if (thread.arena != null) return arena_mod.arena_router;
+    }
+    return allocator;
 }
 
 /// This thread's counters (all zero in builds that do not count).
@@ -191,29 +228,29 @@ pub fn Cell(comptime T: type, comptime tag: std.meta.Tag(T)) type {
 pub inline fn cell(comptime T: type, comptime tag: std.meta.Tag(T), init: Cell(T, tag)) *Cell(T, tag) {
     const C = Cell(T, tag);
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch oom();
+    const c = alloc().create(C) catch oom();
     c.* = init;
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
     return c;
 }
 
-/// Reuse: build in the dead cell that `tok` holds, if it holds one; allocate otherwise.
-pub inline fn cellReuse(comptime T: type, comptime tag: std.meta.Tag(T), tok: anytype, init: Cell(T, tag)) *Cell(T, tag) {
-    const C = Cell(T, tag);
+inline fn reuseCellPtr(comptime C: type, tok: anytype, init: C) ?*C {
     const Dead = @typeInfo(@typeInfo(@TypeOf(tok)).pointer.child).optional.child;
-    // (In generic code the dead cell and the new one are the same case of one generic type,
-    // with type arguments that may differ. Only when they turn out to have one layout is the
-    // dead cell built in; otherwise the token is left alone and its owner frees the cell.)
+    // (In generic code the dead cell and the new one may be different cases or types whose
+    // sizes and alignments only match at monomorphization. Only when they match is the dead
+    // cell built in; otherwise the token is left alone and its owner frees the cell.)
     if (comptime (@sizeOf(@typeInfo(Dead).pointer.child) == @sizeOf(C) and @alignOf(@typeInfo(Dead).pointer.child) == @alignOf(C))) {
         if (tok.*) |p| {
             tok.* = null;
+            std.debug.assert((p.@"$rc" & flag_mask) == 0);
             const c: *C = @ptrCast(@alignCast(p));
             c.* = init;
             // (a new cell: not the identity hash the dead one was given)
             if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(c));
             if (comptime hasGc(C)) {
                 // (a cell that is built in again is a new cell: it gets an age of its own)
+                if (!thread.collector_ready) collectorSetup();
                 thread.collector.allocs += 1;
                 c.@"$gc" = gcHeader(C, c);
             }
@@ -221,7 +258,12 @@ pub inline fn cellReuse(comptime T: type, comptime tag: std.meta.Tag(T), tok: an
             return c;
         }
     }
-    return cell(T, tag, init);
+    return null;
+}
+
+/// Reuse: build in the dead cell that `tok` holds, if it holds one; allocate otherwise.
+pub inline fn cellReuse(comptime T: type, comptime tag: std.meta.Tag(T), tok: anytype, init: Cell(T, tag)) *Cell(T, tag) {
+    return reuseCellPtr(Cell(T, tag), tok, init) orelse cell(T, tag, init);
 }
 
 /// (an atomic load: another thread may be changing a shared cell's count, which is then never
@@ -239,6 +281,14 @@ pub inline fn isUnique(c: anytype) bool {
 // cycle collector follows cannot be shared (the collector belongs to one thread).
 
 pub const shared_bit: u32 = 1 << 31;
+pub const immortal_bit: u32 = 1 << 30;
+pub const weak_bit: u32 = 1 << 29;
+pub const flag_mask: u32 = shared_bit | immortal_bit | weak_bit;
+pub const count_mask: u32 = ~flag_mask;
+
+comptime {
+    std.debug.assert(sgc.rc_count_mask == count_mask);
+}
 
 /// Mark a value shared between threads, with everything it reaches. A cell the cycle collector
 /// follows cannot be shared: NotSupportedException.
@@ -266,8 +316,11 @@ pub fn markShared(x: anytype) Raised!void {
         const rc = @atomicLoad(u32, &p.rc, .monotonic);
         if (rc != Str.literal and rc & shared_bit == 0) {
             // (made in a `[<StackArena>]` function: its memory is that function's stack)
-            if (inThreadArena(p)) return notShareable("a string made in a [<StackArena>] function");
-            p.rc = rc | shared_bit;
+            if (inThreadArena(p)) {
+                if (thread.share_probe) |pr| pr.reason = .stack_arena;
+                return notShareable("a string made in a [<StackArena>] function", " Copy or allocate the string outside the [<StackArena>] function first.");
+            }
+            if (thread.share_probe == null) p.rc = rc | shared_bit;
         }
         return;
     }
@@ -287,620 +340,18 @@ pub fn markShared(x: anytype) Raised!void {
     }
 }
 
-// ---- Ownership regained on receipt (Verona's regions, Pony's `iso`): a value that was marked
-// shared to cross to another thread (a message of a MailboxProcessor) is the receiver's own
-// again where only the receiver holds it: the region reached from it through cells and strings
-// counted once has its shared bits cleared, so its counts are plain from then on and Perceus may
-// change it in place. A cell counted once and reached only through such cells has no other
-// holder, so no thread can take a reference to it meanwhile (those that hold one are counted).
-// The walk stops, leaving it shared, at anything counted more than once, at what is reached
-// through hooks of its own (a function, an object, an exception, an interface), at a weak
-// reference and at a cell the collector follows (it left the collector when shared); unshared
-// cells then point to shared ones, never the other way. Nothing is taken back while weak
-// references to shared values exist (one could take a reference meanwhile). ----
-
-/// (a cell of this thread's `[<StackArena>]`: its memory is that function's stack)
-inline fn inThreadArena(c: anytype) bool {
-    if (thread.arena == null) return false;
-    const bytes: [*]u8 = @ptrCast(c);
-    return arenaOwning(bytes[0..@sizeOf(@TypeOf(c.*))]) != null;
-}
-
-/// Can this cell, counted once, be taken out of sharing (its shared bit cleared)? Not while a
-/// weak reference to a shared value exists anywhere (its TryGetTarget could take a reference
-/// meanwhile, and the cell's free would not look for it); a cell that is not shared, yes.
-inline fn unshareable(c: anytype) bool {
-    return !isShared(c) or weak_refs.shared_count.load(.acquire) == 0;
-}
-
-/// The region of `x` that only the receiver holds made its own again
-pub fn adoptShared(x: anytype) void {
-    if (weak_refs.shared_count.load(.acquire) != 0) return;
-    adoptRegion(x);
-}
-
-/// (one reference, shared or not; read after the other threads' last releases)
-inline fn countedOnce(c: anytype) bool {
-    return @atomicLoad(u32, &c.@"$rc", .acquire) & ~shared_bit == 1;
-}
-
-fn adoptRegion(x: anytype) void {
-    const T = @TypeOf(x);
-    if (comptime !isManaged(T)) return;
-    if (comptime isFunc(T) or isIface(T) or T == Obj or T == Exn or T == Any) return;
-    if (T == String) {
-        const p = x orelse return;
-        const rc = @atomicLoad(u32, &p.rc, .acquire);
-        if (rc != Str.literal and rc & ~shared_bit == 1) p.rc = 1;
-        return;
-    }
-    if (comptime isSlice(T)) {
-        for (x) |item| adoptRegion(item);
-        return;
-    }
-    switch (@typeInfo(T)) {
-        .pointer => |ptr| {
-            const C = ptr.child;
-            if (comptime hasGc(C) or @hasDecl(C, "fable_weak") or @hasDecl(C, "fable_object")) return;
-            var cur = x;
-            while (true) {
-                if (!countedOnce(cur)) return;
-                cur.@"$rc" = 1;
-                if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(cur));
-                var next: ?T = null;
-                inline for (@typeInfo(C).@"struct".field_names) |name| {
-                    if (comptime isCount(name)) continue;
-                    const F = @TypeOf(@field(cur, name));
-                    if (F == T) next = @field(cur, name) else if (F == ?T) next = @field(cur, name) else adoptRegion(@field(cur, name));
-                }
-                cur = next orelse return;
-            }
-        },
-        .optional => if (x) |v| adoptRegion(v),
-        .@"struct" => |st| inline for (st.field_names) |name| adoptRegion(@field(x, name)),
-        .@"union" => {
-            var cur = x;
-            while (true) {
-                var next: ?T = null;
-                switch (cur) {
-                    inline else => |p| {
-                        const P = @TypeOf(p);
-                        if (comptime isCellPtr(P)) {
-                            const C = @typeInfo(P).pointer.child;
-                            if (comptime hasGc(C)) return;
-                            if (!countedOnce(p)) return;
-                            p.@"$rc" = 1;
-                            if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(p));
-                            inline for (@typeInfo(C).@"struct".field_names) |name| {
-                                if (comptime isCount(name)) continue;
-                                if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else adoptRegion(@field(p, name));
-                            }
-                        } else adoptRegion(p);
-                    },
-                }
-                cur = next orelse return;
-            }
-        },
-        else => {},
-    }
-}
-
-// ---- `Fable.Core.Zig.Iso<'T>`: a value moved between threads whole (Verona's isolated region,
-// Pony's `iso`). `Iso.pack x` takes `x` (the caller gives it up), which must be isolated: each
-// cell and string it reaches that is not shared already is counted exactly as often as the value
-// refers to it (trees, diamonds and cycles; see `Region`), and what is shared already is left as
-// a part of it. A function's environment, an object or an exception not shared yet is counted
-// the same way and marked shared once the value is found isolated. A structure of the cycle
-// collector it reaches moves whole to the unpacking thread's collector; loose collector cells are
-// flagged as targets. Refused: interfaces, what a `[<StackArena>]` made, cells with a weak
-// reference of this thread's, a shared cell's bit while shared weak handles exist, a structure
-// being checked. The value is kept as bytes the runtime does not walk, so sharing the Iso
-// (posting it to a MailboxProcessor, capturing it in a thread) marks only the Iso: the value's
-// counts stay plain, and any number of hops cost one pointer each. `Iso.unpack` takes the value
-// out once (an atomic swap: one taker), owned by the thread that unpacks it. A MailboxProcessor
-// boxes its messages the same way (`isoSend`, `isoHold`). ----
-
-pub fn Iso(comptime T: type) type {
-    return *struct {
-        const Self = @This();
-        pub const fable_identity = {};
-        pub const fable_iso = T;
-        @"$rc": u32 = 1,
-        /// 1 while the value is in it
-        full: std.atomic.Value(u8) = .init(1),
-        /// the value reaches cells the cycle collector follows (in a structure or not, however
-        /// deep): the thread that unpacks it makes its collector if it has none
-        has_gc: bool = false,
-        /// the value, as bytes nothing walks (see above)
-        held: [@sizeOf(T)]u8 align(@alignOf(T)) = undefined,
-        /// the structures of the cycle collector the value moved out of the packing thread's
-        /// collector with: their members, one group after another, and where each group ends
-        moved: []*sgc.Hdr = &.{},
-        moved_ends: []usize = &.{},
-
-        fn ptr(c: *Self) *T {
-            return @ptrCast(&c.held);
-        }
-
-        /// (the moved structures join this thread's collector)
-        fn settle(c: *Self) void {
-            // (cells the collector follows, in a structure or not, are this thread's now: its
-            // collector is made if it was not)
-            if (c.has_gc and !thread.collector_ready) collectorSetup();
-            var start: usize = 0;
-            for (c.moved_ends) |end| {
-                thread.collector.moveIn(c.moved[start..end]);
-                start = end;
-            }
-            if (c.moved.len != 0) allocator.free(c.moved);
-            if (c.moved_ends.len != 0) allocator.free(c.moved_ends);
-            c.moved = &.{};
-            c.moved_ends = &.{};
-        }
-
-        pub fn fable_free(c: *Self) void {
-            if (c.full.load(.acquire) == 1) {
-                c.settle();
-                drop(c.ptr().*);
-            } else c.settle();
-        }
-
-        pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
-            _ = x;
-            _ = depth;
-            return b.word("Fable.Core.Zig.Iso`1");
-        }
-    };
-}
-
-/// Is `x` isolated (see above)? Counts read after the other threads' last releases.
-fn isolated(x: anytype) bool {
-    const T = @TypeOf(x);
-    if (comptime !isManaged(T)) return true;
-    if (comptime isFunc(T) or isIface(T) or T == Obj or T == Exn or T == Any) return false;
-    if (T == String) {
-        const p = x orelse return true;
-        const rc = @atomicLoad(u32, &p.rc, .acquire);
-        if (rc == Str.literal) return true;
-        return rc & ~shared_bit == 1 and !inThreadArena(p);
-    }
-    if (comptime isSlice(T)) {
-        for (x) |item| if (!isolated(item)) return false;
-        return true;
-    }
-    switch (@typeInfo(T)) {
-        .pointer => |ptr| {
-            const C = ptr.child;
-            if (comptime hasGc(C) or @hasDecl(C, "fable_weak") or @hasDecl(C, "fable_object") or @hasDecl(C, "fable_iso")) return false;
-            var cur = x;
-            while (true) {
-                if (!countedOnce(cur) or !unshareable(cur) or inThreadArena(cur)) return false;
-                if (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(cur))) return false;
-                var next: ?T = null;
-                inline for (@typeInfo(C).@"struct".field_names) |name| {
-                    if (comptime isCount(name)) continue;
-                    const F = @TypeOf(@field(cur, name));
-                    if (F == T) next = @field(cur, name) else if (F == ?T) next = @field(cur, name) else if (!isolated(@field(cur, name))) return false;
-                }
-                cur = next orelse return true;
-            }
-        },
-        .optional => return if (x) |v| isolated(v) else true,
-        .@"struct" => |st| {
-            inline for (st.field_names) |name| if (!isolated(@field(x, name))) return false;
-            return true;
-        },
-        .@"union" => {
-            var cur = x;
-            while (true) {
-                var next: ?T = null;
-                switch (cur) {
-                    inline else => |p| {
-                        const P = @TypeOf(p);
-                        if (comptime isCellPtr(P)) {
-                            const C = @typeInfo(P).pointer.child;
-                            if (comptime hasGc(C)) return false;
-                            if (!countedOnce(p) or !unshareable(p) or inThreadArena(p)) return false;
-                            if (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(p))) return false;
-                            inline for (@typeInfo(C).@"struct".field_names) |name| {
-                                if (comptime isCount(name)) continue;
-                                if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else if (!isolated(@field(p, name))) return false;
-                            }
-                        } else if (!isolated(p)) return false;
-                    },
-                }
-                cur = next orelse return true;
-            }
-        },
-        else => return true,
-    }
-}
-
-/// `Iso.pack x` (`x` owned: the caller gives it, or keeps it, which makes it not isolated)
-/// `x` in an Iso if it is isolated (see above); null otherwise, `x` left as it was
-fn packOrNull(comptime T: type, x: T) ?Iso(T) {
-    const I = @typeInfo(Iso(T)).pointer.child;
-    // (a tree of cells counted once, none the collector follows: the quick test)
-    if (isolated(x)) {
-        adoptRegion(x);
-        const c = allocator.create(I) catch oom();
-        if (track) thread.stats.allocs += 1;
-        c.* = .{};
-        c.ptr().* = x;
-        return c;
-    }
-    // (shared parts, cycles, cells the collector follows: each cell counted exactly as often as
-    // the value refers to it)
-    var region: Region = .{};
-    defer region.deinit();
-    region.visit(x);
-    if (!region.ok or !region.closed()) return null;
-    const c = allocator.create(I) catch oom();
-    if (track) thread.stats.allocs += 1;
-    c.* = .{};
-    c.has_gc = region.saw_gc;
-    region.moveOut(&c.moved, &c.moved_ends);
-    c.ptr().* = x;
-    return c;
-}
-
-/// `Iso.pack x` (`x` owned: the caller gives it, or keeps it, which makes it not isolated)
-pub fn isoPack(comptime T: type) type {
-    return struct {
-        pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
-
-        pub fn call(x: T) Raised!Iso(T) {
-            if (packOrNull(T, x)) |c| return c;
-            drop(x);
-            return raise(InvalidOperationException, str("Iso.pack: the value is not isolated (something else refers to a part of it, or it holds a function, an object or an interface not shared already, a weak reference, something made in a [<StackArena>], or a structure of the cycle collector that is being checked)."));
-        }
-    };
-}
-
-/// `Iso.tryPack x`: the Iso, or the value given back (as an F# tuple of two options, which
-/// Fable.Core.Zig's inline `tryPack` turns into a Result where it is used)
-pub fn isoTryPack(comptime T: type) type {
-    return struct {
-        pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
-
-        pub fn call(x: T) @Tuple(&.{ ?Iso(T), ?T }) {
-            if (packOrNull(T, x)) |c| return .{ c, null };
-            return .{ null, x };
-        }
-    };
-}
-
-/// A MailboxProcessor's message as it is sent across threads (see Async.fs's MessageQueue): an
-/// isolated tree of cells goes in unmarked (its counts stay plain: the receiver gets it as its
-/// own); anything else is marked shared, as any value that reaches another thread is
-pub fn isoSend(comptime T: type) type {
-    return struct {
-        pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
-
-        pub fn call(x: T) Iso(T) {
-            transferOrShare(x);
-            return isoBox(T, x);
-        }
-    };
-}
-
-/// What crosses with a message: the cells and strings it alone holds (counted once, not shared,
-/// not in a `[<StackArena>]`, no weak reference of this thread's to them, none the collector
-/// follows) go as they are, plain; at what is shared already the walk stops (the message's cells
-/// may point at it); anything else is marked shared, with all it reaches (shared never points
-/// at unshared). A unique envelope around a shared part keeps its plain counts.
-fn transferOrShare(x: anytype) void {
-    const T = @TypeOf(x);
-    if (comptime !isManaged(T)) return;
-    if (comptime isFunc(T) or isIface(T) or T == Obj or T == Exn or T == Any) return shareStored(x);
-    if (T == String) {
-        const p = x orelse return;
-        const rc = @atomicLoad(u32, &p.rc, .monotonic);
-        if (rc == Str.literal or rc & shared_bit != 0) return;
-        if (rc == 1 and !inThreadArena(p)) return;
-        return shareStored(x);
-    }
-    if (comptime isSlice(T)) {
-        for (x) |item| transferOrShare(item);
-        return;
-    }
-    switch (@typeInfo(T)) {
-        .pointer => |ptr| {
-            const C = ptr.child;
-            if (comptime hasGc(C) or @hasDecl(C, "fable_weak") or @hasDecl(C, "fable_object") or @hasDecl(C, "fable_iso")) return shareStored(x);
-            var cur = x;
-            while (true) {
-                if (isShared(cur)) return;
-                if (cur.@"$rc" != 1 or inThreadArena(cur) or (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(cur)))) return shareStored(cur);
-                if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(cur));
-                var next: ?T = null;
-                inline for (@typeInfo(C).@"struct".field_names) |name| {
-                    if (comptime isCount(name)) continue;
-                    const F = @TypeOf(@field(cur, name));
-                    if (F == T) next = @field(cur, name) else if (F == ?T) next = @field(cur, name) else transferOrShare(@field(cur, name));
-                }
-                cur = next orelse return;
-            }
-        },
-        .optional => if (x) |v| transferOrShare(v),
-        .@"struct" => |st| inline for (st.field_names) |name| transferOrShare(@field(x, name)),
-        .@"union" => {
-            var cur = x;
-            while (true) {
-                var next: ?T = null;
-                switch (cur) {
-                    inline else => |p| {
-                        const P = @TypeOf(p);
-                        if (comptime isCellPtr(P)) {
-                            const C = @typeInfo(P).pointer.child;
-                            if (comptime hasGc(C)) return shareStored(cur);
-                            if (isShared(p)) return;
-                            if (p.@"$rc" != 1 or inThreadArena(p) or (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(p)))) return shareStored(cur);
-                            if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(p));
-                            inline for (@typeInfo(C).@"struct".field_names) |name| {
-                                if (comptime isCount(name)) continue;
-                                if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else transferOrShare(@field(p, name));
-                            }
-                        } else transferOrShare(p);
-                    },
-                }
-                cur = next orelse return;
-            }
-        },
-        else => {},
-    }
-}
-
-/// A message boxed by the thread that holds it (a mailbox of one thread, or a message put back)
-pub fn isoHold(comptime T: type) type {
-    return struct {
-        pub const sig = .{ .borrows = .{false}, .result_borrowed = false };
-
-        pub fn call(x: T) Iso(T) {
-            return isoBox(T, x);
-        }
-    };
-}
-
-fn isoBox(comptime T: type, x: T) Iso(T) {
-    const I = @typeInfo(Iso(T)).pointer.child;
-    const c = allocator.create(I) catch oom();
-    if (track) thread.stats.allocs += 1;
-    c.* = .{};
-    c.ptr().* = x;
-    return c;
-}
-
-/// The value in a box, left in it (a reference of its own)
-pub fn isoPeek(iso: anytype) @typeInfo(@TypeOf(iso)).pointer.child.fable_iso {
-    return dup(iso.ptr().*);
-}
-
-/// `Iso.unpack iso`: the value, once (InvalidOperationException after)
-pub fn isoUnpack(iso: anytype) Raised!@typeInfo(@TypeOf(iso)).pointer.child.fable_iso {
-    if (iso.full.swap(0, .acq_rel) != 1) return raise(InvalidOperationException, str("Iso.unpack: the value was taken already."));
-    iso.settle();
-    return iso.ptr().*;
-}
-
-/// The cells a value reaches, each with the references to it found inside the value (the value
-/// itself is reached once: the caller gave it up). Isolated: each cell's count is that number,
-/// nothing is reached through hooks of its own, and every member of a structure of the cycle
-/// collector that it reaches is reached (the structure moves whole).
-const Region = struct {
-    /// `share`: a function's environment, an object or an exception, reached through hooks of
-    /// its own: counted as a cell, and marked shared once the value is found isolated
-    const Reached = struct { rc: *u32, seen: u32, hdr: ?*sgc.Hdr, share: ?*const fn (usize) Raised!void = null };
-    cells: std.AutoHashMapUnmanaged(usize, Reached) = .empty,
-    ok: bool = true,
-    /// a cell the cycle collector follows was reached
-    saw_gc: bool = false,
-
-    fn deinit(r: *Region) void {
-        r.cells.deinit(bookkeeping());
-    }
-
-    /// One reference found to the cell at `addr`: true when it was seen before (not walked again)
-    fn reach(r: *Region, addr: usize, rc: *u32, hdr: ?*sgc.Hdr) bool {
-        const e = r.cells.getOrPut(bookkeeping(), addr) catch oom();
-        if (e.found_existing) {
-            e.value_ptr.seen += 1;
-            return true;
-        }
-        if (hdr != null) r.saw_gc = true;
-        e.value_ptr.* = .{ .rc = rc, .seen = 1, .hdr = hdr };
-        return false;
-    }
-
-    /// One reference found to something reached through hooks (see Reached)
-    fn reachOpaque(r: *Region, comptime P: type, p: P) void {
-        if (isShared(p)) return;
-        const e = r.cells.getOrPut(bookkeeping(), @intFromPtr(p)) catch oom();
-        if (e.found_existing) {
-            e.value_ptr.seen += 1;
-            return;
-        }
-        const S = struct {
-            fn share(a: usize) Raised!void {
-                const q: P = @ptrFromInt(a);
-                if (P == *Env) {
-                    if (try markCell(q)) try q.share(q);
-                } else try markShared(q);
-            }
-        };
-        e.value_ptr.* = .{ .rc = &p.@"$rc", .seen = 1, .hdr = null, .share = S.share };
-    }
-
-    /// (what is shared between threads already is left as it is: the value's cells may point at
-    /// it, its counts are atomic. A function's environment, an object or an exception, whose
-    /// parts are reached through hooks, is shared already (a shared mailbox's reply channel), or
-    /// counted as a cell and marked shared once the whole value is found isolated (marking it
-    /// while walking would change the counts of what it captured, which the walk relies on);
-    /// what it captured is then shared too. An interface's value cannot be told apart.)
-    fn visit(r: *Region, x: anytype) void {
-        if (!r.ok) return;
-        const T = @TypeOf(x);
-        if (comptime !isManaged(T)) return;
-        if (comptime isFunc(T)) {
-            const e = x.env orelse return;
-            r.reachOpaque(*Env, e);
-            return;
-        }
-        if (T == Obj or T == Exn) {
-            r.reachOpaque(T, x);
-            return;
-        }
-        if (T == Any) {
-            const o = x orelse return;
-            r.reachOpaque(Obj, o);
-            return;
-        }
-        if (comptime isIface(T)) {
-            r.ok = false;
-            return;
-        }
-        if (T == String) {
-            const p = x orelse return;
-            const rc = @atomicLoad(u32, &p.rc, .acquire);
-            if (rc == Str.literal or rc & shared_bit != 0) return;
-            if (inThreadArena(p)) {
-                r.ok = false;
-                return;
-            }
-            _ = r.reach(@intFromPtr(p), &p.rc, null);
-            return;
-        }
-        if (comptime isSlice(T)) {
-            for (x) |item| r.visit(item);
-            return;
-        }
-        switch (@typeInfo(T)) {
-            .pointer => |ptr| {
-                const C = ptr.child;
-                if (comptime @hasDecl(C, "fable_weak") or @hasDecl(C, "fable_object") or @hasDecl(C, "fable_iso")) {
-                    r.ok = false;
-                    return;
-                }
-                var cur = x;
-                while (r.ok) {
-                    if (isShared(cur)) return;
-                    if (inThreadArena(cur) or (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(cur)))) {
-                        r.ok = false;
-                        return;
-                    }
-                    if (r.reach(@intFromPtr(cur), &cur.@"$rc", gcOf(cur))) return;
-                    var next: ?T = null;
-                    inline for (@typeInfo(C).@"struct".field_names) |name| {
-                        if (comptime isCount(name)) continue;
-                        const F = @TypeOf(@field(cur, name));
-                        if (F == T) next = @field(cur, name) else if (F == ?T) next = @field(cur, name) else r.visit(@field(cur, name));
-                    }
-                    cur = next orelse return;
-                }
-            },
-            .optional => if (x) |v| r.visit(v),
-            .@"struct" => |st| inline for (st.field_names) |name| r.visit(@field(x, name)),
-            .@"union" => {
-                var cur = x;
-                while (r.ok) {
-                    var next: ?T = null;
-                    switch (cur) {
-                        inline else => |p| {
-                            const P = @TypeOf(p);
-                            if (comptime isCellPtr(P)) {
-                                if (isShared(p)) return;
-                                if (inThreadArena(p) or (thread.weak.count() != 0 and thread.weak.contains(@intFromPtr(p)))) {
-                                    r.ok = false;
-                                    return;
-                                }
-                                if (r.reach(@intFromPtr(p), &p.@"$rc", gcOf(p))) return;
-                                inline for (@typeInfo(@typeInfo(P).pointer.child).@"struct".field_names) |name| {
-                                    if (comptime isCount(name)) continue;
-                                    if (@TypeOf(@field(p, name)) == T) next = @field(p, name) else r.visit(@field(p, name));
-                                }
-                            } else r.visit(p);
-                        },
-                    }
-                    cur = next orelse return;
-                }
-            },
-            else => {},
-        }
-    }
-
-    /// Is every cell counted exactly as often as the value refers to it, and every structure of
-    /// the collector it reaches reached whole and free to move?
-    fn closed(r: *Region) bool {
-        const Seen = struct { reached: usize, members: usize };
-        var per_structure: std.AutoHashMapUnmanaged(usize, Seen) = .empty;
-        defer per_structure.deinit(bookkeeping());
-        var it = r.cells.iterator();
-        while (it.next()) |e| {
-            const reached = e.value_ptr.*;
-            if (@atomicLoad(u32, reached.rc, .acquire) != reached.seen) return false;
-            const h = reached.hdr orelse continue;
-            if (!thread.collector.canMove(h)) return false;
-            if (h.st == 0) continue;
-            const s = thread.collector.structureOf(h);
-            const n = per_structure.getOrPut(bookkeeping(), s.key) catch oom();
-            if (!n.found_existing) n.value_ptr.* = .{ .reached = 0, .members = s.members };
-            n.value_ptr.reached += 1;
-        }
-        var ps = per_structure.valueIterator();
-        while (ps.next()) |n| if (n.reached != n.members) return false;
-        // (isolated: what is reached through hooks becomes a part shared already)
-        var shares = r.cells.iterator();
-        while (shares.next()) |e| {
-            const share = e.value_ptr.share orelse continue;
-            share(e.key_ptr.*) catch {
-                drop(take());
-                return false;
-            };
-        }
-        return true;
-    }
-
-    /// The value's cells made the Iso's: plain counts, no identity stamps of this thread's,
-    /// loose collector cells flagged, structures moved out (their members listed for `settle`)
-    fn moveOut(r: *Region, moved: *[]*sgc.Hdr, ends: *[]usize) void {
-        var groups: std.AutoArrayHashMapUnmanaged(usize, std.ArrayList(*sgc.Hdr)) = .empty;
-        defer {
-            for (groups.values()) |*g| g.deinit(bookkeeping());
-            groups.deinit(bookkeeping());
-        }
-        var it = r.cells.iterator();
-        while (it.next()) |e| {
-            const reached = e.value_ptr.*;
-            if (reached.share != null) continue;
-            reached.rc.* = reached.seen;
-            if (thread.stamps.count() != 0) _ = thread.stamps.remove(e.key_ptr.*);
-            const h = reached.hdr orelse continue;
-            if (h.st == 0) {
-                sgc.Gc.moveLoose(h);
-                continue;
-            }
-            const key = thread.collector.structureOf(h).key;
-            const g = groups.getOrPut(bookkeeping(), key) catch oom();
-            if (!g.found_existing) g.value_ptr.* = .empty;
-            g.value_ptr.append(bookkeeping(), h) catch oom();
-        }
-        if (groups.count() == 0) return;
-        var total: usize = 0;
-        for (groups.values()) |g| total += g.items.len;
-        const all = allocator.alloc(*sgc.Hdr, total) catch oom();
-        const group_ends = allocator.alloc(usize, groups.count()) catch oom();
-        var at: usize = 0;
-        for (groups.values(), 0..) |g, i| {
-            // (the structure leaves this collector: one member is enough to name it)
-            thread.collector.moveOut(g.items[0]);
-            @memcpy(all[at .. at + g.items.len], g.items);
-            at += g.items.len;
-            group_ends[i] = at;
-        }
-        moved.* = all;
-        ends.* = group_ends;
-    }
-};
+const iso_mod = @import("fable_iso.zig");
+pub const adoptShared = iso_mod.adoptShared;
+pub const transferOrShareOrRaise = iso_mod.transferOrShareOrRaise;
+pub const tryReclaimHomeCell = iso_mod.tryReclaimHomeCell;
+pub const Iso = iso_mod.Iso;
+pub const IsoRegion = iso_mod.Region;
+pub const isoPack = iso_mod.isoPack;
+pub const isoTryPack = iso_mod.isoTryPack;
+pub const isoSend = iso_mod.isoSend;
+pub const isoHold = iso_mod.isoHold;
+pub const isoPeek = iso_mod.isoPeek;
+pub const isoUnpack = iso_mod.isoUnpack;
 
 /// `markShared`, or false where the value reaches a cell the cycle collector follows (what was
 /// marked before it stays marked: its counts are atomic from then on, which is still right)
@@ -928,233 +379,27 @@ pub fn shareStored(value: anytype) void {
     };
 }
 
-/// .NET's `Thread`: a function run on a thread of its own. What the function captured is
-/// shared when the thread starts (`markShared`).
-pub const ThreadStart = Func(*const fn (?*Env, void) Raised!void);
-
-pub const ThreadOf = *struct {
-    pub const fable_identity = {};
-    @"$rc": u32 = 1,
-    start: ThreadStart,
-    /// the thread, once started and until joined
-    handle: ?*std.Thread = null,
-    started: bool = false,
-    /// set (atomically) when the thread's function has ended
-    finished: u32 = 0,
-};
-
-/// `Thread(fun () -> ...)`
-pub fn threadNew(start: ThreadStart) ThreadOf {
-    return new(ThreadOf, .{ .start = dup(start) });
-}
-
-/// `t.Start()`
-pub fn threadStart(t: ThreadOf) Raised!void {
-    if (t.started) return raise(ThreadStateException, str("Thread is running or terminated; it cannot restart."));
-    // (the thread object too: the new thread holds it, and the flag in it, until it ends)
-    try markShared(t);
-    const h = allocator.create(std.Thread) catch oom();
-    h.* = std.Thread.spawn(.{}, threadMain, .{ dup(t.start), &t.finished, dup(t) }) catch {
-        allocator.destroy(h);
-        return raise(OutOfMemoryException, str("Thread failed to start."));
-    };
-    t.handle = h;
-    t.started = true;
-}
-
-/// (what a thread runs: its function, then what it kept for itself is given up; an exception
-/// that leaves it ends the program, as on .NET)
-fn threadMain(f: ThreadStart, finished: *u32, t: ThreadOf) void {
-    f.code(f.env, {}) catch {
-        uncaught();
-        std.process.exit(134);
-    };
-    drop(f);
-    // (the thread object lets go of its function once it has run: what the function captured
-    // may hold the thread object, as a task of Task.Run does, and shared values are not
-    // collected in cycles)
-    const old = t.start;
-    t.start = .{ .env = null, .code = threadRan };
-    drop(old);
-    // (what the function wrote is seen by whoever sees this; the thread object is kept alive
-    // until then, as it holds the flag)
-    @atomicStore(u32, finished, 1, .release);
-    drop(t);
-    collectorDeinit();
-    if (track) _ = @atomicRmw(isize, &ended_threads_live, .Add, @intCast(thread.stats.allocs - thread.stats.frees), .monotonic);
-}
-
-fn threadRan(_: ?*Env, _: void) Raised!void {}
-
-/// `t.Join()`: waits for the thread to end
-pub fn threadJoin(t: ThreadOf) void {
-    const h = t.handle orelse return;
-    h.join();
-    allocator.destroy(h);
-    t.handle = null;
-}
-
-/// `t.IsAlive`: started and not ended
-pub fn threadIsAlive(t: ThreadOf) bool {
-    return t.started and @atomicLoad(u32, &t.finished, .acquire) == 0;
-}
-
-/// `Thread.CurrentThread.ManagedThreadId`
-pub fn threadId() i32 {
-    return @truncate(@as(i64, @intCast(std.Thread.getCurrentId())));
-}
-
-// ---- `lock`: .NET's Monitor, re-entrant, per object address with OS futex parking ----
-//
-// Each locked object address gets its own MonitorNode stored in a small table guarded by a
-// spinlock only while acquiring/releasing a reference count on the node. Contended callers
-// sleep in the OS kernel via futex (__ulock_wait on Darwin, futex on Linux), so unrelated
-// objects never collide and waiting threads do not busy-spin.
-
-pub fn futexWait(ptr: *const u32, expect: u32) void {
-    if (comptime builtin.single_threaded) return;
-    switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => {
-            const flags: std.c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true };
-            _ = std.c.__ulock_wait(flags, @constCast(ptr), expect, 0);
-        },
-        .linux => {
-            _ = std.os.linux.futex_4arg(@ptrCast(ptr), .{ .cmd = .WAIT, .private = true }, expect, null);
-        },
-        else => std.Thread.yield() catch {},
-    }
-}
-
-pub fn futexWake(ptr: *const u32, wake_all: bool) void {
-    if (comptime builtin.single_threaded) return;
-    switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => {
-            const flags: std.c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true, .WAKE_ALL = wake_all };
-            _ = std.c.__ulock_wake(flags, @constCast(ptr), 0);
-        },
-        .linux => {
-            _ = std.os.linux.futex_3arg(@ptrCast(ptr), .{ .cmd = .WAKE, .private = true }, if (wake_all) std.math.maxInt(i32) else 1);
-        },
-        else => {},
-    }
-}
-
-pub fn waitUntilSet(flag: *const u32) void {
-    while (@atomicLoad(u32, flag, .acquire) == 0) {
-        futexWait(flag, 0);
-    }
-}
-
-pub fn setAndWakeAll(flag: *u32) void {
-    @atomicStore(u32, flag, 1, .release);
-    futexWake(flag, true);
-}
-
-const MonitorNode = struct {
-    // state: 0 = unlocked, 1 = locked (uncontended), 2 = locked (maybe waiters)
-    state: u32 = 0,
-    owner_valid: u32 = 0,
-    owner: usize = 0,
-    depth: u32 = 0,
-    refs: usize = 0,
-    next_free: ?*MonitorNode = null,
-};
-
-var monitor_table_lock: u32 = 0;
-var monitors: std.AutoHashMapUnmanaged(usize, *MonitorNode) = .empty;
-var free_monitors: ?*MonitorNode = null;
-
-fn acquireMonitor(key: usize) *MonitorNode {
-    lockField(&monitor_table_lock);
-    defer unlockField(&monitor_table_lock);
-    if (monitors.get(key)) |node| {
-        node.refs += 1;
-        return node;
-    }
-    const node = if (free_monitors) |head| blk: {
-        free_monitors = head.next_free;
-        head.* = .{ .refs = 1 };
-        break :blk head;
-    } else blk: {
-        const fresh = bookkeeping().create(MonitorNode) catch oom();
-        fresh.* = .{ .refs = 1 };
-        break :blk fresh;
-    };
-    monitors.put(bookkeeping(), key, node) catch oom();
-    return node;
-}
-
-fn releaseMonitor(key: usize, node: *MonitorNode) void {
-    lockField(&monitor_table_lock);
-    defer unlockField(&monitor_table_lock);
-    node.refs -= 1;
-    if (node.refs == 0) {
-        _ = monitors.remove(key);
-        node.next_free = free_monitors;
-        free_monitors = node;
-    }
-}
-
-pub fn lockEnter(key: usize) void {
-    const node = acquireMonitor(key);
-    const me: usize = if (comptime builtin.single_threaded) 1 else @intCast(std.Thread.getCurrentId());
-    if (@atomicLoad(u32, &node.state, .acquire) != 0 and
-        @atomicLoad(u32, &node.owner_valid, .acquire) != 0 and
-        @atomicLoad(usize, &node.owner, .monotonic) == me)
-    {
-        node.depth += 1;
-        return;
-    }
-    var c = @cmpxchgStrong(u32, &node.state, 0, 1, .acquire, .monotonic);
-    if (c != null) {
-        if (c.? == 1) c = @atomicRmw(u32, &node.state, .Xchg, 2, .acquire);
-        while (c.? != 0) : (c = @atomicRmw(u32, &node.state, .Xchg, 2, .acquire)) {
-            futexWait(&node.state, 2);
-        }
-    }
-    @atomicStore(usize, &node.owner, me, .monotonic);
-    @atomicStore(u32, &node.owner_valid, 1, .release);
-    node.depth = 1;
-}
-
-pub fn lockExit(key: usize) void {
-    const node = blk: {
-        lockField(&monitor_table_lock);
-        defer unlockField(&monitor_table_lock);
-        break :blk monitors.get(key) orelse unreachable;
-    };
-    node.depth -= 1;
-    if (node.depth == 0) {
-        @atomicStore(u32, &node.owner_valid, 0, .monotonic);
-        if (@atomicRmw(u32, &node.state, .Xchg, 0, .release) == 2) {
-            futexWake(&node.state, false);
-        }
-    }
-    releaseMonitor(key, node);
-}
-
-/// (the address a lock is taken on: of the cell; null cannot be locked)
-fn lockKey(o: anytype) ?usize {
-    const T = @TypeOf(o);
-    if (comptime @typeInfo(T) == .optional) {
-        const p = o orelse return null;
-        return lockKey(p);
-    }
-    if (comptime @typeInfo(T) != .pointer) @compileError("fable: `lock` needs an object of a reference type, not " ++ @typeName(T));
-    return @intFromPtr(o);
-}
-
-fn LockResult(comptime F: type) type {
-    return @typeInfo(@typeInfo(@FieldType(F, "code")).pointer.child).@"fn".return_type.?;
-}
-
-/// `lock o (fun () -> ...)`: the function, run while this thread holds the lock of `o`
-pub fn lockRun(o: anytype, f: anytype) LockResult(@TypeOf(f)) {
-    const key = lockKey(o) orelse return raise(ArgumentNullException, str("Value cannot be null. (Parameter 'obj')"));
-    lockEnter(key);
-    defer lockExit(key);
-    return f.code(f.env, {});
-}
+const thread_mod = @import("fable_thread.zig");
+pub const ThreadStart = thread_mod.ThreadStart;
+pub const ThreadOf = thread_mod.ThreadOf;
+pub const threadNew = thread_mod.threadNew;
+pub const threadStart = thread_mod.threadStart;
+pub const threadJoin = thread_mod.threadJoin;
+pub const threadIsAlive = thread_mod.threadIsAlive;
+pub const threadId = thread_mod.threadId;
+pub const poolNew = thread_mod.poolNew;
+pub const poolStart = thread_mod.poolStart;
+pub const poolRunWorkers = thread_mod.poolRunWorkers;
+pub const poolShutdown = thread_mod.poolShutdown;
+pub const futexWait = thread_mod.futexWait;
+pub const futexWake = thread_mod.futexWake;
+pub const waitUntilSet = thread_mod.waitUntilSet;
+pub const setAndWakeAll = thread_mod.setAndWakeAll;
+pub const lockEnter = thread_mod.lockEnter;
+pub const lockExit = thread_mod.lockExit;
+pub const lockRun = thread_mod.lockRun;
+pub const parallelFor = thread_mod.parallelFor;
+pub const parallelForRange = thread_mod.parallelForRange;
 
 /// `obj ()`: an object of no class of the program's, to lock on or compare by reference
 pub fn objectNew() Obj {
@@ -1164,117 +409,51 @@ pub fn objectNew() Obj {
 const PlainObjectChain = struct { own: struct {} };
 const object_type: ObjType = objType(PlainObjectChain, "System.Object", null, &.{}, null);
 
-/// `step(ctx, i)` for each `i` below `n`, in chunks on up to eight threads (the calling one
-/// among them); what `ctx` holds must be shared already, and so must what a step leaves behind.
-/// The first exception stops the others and is raised here. (Few items: here, in order.)
-pub fn parallelFor(n: usize, ctx: anytype, comptime step: fn (@TypeOf(ctx), usize) Raised!void) Raised!void {
-    const cpus = std.Thread.getCpuCount() catch 1;
-    const workers = @min(@min(cpus, 8), n / 256);
-    if (workers < 2) {
-        var i: usize = 0;
-        while (i < n) : (i += 1) step(ctx, i) catch return aggregated(take());
-        return;
-    }
-    const State = struct {
-        failed: ?Exn = null,
-        stop: u32 = 0,
-
-        fn chunk(st: *@This(), c: @TypeOf(ctx), lo: usize, hi: usize) void {
-            var i = lo;
-            while (i < hi) : (i += 1) {
-                if (@atomicLoad(u32, &st.stop, .acquire) != 0) return;
-                step(c, i) catch {
-                    const e = take();
-                    if (@cmpxchgStrong(u32, &st.stop, 0, 1, .acq_rel, .acquire) == null) {
-                        // (the exception goes to the calling thread)
-                        markShared(e) catch drop(take());
-                        st.failed = e;
-                    } else drop(e);
-                    return;
-                };
-            }
-        }
-
-        fn worker(st: *@This(), c: @TypeOf(ctx), lo: usize, hi: usize) void {
-            st.chunk(c, lo, hi);
-            collectorDeinit();
-            if (track) _ = @atomicRmw(isize, &ended_threads_live, .Add, @intCast(thread.stats.allocs - thread.stats.frees), .monotonic);
-        }
-    };
-    var state: State = .{};
-    var threads: [8]std.Thread = undefined;
-    var started: usize = 0;
-    const size = (n + workers - 1) / workers;
-    var w: usize = 1;
-    while (w < workers) : (w += 1) {
-        const lo = @min(n, w * size);
-        const hi = @min(n, lo + size);
-        threads[started] = std.Thread.spawn(.{}, State.worker, .{ &state, ctx, lo, hi }) catch {
-            // (no thread: this one does that chunk too)
-            state.chunk(ctx, lo, hi);
-            continue;
-        };
-        started += 1;
-    }
-    state.chunk(ctx, 0, @min(n, size));
-    for (threads[0..started]) |t| t.join();
-    if (state.failed) |e| return aggregated(e);
-}
-
-/// `Parallel.For(from, to, fun i -> ...)`: the body for each `i` from `from` below `to`, on
-/// threads; what it captured is shared first
-pub fn parallelForRange(from: i32, to: i32, f: anytype) Raised!void {
-    if (to <= from) return;
-    try markShared(f);
-    const Ctx = struct { f: @TypeOf(f), from: i32 };
-    const S = struct {
-        fn step(c: Ctx, i: usize) Raised!void {
-            return c.f.code(c.f.env, c.from + @as(i32, @intCast(i)));
-        }
-    };
-    return parallelFor(@intCast(@as(i64, to) - from), Ctx{ .f = f, .from = from }, S.step);
-}
-
-/// (as .NET's Parallel raises an exception of its work: an AggregateException with it inside)
-fn aggregated(e: Exn) Raised {
-    defer drop(e);
-    const agg = AggregateException.new(.{ .Message = str("One or more errors occurred.") });
-    defer drop(agg);
-    throw(exnWithInner(agg, e));
-    return error.Raised;
-}
-
-fn notShareable(what: []const u8) Raised {
+fn notShareable(what: []const u8, hint: []const u8) Raised {
     var b: TextBuilder = .{};
     b.addAscii("The Zig target cannot share ");
     b.addAscii(what);
     b.addAscii(" between threads.");
+    b.addAscii(hint);
     return raise(NotSupportedException, b.finish());
 }
 
 /// Set the shared bit of a cell: false if it was set already
-fn markCell(c: anytype) Raised!bool {
-    // (shared already: other threads may be changing the count; until then, no other has it)
-    if (isShared(c)) return false;
+pub fn markCell(c: anytype) Raised!bool {
+    const rc = @atomicLoad(u32, &c.@"$rc", .monotonic);
+    // (shared already: other threads may be changing the count; static immortal cells already have shared_bit set,
+    // while thread-local immortal null cells need shared_bit set so collectorDeinit leaves them alive)
+    if (rc & shared_bit != 0) return false;
     // (made in a `[<StackArena>]` function of this thread: its memory is that function's stack,
     // which another thread would free on the heap)
-    if (thread.arena != null) {
-        const bytes: [*]u8 = @ptrCast(c);
-        if (arenaOwning(bytes[0..@sizeOf(@TypeOf(c.*))]) != null) return notShareable("a value made in a [<StackArena>] function");
+    if (comptime uses_arena) {
+        if (thread.arena != null) {
+            const bytes: [*]u8 = @ptrCast(c);
+            if (arenaOwning(bytes[0..@sizeOf(@TypeOf(c.*))]) != null) {
+                if (thread.share_probe) |pr| pr.reason = .stack_arena;
+                return notShareable("a value made in a [<StackArena>] function", " Allocate the value outside the [<StackArena>] function before sharing it.");
+            }
+        }
     }
-    // (weak references point at it: their handle moves to the table of shared cells, which a
-    // thread that frees it empties)
-    if (thread.weak.count() != 0) weak_refs.shareWeakHandle(@intFromPtr(c));
-    // (a cell the collector follows leaves it when it is shared, unless it is part of a
-    // structure of cells already, where its count is the collector's business)
     // (a cell the collector follows leaves it when it is shared, unless it is part of a
     // structure of cells already, where its count is the collector's business. The collector
     // does not look at shared cells: a cycle made through them afterwards is not freed, as
     // Koka frees no cycles at all; see Zig_Roadmap.md)
     if (gcOf(c)) |h| {
-        if (sgc.inStructure(h)) return notShareable("a value that is part of a structure of cells the cycle collector follows");
+        if (sgc.inStructure(h)) {
+            if (thread.share_probe) |pr| pr.reason = .cyclic_structure;
+            return notShareable("a value that is part of a cyclic structure tracked by fable_sgc", " Break the cycle with WeakReference or move the whole isolated graph with Fable.Core.Zig.Iso.pack.");
+        }
     }
-    c.@"$rc" |= shared_bit;
+    // Dry-run validation pass (Region.closed): validate shareability without mutating cells or weak handles.
+    if (thread.share_probe) |pr| {
+        const e = pr.seen.getOrPut(bookkeeping(), @intFromPtr(c)) catch oom();
+        return !e.found_existing;
+    }
+    // (weak references point at it: their handle moves to the table of shared cells, which a
+    // thread that frees it empties)
+    if (rc & weak_bit != 0) weak_refs.shareWeakHandle(@intFromPtr(c));
+    c.@"$rc" = rc | shared_bit;
     return true;
 }
 
@@ -1317,37 +496,54 @@ pub inline fn isShared(c: anytype) bool {
 }
 
 pub inline fn retain(c: anytype) void {
-    if (isShared(c)) {
-        _ = @atomicRmw(u32, &c.@"$rc", .Add, 1, .monotonic);
+    const rc = @atomicLoad(u32, &c.@"$rc", .monotonic);
+    if (rc < immortal_bit) {
+        std.debug.assert((rc & count_mask) < count_mask);
+        c.@"$rc" = rc + 1;
+        if (track) thread.stats.dups += 1;
+        if (gcOf(c)) |h| thread.collector.onRetain(h);
         return;
     }
-    c.@"$rc" += 1;
-    if (track) thread.stats.dups += 1;
-    if (gcOf(c)) |h| thread.collector.onRetain(h);
+    if (rc & immortal_bit != 0) return;
+    _ = @atomicRmw(u32, &c.@"$rc", .Add, 1, .monotonic);
 }
 
-/// Take one reference off a cell that is known to be shared.
+/// Take one reference off a cell that is known to be shared (or immortal).
 pub inline fn release(c: anytype) void {
-    if (isShared(c)) {
-        _ = @atomicRmw(u32, &c.@"$rc", .Sub, 1, .release);
+    const rc = @atomicLoad(u32, &c.@"$rc", .monotonic);
+    if (rc < immortal_bit) {
+        c.@"$rc" = rc - 1;
+        if (track) thread.stats.decs += 1;
+        if (gcOf(c)) |h| thread.collector.onRelease(h);
         return;
     }
-    c.@"$rc" -= 1;
-    if (track) thread.stats.decs += 1;
-    if (gcOf(c)) |h| thread.collector.onRelease(h);
+    if (rc & immortal_bit != 0) return;
+    _ = @atomicRmw(u32, &c.@"$rc", .Sub, 1, .release);
 }
 
 /// Take one reference off; true when it was the last one, and the caller gives up what the
 /// cell holds and frees it. (False also when the cell's whole structure died with this
 /// reference: the collector frees all of it, this cell included.)
 pub inline fn releaseIsLast(c: anytype) bool {
-    if (isShared(c)) {
-        // (the last reference of any thread: what the others wrote is seen before it is freed)
-        if (@atomicRmw(u32, &c.@"$rc", .Sub, 1, .acq_rel) != shared_bit | 1) return false;
+    const rc = @atomicLoad(u32, &c.@"$rc", .monotonic);
+    if (rc < weak_bit) {
+        if (rc != 1) {
+            c.@"$rc" = rc - 1;
+            if (track) thread.stats.decs += 1;
+            if (gcOf(c)) |h| thread.collector.onRelease(h);
+            return false;
+        }
+        if (gcOf(c)) |h| return !thread.collector.onZero(h);
         return true;
     }
-    if (c.@"$rc" != 1) {
-        c.@"$rc" -= 1;
+    if (rc & immortal_bit != 0) return false;
+    if (rc & shared_bit != 0) {
+        // (the last reference of any thread: what the others wrote is seen before it is freed)
+        const prev = @atomicRmw(u32, &c.@"$rc", .Sub, 1, .acq_rel);
+        return (prev & count_mask) == 1;
+    }
+    if ((rc & count_mask) != 1) {
+        c.@"$rc" = rc - 1;
         if (track) thread.stats.decs += 1;
         if (gcOf(c)) |h| thread.collector.onRelease(h);
         return false;
@@ -1371,24 +567,40 @@ pub fn movedOut(_: void, h: *sgc.Hdr) void {
     thread.collector.onMoveOut(h);
 }
 
+inline fn rcWeakTarget(c: anytype) ?struct { rc: *const u32, addr: usize } {
+    const C = @TypeOf(c.*);
+    if (comptime @hasField(C, "$rc")) return .{ .rc = &c.@"$rc", .addr = @intFromPtr(c) };
+    if (comptime @hasField(C, "header") and @hasField(@FieldType(C, "header"), "$rc")) return .{ .rc = &c.header.@"$rc", .addr = @intFromPtr(&c.header) };
+    if (comptime @hasDecl(C, "fable_rc_header")) return .{ .rc = &@as(*const C.fable_rc_header, @ptrCast(@alignCast(c))).@"$rc", .addr = @intFromPtr(c) };
+    return null;
+}
+
 pub inline fn free(c: anytype) void {
     if (track) thread.stats.frees += 1;
     // (a cell that weak references point at: they see it is gone. A shared cell's are in the
     // table of all threads)
-    if (thread.weak.count() != 0) weakGone(@intFromPtr(c));
-    if (comptime @hasField(@TypeOf(c.*), "$rc")) {
-        if (isShared(c) and weak_refs.shared_count.load(.monotonic) != 0) weak_refs.sharedWeakGone(@intFromPtr(c));
+    if (rcWeakTarget(c)) |info| {
+        const rc = @atomicLoad(u32, info.rc, .monotonic);
+        if (rc & weak_bit != 0) {
+            if (rc & shared_bit != 0) {
+                weak_refs.sharedWeakGone(info.addr);
+            } else {
+                weakGone(info.addr);
+            }
+        }
     }
     // (a cell whose identity hash was taken: the next cell made here gets a new one)
     if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(c));
     // (the blocks a cell holds besides itself: an array's items, a dictionary's entries)
-    if (comptime @hasDecl(@TypeOf(c.*), "fable_array")) allocator.free(c.items);
+    if (comptime @hasDecl(@TypeOf(c.*), "fable_array")) {
+        if (c.capacity != 0) alloc().free(c.items.ptr[0..c.capacity]);
+    }
     if (comptime @hasDecl(@TypeOf(c.*), "fable_free")) @TypeOf(c.*).fable_free(c);
-    allocator.destroy(c);
+    alloc().destroy(c);
 }
 
 /// The items of an array, as a field of its cell.
-fn isSlice(comptime T: type) bool {
+pub fn isSlice(comptime T: type) bool {
     const info = @typeInfo(T);
     return info == .pointer and info.pointer.size == .slice;
 }
@@ -1487,10 +699,13 @@ pub fn retainAll(x: anytype) void {
         return;
     }
     if (T == String) return strRetain(x);
-    // (a shared resource is told it is copied)
-    if (comptime isResource(T) and @hasDecl(T, "fable_dup")) {
+    // (a resource: shared resources invoke Dup; move-only resources cannot be copied)
+    if (comptime isResource(T)) {
+        if (comptime !@hasDecl(T, "fable_dup")) {
+            @compileError("fable: cannot copy move-only IResource " ++ @typeName(T));
+        }
         callHook(T.fable_dup, x);
-        thread.stats.copies += 1;
+        if (track) thread.stats.copies += 1;
     }
     switch (@typeInfo(T)) {
         .pointer => retain(x),
@@ -1528,7 +743,7 @@ pub fn drop(x: anytype) void {
     // (a resource is destroyed, then what it holds is given up)
     if (comptime isResource(T)) {
         callHook(T.fable_destroy, x);
-        thread.stats.destroys += 1;
+        if (track) thread.stats.destroys += 1;
     }
     switch (@typeInfo(T)) {
         .pointer => dropRecord(T, x),
@@ -1805,11 +1020,16 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
 pub inline fn new(comptime P: type, init: @typeInfo(P).pointer.child) P {
     const C = @typeInfo(P).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch oom();
+    const c = alloc().create(C) catch oom();
     c.* = init;
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
     return c;
+}
+
+/// Reuse: build a reference record in the dead cell that `tok` holds, if it holds one; allocate otherwise.
+pub inline fn newReuse(comptime P: type, tok: anytype, init: @typeInfo(P).pointer.child) P {
+    return reuseCellPtr(@typeInfo(P).pointer.child, tok, init) orelse new(P, init);
 }
 
 /// Store into a variable or a field of a plain value that owns what it holds: the old value
@@ -2194,227 +1414,6 @@ pub fn Anon24(comptime names: [24][]const u8) type {
     };
 }
 
-fn ifaceVtStruct(comptime N: usize, comptime names: [N][]const u8, comptime types: [N]type) type {
-    const FieldAttr = std.builtin.Type.Struct.FieldAttributes;
-    const meta_name: [1][]const u8 = .{"$meta"};
-    const meta_type: [1]type = .{*const IfaceMeta};
-    const meta_attr: [1]FieldAttr = .{.{}};
-    var tc_names: [N][]const u8 = undefined;
-    var tc_types: [N]type = undefined;
-    var tc_attrs: [N]FieldAttr = undefined;
-    const default_null: ?TailFn = null;
-    for (0..N) |i| {
-        tc_names[i] = names[i] ++ "$tc";
-        tc_types[i] = ?TailFn;
-        tc_attrs[i] = .{ .default_value_ptr = @ptrCast(&default_null) };
-    }
-    const base_attrs: [N]FieldAttr = @splat(.{});
-    const all_names = meta_name ++ names ++ tc_names;
-    const all_types = meta_type ++ types ++ tc_types;
-    const all_attrs = meta_attr ++ base_attrs ++ tc_attrs;
-    return @Struct(.auto, null, &all_names, &all_types, &all_attrs);
-}
-
-pub fn IfaceAnon0() type {
-    return struct {
-        pub fn of() type {
-            return ifaceVtStruct(0, .{}, .{});
-        }
-    };
-}
-
-pub fn IfaceAnon1(comptime names: [1][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type) type {
-            return ifaceVtStruct(1, names, .{T1});
-        }
-    };
-}
-
-pub fn IfaceAnon2(comptime names: [2][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type) type {
-            return ifaceVtStruct(2, names, .{ T1, T2 });
-        }
-    };
-}
-
-pub fn IfaceAnon3(comptime names: [3][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type) type {
-            return ifaceVtStruct(3, names, .{ T1, T2, T3 });
-        }
-    };
-}
-
-pub fn IfaceAnon4(comptime names: [4][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type) type {
-            return ifaceVtStruct(4, names, .{ T1, T2, T3, T4 });
-        }
-    };
-}
-
-pub fn IfaceAnon5(comptime names: [5][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type) type {
-            return ifaceVtStruct(5, names, .{ T1, T2, T3, T4, T5 });
-        }
-    };
-}
-
-pub fn IfaceAnon6(comptime names: [6][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type) type {
-            return ifaceVtStruct(6, names, .{ T1, T2, T3, T4, T5, T6 });
-        }
-    };
-}
-
-pub fn IfaceAnon7(comptime names: [7][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type) type {
-            return ifaceVtStruct(7, names, .{ T1, T2, T3, T4, T5, T6, T7 });
-        }
-    };
-}
-
-pub fn IfaceAnon8(comptime names: [8][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type) type {
-            return ifaceVtStruct(8, names, .{ T1, T2, T3, T4, T5, T6, T7, T8 });
-        }
-    };
-}
-
-pub fn IfaceAnon9(comptime names: [9][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type) type {
-            return ifaceVtStruct(9, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9 });
-        }
-    };
-}
-
-pub fn IfaceAnon10(comptime names: [10][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type) type {
-            return ifaceVtStruct(10, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10 });
-        }
-    };
-}
-
-pub fn IfaceAnon11(comptime names: [11][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type) type {
-            return ifaceVtStruct(11, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11 });
-        }
-    };
-}
-
-pub fn IfaceAnon12(comptime names: [12][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type) type {
-            return ifaceVtStruct(12, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12 });
-        }
-    };
-}
-
-pub fn IfaceAnon13(comptime names: [13][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type) type {
-            return ifaceVtStruct(13, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13 });
-        }
-    };
-}
-
-pub fn IfaceAnon14(comptime names: [14][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type) type {
-            return ifaceVtStruct(14, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14 });
-        }
-    };
-}
-
-pub fn IfaceAnon15(comptime names: [15][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type) type {
-            return ifaceVtStruct(15, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15 });
-        }
-    };
-}
-
-pub fn IfaceAnon16(comptime names: [16][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type) type {
-            return ifaceVtStruct(16, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16 });
-        }
-    };
-}
-
-pub fn IfaceAnon17(comptime names: [17][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type) type {
-            return ifaceVtStruct(17, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17 });
-        }
-    };
-}
-
-pub fn IfaceAnon18(comptime names: [18][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type) type {
-            return ifaceVtStruct(18, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18 });
-        }
-    };
-}
-
-pub fn IfaceAnon19(comptime names: [19][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type) type {
-            return ifaceVtStruct(19, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19 });
-        }
-    };
-}
-
-pub fn IfaceAnon20(comptime names: [20][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type) type {
-            return ifaceVtStruct(20, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20 });
-        }
-    };
-}
-
-pub fn IfaceAnon21(comptime names: [21][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type) type {
-            return ifaceVtStruct(21, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21 });
-        }
-    };
-}
-
-pub fn IfaceAnon22(comptime names: [22][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type) type {
-            return ifaceVtStruct(22, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22 });
-        }
-    };
-}
-
-pub fn IfaceAnon23(comptime names: [23][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type, comptime T23: type) type {
-            return ifaceVtStruct(23, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23 });
-        }
-    };
-}
-
-pub fn IfaceAnon24(comptime names: [24][]const u8) type {
-    return struct {
-        pub fn of(comptime T1: type, comptime T2: type, comptime T3: type, comptime T4: type, comptime T5: type, comptime T6: type, comptime T7: type, comptime T8: type, comptime T9: type, comptime T10: type, comptime T11: type, comptime T12: type, comptime T13: type, comptime T14: type, comptime T15: type, comptime T16: type, comptime T17: type, comptime T18: type, comptime T19: type, comptime T20: type, comptime T21: type, comptime T22: type, comptime T23: type, comptime T24: type) type {
-            return ifaceVtStruct(24, names, .{ T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23, T24 });
-        }
-    };
-}
-
 /// F#'s `lazy`: the code that computes the value, then the value, or the exception the code
 /// raised, which every later `Force` raises again (as on .NET).
 pub fn Lazy(comptime T: type) type {
@@ -2450,7 +1449,7 @@ pub fn Lazy(comptime T: type) type {
 pub fn lazyNew(comptime L: type, thunk: anytype) L {
     const C = @typeInfo(L).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch oom();
+    const c = alloc().create(C) catch oom();
     c.* = .{ .state = .{ .thunk = dup(thunk) } };
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -2461,7 +1460,7 @@ pub fn lazyNew(comptime L: type, thunk: anytype) L {
 pub fn lazyOf(comptime L: type, value: anytype) L {
     const C = @typeInfo(L).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch oom();
+    const c = alloc().create(C) catch oom();
     c.* = .{ .state = .{ .value = dup(value) } };
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -2539,6 +1538,7 @@ pub const arrayCreate = arrays.arrayCreate;
 pub const arrayExists = arrays.arrayExists;
 pub const arrayFill = arrays.arrayFill;
 pub const arrayFilter = arrays.arrayFilter;
+pub const arrayFilterInPlace = arrays.arrayFilterInPlace;
 pub const arrayFold = arrays.arrayFold;
 pub const arrayForall = arrays.arrayForall;
 pub const arrayFrom = arrays.arrayFrom;
@@ -2552,7 +1552,9 @@ pub const arrayIter = arrays.arrayIter;
 pub const arrayIteri = arrays.arrayIteri;
 pub const arrayLen = arrays.arrayLen;
 pub const arrayMap = arrays.arrayMap;
+pub const arrayMapInPlace = arrays.arrayMapInPlace;
 pub const arrayMapi = arrays.arrayMapi;
+pub const arrayMapiInPlace = arrays.arrayMapiInPlace;
 pub const arrayOf = arrays.arrayOf;
 pub const arrayOfList = arrays.arrayOfList;
 pub const arrayPut = arrays.arrayPut;
@@ -2561,8 +1563,10 @@ pub const arraySet = arrays.arraySet;
 pub const arraySetAt = arrays.arraySetAt;
 pub const arraySlice = arrays.arraySlice;
 pub const arraySort = arrays.arraySort;
+pub const arraySortByKeys = arrays.arraySortByKeys;
 pub const arraySortDesc = arrays.arraySortDesc;
 pub const arraySortInPlace = arrays.arraySortInPlace;
+pub const arraySortInPlaceByKeys = arrays.arraySortInPlaceByKeys;
 pub const arraySortInPlaceWith = arrays.arraySortInPlaceWith;
 pub const arraySortWith = arrays.arraySortWith;
 pub const arraySub = arrays.arraySub;
@@ -2579,13 +1583,27 @@ pub const arrayBufNew = arrays.arrayBufNew;
 pub const arrayBufPush = arrays.arrayBufPush;
 pub const arrayBufFinish = arrays.arrayBufFinish;
 pub const arrayBufAbandon = arrays.arrayBufAbandon;
+pub const MapBuf = arrays.MapBuf;
+pub const arrayMapBufNew = arrays.arrayMapBufNew;
+pub const arrayMapBufLen = arrays.arrayMapBufLen;
+pub const arrayMapBufTake = arrays.arrayMapBufTake;
+pub const arrayMapBufPush = arrays.arrayMapBufPush;
+pub const arrayMapBufFinish = arrays.arrayMapBufFinish;
+pub const arrayMapBufAbandon = arrays.arrayMapBufAbandon;
 pub const FilterBuf = arrays.FilterBuf;
 pub const arrayFilterNew = arrays.arrayFilterNew;
 pub const arrayFilterSet = arrays.arrayFilterSet;
 pub const arrayFilterFinish = arrays.arrayFilterFinish;
 pub const arrayFilterAbandon = arrays.arrayFilterAbandon;
+pub const FilterReuseBuf = arrays.FilterReuseBuf;
+pub const arrayFilterBufNew = arrays.arrayFilterBufNew;
+pub const arrayFilterBufLen = arrays.arrayFilterBufLen;
+pub const arrayFilterBufItem = arrays.arrayFilterBufItem;
+pub const arrayFilterBufStep = arrays.arrayFilterBufStep;
+pub const arrayFilterBufFinish = arrays.arrayFilterBufFinish;
+pub const arrayFilterBufAbandon = arrays.arrayFilterBufAbandon;
 pub const indexOutside = arrays.indexOutside;
-const listOf = arrays.listOf;
+pub const listOf = arrays.listOf;
 test {
     _ = arrays;
 }
@@ -2630,7 +1648,7 @@ pub fn ResizeArray(comptime T: type) type {
         capacity: usize = 0,
 
         pub fn fable_free(c: *Self) void {
-            if (c.capacity != 0) allocator.free(c.items.ptr[0..c.capacity]);
+            if (c.capacity != 0) alloc().free(c.items.ptr[0..c.capacity]);
         }
 
         pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
@@ -2657,7 +1675,7 @@ pub fn rItem(comptime R: type) type {
 pub fn raNew(comptime R: type) R {
     const C = @typeInfo(R).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch oom();
+    const c = alloc().create(C) catch oom();
     c.* = .{};
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -2668,9 +1686,9 @@ pub fn raGrow(r: anytype, need: usize) void {
     if (need <= r.capacity) return;
     const cap = @max(need, @max(4, r.capacity * 2));
     const T = rItem(@TypeOf(r));
-    const block = allocator.alloc(T, cap) catch oom();
+    const block = alloc().alloc(T, cap) catch oom();
     @memcpy(block[0..r.items.len], r.items);
-    if (r.capacity != 0) allocator.free(r.items.ptr[0..r.capacity]);
+    if (r.capacity != 0) alloc().free(r.items.ptr[0..r.capacity]);
     r.items = block[0..r.items.len];
     r.capacity = cap;
 }
@@ -2798,7 +1816,7 @@ pub fn raRemoveRange(r: anytype, index: i32, count: i32) Raised!void {
     var removed: []T = &.{};
     if (comptime isManaged(T)) {
         if (n > 0) {
-            removed = allocator.alloc(T, n) catch oom();
+            removed = alloc().alloc(T, n) catch oom();
             @memcpy(removed, r.items[at .. at + n]);
             if (gcOf(r)) |h| for (removed) |old| eachHdr(old, h, unstored);
         }
@@ -2808,7 +1826,7 @@ pub fn raRemoveRange(r: anytype, index: i32, count: i32) Raised!void {
     if (shared) lockExit(@intFromPtr(r));
     if (comptime isManaged(T)) {
         for (removed) |old| drop(old);
-        if (n > 0) allocator.free(removed);
+        if (n > 0) alloc().free(removed);
     }
 }
 
@@ -2872,7 +1890,7 @@ pub fn raClear(r: anytype) void {
         r.capacity = 0;
         lockExit(@intFromPtr(r));
         for (old_items) |item| drop(item);
-        if (old_cap != 0) allocator.free(old_items.ptr[0..old_cap]);
+        if (old_cap != 0) alloc().free(old_items.ptr[0..old_cap]);
         return;
     }
     while (r.items.len != 0) raTake(r, r.items.len - 1);
@@ -2963,8 +1981,8 @@ pub fn HashTable(comptime K: type, comptime V: type, comptime is_set: bool) type
 
         pub fn fable_free(c: *Self) void {
             if (c.capacity != 0) {
-                allocator.free(c.entries.ptr[0..c.capacity]);
-                allocator.free(c.buckets);
+                alloc().free(c.entries.ptr[0..c.capacity]);
+                alloc().free(c.buckets);
             }
         }
 
@@ -3019,7 +2037,7 @@ pub fn ValueOf(comptime D: type) type {
 pub fn htNew(comptime D: type) D {
     const C = @typeInfo(D).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = allocator.create(C) catch oom();
+    const c = alloc().create(C) catch oom();
     c.* = .{};
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
@@ -3141,15 +2159,15 @@ pub fn htBucket(d: anytype, h: i32) usize {
 
 pub fn htResize(d: anytype, size: usize) void {
     const C = @TypeOf(d.*);
-    const block = allocator.alloc(C.Entry, size) catch oom();
+    const block = alloc().alloc(C.Entry, size) catch oom();
     @memcpy(block[0..d.entries.len], d.entries);
     if (d.capacity != 0) {
-        allocator.free(d.entries.ptr[0..d.capacity]);
-        allocator.free(d.buckets);
+        alloc().free(d.entries.ptr[0..d.capacity]);
+        alloc().free(d.buckets);
     }
     d.entries = block[0..d.entries.len];
     d.capacity = size;
-    d.buckets = allocator.alloc(i32, size) catch oom();
+    d.buckets = alloc().alloc(i32, size) catch oom();
     @memset(d.buckets, 0);
     for (d.entries, 0..) |*e, i| {
         if (e.kv == null) continue;
@@ -3413,8 +2431,8 @@ pub fn htClear(d: anytype) Raised!void {
             if (e.kv) |kv| drop(kv);
         }
         if (old_cap != 0) {
-            allocator.free(old_entries.ptr[0..old_cap]);
-            allocator.free(old_buckets);
+            alloc().free(old_entries.ptr[0..old_cap]);
+            alloc().free(old_buckets);
         }
         return;
     }
@@ -3438,9 +2456,9 @@ pub fn dictToList(d: anytype) List(struct { KeyOf(@TypeOf(d)), ValueOf(@TypeOf(d
     defer if (shared) lockExit(@intFromPtr(d));
     const P = struct { KeyOf(@TypeOf(d)), ValueOf(@TypeOf(d)) };
     var items: std.ArrayList(P) = .empty;
-    defer items.deinit(allocator);
+    defer items.deinit(alloc());
     for (d.entries) |e| {
-        if (e.kv) |kv| items.append(allocator, .{ kv.key, kv.value }) catch oom();
+        if (e.kv) |kv| items.append(alloc(), .{ kv.key, kv.value }) catch oom();
     }
     return listOf(P, items.items);
 }
@@ -3514,9 +2532,9 @@ pub fn dictKeys(d: anytype) List(KeyOf(@TypeOf(d))) {
     if (shared) lockEnter(@intFromPtr(d));
     defer if (shared) lockExit(@intFromPtr(d));
     var items: std.ArrayList(KeyOf(@TypeOf(d))) = .empty;
-    defer items.deinit(allocator);
+    defer items.deinit(alloc());
     for (d.entries) |e| {
-        if (e.kv) |kv| items.append(allocator, kv.key) catch oom();
+        if (e.kv) |kv| items.append(alloc(), kv.key) catch oom();
     }
     return listOf(KeyOf(@TypeOf(d)), items.items);
 }
@@ -3526,9 +2544,9 @@ pub fn dictValues(d: anytype) List(ValueOf(@TypeOf(d))) {
     if (shared) lockEnter(@intFromPtr(d));
     defer if (shared) lockExit(@intFromPtr(d));
     var items: std.ArrayList(ValueOf(@TypeOf(d))) = .empty;
-    defer items.deinit(allocator);
+    defer items.deinit(alloc());
     for (d.entries) |e| {
-        if (e.kv) |kv| items.append(allocator, kv.value) catch oom();
+        if (e.kv) |kv| items.append(alloc(), kv.value) catch oom();
     }
     return listOf(ValueOf(@TypeOf(d)), items.items);
 }
@@ -3578,86 +2596,12 @@ pub fn setToList(h: anytype) List(KeyOf(@TypeOf(h))) {
     return dictKeys(h);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Stack arenas: `[<StackArena(bytes)>]`
-// ---------------------------------------------------------------------------------------------
-
-/// The frame of a `[<StackArena>]` function that is running: its buffer, the arena it was called
-/// inside of (arenas nest), and how many of the cells made in it are still alive. It lives in
-/// that function's own stack frame.
-pub const Arena = struct {
-    fba: *std.heap.FixedBufferAllocator,
-    outer: ?*Arena,
-    live: i64 = 0,
-};
-
-/// What `allocator` was before the first arena: once one runs, `allocator` is the router
-/// below, which sends each thread's allocations to its own innermost arena, or here. (Each
-/// thread has its own arenas: one thread's arena never gives cells to another thread.)
-var arena_base: ?std.mem.Allocator = null;
-var arena_router_installed: u32 = 0;
-
-const arena_router: std.mem.Allocator = .{ .ptr = undefined, .vtable = &.{
-    .alloc = routerAlloc,
-    .resize = routerResize,
-    .remap = routerRemap,
-    .free = routerFree,
-} };
-
-/// (the arena of this thread that holds `memory`, if any)
-fn arenaOwning(memory: []u8) ?*Arena {
-    var f = thread.arena;
-    while (f) |a| : (f = a.outer) if (a.fba.ownsSlice(memory)) return a;
-    return null;
-}
-
-fn routerAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-    if (thread.arena) |a| {
-        const p = a.fba.allocator().rawAlloc(len, alignment, ret_addr) orelse return null;
-        a.live += 1;
-        return p;
-    }
-    return arena_base.?.rawAlloc(len, alignment, ret_addr);
-}
-
-fn routerResize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-    if (arenaOwning(memory)) |a| return a.fba.allocator().rawResize(memory, alignment, new_len, ret_addr);
-    return arena_base.?.rawResize(memory, alignment, new_len, ret_addr);
-}
-
-fn routerRemap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-    if (arenaOwning(memory)) |a| return a.fba.allocator().rawRemap(memory, alignment, new_len, ret_addr);
-    return arena_base.?.rawRemap(memory, alignment, new_len, ret_addr);
-}
-
-fn routerFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-    if (arenaOwning(memory)) |a| {
-        a.fba.allocator().rawFree(memory, alignment, ret_addr);
-        a.live -= 1;
-        return;
-    }
-    arena_base.?.rawFree(memory, alignment, ret_addr);
-}
-
-/// A `[<StackArena>]` function starts: the cells this thread makes come from `fba` (a buffer on
-/// its stack) until it ends; an arena it calls stands in for it until that one ends. The
-/// runtime's own bookkeeping stays on the allocator.
-pub fn arenaEnter(frame: *Arena, fba: *std.heap.FixedBufferAllocator) void {
-    if (!thread.collector_ready) collectorSetup();
-    if (@cmpxchgStrong(u32, &arena_router_installed, 0, 1, .acq_rel, .acquire) == null) {
-        arena_base = allocator;
-        allocator = arena_router;
-    } else while (@atomicLoad(u32, &arena_router_installed, .acquire) != 1 or arena_base == null) std.atomic.spinLoopHint();
-    frame.* = .{ .fba = fba, .outer = thread.arena };
-    thread.arena = frame;
-}
-
-/// ... and ends. A cell made in the arena that is still alive now would point into a stack
-/// frame that is gone: that is a panic (counted exactly, cell by cell, in every build).
-pub fn arenaLeave(frame: *Arena) void {
-    thread.arena = frame.outer;
-    if (frame.live != 0) @panic("fable: a value made in a [<StackArena>] function outlived it");
-}
+const arena_mod = @import("fable_arena.zig");
+pub const Arena = arena_mod.Arena;
+pub const arenaEnter = arena_mod.arenaEnter;
+pub const arenaLeave = arena_mod.arenaLeave;
+pub const arenaOwning = arena_mod.arenaOwning;
+pub const inThreadArena = arena_mod.inThreadArena;
 
 // ---------------------------------------------------------------------------------------------
 // Spans: `Span<'T>` and `ReadOnlySpan<'T>` are Zig slices of what they view (an array's items
@@ -3875,46 +2819,6 @@ pub const ObjType = struct {
     ifaces: []const IfaceImpl = &.{},
 };
 
-/// An interface a class implements: the interface (`ifaceId`) and the class's table for it
-pub const IfaceImpl = struct { id: *const anyopaque, vt: *const anyopaque };
-
-/// What tells an interface type from the others at run time (a variable of its own: constants
-/// of equal values could share an address)
-pub fn ifaceId(comptime I: type) *const anyopaque {
-    return @ptrCast(&IfaceIdOf(I).tag);
-}
-
-fn IfaceIdOf(comptime I: type) type {
-    return struct {
-        var tag: u8 = @truncate(@sizeOf(I));
-    };
-}
-
-/// A class's object type with the interfaces it implements
-pub fn withIfaces(comptime t: ObjType, comptime ifaces: []const IfaceImpl) ObjType {
-    var r = t;
-    r.ifaces = ifaces;
-    return r;
-}
-
-/// The table of interface `C` of the class of `p` (or of a parent class), if it implements it
-fn objIfaceVt(comptime C: type, p: Obj) ?*const anyopaque {
-    var t: ?*const ObjType = p.type;
-    while (t) |ty| : (t = ty.parent) {
-        for (ty.ifaces) |e| {
-            if (e.id == ifaceId(C)) return e.vt;
-        }
-    }
-    return null;
-}
-
-/// `o :?> C` of an object of a class that implements interface `C` (a reference of its own)
-fn objAsIface(comptime C: type, p: Obj) ?C {
-    const vt = objIfaceVt(C, p) orelse return null;
-    retain(p);
-    return C{ .data = @ptrCast(p), .vt = @ptrCast(@alignCast(vt)) };
-}
-
 pub const ObjHeader = struct {
     @"$rc": u32 = 1,
     /// the object's identity hash, given the first time it is asked for (.NET keeps one in the
@@ -3973,7 +2877,7 @@ fn partBases(comptime parts: []const type) []const usize {
 
 /// An object whose class has the chain of fields `Chain`: the header, the fields of each class
 /// in turn, the collector's header if what it holds can be part of a cycle, and the field-init bits.
-fn ObjCell(comptime Chain: type) type {
+pub fn ObjCell(comptime Chain: type) type {
     return struct {
         const parts = partsOf(Chain);
         const part_bases = partBases(parts);
@@ -3993,7 +2897,10 @@ fn ObjCell(comptime Chain: type) type {
             for (parts) |P| a = @max(a, @alignOf(P));
             break :blk a;
         };
-        const Raw = struct { bytes: [size]u8 align(alignment) };
+        const Raw = struct {
+            pub const fable_rc_header = ObjHeader;
+            bytes: [size]u8 align(alignment),
+        };
 
         pub inline fn part(o: Obj, comptime i: usize) *parts[i] {
             return @ptrFromInt(@intFromPtr(o) + comptime partOffset(parts, i));
@@ -4045,7 +2952,7 @@ fn ObjCell(comptime Chain: type) type {
 
         pub fn alloc(ty: *const ObjType) Obj {
             if (comptime cyclic) gcTick();
-            const raw = allocator.create(Raw) catch oom();
+            const raw = @import("fable_rt.zig").alloc().create(Raw) catch oom();
             const o: Obj = @ptrCast(@alignCast(&raw.bytes));
             o.* = .{ .type = ty };
             if (comptime init_bytes_len > 0) {
@@ -4062,7 +2969,7 @@ fn ObjCell(comptime Chain: type) type {
 
         pub fn new(ty: *const ObjType, chain: Chain) Obj {
             if (comptime cyclic) gcTick();
-            const raw = allocator.create(Raw) catch oom();
+            const raw = @import("fable_rt.zig").alloc().create(Raw) catch oom();
             const o: Obj = @ptrCast(@alignCast(&raw.bytes));
             o.* = .{ .type = ty };
             inline for (0..parts.len) |i| part(o, i).* = chainPart(chain, i);
@@ -4193,7 +3100,7 @@ pub fn boxed(comptime T: type, o: Obj) *BoxPart(T) {
 }
 
 /// .NET's name of a type, for messages and for the text of a boxed value
-fn netTypeName(comptime T: type) [:0]const u8 {
+pub fn netTypeName(comptime T: type) [:0]const u8 {
     return switch (T) {
         i8 => "System.SByte",
         u8 => "System.Byte",
@@ -4253,14 +3160,14 @@ pub fn boxType(comptime T: type) *const ObjType {
         pub fn itemsOf(o: Obj) Array(Any) {
             const x = boxed(T, o).value;
             var out: std.ArrayList(Any) = .empty;
-            defer out.deinit(allocator);
+            defer out.deinit(alloc());
             if (comptime T == String) {
-                for (unitsOf(x)) |c| out.append(allocator, box(c)) catch oom();
+                for (unitsOf(x)) |c| out.append(alloc(), box(c)) catch oom();
             } else if (comptime isListType(T)) {
                 var rest = x;
-                while (rest == .Cons) : (rest = rest.Cons.Tail) out.append(allocator, box(rest.Cons.Head)) catch oom();
+                while (rest == .Cons) : (rest = rest.Cons.Tail) out.append(alloc(), box(rest.Cons.Head)) catch oom();
             } else {
-                for (x.items) |item| out.append(allocator, box(item)) catch oom();
+                for (x.items) |item| out.append(alloc(), box(item)) catch oom();
             }
             const A = Array(Any);
             const items = arrayItems(A, out.items.len);
@@ -4440,7 +3347,14 @@ pub inline fn objNonNull(o: Any) Raised!Obj {
 
 /// Raise NullReferenceException when an optional object or interface is null, without retaining.
 pub inline fn checkNonNull(x: anytype) Raised!void {
+    if (comptime isKnownIface(@TypeOf(x))) return;
     if (x == null) return nullRef();
+}
+
+/// Unwrap an optional interface parameter or pass through a specialized `KnownIface` unchanged.
+pub inline fn unwrapIfaceK(x: anytype) if (isKnownIface(@TypeOf(x))) @TypeOf(x) else @typeInfo(@TypeOf(x)).optional.child {
+    if (comptime isKnownIface(@TypeOf(x))) return x;
+    return x.?;
 }
 
 /// Raise NullReferenceException when a .NET collection (a cell with `fable_null_cell`) is the
@@ -4564,7 +3478,7 @@ const CString = struct {
         const units = unitsOf(s);
         const need = units.len * 3 + 1;
         const buf: []u8 = if (need <= c.small.len) &c.small else blk: {
-            const b = allocator.alloc(u8, need) catch oom();
+            const b = alloc().alloc(u8, need) catch oom();
             c.big = b;
             break :blk b;
         };
@@ -4574,7 +3488,7 @@ const CString = struct {
     }
 
     fn deinit(c: *CString) void {
-        if (c.big) |b| allocator.free(b);
+        if (c.big) |b| alloc().free(b);
     }
 };
 
@@ -4625,7 +3539,7 @@ const CWString = struct {
     fn init(c: *CWString, s: String) [*:0]const u16 {
         const units = unitsOf(s);
         const buf: []u16 = if (units.len + 1 <= c.small.len) &c.small else blk: {
-            const b = allocator.alloc(u16, units.len + 1) catch oom();
+            const b = alloc().alloc(u16, units.len + 1) catch oom();
             c.big = b;
             break :blk b;
         };
@@ -4635,7 +3549,7 @@ const CWString = struct {
     }
 
     fn deinit(c: *CWString) void {
-        if (c.big) |b| allocator.free(b);
+        if (c.big) |b| alloc().free(b);
     }
 };
 
@@ -5585,7 +4499,7 @@ pub fn nullOf(comptime T: type) T {
 
 /// Is a counted cell the null cell of its type?
 pub inline fn isCellNull(c: anytype) bool {
-    return (@atomicLoad(u32, &c.@"$rc", .monotonic) & ~shared_bit) >= arrays.null_count / 2;
+    return @atomicLoad(u32, &c.@"$rc", .monotonic) & immortal_bit != 0;
 }
 
 /// Is a value of a type with no null of its own .NET's null (`nullOf` made it)?
@@ -5610,7 +4524,7 @@ fn CellNull(comptime P: type) type {
             const c = allocator.create(C) catch oom();
             if (track) thread.stats.allocs += 1;
             made = c;
-            fillNullCell(P, c);
+            fillNullCell(P, c, false);
             c.@"$gc" = gcHeader(C, c);
             thread.null_arrays.append(bookkeeping(), .{ .cell = c, .free = freeNull }) catch oom();
             uncount();
@@ -5625,7 +4539,7 @@ fn CellNull(comptime P: type) type {
                 made = null;
                 return;
             }
-            c.@"$rc" = 1;
+            c.@"$rc" = (c.@"$rc" & weak_bit) | 1;
             recount();
             drop(c);
             made = null;
@@ -5639,7 +4553,7 @@ fn CellNull(comptime P: type) type {
             if (ready.load(.acquire) == 2 or filling) return &null_cell;
             if (ready.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
                 filling = true;
-                fillNullCell(P, &null_cell);
+                fillNullCell(P, &null_cell, true);
                 filling = false;
                 ready.store(2, .release);
             } else {
@@ -5652,17 +4566,18 @@ fn CellNull(comptime P: type) type {
 
 /// (the null cell's fields: their own types' nulls; the count first, so that a field of the
 /// cell's own type, which reads the cell back, sees it as a null cell)
-fn fillNullCell(comptime P: type, c: P) void {
+fn fillNullCell(comptime P: type, c: P, comptime is_static: bool) void {
     const C = @typeInfo(P).pointer.child;
+    const init_rc: u32 = if (is_static) immortal_bit | shared_bit else immortal_bit;
     if (comptime @hasDecl(C, "fable_null_cell")) {
         // (its fields' own defaults: an empty collection, never changed, as members check)
         const gc = if (comptime @hasField(C, "$gc")) c.@"$gc" else {};
         c.* = .{};
         if (comptime @hasField(C, "$gc")) c.@"$gc" = gc;
-        c.@"$rc" = arrays.null_count;
+        c.@"$rc" = init_rc;
         return;
     }
-    c.@"$rc" = arrays.null_count;
+    c.@"$rc" = init_rc;
     const st = @typeInfo(C).@"struct";
     inline for (st.field_names, st.field_types) |name, F| {
         if (comptime !std.mem.eql(u8, name, "$rc") and !std.mem.eql(u8, name, "$gc")) {
@@ -6072,6 +4987,8 @@ pub const Cycles = struct {
     exn_show: bool = true,
     /// a handler of the program can catch OutOfMemoryException
     oom_catch: bool = false,
+    /// at least one function in the program uses `[<StackArena>]`
+    uses_arena: bool = false,
 };
 
 /// A file's own answer joined with those of the files it uses.
@@ -6088,6 +5005,7 @@ pub fn joinCycles(comptime own: Cycles, comptime used: anytype) Cycles {
         if (@hasField(@TypeOf(u), "reflection")) r.reflection = r.reflection or u.reflection;
         if (@hasField(@TypeOf(u), "exn_show")) r.exn_show = r.exn_show or u.exn_show;
         if (@hasField(@TypeOf(u), "oom_catch")) r.oom_catch = r.oom_catch or u.oom_catch;
+        if (@hasField(@TypeOf(u), "uses_arena")) r.uses_arena = r.uses_arena or u.uses_arena;
     }
     return r;
 }
@@ -6360,7 +5278,7 @@ pub fn Collected(comptime C: type, comptime gc_field: []const u8, comptime rc_of
     };
 }
 
-noinline fn collectorSetup() void {
+pub noinline fn collectorSetup() void {
     thread.collector.init(.{}, null, bookkeeping());
     thread.collector_ready = true;
 }
@@ -6483,6 +5401,25 @@ pub fn asyncStateRelease() void {
     drop(old);
 }
 
+pub const ThreadExitSgcStats = struct {
+    collected_on_exit: usize = 0,
+    remaining_structures_on_exit: usize = 0,
+    threads_drained: usize = 0,
+};
+
+var ended_threads_sgc_collected: usize = 0;
+var ended_threads_sgc_remaining: usize = 0;
+var ended_threads_sgc_drained: usize = 0;
+
+/// Cumulative `fable_sgc` drain telemetry from threads that exited through `collectorDeinit()`.
+pub fn threadExitSgcStats() ThreadExitSgcStats {
+    return .{
+        .collected_on_exit = @atomicLoad(usize, &ended_threads_sgc_collected, .monotonic),
+        .remaining_structures_on_exit = @atomicLoad(usize, &ended_threads_sgc_remaining, .monotonic),
+        .threads_drained = @atomicLoad(usize, &ended_threads_sgc_drained, .monotonic),
+    };
+}
+
 pub fn collectorDeinit() void {
     asyncStateRelease();
     random.randomSharedRelease();
@@ -6490,7 +5427,17 @@ pub fn collectorDeinit() void {
     for (thread.null_arrays.items) |n| n.free(n.cell);
     thread.null_arrays.deinit(bookkeeping());
     thread.null_arrays = .empty;
-    if (thread.collector_ready) thread.collector.deinit();
+    if (thread.collector_ready) {
+        const freed = thread.collector.collectAll();
+        const remaining = thread.collector.n_live;
+        if (track) {
+            _ = @atomicRmw(usize, &ended_threads_sgc_collected, .Add, freed, .monotonic);
+            _ = @atomicRmw(usize, &ended_threads_sgc_remaining, .Add, remaining, .monotonic);
+            _ = @atomicRmw(usize, &ended_threads_sgc_drained, .Add, 1, .monotonic);
+        }
+        thread.collector.deinit();
+        thread.collector_ready = false;
+    }
     thread.weak.deinit(bookkeeping());
     thread.weak = .empty;
     thread.stamps.deinit(bookkeeping());
@@ -6517,6 +5464,9 @@ pub const tail_args_align: usize = 16;
 pub const TailCtx = struct {
     self: ?*anyopaque = null,
     self_owned: bool = true,
+    reuse_env: ?*anyopaque = null,
+    reuse_env_size: usize = 0,
+    reuse_env_align: usize = 0,
     args: [tail_args_cap]u8 align(tail_args_align) = undefined,
 };
 
@@ -6582,7 +5532,7 @@ fn zeroSizedVal(comptime P: type) P {
             }
             break :blk z;
         },
-        .@"enum" => @enumFromInt(0),
+        .@"enum" => @fromBackingInt(@intCast(0)),
         .array => |a| @splat(zeroSizedVal(a.child)),
         else => undefined,
     };
@@ -6838,7 +5788,7 @@ fn writeNetShape(out: *TextBuilder, x: anytype, comptime shape: TypeShape, node_
     }
     if (comptime isBigInt(T)) {
         const d = bigDigits(x);
-        defer allocator.free(d);
+        defer alloc().free(d);
         return out.addAscii(d);
     }
     if (comptime isDecimal(T)) {
@@ -7128,445 +6078,66 @@ pub fn isKnown(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "fable_known");
 }
 
-// ---------------------------------------------------------------------------------------------
-// Interfaces: fat pointer `{ data, vt }` with a static vtable and metadata hooks
-// ---------------------------------------------------------------------------------------------
-
-pub const IfaceMeta = struct {
-    retain: *const fn (?*anyopaque) void,
-    drop: *const fn (?*anyopaque) void,
-    share: *const fn (?*anyopaque) Raised!void,
-    hdr_of: *const fn (?*anyopaque) ?*sgc.Hdr,
-    as_obj: *const fn (?*anyopaque) ?Obj,
-    find_box: *const fn (?*anyopaque, *const ObjType) ?Obj,
-};
-
-fn emptyRetain(_: ?*anyopaque) void {}
-fn emptyDrop(_: ?*anyopaque) void {}
-fn emptyShare(_: ?*anyopaque) Raised!void {}
-fn emptyHdr(_: ?*anyopaque) ?*sgc.Hdr {
-    return null;
-}
-fn emptyAsObj(_: ?*anyopaque) ?Obj {
-    return null;
-}
-fn emptyFindBox(_: ?*anyopaque, _: *const ObjType) ?Obj {
-    return null;
+pub fn isKnownIface(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "fable_known_iface");
 }
 
-pub const empty_iface_meta: IfaceMeta = .{
-    .retain = emptyRetain,
-    .drop = emptyDrop,
-    .share = emptyShare,
-    .hdr_of = emptyHdr,
-    .as_obj = emptyAsObj,
-    .find_box = emptyFindBox,
-};
-
-fn objIfaceRetain(d: ?*anyopaque) void {
-    if (d) |p| retain(@as(Obj, @ptrCast(@alignCast(p))));
-}
-fn objIfaceDrop(d: ?*anyopaque) void {
-    if (d) |p| drop(@as(Obj, @ptrCast(@alignCast(p))));
-}
-fn objIfaceShare(d: ?*anyopaque) Raised!void {
-    if (d) |p| try markShared(@as(Obj, @ptrCast(@alignCast(p))));
-}
-fn objIfaceHdr(d: ?*anyopaque) ?*sgc.Hdr {
-    const p = d orelse return null;
-    const o: Obj = @ptrCast(@alignCast(p));
-    return o.gc;
-}
-fn objIfaceAsObj(d: ?*anyopaque) ?Obj {
-    const p = d orelse return null;
-    return @ptrCast(@alignCast(p));
-}
-fn objIfaceFindBox(d: ?*anyopaque, target_ty: *const ObjType) ?Obj {
-    const p = d orelse return null;
-    const o: Obj = @ptrCast(@alignCast(p));
-    if (o.type == target_ty) return o;
-    if (o.type.unwrap_box) |f| return f(o, target_ty);
-    return null;
-}
-
-pub const obj_iface_meta: IfaceMeta = .{
-    .retain = objIfaceRetain,
-    .drop = objIfaceDrop,
-    .share = objIfaceShare,
-    .hdr_of = objIfaceHdr,
-    .as_obj = objIfaceAsObj,
-    .find_box = objIfaceFindBox,
-};
-
-pub const box_iface_meta = obj_iface_meta;
-
-fn envIfaceRetain(d: ?*anyopaque) void {
-    if (d) |p| retain(@as(*Env, @ptrCast(@alignCast(p))));
-}
-fn envIfaceDrop(d: ?*anyopaque) void {
-    if (d) |p| dropEnv(@ptrCast(@alignCast(p)));
-}
-fn envIfaceShare(d: ?*anyopaque) Raised!void {
-    if (d) |p| {
-        const e: *Env = @ptrCast(@alignCast(p));
-        if (!try markCell(e)) return;
-        return e.share(e);
-    }
-}
-fn envIfaceHdr(d: ?*anyopaque) ?*sgc.Hdr {
-    const p = d orelse return null;
-    const e: *Env = @ptrCast(@alignCast(p));
-    return e.gc;
-}
-
-pub const env_iface_meta: IfaceMeta = .{
-    .retain = envIfaceRetain,
-    .drop = envIfaceDrop,
-    .share = envIfaceShare,
-    .hdr_of = envIfaceHdr,
-    .as_obj = emptyAsObj,
-    .find_box = emptyFindBox,
-};
-
-pub fn upcastIfaceMeta(comptime SubIface: type) *const IfaceMeta {
-    return &struct {
-        fn asObj(d: ?*anyopaque) ?Obj {
-            const p = d orelse return null;
-            const o: Obj = @ptrCast(@alignCast(p));
-            const sub = boxed(SubIface, o).value;
-            return sub.vt.@"$meta".as_obj(sub.data);
-        }
-        fn findBox(d: ?*anyopaque, target_ty: *const ObjType) ?Obj {
-            const p = d orelse return null;
-            const o: Obj = @ptrCast(@alignCast(p));
-            if (o.type == target_ty) return o;
-            const sub = boxed(SubIface, o).value;
-            return sub.vt.@"$meta".find_box(sub.data, target_ty);
-        }
-        const meta: IfaceMeta = .{
-            .retain = objIfaceRetain,
-            .drop = objIfaceDrop,
-            .share = objIfaceShare,
-            .hdr_of = objIfaceHdr,
-            .as_obj = asObj,
-            .find_box = findBox,
-        };
-    }.meta;
-}
-
-pub fn Iface(comptime Vt: type) type {
-    return struct {
-        pub const fable_iface = {};
-        data: ?*anyopaque,
-        vt: *const Vt,
-    };
-}
-
-pub fn isIface(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and @hasDecl(T, "fable_iface");
-}
-
-/// Box `val` directly into a fat-pointer interface (consumes `val`).
-pub inline fn ifaceBox(comptime I: type, comptime T: type, val: T, vt: @FieldType(I, "vt")) I {
-    const o = ObjCell(BoxChain(T)).new(boxType(T), .{ .own = .{ .value = val } });
-    return .{ .data = @ptrCast(o), .vt = vt };
-}
-
-/// Allocate an environment holding `captures` for an object-expression fat-pointer interface (consumes `captures`).
-pub inline fn ifaceClosure(comptime I: type, comptime Captures: type, captures: Captures, vt: @FieldType(I, "vt")) I {
-    if (@sizeOf(Captures) == 0) return .{ .data = null, .vt = vt };
-    const E = EnvOf(Captures);
-    if (comptime E.cyclic) gcTick();
-    const e = allocator.create(E) catch oom();
-    e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
-    if (comptime E.cyclic) {
-        e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
-        e.header.gc = &e.hdr;
-    }
-    if (track) thread.stats.allocs += 1;
-    return .{ .data = @ptrCast(&e.header), .vt = vt };
-}
-
-// ---- generic methods of interfaces: one slot, its type parameters erased to `obj` (as Koka
-// compiles polymorphism), and values converted where the slot is called ----
-
-fn ifaceOf(comptime T: type) ?type {
-    if (isIface(T)) return T;
-    if (@typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child)) return @typeInfo(T).optional.child;
-    return null;
-}
-
-/// `x` (borrowed) as a value of type `To` (owned): the same, boxed into an object, unboxed from
-/// one, or an interface adapted to its erased instantiation (or back)
-pub fn erasedConv(comptime To: type, x: anytype) To {
-    const From = @TypeOf(x);
-    if (From == To) return dup(x);
-    if (To == Any) return box(x);
-    if (From == Any) {
-        if (tryUnbox(?To, x)) |v| return v;
-        @panic("fable: an erased value of a generic method is not of the type it is used as");
-    }
-    if (comptime ifaceOf(To) != null and ifaceOf(From) != null) return ifaceAdapt(To, x);
-    @compileError("fable: a generic method of an interface cannot convert " ++ @typeName(From) ++ " to " ++ @typeName(To) ++ " yet");
-}
-
-/// The interface `src` (borrowed) seen as the interface type `Target`, whose members take and give
-/// the same values erased to `obj` (or the other way): each member converts what it is given
-/// (a member takes its arguments over, as every slot does), calls the member of `src` with them,
-/// and converts what it gives back
-pub fn ifaceAdapt(comptime Target: type, src: anytype) Target {
-    const S = @TypeOf(src);
-    const I = ifaceOf(Target).?;
-    const SI = ifaceOf(S).?;
-    const s: SI = if (comptime @typeInfo(S) == .optional) (src orelse return if (comptime @typeInfo(Target) == .optional) null else nullRefPanic()) else src;
-    const A = IfaceAdapter(I, SI);
-    return ifaceClosure(I, A.Held, .{ .c0 = dup(s) }, &A.vt);
-}
-
-fn nullRefPanic() noreturn {
-    @panic("fable: a null interface given to a generic method");
-}
-
-fn erasedBack(comptime R: type, raw: anytype) R {
-    const Raw = @TypeOf(raw);
-    if (comptime @typeInfo(Raw) == .error_union) {
-        const v = raw catch {
-            if (comptime @typeInfo(R) == .error_union) return error.Raised;
-            @panic("fable: an erased member raised where its slot cannot");
-        };
-        return erasedBack(R, v);
-    }
-    const Out = if (@typeInfo(R) == .error_union) @typeInfo(R).error_union.payload else R;
-    const out = erasedConv(Out, raw);
-    drop(raw);
-    return out;
-}
-
-fn IfaceAdapter(comptime I: type, comptime SI: type) type {
-    const Vt = @typeInfo(@FieldType(I, "vt")).pointer.child;
-    const SVt = @typeInfo(@FieldType(SI, "vt")).pointer.child;
-    return struct {
-        const Held = struct { c0: SI };
-
-        fn Thunk(comptime name: []const u8) type {
-            const F = @typeInfo(@typeInfo(@FieldType(Vt, name)).pointer.child).@"fn";
-            const SF = @typeInfo(@typeInfo(@FieldType(SVt, name)).pointer.child).@"fn";
-            const R = F.return_type.?;
-            const P = F.param_types;
-            const SP = SF.param_types;
-            return switch (P.len) {
-                2 => struct {
-                    fn f(d: ?*anyopaque, a0: P[1].?) R {
-                        const c = captured(Held, @ptrCast(@alignCast(d)));
-                        const x0 = erasedConv(SP[1].?, a0);
-                        drop(a0);
-                        return erasedBack(R, @field(c.c0.vt, name)(c.c0.data, x0));
-                    }
-                },
-                3 => struct {
-                    fn f(d: ?*anyopaque, a0: P[1].?, a1: P[2].?) R {
-                        const c = captured(Held, @ptrCast(@alignCast(d)));
-                        const x0 = erasedConv(SP[1].?, a0);
-                        drop(a0);
-                        const x1 = erasedConv(SP[2].?, a1);
-                        drop(a1);
-                        return erasedBack(R, @field(c.c0.vt, name)(c.c0.data, x0, x1));
-                    }
-                },
-                4 => struct {
-                    fn f(d: ?*anyopaque, a0: P[1].?, a1: P[2].?, a2: P[3].?) R {
-                        const c = captured(Held, @ptrCast(@alignCast(d)));
-                        const x0 = erasedConv(SP[1].?, a0);
-                        drop(a0);
-                        const x1 = erasedConv(SP[2].?, a1);
-                        drop(a1);
-                        const x2 = erasedConv(SP[3].?, a2);
-                        drop(a2);
-                        return erasedBack(R, @field(c.c0.vt, name)(c.c0.data, x0, x1, x2));
-                    }
-                },
-                else => @compileError("fable: an interface member of this many parameters cannot be adapted yet"),
-            };
-        }
-
-        const vt: Vt = blk: {
-            var v: Vt = undefined;
-            for (@typeInfo(Vt).@"struct".field_names) |name| {
-                if (std.mem.eql(u8, name, "$meta")) {
-                    v.@"$meta" = &env_iface_meta;
-                } else if (std.mem.endsWith(u8, name, "$tc")) {
-                    @field(v, name) = null;
-                } else {
-                    @field(v, name) = Thunk(name).f;
-                }
-            }
-            break :blk v;
-        };
-    };
-}
-
-/// Extract a first-class `Func` closure from a fat-pointer interface method slot (borrows `iface`).
-pub fn ifaceMethod(comptime F: type, iface: anytype, comptime field: []const u8) F {
-    const I = @TypeOf(iface);
-    const Caps = struct { iface: I };
-    const Fn = @typeInfo(@typeInfo(@FieldType(F, "code")).pointer.child).@"fn";
-    const R = Fn.return_type.?;
-    const P = Fn.param_types;
-    const M = switch (P.len) {
-        1 => struct {
-            fn code(env: ?*Env) R {
-                const c = captured(Caps, env);
-                return @field(c.iface.vt, field)(c.iface.data);
-            }
-        },
-        2 => struct {
-            fn code(env: ?*Env, a0: P[1].?) R {
-                const c = captured(Caps, env);
-                return @field(c.iface.vt, field)(c.iface.data, a0);
-            }
-        },
-        3 => struct {
-            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?) R {
-                const c = captured(Caps, env);
-                return @field(c.iface.vt, field)(c.iface.data, a0, a1);
-            }
-        },
-        4 => struct {
-            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?) R {
-                const c = captured(Caps, env);
-                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2);
-            }
-        },
-        5 => struct {
-            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?) R {
-                const c = captured(Caps, env);
-                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3);
-            }
-        },
-        6 => struct {
-            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?, a4: P[5].?) R {
-                const c = captured(Caps, env);
-                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3, a4);
-            }
-        },
-        7 => struct {
-            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?, a4: P[5].?, a5: P[6].?) R {
-                const c = captured(Caps, env);
-                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3, a4, a5);
-            }
-        },
-        8 => struct {
-            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?, a4: P[5].?, a5: P[6].?, a6: P[7].?) R {
-                const c = captured(Caps, env);
-                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3, a4, a5, a6);
-            }
-        },
-        9 => struct {
-            fn code(env: ?*Env, a0: P[1].?, a1: P[2].?, a2: P[3].?, a3: P[4].?, a4: P[5].?, a5: P[6].?, a6: P[7].?, a7: P[8].?) R {
-                const c = captured(Caps, env);
-                return @field(c.iface.vt, field)(c.iface.data, a0, a1, a2, a3, a4, a5, a6, a7);
-            }
-        },
-        else => @compileError("fable: interface method of this many arguments"),
-    };
-    return closure(F, Caps, .{ .iface = dup(iface) }, M.code);
-}
-
-/// Borrow the underlying `Obj` from an interface value or optional interface, if any.
-pub inline fn ifaceToObjBorrow(x: anytype) ?Obj {
-    const T = @TypeOf(x);
-    if (comptime @typeInfo(T) == .optional) {
-        const v = x orelse return null;
-        return v.vt.@"$meta".as_obj(v.data);
-    }
-    return x.vt.@"$meta".as_obj(x.data);
-}
-
-pub fn ifaceToAnyBorrow(x: anytype) Any {
-    return ifaceToObjBorrow(x);
-}
-
-pub fn ifaceIsClass(x: anytype, ty: *const ObjType) bool {
-    const o = ifaceToObjBorrow(x) orelse return false;
-    return objIs(o, ty);
-}
-
-pub fn ifaceCastClass(x: anytype, ty: *const ObjType) Raised!Any {
-    if (comptime @typeInfo(@TypeOf(x)) == .optional) {
-        if (x == null) return null;
-    }
-    if (ifaceToObjBorrow(x)) |o| return objCast(o, ty);
-    const Short = struct {
-        pub fn of(name: []const u8) []const u8 {
-            return if (std.mem.lastIndexOfScalar(u8, name, '+')) |i| name[i + 1 ..] else name;
-        }
-    };
-    var b: TextBuilder = .{};
-    b.addAscii("Unable to cast object of type '<iface>' to type '");
-    b.addAscii(Short.of(ty.name));
-    b.addAscii("'.");
-    return raise(InvalidCastException, b.finish());
-}
-
-pub fn ifaceTryUnbox(comptime OT: type, x: anytype) OT {
-    const T = @typeInfo(OT).optional.child;
-    const v = if (comptime @typeInfo(@TypeOf(x)) == .optional)
-        (x orelse return if (T == void) {} else null)
-    else
-        x;
-    if (T == void) return null;
-    const V = @TypeOf(v);
-    if (comptime V == T) return dup(v);
-    if (comptime (@typeInfo(T) == .optional and @typeInfo(T).optional.child == V)) return @as(T, dup(v));
-    if (T == Any or T == Obj) {
-        if (ifaceToObjBorrow(v)) |o| return dup(o);
-        return box(v);
-    }
-    if (comptime (@typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child))) {
-        const C = @typeInfo(T).optional.child;
-        if (v.vt.@"$meta".find_box(v.data, boxType(C))) |bp| return @as(T, dup(boxed(C, bp).value));
-    }
-    if (v.vt.@"$meta".find_box(v.data, boxType(T))) |bp| return dup(boxed(T, bp).value);
-    if (ifaceToObjBorrow(v)) |o| return tryUnbox(OT, @as(Any, o));
-    return null;
-}
-
-pub fn ifaceUnbox(comptime T: type, x: anytype) Raised!T {
-    const v = if (comptime @typeInfo(@TypeOf(x)) == .optional)
-        (x orelse {
-            if (T == void) return {};
-            if (comptime @typeInfo(T) == .optional) return null;
-            if (comptime isArrayPtr(T)) return arrayNull(T);
-            return nullRef();
-        })
-    else
-        x;
-    const V = @TypeOf(v);
-    if (comptime V == T) return dup(v);
-    if (comptime (@typeInfo(T) == .optional and @typeInfo(T).optional.child == V)) return @as(T, dup(v));
-    if (T == Any) return box(v);
-    if (T == Obj) {
-        if (ifaceToObjBorrow(v)) |o| return dup(o);
-        return box(v).?;
-    }
-    if (comptime (@typeInfo(T) == .optional and isIface(@typeInfo(T).optional.child))) {
-        const C = @typeInfo(T).optional.child;
-        if (v.vt.@"$meta".find_box(v.data, boxType(C))) |bp| return @as(T, dup(boxed(C, bp).value));
-    }
-    if (v.vt.@"$meta".find_box(v.data, boxType(T))) |bp| return dup(boxed(T, bp).value);
-    if (ifaceToObjBorrow(v)) |o| return unbox(T, @as(Any, o));
-    var b: TextBuilder = .{};
-    b.addAscii("Unable to cast object of type '<iface>' to type '");
-    b.addAscii(netTypeName(T));
-    b.addAscii("'.");
-    return raise(InvalidCastException, b.finish());
-}
+const iface_mod = @import("fable_iface.zig");
+pub const IfaceImpl = iface_mod.IfaceImpl;
+pub const ifaceId = iface_mod.ifaceId;
+pub const withIfaces = iface_mod.withIfaces;
+const objIfaceVt = iface_mod.objIfaceVt;
+const objAsIface = iface_mod.objAsIface;
+pub const IfaceMeta = iface_mod.IfaceMeta;
+pub const empty_iface_meta = iface_mod.empty_iface_meta;
+pub const obj_iface_meta = iface_mod.obj_iface_meta;
+pub const box_iface_meta = iface_mod.box_iface_meta;
+pub const env_iface_meta = iface_mod.env_iface_meta;
+pub const upcastIfaceMeta = iface_mod.upcastIfaceMeta;
+pub const Iface = iface_mod.Iface;
+pub const isIface = iface_mod.isIface;
+pub const ifaceBox = iface_mod.ifaceBox;
+pub const ifaceClosure = iface_mod.ifaceClosure;
+pub const erasedConv = iface_mod.erasedConv;
+pub const ifaceAdapt = iface_mod.ifaceAdapt;
+pub const ifaceMethod = iface_mod.ifaceMethod;
+pub const ifaceToObjBorrow = iface_mod.ifaceToObjBorrow;
+pub const ifaceToAnyBorrow = iface_mod.ifaceToAnyBorrow;
+pub const ifaceIsClass = iface_mod.ifaceIsClass;
+pub const ifaceCastClass = iface_mod.ifaceCastClass;
+pub const ifaceTryUnbox = iface_mod.ifaceTryUnbox;
+pub const ifaceUnbox = iface_mod.ifaceUnbox;
+pub const IfaceAnon0 = iface_mod.IfaceAnon0;
+pub const IfaceAnon1 = iface_mod.IfaceAnon1;
+pub const IfaceAnon2 = iface_mod.IfaceAnon2;
+pub const IfaceAnon3 = iface_mod.IfaceAnon3;
+pub const IfaceAnon4 = iface_mod.IfaceAnon4;
+pub const IfaceAnon5 = iface_mod.IfaceAnon5;
+pub const IfaceAnon6 = iface_mod.IfaceAnon6;
+pub const IfaceAnon7 = iface_mod.IfaceAnon7;
+pub const IfaceAnon8 = iface_mod.IfaceAnon8;
+pub const IfaceAnon9 = iface_mod.IfaceAnon9;
+pub const IfaceAnon10 = iface_mod.IfaceAnon10;
+pub const IfaceAnon11 = iface_mod.IfaceAnon11;
+pub const IfaceAnon12 = iface_mod.IfaceAnon12;
+pub const IfaceAnon13 = iface_mod.IfaceAnon13;
+pub const IfaceAnon14 = iface_mod.IfaceAnon14;
+pub const IfaceAnon15 = iface_mod.IfaceAnon15;
+pub const IfaceAnon16 = iface_mod.IfaceAnon16;
+pub const IfaceAnon17 = iface_mod.IfaceAnon17;
+pub const IfaceAnon18 = iface_mod.IfaceAnon18;
+pub const IfaceAnon19 = iface_mod.IfaceAnon19;
+pub const IfaceAnon20 = iface_mod.IfaceAnon20;
+pub const IfaceAnon21 = iface_mod.IfaceAnon21;
+pub const IfaceAnon22 = iface_mod.IfaceAnon22;
+pub const IfaceAnon23 = iface_mod.IfaceAnon23;
+pub const IfaceAnon24 = iface_mod.IfaceAnon24;
 
 pub fn EnvOf(comptime Captures: type) type {
     return struct {
         const Self = @This();
-        const cyclic = functions_in_cycles and holdsCyclic(Captures);
-        const K = Collected(
+        pub const cyclic = functions_in_cycles and holdsCyclic(Captures);
+        pub const K = Collected(
             Self,
             "hdr",
             @as(isize, @offsetOf(Self, "header")) + @as(isize, @offsetOf(Env, "$rc")) - @as(isize, @offsetOf(Self, "hdr")),
@@ -7612,7 +6183,11 @@ pub fn EnvOf(comptime Captures: type) type {
 
         pub fn share(header: *Env) Raised!void {
             const self: *Self = @alignCast(@fieldParentPtr("header", header));
-            try markShared(self.captures);
+            if (thread.transfer_env) {
+                thread.transfer_env = false;
+                return transferOrShareOrRaise(self.captures);
+            }
+            return markShared(self.captures);
         }
     };
 }
@@ -7621,7 +6196,7 @@ pub fn EnvOf(comptime Captures: type) type {
 pub inline fn closure(comptime F: type, comptime Captures: type, captures: Captures, code: @FieldType(F, "code")) F {
     const E = EnvOf(Captures);
     if (comptime E.cyclic) gcTick();
-    const e = allocator.create(E) catch oom();
+    const e = alloc().create(E) catch oom();
     e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
     if (comptime E.cyclic) {
         e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
@@ -7670,7 +6245,7 @@ pub inline fn closure2(
 ) F {
     const E = EnvOf(Captures);
     if (comptime E.cyclic) gcTick();
-    const e = allocator.create(E) catch oom();
+    const e = alloc().create(E) catch oom();
     e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
     if (comptime E.cyclic) {
         e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
@@ -7678,6 +6253,86 @@ pub inline fn closure2(
     }
     if (track) thread.stats.allocs += 1;
     return .{ .env = &e.header, .code = code, .code2 = code2 };
+}
+
+/// A unique closure environment is about to be taken apart or reused without `dropEnv`.
+pub inline fn forgetEnv(e: *Env) void {
+    if (e.gc) |h| thread.collector.onFree(h);
+}
+
+inline fn tryReuseEnv(ctx: *TailCtx, comptime Captures: type, captures: Captures) ?*EnvOf(Captures) {
+    const E = EnvOf(Captures);
+    if (ctx.reuse_env) |p| {
+        if (ctx.reuse_env_size == @sizeOf(E) and ctx.reuse_env_align == @alignOf(E)) {
+            ctx.reuse_env = null;
+            const e: *E = @ptrCast(@alignCast(p));
+            e.* = .{ .header = .{ .destroy = E.destroy, .share = E.share }, .captures = captures };
+            if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(e));
+            if (comptime E.cyclic) {
+                if (!thread.collector_ready) collectorSetup();
+                thread.collector.allocs += 1;
+                e.hdr = thread.collector.hdr(&E.K.desc, E.K.isLeaf(e));
+                e.header.gc = &e.hdr;
+            }
+            if (track) thread.stats.reuses += 1;
+            return e;
+        }
+    }
+    return null;
+}
+
+/// Construct a closure, reusing `ctx.reuse_env` if its `EnvOf` layout matches.
+pub inline fn closureReuse(ctx: *TailCtx, comptime F: type, comptime Captures: type, captures: Captures, code: @FieldType(F, "code")) F {
+    if (tryReuseEnv(ctx, Captures, captures)) |e| {
+        return .{ .env = &e.header, .code = code };
+    }
+    return closure(F, Captures, captures, code);
+}
+
+/// Construct a `$tc`-capable closure, reusing `ctx.reuse_env` if its `EnvOf` layout matches.
+pub inline fn closureTcReuse(
+    ctx: *TailCtx,
+    comptime F: type,
+    comptime Captures: type,
+    captures: Captures,
+    code: @FieldType(F, "code"),
+    tcode: ?TailFn,
+) F {
+    var f = closureReuse(ctx, F, Captures, captures, code);
+    f.tcode = tcode;
+    return f;
+}
+
+/// Construct a curried 2-arg closure, reusing `ctx.reuse_env` if its `EnvOf` layout matches.
+pub inline fn closure2Reuse(
+    ctx: *TailCtx,
+    comptime F: type,
+    comptime Captures: type,
+    captures: Captures,
+    code: @FieldType(F, "code"),
+    code2: Code2Of(@FieldType(F, "code")),
+) F {
+    if (tryReuseEnv(ctx, Captures, captures)) |e| {
+        return .{ .env = &e.header, .code = code, .code2 = code2 };
+    }
+    return closure2(F, Captures, captures, code, code2);
+}
+
+/// Construct a `$tc`/`tcode2`-capable closure, reusing `ctx.reuse_env` if its `EnvOf` layout matches.
+pub inline fn closure2TcReuse(
+    ctx: *TailCtx,
+    comptime F: type,
+    comptime Captures: type,
+    captures: Captures,
+    code: @FieldType(F, "code"),
+    code2: Code2Of(@FieldType(F, "code")),
+    tcode: ?TailFn,
+    tcode2: ?TailFn,
+) F {
+    var f = closure2Reuse(ctx, F, Captures, captures, code, code2);
+    f.tcode = tcode;
+    f.tcode2 = tcode2;
+    return f;
 }
 
 // ---- stages: a function value of several arguments that is really a function of fewer, which
@@ -8481,6 +7136,64 @@ pub inline fn invokeK(
     }
 }
 
+/// Call a slot on an interface parameter inside a specialized `callK` HOF: when `recv` is a
+/// stack-allocated `KnownIface`, dispatch directly without vtable/box overhead while reconciling
+/// `uses` against its slot `$borrows` / `$result_borrowed`; otherwise fall back to `recv.vt`.
+pub fn InvokeIfaceKRet(comptime R: type, comptime K: type, comptime slot: []const u8) type {
+    if (isKnownIface(K)) {
+        const SlotFn = @typeInfo(@TypeOf(@field(K, "slot_" ++ slot))).@"fn";
+        const R1 = SlotFn.return_type.?;
+        return if (isRaised(R1)) Raised!R else error{}!R;
+    }
+    return Raised!R;
+}
+
+pub inline fn invokeIfaceK(
+    comptime R: type,
+    recv: anytype,
+    comptime slot: []const u8,
+    comptime uses: []const u8,
+    args: anytype,
+    err_drops: anytype,
+) InvokeIfaceKRet(R, @TypeOf(recv), slot) {
+    @setEvalBranchQuota(1_000_000);
+    const K = @TypeOf(recv);
+    if (comptime isKnownIface(K)) {
+        const slot_name = "slot_" ++ slot;
+        const borrows = @field(K, slot_name ++ "$borrows");
+        const res_borrowed = @field(K, slot_name ++ "$result_borrowed");
+        var a: std.meta.ArgsTuple(@TypeOf(@field(K, slot_name))) = undefined;
+        a[0] = &recv;
+        inline for (uses, 0..) |u, i| {
+            a[i + 1] = if (u == 'k' and !borrows[i]) dup(args[i]) else args[i];
+        }
+        const raw = @call(.auto, @field(K, slot_name), a);
+        const r = if (comptime isRaised(@TypeOf(raw))) raw catch |err| {
+            inline for (uses, 0..) |u, i| {
+                if (u == 'g' and borrows[i]) drop(args[i]);
+            }
+            inline for (err_drops) |d| drop(d);
+            return err;
+        } else raw;
+        const result = if (res_borrowed) dup(r) else r;
+        inline for (uses, 0..) |u, i| {
+            if (u == 'g' and borrows[i]) drop(args[i]);
+        }
+        return result;
+    } else {
+        const slot_fn_ptr = @field(recv.vt.*, slot);
+        var a: std.meta.ArgsTuple(@typeInfo(@TypeOf(slot_fn_ptr)).pointer.child) = undefined;
+        a[0] = recv.data;
+        inline for (uses, 0..) |u, i| {
+            a[i + 1] = if (u == 'k') dup(args[i]) else args[i];
+        }
+        return @call(.auto, slot_fn_ptr, a) catch |err| {
+            inline for (err_drops) |d| drop(d);
+            return err;
+        };
+    }
+}
+
 // ---- `NativePtr.stackalloc`: memory of the function that asks for it ----
 //
 // .NET's `stackalloc` (F#'s `NativePtr.stackalloc`, then `Span(ptr, n)` over it) gives memory
@@ -8506,10 +7219,10 @@ pub const StackAlloc = struct {
             @memset(bytes, 0);
             return @ptrCast(@alignCast(bytes.ptr));
         }
-        const bytes = allocator.alignedAlloc(u8, .@"16", @max(size, 1)) catch return raise(OutOfMemoryException, str("Insufficient memory to continue the execution of the program."));
+        const bytes = @import("fable_rt.zig").alloc().alignedAlloc(u8, .@"16", @max(size, 1)) catch return raise(OutOfMemoryException, str("Insufficient memory to continue the execution of the program."));
         @memset(bytes, 0);
-        const b = allocator.create(Block) catch {
-            allocator.free(bytes);
+        const b = @import("fable_rt.zig").alloc().create(Block) catch {
+            @import("fable_rt.zig").alloc().free(bytes);
             return raise(OutOfMemoryException, str("Insufficient memory to continue the execution of the program."));
         };
         b.* = .{ .next = self.blocks, .bytes = bytes };
@@ -8521,8 +7234,8 @@ pub const StackAlloc = struct {
         var b = self.blocks;
         while (b) |x| {
             b = x.next;
-            allocator.free(x.bytes);
-            allocator.destroy(x);
+            @import("fable_rt.zig").alloc().free(x.bytes);
+            @import("fable_rt.zig").alloc().destroy(x);
         }
         self.blocks = null;
     }
@@ -8543,17 +7256,22 @@ pub fn live() i64 {
 
 /// What threads that have ended allocated and did not free themselves: a cell made on one
 /// thread may be freed on another (the last to let go of a shared value).
-var ended_threads_live: isize = 0;
+pub var ended_threads_live: isize = 0;
 
 /// Called when the program's entry point has returned: true, with a message, if cells are
 /// still allocated. Only checks in builds that keep counters.
 pub fn leaked() bool {
+    poolShutdown();
     asyncStateRelease();
     random.randomSharedRelease();
     // (cycles that died without anything noticing yet are not leaks)
     _ = collect();
     if (!track or live() == 0) return false;
     std.debug.print("fable: {d} cell(s) were never freed (allocated {d}, freed {d}, and threads that ended {d} more than they freed)\n", .{ live(), thread.stats.allocs, thread.stats.frees, ended_threads_live });
+    const sgc_exit = threadExitSgcStats();
+    if (sgc_exit.remaining_structures_on_exit != 0 or sgc_exit.collected_on_exit != 0) {
+        std.debug.print("fable: thread-exit fable_sgc drain across {d} thread(s): collected {d} cells, {d} live structure(s) remained (possible cross-thread or externally referenced cycles)\n", .{ sgc_exit.threads_drained, sgc_exit.collected_on_exit, sgc_exit.remaining_structures_on_exit });
+    }
     return true;
 }
 
@@ -8624,2308 +7342,7 @@ pub const decTryParseStyle = decimal.decTryParseStyle;
 pub const tryParseAny = fable_math.tryParseAny;
 pub const tryParseFloat = fable_math.tryParseFloat;
 pub const tryParseInt = fable_math.tryParseInt;
-// Tests (`zig test fable_rt.zig`)
-// ---------------------------------------------------------------------------------------------
 
-const TestList = union(enum) {
-    Nil,
-    Cons: *struct { @"$rc": u32 = 1, head: i32, tail: TestList },
-};
-
-const TestTree = union(enum) {
-    Leaf,
-    Node: *struct { @"$rc": u32 = 1, left: TestTree, value: i32, right: TestTree },
-};
-
-const TestPair = struct { first: TestList, second: ?TestList, n: i32 };
-
-pub fn testCons(head: i32, tail: TestList) TestList {
-    return .{ .Cons = cell(TestList, .Cons, .{ .head = head, .tail = tail }) };
-}
-
-pub fn testRange(n: i32) TestList {
-    var l: TestList = .Nil;
-    var i: i32 = n;
-    while (i > 0) : (i -= 1) l = testCons(i, l);
-    return l;
-}
-
-pub fn testTree(depth: i32) TestTree {
-    if (depth == 0) return .Leaf;
-    return .{ .Node = cell(TestTree, .Node, .{ .left = testTree(depth - 1), .value = depth, .right = testTree(depth - 1) }) };
-}
-
-test "a dropped list frees every cell, without recursion" {
-    const before = thread.stats;
-    drop(testRange(1_000_000));
-    try std.testing.expectEqual(@as(i64, 1_000_000), thread.stats.allocs - before.allocs);
-    try std.testing.expectEqual(@as(i64, 1_000_000), thread.stats.frees - before.frees);
-}
-
-test "a shared cell is freed by its last owner" {
-    const before = thread.stats;
-    const tail = testRange(3);
-    const a = testCons(10, dup(tail));
-    const b = testCons(20, tail);
-    drop(a);
-    try std.testing.expectEqual(@as(i64, 1), thread.stats.frees - before.frees);
-    try std.testing.expectEqual(@as(i32, 1), b.Cons.tail.Cons.head);
-    drop(b);
-    try std.testing.expectEqual(@as(i64, 5), thread.stats.frees - before.frees);
-}
-
-test "trees, and values that hold cells" {
-    const before = thread.stats;
-    drop(testTree(10));
-    try std.testing.expectEqual(@as(i64, 1023), thread.stats.frees - before.frees);
-    const p = TestPair{ .first = testRange(2), .second = testRange(3), .n = 1 };
-    const q = dup(p);
-    drop(p);
-    try std.testing.expectEqual(@as(i64, 1023), thread.stats.frees - before.frees);
-    drop(q);
-    try std.testing.expectEqual(@as(i64, 1028), thread.stats.frees - before.frees);
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "a dead cell is built in again" {
-    const before = thread.stats;
-    const l = testRange(1);
-    var tok: ?*Cell(TestList, .Cons) = null;
-    if (isUnique(l.Cons)) tok = l.Cons;
-    const m = TestList{ .Cons = cellReuse(TestList, .Cons, &tok, .{ .head = 7, .tail = .Nil }) };
-    try std.testing.expectEqual(l.Cons, m.Cons);
-    try std.testing.expectEqual(@as(i64, 1), thread.stats.reuses - before.reuses);
-    try std.testing.expectEqual(@as(i64, 1), thread.stats.allocs - before.allocs);
-    drop(m);
-}
-
-test "structural equality looks through cells" {
-    const a = testRange(4);
-    const b = testRange(4);
-    const c = testRange(5);
-    try std.testing.expect(eql(a, b));
-    try std.testing.expect(!eql(a, c));
-    try std.testing.expect(eql(TestPair{ .first = a, .second = null, .n = 1 }, TestPair{ .first = b, .second = null, .n = 1 }));
-    try std.testing.expect(!eql(TestPair{ .first = a, .second = c, .n = 1 }, TestPair{ .first = b, .second = null, .n = 1 }));
-    try std.testing.expect(eql(@as(?TestList, a), @as(?TestList, b)));
-    drop(a);
-    drop(b);
-    drop(c);
-}
-
-pub fn testSum(xs: TestList) i32 {
-    var total: i32 = 0;
-    var cur = xs;
-    while (cur == .Cons) : (cur = cur.Cons.tail) total += cur.Cons.head;
-    return total;
-}
-const testSum_sig = .{ .borrows = .{true}, .result_borrowed = false };
-
-pub fn testTail(xs: TestList) TestList {
-    return if (xs == .Cons) xs.Cons.tail else .Nil;
-}
-const testTail_sig = .{ .borrows = .{true}, .result_borrowed = true };
-
-pub fn testPush(n: i32, xs: TestList) TestList {
-    return testCons(n, xs);
-}
-const testPush_sig = .{ .borrows = .{ false, false }, .result_borrowed = false };
-
-test "a call between files costs what the callee needs" {
-    const before = thread.stats;
-    const xs = testRange(3);
-    // borrowed by the callee, kept by the caller: nothing is counted
-    try std.testing.expectEqual(@as(i32, 6), across(testSum, testSum_sig, .{.keep}, .{xs}));
-    try std.testing.expectEqual(@as(i64, 0), thread.stats.dups - before.dups);
-    // a borrowed result is made owned
-    const t = across(testTail, testTail_sig, .{.keep}, .{xs});
-    try std.testing.expectEqual(@as(i64, 1), thread.stats.dups - before.dups);
-    // owned by the callee, kept by the caller: one more reference
-    const ys = across(testPush, testPush_sig, .{ .plain, .keep }, .{ 0, xs });
-    try std.testing.expectEqual(@as(i64, 2), thread.stats.dups - before.dups);
-    // owned by the callee, given by the caller: a move
-    const zs = across(testPush, testPush_sig, .{ .plain, .give }, .{ 9, ys });
-    try std.testing.expectEqual(@as(i64, 2), thread.stats.dups - before.dups);
-    // borrowed by the callee, given by the caller: the caller gives it up after the call
-    try std.testing.expectEqual(@as(i32, 15), across(testSum, testSum_sig, .{.give}, .{zs}));
-    try std.testing.expectEqual(@as(i32, 5), across(testSum, testSum_sig, .{.give}, .{t}));
-    drop(xs);
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-const TestFn = Func(*const fn (?*Env, i32) i32);
-const TestCaptures = struct { xs: TestList, n: i32 };
-
-pub fn testAddSum(env: ?*Env, x: i32) i32 {
-    const c = captured(TestCaptures, env);
-    return x + c.n + testSum(c.xs);
-}
-
-pub fn testDouble(_: ?*Env, x: i32) i32 {
-    return x * 2;
-}
-
-test "a function value owns what it captured" {
-    const before = thread.stats;
-    const f = closure(TestFn, TestCaptures, .{ .xs = testRange(3), .n = 10 }, testAddSum);
-    try std.testing.expectEqual(@as(i32, 17), f.code(f.env, 1));
-    const g = dup(f);
-    drop(f);
-    try std.testing.expectEqual(@as(i32, 18), g.code(g.env, 2));
-    const plain = TestFn{ .env = null, .code = testDouble };
-    try std.testing.expectEqual(@as(i32, 8), plain.code(plain.env, 4));
-    drop(dup(plain));
-    // in a value that is dropped as a whole
-    const pair: struct { f: TestFn, o: ?TestFn } = .{ .f = g, .o = plain };
-    drop(pair);
-    try std.testing.expectEqual(@as(i64, 4), thread.stats.allocs - before.allocs);
-    try std.testing.expectEqual(@as(i64, 4), thread.stats.frees - before.frees);
-}
-
-const TestParseError = ExnOf("ParseError", struct { pos: i32, items: TestList });
-const TestOverflow = ExnOf("Overflow", struct { limit: i32 });
-
-pub fn testCheck(x: i32, owned: TestList) Raised!i32 {
-    if (x < 0) {
-        throw(TestParseError.new(.{ .pos = x, .items = owned }));
-        return error.Raised;
-    }
-    drop(owned);
-    return x;
-}
-const testCheck_sig = .{ .borrows = .{ false, false }, .result_borrowed = false };
-
-pub fn testOuter(x: i32) MayRaise(i32, .{testCheck}) {
-    const xs = testRange(2);
-    const raw = across(testCheck, testCheck_sig, .{ .plain, .give }, .{ x, xs });
-    const r = if (comptime isRaised(@TypeOf(raw))) (raw catch return error.Raised) else raw;
-    return r + 1;
-}
-
-pub fn testPlain(x: i32) MayRaise(i32, .{testSum}) {
-    return x;
-}
-
-/// (an allocator that refuses what is larger than a megabyte: the program's allocation fails,
-/// the exception's own does not)
-const RefusingLarge = struct {
-    inner: std.mem.Allocator,
-
-    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
-        const self: *RefusingLarge = @ptrCast(@alignCast(ctx));
-        if (len > 1 << 20) return null;
-        return self.inner.rawAlloc(len, alignment, ret);
-    }
-
-    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
-        const self: *RefusingLarge = @ptrCast(@alignCast(ctx));
-        return self.inner.rawResize(memory, alignment, new_len, ret);
-    }
-
-    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
-        const self: *RefusingLarge = @ptrCast(@alignCast(ctx));
-        return self.inner.rawRemap(memory, alignment, new_len, ret);
-    }
-
-    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
-        const self: *RefusingLarge = @ptrCast(@alignCast(ctx));
-        self.inner.rawFree(memory, alignment, ret);
-    }
-
-    fn get(self: *RefusingLarge) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = allocFn, .resize = resizeFn, .remap = remapFn, .free = freeFn } };
-    }
-};
-
-test "out of memory: an array that cannot be allocated raises OutOfMemoryException (the .dotnet policy)" {
-    try std.testing.expect(oom_policy == .dotnet); // (tests are built in Debug)
-    try std.testing.expect(oom_catchable);
-    var refusing: RefusingLarge = .{ .inner = allocator };
-    const saved = allocator;
-    allocator = refusing.get();
-    defer allocator = saved;
-    try std.testing.expectError(error.Raised, arrayCreate(Array(i64), 10_000_000, 0));
-    const e = take();
-    defer drop(e);
-    try std.testing.expect(OutOfMemoryException.is(e));
-    // (a small one still is)
-    const small = try arrayCreate(Array(i64), 8, 1);
-    defer drop(small);
-    try std.testing.expectEqual(@as(usize, 8), small.items.len);
-}
-
-test "an exception owns its fields and is taken by one handler" {
-    const before = thread.stats;
-    try std.testing.expectEqual(@as(i32, 6), try testOuter(5));
-    try std.testing.expectError(error.Raised, testOuter(-3));
-    const e = take();
-    try std.testing.expect(TestParseError.is(e));
-    try std.testing.expect(!TestOverflow.is(e));
-    try std.testing.expectEqual(@as(i32, -3), TestParseError.of(e).pos);
-    try std.testing.expectEqual(@as(i32, 3), testSum(TestParseError.of(e).items));
-    const again = dup(e);
-    drop(e);
-    drop(again);
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-    // a function that calls nothing that raises has a plain result
-    try std.testing.expect(@TypeOf(testPlain(1)) == i32);
-    try std.testing.expect(@TypeOf(testOuter(1)) == Raised!i32);
-}
-
-const TestNode = *struct { @"$rc": u32 = 1, id: i32, next: ?TestNode };
-
-test "reference records: identity, stores and long chains" {
-    const before = thread.stats;
-    var head: TestNode = new(TestNode, .{ .id = 0, .next = null });
-    var i: i32 = 1;
-    while (i < 200_000) : (i += 1) head = new(TestNode, .{ .id = i, .next = head });
-    const second = dup(head.next.?);
-    // the field gets a new value: the old one stays alive through `second`
-    store(&head.next, null);
-    try std.testing.expectEqual(@as(i32, 199_998), second.id);
-    const r = new(Ref(TestList), .{ .contents = testRange(3) });
-    const alias = dup(r);
-    store(&alias.contents, testRange(5));
-    try std.testing.expectEqual(@as(i32, 15), testSum(r.contents));
-    try std.testing.expect(eql(r, alias));
-    drop(head);
-    drop(second);
-    drop(r);
-    drop(alias);
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-const TestPerson = *struct {
-    pub const fable_cyclic = true;
-    @"$rc": u32 = 1,
-    @"$gc": GcHdr(fable_cyclic) = undefined,
-    id: i32,
-    friend: ?TestPerson,
-    friends: List(TestPerson),
-    callback: ?Func(*const fn (?*Env, i32) Raised!i32),
-};
-
-pub fn testPerson(id: i32) TestPerson {
-    return new(TestPerson, .{ .id = id, .friend = null, .friends = .Empty, .callback = null });
-}
-
-const TestSelf = struct { self: TestPerson };
-
-pub fn testAddId(env: ?*Env, x: i32) Raised!i32 {
-    return x + captured(TestSelf, env).self.id;
-}
-
-test "cycles are freed when their last outside reference goes" {
-    const before = thread.stats;
-    // two records that point at each other
-    const a = testPerson(1);
-    const b = testPerson(2);
-    storeIn(a, "friend", dup(b));
-    storeIn(b, "friend", dup(a));
-    drop(a);
-    try std.testing.expectEqual(@as(i64, 0), thread.stats.frees - before.frees);
-    drop(b);
-    try std.testing.expectEqual(@as(i64, 2), thread.stats.frees - before.frees);
-    // a record that reaches itself through a list
-    const c = testPerson(3);
-    const cons = List(TestPerson){ .Cons = cell(List(TestPerson), .Cons, .{ .Head = dup(c), .Tail = .Empty }) };
-    storeIn(c, "friends", cons);
-    drop(c);
-    try std.testing.expectEqual(@as(i64, 4), thread.stats.frees - before.frees);
-    // a record that holds a function which captured the record
-    const d = testPerson(40);
-    const f = closure(Func(*const fn (?*Env, i32) Raised!i32), TestSelf, .{ .self = dup(d) }, testAddId);
-    storeIn(d, "callback", f);
-    try std.testing.expectEqual(@as(i32, 42), try d.callback.?.code(d.callback.?.env, 2));
-    drop(d);
-    try std.testing.expectEqual(@as(i64, 6), thread.stats.frees - before.frees);
-    // a ring with a tail hanging off it, cut loose in the middle of a structure that lives on
-    const keep = testPerson(5);
-    const x = testPerson(6);
-    const y = testPerson(7);
-    storeIn(x, "friend", dup(y));
-    storeIn(y, "friend", dup(x));
-    storeIn(keep, "friend", x);
-    drop(y);
-    storeIn(keep, "friend", null);
-    _ = collect();
-    try std.testing.expectEqual(@as(i64, 8), thread.stats.frees - before.frees);
-    drop(keep);
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-    // cells of the same types that never form a cycle are plain reference counting
-    const lone = testPerson(8);
-    storeIn(lone, "friends", List(TestPerson){ .Cons = cell(List(TestPerson), .Cons, .{ .Head = testPerson(9), .Tail = .Empty }) });
-    drop(lone);
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-    try std.testing.expect(@sizeOf(@typeInfo(@FieldType(List(i32), "Cons")).pointer.child) == 24);
-}
-
-pub fn testThreadWork(result: *i64) void {
-    const before = thread.stats;
-    var round: i32 = 0;
-    while (round < 2000) : (round += 1) {
-        const a = testPerson(round);
-        const b = testPerson(round + 1);
-        storeIn(a, "friend", dup(b));
-        storeIn(b, "friend", dup(a));
-        drop(a);
-        drop(b);
-    }
-    throw(TestOverflow.new(.{ .limit = 1 }));
-    drop(take());
-    result.* = (thread.stats.allocs - before.allocs) - (thread.stats.frees - before.frees);
-}
-
-test "every thread has its own collector" {
-    if (!sgc.per_thread) return;
-    var left: [4]i64 = @splat(-1);
-    var threads: [4]std.Thread = undefined;
-    for (&threads, &left) |*t, *l| t.* = try std.Thread.spawn(.{}, testThreadWork, .{l});
-    for (threads) |t| t.join();
-    for (left) |l| try std.testing.expectEqual(@as(i64, 0), l);
-}
-
-test "the collector can be stepped and tuned" {
-    const before = thread.stats;
-    collectorSet(.free_budget, 2);
-    const a = testPerson(1);
-    const b = testPerson(2);
-    const c = testPerson(3);
-    storeIn(a, "friend", dup(b));
-    storeIn(b, "friend", dup(c));
-    storeIn(c, "friend", dup(a));
-    drop(a);
-    drop(b);
-    drop(c);
-    // dead, and queued: freed a few cells at a time
-    try std.testing.expect(thread.stats.frees - before.frees < 3);
-    var steps: i32 = 0;
-    while (collectStep(1)) steps += 1;
-    try std.testing.expect(steps > 0);
-    try std.testing.expectEqual(@as(i64, 3), thread.stats.frees - before.frees);
-    collectorSet(.free_budget, 0);
-    collectorPause();
-    collectorResume();
-    try std.testing.expectEqual(@as(i32, 0), collect());
-}
-
-test "storing a composite value with two cyclic cells does not double-count" {
-    const before = thread.stats;
-    const Fn = Func(*const fn (?*Env, i32) Raised!i32);
-    const Pair = struct { first: Fn, second: Fn };
-    const Cap = struct { box: Ref(?Pair) };
-    const r = new(Ref(?Pair), .{ .contents = null });
-    const f1 = closure(Fn, Cap, .{ .box = dup(r) }, struct {
-        fn call(_: ?*Env, x: i32) Raised!i32 {
-            return x;
-        }
-    }.call);
-    const f2 = closure(Fn, Cap, .{ .box = dup(r) }, struct {
-        fn call(_: ?*Env, x: i32) Raised!i32 {
-            return x;
-        }
-    }.call);
-    storeIn(r, "contents", .{ .first = f1, .second = f2 });
-    const f2_keep = dup(r.contents.?.second);
-    storeIn(r, "contents", null);
-    drop(f2_keep);
-    drop(r);
-    _ = collect();
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-pub fn expectText(expected: []const u8, s: String) !void {
-    var buf: [512]u8 = undefined;
-    const n = std.unicode.wtf16LeToWtf8(&buf, unitsOf(s));
-    try std.testing.expectEqualStrings(expected, buf[0..n]);
-    drop(s);
-}
-
-test "strings: literals, concatenation, comparison" {
-    const before = thread.stats;
-    const hello = str("héllo");
-    try std.testing.expectEqual(@as(i32, 5), try strLen(hello));
-    try std.testing.expectEqual(@as(u16, 0xE9), try strAt(hello, 1));
-    const both = strConcat(hello, str(" wörld"));
-    try std.testing.expectEqual(@as(i32, 11), try strLen(both));
-    const again = dup(both);
-    try std.testing.expect(eql(both, again));
-    try std.testing.expect(eql(str("ab"), str("ab")) and !eql(str("ab"), str("ac")));
-    try std.testing.expect(strConcat(str(""), hello) == hello);
-    drop(both);
-    drop(again);
-    drop(hello);
-    // (a literal is never counted: only `both` was allocated)
-    try std.testing.expectEqual(@as(i64, 1), thread.stats.allocs - before.allocs);
-    try std.testing.expectEqual(@as(i64, 1), thread.stats.frees - before.frees);
-    // an emoji is two units
-    try std.testing.expectEqual(@as(i32, 2), try strLen(str("\u{1F600}")));
-}
-
-test "format follows F# and .NET" {
-    const name = str("list");
-    try expectText("list has 3 items", format(.{ name, " has ", @as(i32, 3), " items" }));
-    try expectText("n=   42|42   |00042|-0042|+7| 7|  +42|+42  ", format(.{
-        "n=", arg(.{ .kind = 'd', .width = 5 }, @as(i32, 42)),
-        "|",  arg(.{ .kind = 'd', .width = 5, .left = true }, @as(i32, 42)),
-        "|",  arg(.{ .kind = 'd', .width = 5, .zero = true }, @as(i32, 42)),
-        "|",  arg(.{ .kind = 'd', .width = 5, .zero = true }, @as(i32, -42)),
-        "|",  arg(.{ .kind = 'd', .plus = true }, @as(i32, 7)),
-        "|",  arg(.{ .kind = 'd', .space = true }, @as(i32, 7)),
-        "|",  arg(.{ .kind = 'd', .width = 5, .plus = true }, @as(i32, 42)),
-        "|",  arg(.{ .kind = 'd', .width = 5, .plus = true, .left = true }, @as(i32, 42)),
-    }));
-    try expectText("ff FF 377 ffffffff 4294967295 -9223372036854775808", format(.{
-        arg(.{ .kind = 'x' }, @as(i32, 255)), " ", arg(.{ .kind = 'X' }, @as(i32, 255)),                  " ",
-        arg(.{ .kind = 'o' }, @as(i32, 255)), " ", arg(.{ .kind = 'x' }, @as(i32, -1)),                   " ",
-        arg(.{ .kind = 'u' }, @as(i32, -1)),  " ", arg(.{ .kind = 'd' }, @as(i64, std.math.minInt(i64))),
-    }));
-    try expectText("true True A é", format(.{
-        arg(.{ .kind = 'b' }, true), " ", true, " ", arg(.{ .kind = 'c' }, @as(u16, 'A')), " ", arg(.{ .kind = 'c' }, @as(u16, 0xE9)),
-    }));
-    try expectText("[  ab]", format(.{ "[", arg(.{ .kind = 's', .width = 4 }, str("ab")), "]" }));
-}
-
-pub fn expectFloat(expected: []const u8, comptime spec: Spec, value: anytype) !void {
-    var buf: [scratch_len]u8 = undefined;
-    try std.testing.expectEqualStrings(expected, floatText(spec, value, &buf));
-}
-
-test "floats are written as .NET writes them" {
-    const f: Spec = .{ .kind = 'f' };
-    const e: Spec = .{ .kind = 'e' };
-    const g: Spec = .{ .kind = 'g' };
-    // (every expected text here is what .NET 10 prints)
-    // %f: the exact value, a tie to the even digit
-    try expectFloat("3.141590", f, @as(f64, 3.14159));
-    try expectFloat("2.67", .{ .kind = 'f', .precision = 2 }, @as(f64, 2.675));
-    try expectFloat("0.12", .{ .kind = 'f', .precision = 2 }, @as(f64, 0.125));
-    try expectFloat("0.38", .{ .kind = 'f', .precision = 2 }, @as(f64, 0.375));
-    try expectFloat("0.62", .{ .kind = 'f', .precision = 2 }, @as(f64, 0.625));
-    try expectFloat("1.00", .{ .kind = 'f', .precision = 2 }, @as(f64, 1.005));
-    try expectFloat("0", .{ .kind = 'f', .precision = 0 }, @as(f64, 0.5));
-    try expectFloat("2", .{ .kind = 'f', .precision = 0 }, @as(f64, 1.5));
-    try expectFloat("2", .{ .kind = 'f', .precision = 0 }, @as(f64, 2.5));
-    try expectFloat("1.000", .{ .kind = 'f', .precision = 3 }, @as(f64, 1.0005));
-    try expectFloat("10000000000000000000000.000000", f, @as(f64, 1e22));
-    try expectFloat("-0.000000", f, @as(f64, -0.0));
-    try expectFloat("0.000000", f, @as(f64, 1e-7));
-    try expectFloat("0.000", .{ .kind = 'f', .precision = 3 }, std.math.floatTrueMin(f64));
-    try expectFloat("0.100000", f, @as(f32, 0.1));
-    try expectFloat("0.1000000015", .{ .kind = 'f', .precision = 10 }, @as(f32, 0.1));
-    try expectFloat("+1.500000", .{ .kind = 'f', .plus = true }, @as(f64, 1.5));
-    try expectFloat(" 1.500000", .{ .kind = 'f', .space = true }, @as(f64, 1.5));
-    try expectFloat("999.999000", f, @as(f64, 999.999));
-    try expectFloat("1000.00", .{ .kind = 'f', .precision = 2 }, @as(f64, 999.999));
-    // %e
-    try expectFloat("1.500000e+020", e, @as(f64, 1.5e20));
-    try expectFloat("1.500000E-020", .{ .kind = 'E' }, @as(f64, 1.5e-20));
-    try expectFloat("1.23e+004", .{ .kind = 'e', .precision = 2 }, @as(f64, 12345.678));
-    try expectFloat("0.000000e+000", e, @as(f64, 0.0));
-    try expectFloat("2e+000", .{ .kind = 'e', .precision = 0 }, @as(f64, 2.5));
-    try expectFloat("1.2e+000", .{ .kind = 'e', .precision = 1 }, @as(f64, 1.25));
-    try expectFloat("1.4e+000", .{ .kind = 'e', .precision = 1 }, @as(f64, 1.35));
-    try expectFloat("1.000000e+023", e, @as(f64, 1e23));
-    try expectFloat("1.000000e+011", e, @as(f64, 9.9999999e10));
-    try expectFloat("-1.234e-004", .{ .kind = 'e', .precision = 3 }, @as(f64, -0.00012345));
-    try expectFloat("4.940656e-324", e, std.math.floatTrueMin(f64));
-    try expectFloat("1.000000e-001", e, @as(f32, 0.1));
-    // %g
-    try expectFloat("3", g, @as(f64, 3.0));
-    try expectFloat("1e+20", g, @as(f64, 1e20));
-    try expectFloat("0.0001", g, @as(f64, 0.0001));
-    try expectFloat("1e-05", g, @as(f64, 0.00001));
-    try expectFloat("3.14159", g, @as(f64, 3.14159265));
-    try expectFloat("123456", g, @as(f64, 123456.0));
-    try expectFloat("1.23457e+06", g, @as(f64, 1234567.0));
-    try expectFloat("100000", g, @as(f64, 100000.0));
-    try expectFloat("1e+06", g, @as(f64, 1000000.0));
-    try expectFloat("1E-20", .{ .kind = 'G' }, @as(f64, 1e-20));
-    try expectFloat("3.14", .{ .kind = 'g', .precision = 3 }, @as(f64, 3.14159));
-    try expectFloat("1.23e+03", .{ .kind = 'g', .precision = 3 }, @as(f64, 1234.0));
-    try expectFloat("10", g, @as(f64, 9.9999995));
-    try expectFloat("-0", g, @as(f64, -0.0));
-    try expectFloat("0.1", g, @as(f32, 0.1));
-    try expectFloat("1.79769e+308", g, std.math.floatMax(f64));
-    try expectFloat("2.5", .{ .kind = 'g', .precision = 0 }, @as(f64, 2.5));
-    try expectFloat("1.2345678901234568e+17", .{ .kind = 'g', .precision = 0 }, @as(f64, 123456789012345678.0));
-    try expectFloat("2", .{ .kind = 'g', .precision = 1 }, @as(f64, 2.5));
-    try expectFloat("0.3", .{ .kind = 'g', .precision = 1 }, @as(f64, 0.35));
-    try expectFloat("0.10000000000000000555", .{ .kind = 'g', .precision = 20 }, @as(f64, 0.1));
-    // `string x`
-    const p: Spec = .{};
-    try expectFloat("1", p, @as(f64, 1.0));
-    try expectFloat("1.5", p, @as(f64, 1.5));
-    try expectFloat("-0", p, @as(f64, -0.0));
-    try expectFloat("0.0001", p, @as(f64, 0.0001));
-    try expectFloat("1E-05", p, @as(f64, 0.00001));
-    try expectFloat("1.5E-05", p, @as(f64, 1.5e-5));
-    try expectFloat("100000000000000", p, @as(f64, 1e14));
-    try expectFloat("10000000000000000", p, @as(f64, 1e16));
-    try expectFloat("15000000000000000", p, @as(f64, 1.5e16));
-    try expectFloat("1E+17", p, @as(f64, 1e17));
-    try expectFloat("1.2345678901234568E+17", p, @as(f64, 123456789012345678.0));
-    try expectFloat("1E+20", p, @as(f64, 1e20));
-    try expectFloat("1.7976931348623157E+308", p, std.math.floatMax(f64));
-    try expectFloat("5E-324", p, std.math.floatTrueMin(f64));
-    try expectFloat("NaN", p, std.math.nan(f64));
-    try expectFloat("-Infinity", p, -std.math.inf(f64));
-    try expectFloat("0.1", p, @as(f32, 0.1));
-    try expectFloat("16777216", p, @as(f32, 16777216.0));
-    try expectFloat("100000000", p, @as(f32, 1e8));
-    try expectFloat("1E+09", p, @as(f32, 1e9));
-    try expectFloat("123456790", p, @as(f32, 123456789.0));
-    try expectFloat("3E-05", p, @as(f32, 3.0e-5));
-    try expectFloat("3.4028235E+38", p, std.math.floatMax(f32));
-}
-
-test "compare gives what .NET gives" {
-    const P = struct { Name: String, Age: i32 };
-    try std.testing.expectEqual(@as(i32, -1), compare(P{ .Name = str("a"), .Age = 2 }, P{ .Name = str("a"), .Age = 3 }));
-    try std.testing.expectEqual(@as(i32, 1), compare(@as(?i32, 1), @as(?i32, null)));
-    try std.testing.expectEqual(@as(i32, -1), compare(@as(struct { i32, i32 }, .{ 1, 2 }), @as(struct { i32, i32 }, .{ 1, 3 })));
-    try std.testing.expect(hash(P{ .Name = str("a"), .Age = 2 }) == hash(P{ .Name = str("a"), .Age = 2 }) and hash(@as(i32, -7)) == -7);
-    try std.testing.expectEqual(@as(i32, -1), compare(str("abc"), str("abd")));
-    try std.testing.expectEqual(@as(i32, 1), compare(str("b"), str("abc")));
-    try std.testing.expectEqual(@as(i32, 32), compare(str("a"), str("A")));
-    try std.testing.expectEqual(@as(i32, 131), compare(str("é"), str("f")));
-    try std.testing.expectEqual(@as(i32, -97), compare(str(""), str("a")));
-    try std.testing.expectEqual(@as(i32, -2), compare(str("ab"), str("abcd")));
-    try std.testing.expectEqual(@as(i32, 0), compare(str("ab"), str("ab")));
-    try std.testing.expectEqual(@as(i32, -1), compare(@as(i32, 1), @as(i32, 2)));
-    try std.testing.expectEqual(@as(i32, 1), compare(true, false));
-    try std.testing.expectEqual(@as(i32, -1), compare(@as(u16, 'a'), @as(u16, 'c')));
-    const nan = std.math.nan(f64);
-    try std.testing.expectEqual(@as(i32, -1), compare(nan, @as(f64, 1.0)));
-    try std.testing.expectEqual(@as(i32, 1), compare(@as(f64, 1.0), nan));
-    try std.testing.expectEqual(@as(i32, 0), compare(nan, nan));
-}
-
-test "a failure carries its message" {
-    const before = thread.stats;
-    throw(Failure.new(.{ .Message = format(.{ "bad ", @as(i32, 7) }) }));
-    const e = take();
-    try std.testing.expect(Failure.is(e) and !ArgumentException.is(e));
-    try expectText("bad 7", exnMessage(e));
-    drop(e);
-    const other = ArgumentException.new(.{ .Message = str("no") });
-    try std.testing.expect(!Failure.is(other) and ArgumentException.is(other));
-    try expectText("no", exnMessage(other));
-    drop(other);
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-pub fn expectRaised(comptime C: type, expected: []const u8, result: anytype) !void {
-    if (result) |value| {
-        drop(value);
-        return error.TestExpectedError;
-    } else |_| {}
-    const e = take();
-    defer drop(e);
-    try std.testing.expect(C.is(e));
-    try expectText(expected, exnMessage(e));
-}
-
-test "string methods do what .NET does" {
-    const before = thread.stats;
-    const abc = str("abc");
-    const none: String = null;
-    try expectText("bc", try strSubstring(abc, 1, null));
-    try expectText("b", try strSubstring(abc, 1, 1));
-    try expectText("", try strSubstring(abc, 3, null));
-    try expectRaised(ArgumentOutOfRangeException, "startIndex cannot be larger than length of string. (Parameter 'startIndex')", strSubstring(abc, 5, null));
-    try expectRaised(ArgumentOutOfRangeException, "Index and length must refer to a location within the string. (Parameter 'length')", strSubstring(abc, 1, 5));
-    try expectRaised(ArgumentOutOfRangeException, "startIndex ('-1') must be a non-negative value. (Parameter 'startIndex')\nActual value was -1.", strSubstring(abc, -1, null));
-    try expectRaised(ArgumentOutOfRangeException, "length ('-1') must be a non-negative value. (Parameter 'length')\nActual value was -1.", strSubstring(abc, 2, -1));
-    try expectRaised(NullReferenceException, "Object reference not set to an instance of an object.", strSubstring(none, 1, null));
-    try expectRaised(NullReferenceException, "Object reference not set to an instance of an object.", strLen(none));
-    try expectRaised(IndexOutOfRangeException, "Index was outside the bounds of the array.", strAt(abc, 5));
-    try expectRaised(IndexOutOfRangeException, "Index was outside the bounds of the array.", strAt(abc, -1));
-    try std.testing.expectEqual(@as(i32, 0), strLength(none));
-    try std.testing.expectEqual(@as(i32, 2), try strIndexOfChar(abc, 'c', 0));
-    try std.testing.expectEqual(@as(i32, -1), try strIndexOf(abc, str("c"), 3));
-    try std.testing.expectEqual(@as(i32, 0), try strIndexOf(abc, str(""), 0));
-    try std.testing.expectEqual(@as(i32, 3), try strLastIndexOf(abc, str("")));
-    try std.testing.expectEqual(@as(i32, 0), try strLastIndexOfChar(abc, 'a'));
-    try expectRaised(ArgumentOutOfRangeException, index_range ++ " (Parameter 'startIndex')", strIndexOf(abc, str("c"), 4));
-    try expectRaised(ArgumentNullException, "Value cannot be null. (Parameter 'value')", strIndexOf(abc, none, 0));
-    try expectRaised(ArgumentNullException, "Value cannot be null. (Parameter 'value')", strContains(abc, none));
-    try std.testing.expect(try strContains(abc, str("bc")) and try strStartsWith(abc, str("")) and try strEndsWith(abc, str("bc")));
-    try std.testing.expect(try strContainsChar(abc, 'b') and try strStartsWithChar(abc, 'a') and !try strEndsWithChar(abc, 'a'));
-    try expectText("Ǆ STRAßE ΐ İI", try strCase(str("ǅ straße ΐ İi"), true));
-    try expectText("ǆ strasse İi σ", try strCase(str("ǅ STRASSE İI Σ"), false));
-    try expectText("x y", try strTrim(str(" \t\n\u{a0}\u{2003}x y\u{3000}\u{85} "), true, true, null));
-    try expectText("a ", try strTrim(str(" a "), true, false, null));
-    try expectText(" a", try strTrim(str(" a "), false, true, null));
-    try expectText("a", try strTrim(str("xxaxx"), true, true, 'x'));
-    try expectText("azcazc", try strReplaceChar(str("abcabc"), 'b', 'z'));
-    try expectText("aa", try strReplace(str("abcabc"), str("bc"), str("")));
-    try expectText("ac", try strReplace(abc, str("b"), none));
-    try expectRaised(ArgumentException, "The value cannot be an empty string. (Parameter 'oldValue')", strReplace(abc, str(""), str("x")));
-    try expectRaised(ArgumentNullException, "Value cannot be null. (Parameter 'oldValue')", strReplace(abc, none, str("x")));
-    try expectText("aXYbc", try strInsert(abc, 1, str("XY")));
-    try expectRaised(ArgumentOutOfRangeException, "startIndex ('5') must be less than or equal to '3'. (Parameter 'startIndex')\nActual value was 5.", strInsert(abc, 5, str("x")));
-    try expectRaised(ArgumentOutOfRangeException, "startIndex ('4294967295') must be less than or equal to '3'. (Parameter 'startIndex')\nActual value was 4294967295.", strInsert(abc, -1, str("x")));
-    try expectText("a", try strRemove(abc, 1, null));
-    try expectText("ac", try strRemove(abc, 1, 1));
-    try expectRaised(ArgumentOutOfRangeException, "startIndex cannot be larger than length of string. (Parameter 'startIndex')", strRemove(abc, 5, null));
-    try expectRaised(ArgumentOutOfRangeException, "StartIndex cannot be less than zero. (Parameter 'startIndex')", strRemove(abc, -1, null));
-    try expectRaised(ArgumentOutOfRangeException, "count ('5') must be less than or equal to '2'. (Parameter 'count')\nActual value was 5.", strRemove(abc, 1, 5));
-    try expectText("  abc", try strPad(abc, true, 5, ' '));
-    try expectText("abc..", try strPad(abc, false, 5, '.'));
-    try expectRaised(ArgumentOutOfRangeException, "totalWidth ('-1') must be a non-negative value. (Parameter 'totalWidth')\nActual value was -1.", strPad(abc, true, -1, ' '));
-    try expectText("xxx", try strOfChar('x', 3));
-    try expectText("ababab", try strReplicate(3, str("ab")));
-    try expectRaised(ArgumentException, "The input must be non-negative.\ncount = -1 (Parameter 'count')", strReplicate(-1, str("a")));
-    try expectText("", strConcat(none, none));
-    try std.testing.expect(strConcat(none, none) != null and strIsNullOrEmpty(none) and strIsNullOrWhiteSpace(str(" \t")));
-    try std.testing.expect(!eql(none, str("")) and eql(none, none));
-    try std.testing.expectEqual(@as(i32, -1), compare(none, str("")));
-    try std.testing.expectEqual(@as(i32, 1), compare(str(""), none));
-    try expectText("|     |<null>|", format(.{ arg(.{ .kind = 's' }, none), "|", arg(.{ .kind = 's', .width = 5 }, none), "|", arg(.{ .kind = 'O' }, none), "|", none }));
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "case mapping is .NET's for every code unit" {
-    var upper: u32 = 0;
-    var lower: u32 = 0;
-    for (0..0x10000) |c| {
-        upper = upper *% 31 +% unicode.toUpper(@intCast(c));
-        lower = lower *% 31 +% unicode.toLower(@intCast(c));
-    }
-    // (the same sums over Char.ToUpperInvariant and Char.ToLowerInvariant on .NET 10)
-    try std.testing.expectEqual(@as(u32, 4105874476), upper);
-    try std.testing.expectEqual(@as(u32, 3480348820), lower);
-}
-
-pub fn expectNet(expected: []const u8, comptime fmt: []const u8, value: anytype) !void {
-    var buf: [scratch_len]u8 = undefined;
-    try std.testing.expectEqualStrings(expected, netText(fmt, value, &buf));
-}
-
-test ".NET's standard numeric formats" {
-    const x: f64 = 1234.5678;
-    try expectNet("1,234.57", "N2", x);
-    try expectNet("1,235", "N0", x);
-    try expectNet("1,234.57", "N", x);
-    try expectNet("1234.6", "F1", x);
-    try expectNet("1235", "F0", x);
-    try expectNet("1.23E+003", "E2", x);
-    try expectNet("1.234568e+003", "e", x);
-    try expectNet("1234.5678", "G", x);
-    try expectNet("1.23E+03", "G3", x);
-    try expectNet("1.2e+03", "g2", x);
-    try expectNet("1234.5678", "R", x);
-    try expectNet("123,456.8 %", "P1", x);
-    try expectNet("123,456.78 %", "P", x);
-    try expectNet("\xA41,234.57", "C", x);
-    try expectNet("(\xA41,234.57)", "C", -x);
-    try expectNet("-123,456.78 %", "P", -x);
-    try expectNet("1E+03", "G1", x);
-    try expectNet("1234.5678", "G10", x);
-    try expectNet("42", "D", @as(i32, 42));
-    try expectNet("00042", "D5", @as(i32, 42));
-    try expectNet("2A", "X", @as(i32, 42));
-    try expectNet("002a", "x4", @as(i32, 42));
-    try expectNet("42.00", "N2", @as(i32, 42));
-    try expectNet("4.20E+001", "E2", @as(i32, 42));
-    try expectNet("4,200 %", "P0", @as(i32, 42));
-    try expectNet("\xA442.00", "C", @as(i32, 42));
-    try expectNet("00101010", "B8", @as(i32, 42));
-    try expectNet("-0001234567", "D10", @as(i32, -1234567));
-    try expectNet("FFED2979", "X", @as(i32, -1234567));
-    try expectNet("-1,234,567.0", "N1", @as(i32, -1234567));
-    try expectNet("(\xA41,234,567.00)", "C", @as(i32, -1234567));
-    try expectNet("-123,456,700 %", "P0", @as(i32, -1234567));
-    try expectNet("-1.235E+006", "E3", @as(i32, -1234567));
-    try expectNet("-1.235E+06", "G4", @as(i32, -1234567));
-    try expectNet("1,234,567,890,123", "N0", @as(i64, 1234567890123));
-    try expectNet("FF", "X", @as(i8, -1));
-    try expectNet("ffffffffffffffff", "x", @as(i64, -1));
-    try expectNet("00065535", "D8", @as(u16, 65535));
-    try expectNet("0", "N0", @as(i32, 0));
-    try expectNet("0.00E+000", "E2", @as(i32, 0));
-    try expectNet("1.23E+04", "G3", @as(i32, 12345));
-    try expectNet("12345", "G", @as(i32, 12345));
-    try expectNet("1.2E+04", "G2", @as(i64, 12345));
-    try expectNet("0.00", "N2", @as(f64, 0.0));
-    try expectNet("-0", "N0", @as(f64, -0.5));
-    try expectNet("-0.0", "F1", @as(f64, -0.0));
-    try expectNet("0.12", "F2", @as(f64, 0.125));
-    try expectNet("2.67", "F2", @as(f64, 2.675));
-    try expectNet("2", "F0", @as(f64, 2.5));
-    try expectNet("2", "N0", @as(f64, 1.5));
-    try expectNet("100,000,000,000,000,000,000", "N0", @as(f64, 1e20));
-    try expectNet("1E+008", "E0", @as(f64, 123456789.0));
-    try expectNet("0.00012", "G2", @as(f64, 0.000123));
-    try expectNet("1000000000000000", "G", @as(f64, 1e15));
-    try expectNet("1E-05", "G", @as(f64, 1e-5));
-    try expectNet("1.2345678901234568E+17", "G", @as(f64, 123456789012345678.0));
-    try expectNet("1E+02", "G2", @as(f64, 100.0));
-    try expectNet("0.10000000000000001", "G17", @as(f64, 0.1));
-    try expectNet("NaN", "N2", std.math.nan(f64));
-    try expectNet("-Infinity", "E2", -std.math.inf(f64));
-    try expectNet("0.100", "F3", @as(f32, 0.1));
-    try expectNet("0.1", "G", @as(f32, 0.1));
-    try expectNet("0.1000000015", "N10", @as(f32, 0.1));
-    try expectText("   42|42   |     1,234.6", format(.{
-        arg(.{ .width = 5 }, @as(i32, 42)), "|", arg(.{ .width = 5, .left = true }, @as(i32, 42)), "|", arg(.{ .width = 12, .net = "N1" }, x),
-    }));
-}
-
-pub fn run(comptime c: u8, comptime n: usize) *const [n]u8 {
-    return &@as([n]u8, @splat(c));
-}
-
-const ShowPerson = struct { Name: String, Age: i32 };
-const ShowShape = union(enum) {
-    A,
-    B: struct { Item: i32 },
-    C: struct { Item1: String, Item2: i32 },
-    D: struct { Item: ShowPerson },
-    F: struct { Item: struct { i32, i32 } },
-};
-const ShowTree = union(enum) {
-    Leaf,
-    Node: *struct { @"$rc": u32 = 1, Item1: ShowTree, Item2: i32, Item3: ShowTree },
-};
-const ShowRing = *struct { @"$rc": u32 = 1, Count: i32, Next: ?ShowRing };
-const ShowErr = ExnOf("MyErr", struct { Data0: i32, Data1: String });
-
-pub fn testList(comptime T: type, items: []const T) List(T) {
-    var all: List(T) = .Empty;
-    var i = items.len;
-    while (i > 0) {
-        i -= 1;
-        const tail = all;
-        all = .{ .Cons = cell(List(T), .Cons, .{ .Head = dup(items[i]), .Tail = tail }) };
-    }
-    return all;
-}
-
-pub fn expectAny(expected: []const u8, x: anytype) !void {
-    try expectText(expected, anyText(x));
-}
-
-test "%A writes what F# writes" {
-    const before = thread.stats;
-    try expectAny("1", @as(i32, 1));
-    try expectAny("1uy", @as(u8, 1));
-    try expectAny("-1y", @as(i8, -1));
-    try expectAny("1L", @as(i64, 1));
-    try expectAny("1UL", @as(u64, 1));
-    try expectAny("1.0", @as(f64, 1.0));
-    try expectAny("-0.0", @as(f64, -0.0));
-    try expectAny("1e+20", @as(f64, 1e20));
-    try expectAny("1e-05", @as(f64, 1e-5));
-    try expectAny("123456789.1", @as(f64, 123456789.123456789));
-    try expectAny("1.23456789e+12", @as(f64, 1234567890123.0));
-    try expectAny("1.0f", @as(f32, 1.0));
-    try expectAny("1.5f", @as(f32, 1.5));
-    try expectAny("1e+10f", @as(f32, 1e10));
-    try expectAny("nan", std.math.nan(f64));
-    try expectAny("nanf", std.math.nan(f32));
-    try expectAny("-infinity", -std.math.inf(f64));
-    try expectAny("'a'", @as(u16, 'a'));
-    try expectAny("'\\010'", @as(u16, '\n'));
-    try expectAny("'\\''", @as(u16, '\''));
-    try expectAny("'\"'", @as(u16, '"'));
-    try expectAny("'\\\\'", @as(u16, '\\'));
-    try expectAny("'\\000'", @as(u16, 0));
-    try expectAny("\"q\"uote\"", str("q\"uote"));
-    try expectAny("<null>", @as(String, null));
-    try expectAny("()", {});
-    try expectAny("(1, \"a\")", @as(struct { i32, String }, .{ 1, str("a") }));
-    try expectAny("Some 1", @as(?i32, 1));
-    try expectAny("None", @as(?i32, null));
-    try expectAny("Some (Some 1)", @as(??i32, @as(?i32, 1)));
-    try expectAny("Some None", @as(??i32, @as(?i32, null)));
-    try expectAny("Some (1, 2)", @as(?struct { i32, i32 }, .{ 1, 2 }));
-    try expectAny("Some -1", @as(?i32, -1));
-    try expectAny("A", @as(ShowShape, .A));
-    try expectAny("B 1", @as(ShowShape, .{ .B = .{ .Item = 1 } }));
-    try expectAny("C (\"x\", 2)", @as(ShowShape, .{ .C = .{ .Item1 = str("x"), .Item2 = 2 } }));
-    try expectAny("F (1, 2)", @as(ShowShape, .{ .F = .{ .Item = .{ 1, 2 } } }));
-    try expectAny("Some A", @as(?ShowShape, .A));
-    try expectAny("Some (B 1)", @as(?ShowShape, .{ .B = .{ .Item = 1 } }));
-    const ann: ShowPerson = .{ .Name = str("Ann"), .Age = 3 };
-    try expectAny("{ Name = \"Ann\"\n  Age = 3 }", ann);
-    try expectAny("D { Name = \"Ann\"\n    Age = 3 }", @as(ShowShape, .{ .D = .{ .Item = ann } }));
-    try expectAny("{ Name = null\n  Age = 3 }", @as(ShowPerson, .{ .Name = null, .Age = 3 }));
-    try expectAny(
-        "{ Inner = { Name = \"Ann\"\n            Age = 3 }\n  Opt = Some 1 }",
-        @as(struct { Inner: ShowPerson, Opt: ?i32 }, .{ .Inner = ann, .Opt = 1 }),
-    );
-
-    const three = testList(i32, &.{ 1, 2, 3 });
-    try expectAny("[1; 2; 3]", three);
-    try expectAny("Some [1; 2; 3]", @as(?List(i32), three));
-    drop(three);
-    try expectAny("[]", @as(List(i32), .Empty));
-    var numbers: [120]i32 = undefined;
-    for (&numbers, 1..) |*n, i| n.* = @intCast(i);
-    const forty = testList(i32, numbers[0..40]);
-    try expectAny(
-        "[1; 2; 3; 4; 5; 6; 7; 8; 9; 10; 11; 12; 13; 14; 15; 16; 17; 18; 19; 20; 21; 22;\n" ++
-            " 23; 24; 25; 26; 27; 28; 29; 30; 31; 32; 33; 34; 35; 36; 37; 38; 39; 40]",
-        forty,
-    );
-    drop(forty);
-    const many = testList(i32, &numbers);
-    try expectAny(
-        "[1; 2; 3; 4; 5; 6; 7; 8; 9; 10; 11; 12; 13; 14; 15; 16; 17; 18; 19; 20; 21; 22;\n" ++
-            " 23; 24; 25; 26; 27; 28; 29; 30; 31; 32; 33; 34; 35; 36; 37; 38; 39; 40; 41; 42;\n" ++
-            " 43; 44; 45; 46; 47; 48; 49; 50; 51; 52; 53; 54; 55; 56; 57; 58; 59; 60; 61; 62;\n" ++
-            " 63; 64; 65; 66; 67; 68; 69; 70; 71; 72; 73; 74; 75; 76; 77; 78; 79; 80; 81; 82;\n" ++
-            " 83; 84; 85; 86; 87; 88; 89; 90; 91; 92; 93; 94; 95; 96; 97; 98; 99; 100; ...]",
-        many,
-    );
-    drop(many);
-    const people = testList(ShowPerson, &.{ ann, .{ .Name = str("Bob"), .Age = 4 } });
-    try expectAny("[{ Name = \"Ann\"\n   Age = 3 }; { Name = \"Bob\"\n                Age = 4 }]", people);
-    drop(people);
-
-    const z80 = str(run('z', 80));
-    try expectAny("C (\"" ++ run('z', 80) ++ "\",\n   1)", @as(ShowShape, .{ .C = .{ .Item1 = z80, .Item2 = 1 } }));
-    try expectAny("Some\n  \"" ++ run('z', 80) ++ "\"", @as(?String, z80));
-    try expectAny(
-        "(\"" ++ run('z', 70) ++ "\",\n \"" ++ run('w', 70) ++ "\")",
-        @as(struct { String, String }, .{ str(run('z', 70)), str(run('w', 70)) }),
-    );
-
-    const leafT: ShowTree = .Leaf;
-    const node = struct {
-        pub fn of(l: ShowTree, v: i32, r: ShowTree) ShowTree {
-            return .{ .Node = cell(ShowTree, .Node, .{ .Item1 = l, .Item2 = v, .Item3 = r }) };
-        }
-    }.of;
-    const small = node(node(leafT, 1, leafT), 2, node(leafT, 3, leafT));
-    try expectAny("Node (Node (Leaf, 1, Leaf), 2, Node (Leaf, 3, Leaf))", small);
-    drop(small);
-    const big = node(
-        node(node(node(leafT, 1111111111, leafT), 222222222, leafT), 333333333, node(leafT, 444444444, leafT)),
-        555555555,
-        node(leafT, 666666666, node(leafT, 777777777, leafT)),
-    );
-    try expectAny(
-        "Node\n  (Node\n     (Node (Node (Leaf, 1111111111, Leaf), 222222222, Leaf), 333333333,\n" ++
-            "      Node (Leaf, 444444444, Leaf)), 555555555,\n   Node (Leaf, 666666666, Node (Leaf, 777777777, Leaf)))",
-        big,
-    );
-    drop(big);
-
-    // a record that contains itself
-    const first = new(ShowRing, .{ .Count = 1, .Next = null });
-    const second = new(ShowRing, .{ .Count = 2, .Next = first });
-    first.Next = second;
-    try expectAny("{ Count = 1\n  Next = Some { Count = 2\n                Next = Some ... } }", first);
-    first.Next = null;
-    drop(second);
-
-    // an F# exception: `%A`, and its message
-    const e = ShowErr.new(.{ .Data0 = 1, .Data1 = str("a") });
-    try expectAny("MyErr (1, \"a\")", e);
-    try expectText("MyErr (1, \"a\")", exnMessage(e));
-    try expectText("x=MyErr (1, \"a\")!", format(.{ "x=", arg(.{ .kind = 'A' }, e), "!" }));
-    drop(e);
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "exception classes derive as on .NET, division raises" {
-    const e = ArgumentNullException.new(.{ .Message = str("no") });
-    try std.testing.expect(ArgumentNullException.is(e) and ArgumentException.is(e) and SystemException.is(e));
-    try std.testing.expect(!ArgumentOutOfRangeException.is(e) and !Failure.is(e) and !ArithmeticException.is(e));
-    drop(e);
-    try std.testing.expectEqual(@as(i32, -3), try div(i32, 7, -2));
-    try std.testing.expectEqual(@as(i32, 1), try rem(i32, 7, -2));
-    try std.testing.expectEqual(@as(i8, -128), try div(i8, -128, -1));
-    try std.testing.expectEqual(@as(i8, 0), try rem(i8, -128, -1));
-    try expectRaised(DivideByZeroException, "Attempted to divide by zero.", div(i32, 5, 0));
-    try expectRaised(DivideByZeroException, "Attempted to divide by zero.", rem(u8, 5, 0));
-    try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", div(i32, std.math.minInt(i32), -1));
-    try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", rem(i64, std.math.minInt(i64), -1));
-}
-
-test "arrays: identity, items, what they raise" {
-    const before = thread.stats;
-    const A = Array(String);
-    const bc = strConcat(str("b"), str("c"));
-    const a = arrayOf(A, .{ str("a"), bc, str("d") });
-    drop(bc);
-    try std.testing.expectEqual(@as(i32, 3), arrayLen(a));
-    try expectText("bc", try arrayGet(a, 1));
-    const made = strConcat(str("x"), str("y"));
-    try arraySet(a, 0, made);
-    drop(made);
-    try expectText("xy", try arrayGet(a, 0));
-    try expectRaised(IndexOutOfRangeException, "Index was outside the bounds of the array.", arrayGet(a, 3));
-    try expectRaised(IndexOutOfRangeException, "Index was outside the bounds of the array.", arraySet(a, -1, str("z")));
-    const copy = arrayCopy(a);
-    try std.testing.expect(eql(a, copy) and a != copy);
-    try expectAny("[|\"xy\"; \"bc\"; \"d\"|]", a);
-    const part = arraySlice(a, 1, 5);
-    try expectAny("[|\"bc\"; \"d\"|]", part);
-    const none = arraySlice(a, 2, 1);
-    try expectAny("[||]", none);
-    try expectRaised(ArgumentOutOfRangeException, "The index is outside the legal range.\ncount = 5, array.Length = 3 (Parameter 'count')", arraySub(a, 1, 5));
-    const zeros = try arrayZero(Array(?i32), 2);
-    try expectAny("[|None; None|]", zeros);
-    try expectRaised(ArgumentException, "The input must be non-negative.\ncount = -1 (Parameter 'count')", arrayZero(Array(i32), -1));
-    const list = arrayToList(a);
-    const back = arrayOfList(A, list);
-    try std.testing.expect(eql(a, back));
-    for ([_]A{ a, copy, part, none, back }) |x| drop(x);
-    drop(zeros);
-    drop(list);
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "numbers: what .NET raises and returns" {
-    try std.testing.expectEqual(@as(i32, 5), try absOf(@as(i32, -5)));
-    try expectRaised(OverflowException, "Negating the minimum value of a twos complement number is invalid.", absOf(@as(i32, std.math.minInt(i32))));
-    try expectRaised(ArithmeticException, "Function does not accept floating point Not-a-Number values.", signOf(std.math.nan(f64)));
-    try std.testing.expectEqual(@as(i32, 1024), pown(@as(i32, 2), 10));
-    try std.testing.expectEqual(@as(f64, 0.25), pown(@as(f64, 2), -2));
-    try std.testing.expectEqual(@as(f64, 2), roundEven(@as(f64, 2.5)));
-    try std.testing.expectEqual(@as(f64, 4), roundEven(@as(f64, 3.5)));
-    try std.testing.expectEqual(@as(f64, -2), roundEven(@as(f64, -2.5)));
-    try std.testing.expectEqual(@as(f64, 2.57), try roundTo(@as(f64, 2.567), 2));
-    try std.testing.expectEqual(@as(i32, -7), try parseIntFs(i32, str(" -7 ")));
-    try std.testing.expectEqual(@as(i32, 31), try parseIntFs(i32, str("0x1F")));
-    try std.testing.expectEqual(@as(i32, 5), try parseIntFs(i32, str("0b101")));
-    try std.testing.expectEqual(@as(i32, 10), try parseIntFs(i32, str("1_0")));
-    try std.testing.expectEqual(@as(i64, 9223372036854775807), try parseIntFs(i64, str("9223372036854775807")));
-    try expectRaised(FormatException, "The input string '4x' was not in a correct format.", parseIntFs(i32, str("4x")));
-    try expectRaised(FormatException, "Input string was not in a correct format.", parseIntFs(i32, str("")));
-    try expectRaised(OverflowException, "Value was either too large or too small for an Int32.", parseIntFs(i32, str("99999999999")));
-    try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", parseIntFs(u8, str("256")));
-    try expectRaised(OverflowException, "Arithmetic operation resulted in an overflow.", parseIntFs(i16, str("40000")));
-    try expectRaised(OverflowException, "Value was either too large or too small for a UInt32.", parseIntFs(u16, str("-1")));
-    try expectRaised(FormatException, "The input string '0x1F' was not in a correct format.", parseInt(i32, str("0x1F")));
-    try expectRaised(OverflowException, "Value was either too large or too small for an unsigned byte.", parseInt(u8, str("300")));
-    try std.testing.expectEqual(@as(?i32, 12), tryParseInt(i32, str("12")));
-    try std.testing.expectEqual(@as(?i32, null), tryParseInt(i32, str("x")));
-    try std.testing.expectEqual(@as(f64, 1000), try parseFloat(f64, str(" 1e3 ")));
-    try std.testing.expectEqual(@as(f64, 0.5), try parseFloat(f64, str(".5")));
-    try std.testing.expect(std.math.isNan(try parseFloat(f64, str("NaN"))));
-    try std.testing.expectEqual(-std.math.inf(f64), try parseFloat(f64, str("-Infinity")));
-    try expectRaised(FormatException, "The input string 'abc' was not in a correct format.", parseFloat(f64, str("abc")));
-    try expectRaised(FormatException, "The input string 'inf' was not in a correct format.", parseFloat(f64, str("inf")));
-    try std.testing.expect(try parseBool(str("True")) and !try parseBool(str("false")));
-}
-
-test ".NET's collections: ResizeArray, Dictionary, HashSet" {
-    const before = thread.stats;
-    const R = ResizeArray(i32);
-    const r = raOfList(R, listOf(i32, &.{ 3, 1, 2 }));
-    defer drop(r);
-    raAdd(r, 5);
-    try expectAny("seq [3; 1; 2; 5]", r);
-    try expectRaised(ArgumentOutOfRangeException, "Index was out of range. Must be non-negative and less than the size of the collection. (Parameter 'index')", raGet(r, 9));
-    try expectRaised(ArgumentOutOfRangeException, "Index must be within the bounds of the List. (Parameter 'index')", raInsert(r, 9, 1));
-    try raInsert(r, 0, 9);
-    try raRemoveAt(r, 1);
-    raSort(r);
-    try expectAny("seq [1; 2; 5; 9]", r);
-    try std.testing.expect(!raContains(r, 3) and raIndexOf(r, 5) == 2 and !raRemove(r, 3));
-    const D = Dictionary(i32, String);
-    const d = htNew(D);
-    defer drop(d);
-    try dictAdd(d, 2, str("b"));
-    try dictAdd(d, 1, str("a"));
-    try dictSet(d, 3, str("c"));
-    try dictSet(d, 2, str("B"));
-    try expectAny("seq [[2, B]; [1, a]; [3, c]]", d);
-    try expectRaised(ArgumentException, "An item with the same key has already been added. Key: 1", dictAdd(d, 1, str("x")));
-    try expectRaised(KeyNotFoundException, "The given key '9' was not present in the dictionary.", dictGet(d, 9));
-    try std.testing.expect(try htRemove(d, 2));
-    try dictSet(d, 7, str("g"));
-    try expectAny("seq [[7, g]; [1, a]; [3, c]]", d);
-    try std.testing.expectEqual(@as(i32, 3), htCount(d));
-    const h = setOfList(HashSet(i32), listOf(i32, &.{ 3, 1, 3 }));
-    defer drop(h);
-    try std.testing.expect(setAdd(h, 4) and !setAdd(h, 1));
-    try expectAny("seq [3; 1; 4]", h);
-    for (0..1000) |i| try dictSet(d, @intCast(i), str("n"));
-    try std.testing.expectEqual(@as(i32, 1000), htCount(d));
-    _ = before;
-}
-
-test ".NET's ToString, Split, StringBuilder, categories" {
-    try expectText("Some(1)|(1, a)|[1; 2; 3; ... ]|[a]", format(.{
-        toText(@as(?i32, 1)), "|", toText(@as(struct { i32, String }, .{ 1, str("a") })), "|", toText(listOf(i32, &.{ 1, 2, 3, 4 })), "|", toText(listOf(String, &.{str("a")})),
-    }));
-    try expectAny("[|\"a\"; \"b\"; \"\"; \"c\"|]", try strSplitChars(str("a,b,,c"), &.{','}, std.math.maxInt(i32), 0));
-    try expectAny("[|\"a\"; \"b\"|]", try strSplitChars(str("a,,b"), &.{','}, std.math.maxInt(i32), 1));
-    try expectAny("[|\"a\"; \"b\"; \"c\"|]", try strSplitString(str("a--b--c"), str("--"), std.math.maxInt(i32), 0));
-    try expectAny("[|\"a\"; \"b\"; \"c\"|]", try strSplitChars(str("a b\tc"), &.{}, std.math.maxInt(i32), 0));
-    const sb = sbNew(str(""));
-    drop(sbAppend(sb, str("a")));
-    drop(sbAppend(sb, @as(i32, 1)));
-    drop(sbAppend(sb, @as(u16, 'c')));
-    drop(sbAppend(sb, @as(f64, 2.5)));
-    drop(sbAppend(sb, true));
-    try expectText("a1c2.5True", sbToString(sb));
-    drop(sb);
-    var sum: u32 = 0;
-    for (0..0x10000) |c| sum = sum *% 31 +% @backingInt(unicode.category(@intCast(c)));
-    // (the same sum over Char.GetUnicodeCategory on .NET 10)
-    try std.testing.expectEqual(@as(u32, 3966132137), sum);
-    try std.testing.expect(strEqualsIgnoreCase(str("abc"), str("ABC")) and strCompareIgnoreCase(str("a"), str("A")) == 0);
-    try std.testing.expectEqual(@as(f64, 7), charNumericValue('7'));
-}
-
-test "weak references see their target go" {
-    const before = thread.stats;
-    const R = *struct { @"$rc": u32 = 1, value: i32 };
-    const a = new(R, .{ .value = 7 });
-    const w = try weakNew(Weak(R), a);
-    const w2 = try weakNew(Weak(R), a);
-    const got = weakTryGet(w).?;
-    try std.testing.expectEqual(@as(i32, 7), got.value);
-    drop(got);
-    drop(a);
-    try std.testing.expect(weakTryGet(w) == null and weakTryGet(w2) == null);
-    const b = new(R, .{ .value = 8 });
-    try weakSet(w, b);
-    try std.testing.expectEqual(@as(i32, 8), weakTryGet(w).?.value);
-    drop(b);
-    drop(b);
-    drop(w);
-    drop(w2);
-    try std.testing.expectEqual(@as(usize, 0), thread.weak.count());
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "objects: parts, virtual members, type tests, cycles" {
-    const before = thread.stats;
-    const Shape = struct {
-        const Part = struct { name: String };
-        const Chain = struct { own: Part };
-        const VT = struct { area: *const fn (Obj) f64 };
-        const ty: ObjType = objType(Chain, "Probe+Shape", null, &.{null}, null);
-        pub fn name(o: Obj) String {
-            return objPart(*Part, &.{Part}, o).name;
-        }
-    };
-    const Circle = struct {
-        const Part = struct { r: f64, next: ?Obj };
-        const Chain = struct { base: Shape.Chain, own: Part };
-        pub fn area(o: Obj) f64 {
-            const r = objPart(*Part, &.{ Shape.Part, Part }, o).r;
-            return 3 * r * r;
-        }
-        const vt: Shape.VT = .{ .area = area };
-        const ty: ObjType = objType(Chain, "Probe+Circle", &Shape.ty, &.{ @ptrCast(&vt), null }, null);
-    };
-    const chain: Circle.Chain = .{ .base = .{ .own = .{ .name = str("circle") } }, .own = .{ .r = 2, .next = null } };
-    const c = objNew(&Circle.ty, chain);
-    drop(chain);
-    try expectText("circle", dup(Shape.name(c)));
-    try std.testing.expectEqual(@as(f64, 12), objVt(*const Shape.VT, c, 0).area(c));
-    try std.testing.expect(objIs(c, &Shape.ty) and objIs(c, &Circle.ty));
-    const s = try objCast(c, &Shape.ty);
-    drop(s);
-    try expectText("Probe+Circle", anyText(c));
-    // (a cycle through an object field: freed by the collector when functions can be in cycles)
-    objStore(c, &objPart(*Circle.Part, &.{ Shape.Part, Circle.Part }, c).next, dup(c));
-    drop(c);
-    _ = collect();
-    _ = before;
-}
-
-test "equality of a long list does not use the stack" {
-    var a: List(i32) = .Empty;
-    var b: List(i32) = .Empty;
-    for (0..1_000_000) |i| {
-        const na = cell(List(i32), .Cons, .{ .Head = @as(i32, @intCast(i)), .Tail = a });
-        a = .{ .Cons = na };
-        const nb = cell(List(i32), .Cons, .{ .Head = @as(i32, @intCast(i)), .Tail = b });
-        b = .{ .Cons = nb };
-    }
-    try std.testing.expect(eql(a, b));
-    const c: List(i32) = .{ .Cons = cell(List(i32), .Cons, .{ .Head = 7, .Tail = b }) };
-    try std.testing.expect(!eql(a, c));
-    drop(a);
-    drop(c);
-}
-
-test "decimal does what .NET does" {
-    const D = struct {
-        pub fn p(comptime text: []const u8) NetDecimal {
-            return decParse(str(text), true) catch unreachable;
-        }
-        pub fn is(expected: []const u8, d: NetDecimal) !void {
-            var buf: [40]u8 = undefined;
-            try std.testing.expectEqualStrings(expected, decAscii(d, &buf));
-        }
-    };
-    const p = D.p;
-    try D.is("1.10", p("1.10"));
-    try D.is("0.3333333333333333333333333333", try decDiv(p("1"), p("3")));
-    try D.is("0.6666666666666666666666666667", try decDiv(p("2"), p("3")));
-    try D.is("0.25", try decDiv(p("1"), p("4")));
-    try D.is("5", try decDiv(p("10"), p("2")));
-    try D.is("1.00", try decDiv(p("1.00"), p("1")));
-    try D.is("1.0000", try decMul(p("1.000"), p("1.0")));
-    try D.is("0.30", try decAdd(p("0.1"), p("0.20")));
-    try D.is("0.0000000000000000000000000000", try decMul(p("1e-28"), p("0.5")));
-    try D.is("0.0000000000000000000000000002", try decMul(p("3e-28"), p("0.5")));
-    try D.is("33.333333333333333333333333333", try decDiv(p("100"), p("3")));
-    try D.is("0.1428571428571428571428571429", try decDiv(p("1"), p("7")));
-    try D.is("10.000", try decSub(p("12.345"), p("2.345")));
-    try D.is("1", try decRem(p("7"), p("3")));
-    try D.is("-1.5", try decRem(p("-7.5"), p("2")));
-    try D.is("1.358024679135802467913580237", try decMul(p("1.23456789012345678901234567"), p("1.1")));
-    try D.is("20", try decDiv(p("10"), p("0.5")));
-    try D.is("0.125", try decDiv(p("1"), p("8")));
-    try D.is("2.00", try decDiv(p("4.00"), p("2")));
-    try D.is("2.5", try decDiv(p("5"), p("2.0")));
-    try D.is("0", try decDiv(p("0"), p("5.00")));
-    try D.is("1.0000000000000000000000000001", try decAdd(p("1e-28"), p("1")));
-    try D.is("79228162514264337593543950334", try decSub(p("79228162514264337593543950335"), p("0.5")));
-    try D.is("79228162514264337593543950334", try decAdd(p("79228162514264337593543950334"), p("0.5")));
-    try D.is("79.22816251426433759354395030", try decMul(p("7.92281625142643375935439503"), p("10")));
-    try expectRaised(OverflowException, "Value was either too large or too small for a Decimal.", decAdd(p("79228162514264337593543950335"), p("1")));
-    try expectRaised(DivideByZeroException, "Attempted to divide by zero.", decDiv(p("1"), p("0")));
-    try expectRaised(OverflowException, "Value was either too large or too small for an Int32.", decToInt(i32, p("1e20")));
-    try expectRaised(OverflowException, "Value was either too large or too small for an unsigned byte.", decToInt(u8, p("300")));
-    try D.is("0.1", try decOf(@as(f64, 0.1)));
-    try D.is("0.333333333333333", try decOf(@as(f64, 1.0 / 3.0)));
-    try D.is("123456789.123457", try decOf(@as(f64, 123456789.123456789)));
-    try D.is("0", try decOf(@as(f64, 1e-30)));
-    try D.is("2.5", try decOf(@as(f32, 2.5)));
-    try D.is("10000000000000000000000000000", try decOf(@as(f64, 1e28)));
-    try D.is("0.0000000000000000000123456789", try decOf(@as(f64, 1.23456789e-20)));
-    try D.is("-1234567890123460000", try decOf(@as(f64, -1234567890123456789.0)));
-    try expectRaised(OverflowException, "Value was either too large or too small for a Decimal.", decOf(@as(f64, 1e29)));
-    try std.testing.expectEqual(@as(i32, -2), try decToInt(i32, p("-2.7")));
-    try std.testing.expectEqual(@as(f64, 1.1), decToFloat(f64, p("1.1")));
-    try std.testing.expectEqual(@as(f64, 7.922816251426434e28), decToFloat(f64, p("79228162514264337593543950335")));
-    try D.is("2", decRound(p("2.5"), 0, true));
-    try D.is("-2", decRound(p("-2.5"), 0, true));
-    try D.is("3", decRound(p("2.5"), 0, false));
-    try D.is("2.34", decRound(p("2.345"), 2, true));
-    try D.is("1.00", decRound(p("1.005"), 2, true));
-    try D.is("-2", decWhole(p("-1.5"), .down));
-    try D.is("2", decWhole(p("1.2"), .up));
-    try D.is("-1", decWhole(p("-1.7"), .toward_zero));
-    try std.testing.expect(eql(p("1.0"), p("1.00")) and compare(p("2"), p("10")) == -1 and hash(p("1.0")) == hash(p("1.00")));
-    try D.is("1000.5", try decParse(str("1,000.5"), false));
-    try expectRaised(FormatException, "The input string '1e3' was not in a correct format.", decParse(str("1e3"), false));
-    try D.is("1000", p("1e3"));
-    try D.is("0.1234567890123456789012345679", p("0.123456789012345678901234567890123"));
-    try expectRaised(OverflowException, "Value was either too large or too small for a Decimal.", decParse(str("99999999999999999999999999999"), false));
-    try expectRaised(FormatException, "The input string '1.5x' was not in a correct format.", decParse(str("1.5x"), false));
-    try D.is("0.000", p("-0.000"));
-    try expectText("2.35|1,234.50|1.500000|1.57|1.5|1.10|  2.25|1.10M", format(.{ arg(.{ .net = "F2" }, p("2.345")), "|", arg(.{ .net = "N2" }, p("1234.5")), "|", arg(.{ .kind = 'f' }, p("1.5")), "|", arg(.{ .kind = 'f', .precision = 2 }, p("1.567")), "|", arg(.{ .kind = 'g' }, p("1.5")), "|", p("1.10"), "|", arg(.{ .kind = 'M', .width = 6 }, p("2.25")), "|", anyText(p("1.10")) }));
-}
-
-test "bigint does what .NET does" {
-    const before = thread.stats;
-    const a = bigLit("123456789012345678901234567890");
-    defer drop(a);
-    const sq = bigMul(a, a);
-    defer drop(sq);
-    try expectText("15241578753238836750495351562536198787501905199875019052100", bigText(sq));
-    const seven = bigOf(@as(i32, 7));
-    defer drop(seven);
-    const q = try bigDivRem(a, seven, true);
-    defer drop(q);
-    try expectText("17636684144620811271604938270", bigText(q));
-    const na = bigNeg(a);
-    defer drop(na);
-    const nq = try bigDivRem(na, seven, true);
-    defer drop(nq);
-    try expectText("-17636684144620811271604938270", bigText(nq));
-    const two = bigOf(@as(i32, 2));
-    defer drop(two);
-    const p = try bigPow(two, 100);
-    defer drop(p);
-    try expectText("1267650600228229401496703205376", bigText(p));
-    const zero = bigOf(@as(i32, 0));
-    defer drop(zero);
-    try expectRaised(DivideByZeroException, "Attempted to divide by zero.", bigDivRem(a, zero, true));
-    try expectRaised(OverflowException, "Value was either too large or too small for an Int32.", bigToInt(i32, a));
-    try expectRaised(FormatException, "The value could not be parsed.", bigParse(str("12x")));
-    const parsed = try bigParse(str(" -123 "));
-    defer drop(parsed);
-    try expectText("-123", bigText(parsed));
-    try std.testing.expect(compare(a, seven) == 1 and eql(a, a) and !eql(a, seven));
-    try std.testing.expectEqual(@as(i32, 42), try bigToInt(i32, bigOf(@as(i32, 42))));
-    try std.testing.expectEqual(@as(f64, 1.2345678901234568e29), bigToFloat(f64, a));
-    try expectText("a=123456789012345678901234567890", format(.{ "a=", a }));
-    _ = before;
-}
-
-test "conv follows .NET" {
-    try std.testing.expectEqual(@as(i32, -1), conv(i32, @as(u32, 0xFFFF_FFFF)));
-    try std.testing.expectEqual(@as(u8, 0x34), conv(u8, @as(i32, 0x1234)));
-    try std.testing.expectEqual(@as(i64, -5), conv(i64, @as(i32, -5)));
-    try std.testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFB), conv(u64, @as(i32, -5)));
-    try std.testing.expectEqual(@as(i32, 3), conv(i32, @as(f64, 3.99)));
-    try std.testing.expectEqual(@as(i32, -3), conv(i32, @as(f64, -3.99)));
-    try std.testing.expectEqual(@as(i32, 2147483647), conv(i32, @as(f64, 1e30)));
-    try std.testing.expectEqual(@as(i32, 0), conv(i32, std.math.nan(f64)));
-    try std.testing.expectEqual(@as(f64, 7.0), conv(f64, @as(i32, 7)));
-}
-
-test "box" {
-    const a = box(@as(i32, 5));
-    const b = box(@as(i32, 5));
-    const c = box(str("x"));
-    defer drop(a);
-    defer drop(b);
-    defer drop(c);
-    try std.testing.expect(eql(a, b));
-    try std.testing.expect(!eql(a, c));
-    try std.testing.expect(!refEql(a, b));
-    try std.testing.expect(isType(i32, a));
-    try std.testing.expect(!isType(i64, a));
-    try std.testing.expectEqual(@as(i32, 5), try unbox(i32, a));
-    try std.testing.expectEqual(hash(@as(i32, 5)), hash(a));
-    try std.testing.expectEqual(@as(i32, 0), compare(a, b));
-    try std.testing.expectError(error.Raised, unbox(i64, a));
-    drop(take());
-    const t = try anyToString(c, false);
-    defer drop(t);
-    try std.testing.expect(strEql(t, str("x")));
-    try std.testing.expect(box(@as(String, null)) == null);
-    try std.testing.expect(box({}) == null);
-    try std.testing.expect(isType(void, null));
-    try std.testing.expect(!isType(void, a));
-    try std.testing.expect(tryUnbox(?void, null) != null);
-    try std.testing.expect(tryUnbox(?void, a) == null);
-    try std.testing.expectEqual({}, try unbox(void, box({})));
-    try std.testing.expectError(error.Raised, unbox(void, a));
-    drop(take());
-}
-
-test "Random(seed) gives .NET's numbers" {
-    const r = randomNew(1234);
-    defer drop(r);
-    // (what `Random(1234)` gives on .NET: Next(), Next(100), Next(1000, 10000), NextDouble())
-    try std.testing.expectEqual(@as(i32, 857019877), randomNext(r));
-    try std.testing.expectEqual(@as(i32, 89), try randomNextMax(r, 100));
-    try std.testing.expectEqual(@as(i32, 3872), try randomNextRange(r, 1000, 10000));
-    try std.testing.expectEqual(@as(f64, 0.9467375338760845), randomNextDouble(r));
-    const b = arrayFrom(Array(u8), allocator.alloc(u8, 6) catch unreachable);
-    defer drop(b);
-    const r2 = randomNew(5432);
-    defer drop(r2);
-    randomNextBytes(r2, b);
-    try std.testing.expectEqualSlices(u8, &.{ 152, 238, 227, 30, 153, 56 }, b.items);
-    const r3 = randomNew(-7);
-    defer drop(r3);
-    try std.testing.expectEqual(@as(i32, 766440938), try randomNextRange(r3, -2000000000, 2000000000));
-    try std.testing.expectEqual(@as(i32, 1419354884), randomNext(r3));
-}
-
-test "TypeShape formats voption, struct tuple, u16_num, and recursive unions" {
-    const vopt_int: TypeShape = .{ .nodes = &.{.{ .kind = .vopt, .a = ShowNode.auto }} };
-    try expectText("ValueSome 42", anyTextShape(vopt_int, @as(?i32, 42)));
-    try expectText("ValueNone", anyTextShape(vopt_int, @as(?i32, null)));
-    try expectText("42", toTextShape(vopt_int, @as(?i32, 42)));
-    try expectText("ValueNone", toTextShape(vopt_int, @as(?i32, null)));
-
-    const vopt_st_num: TypeShape = .{
-        .nodes = &.{
-            .{ .kind = .vopt, .a = 1 },
-            .{ .kind = .struct_tuple, .a = 0, .b = 2 },
-            .{ .kind = .u16_num },
-        },
-        .refs = &.{ ShowNode.auto, 2 },
-    };
-    const p1: ?struct { i32, c_ushort } = .{ 7, 16 };
-    try expectText("ValueSome struct (7, 16us)", anyTextShape(vopt_st_num, p1));
-    try expectText("(7, 16)", toTextShape(vopt_st_num, p1));
-
-    const Tree = union(enum) {
-        Leaf: struct { Value: ?c_ushort },
-        Pair: struct { Left: struct { ?i32, bool }, Right: void },
-    };
-    const tree_shape: TypeShape = .{
-        .nodes = &.{
-            .{ .kind = .@"union", .a = 0, .b = 2 },
-            .{ .kind = .record, .a = 2, .b = 1 },
-            .{ .kind = .vopt, .a = 3 },
-            .{ .kind = .u16_num },
-            .{ .kind = .record, .a = 3, .b = 2 },
-            .{ .kind = .struct_tuple, .a = 5, .b = 2 },
-        },
-        .refs = &.{ 1, 4, 2, 5, ShowNode.auto, ShowNode.auto, ShowNode.auto },
-    };
-    const t1: Tree = .{ .Leaf = .{ .Value = 65 } };
-    const t2: Tree = .{ .Pair = .{ .Left = .{ 9, true }, .Right = {} } };
-    const t3: Tree = .{ .Leaf = .{ .Value = null } };
-    try expectText("Leaf (ValueSome 65us)", anyTextShape(tree_shape, t1));
-    try expectText("Leaf ValueNone", anyTextShape(tree_shape, t3));
-    try expectText("Pair (struct (Some 9, true), ())", anyTextShape(tree_shape, t2));
-}
-
-test "managed span operations maintain reference counts" {
-    const start_stats = thread.stats;
-    {
-        const arr = arrays.arrayOf(Array(String), .{ str("a"), str("b"), str("c") });
-        defer drop(arr);
-        const sp = arr.items;
-
-        const dyn1 = strConcat(str("d"), str("1"));
-        defer drop(dyn1);
-        try spanSet(sp, 1, dyn1);
-        try std.testing.expect(strEql(sp[1], str("d1")));
-
-        const dyn2 = strConcat(str("f"), str("2"));
-        defer drop(dyn2);
-        spanFill(sp[0..2], dyn2);
-        try std.testing.expect(strEql(sp[0], str("f2")));
-        try std.testing.expect(strEql(sp[1], str("f2")));
-        try std.testing.expect(strEql(sp[2], str("c")));
-
-        const copied = spanToArray(Array(String), sp[1..]);
-        defer drop(copied);
-        try std.testing.expectEqual(@as(usize, 2), copied.items.len);
-        try std.testing.expect(strEql(copied.items[0], str("f2")));
-        try std.testing.expect(strEql(copied.items[1], str("c")));
-
-        // Overlapping forward & backward CopyTo
-        const s_hi = strConcat(str("h"), str("i"));
-        defer drop(s_hi);
-        try spanSet(sp, 0, s_hi);
-        try spanCopyTo(sp[0..2], sp[1..3]);
-        try std.testing.expect(strEql(sp[0], str("hi")));
-        try std.testing.expect(strEql(sp[1], str("hi")));
-        try std.testing.expect(strEql(sp[2], str("f2")));
-
-        try spanClear(sp);
-        try std.testing.expect(sp[0] == null and sp[1] == null and sp[2] == null);
-    }
-    try std.testing.expectEqual(start_stats.allocs - start_stats.frees, thread.stats.allocs - thread.stats.frees);
-}
-
-test "culture string comparison matches .NET InvariantCulture weights" {
-    try std.testing.expectEqual(@as(i32, 1), try strCompareTo(str("ABC"), str("abc")));
-    try std.testing.expectEqual(@as(i32, -1), try strCompareTo(str("aBc"), str("Abc")));
-    try std.testing.expectEqual(@as(i32, -1), strCompareCulture(str("ab"), str("ABC"), false));
-    try std.testing.expectEqual(@as(i32, -1), strCompareCulture(str("_"), str("0"), false));
-    try std.testing.expectEqual(@as(i32, -1), strCompareCulture(str("0"), str("a"), false));
-    try std.testing.expectEqual(@as(i32, 0), strCompareCulture(str("ABC"), str("abc"), true));
-    try std.testing.expect(try strCompareCultureRange(str("ABC"), 1, str("bcd"), 0, 2, false) > 0);
-    try std.testing.expectEqual(@as(i32, 0), try strCompareRangeWith(str("ABC"), 1, str("bcd"), 0, 2, 5));
-    try std.testing.expect(try strStartsWithOpt(str("ABCD"), str("ab"), true));
-    try std.testing.expect(try strEndsWithOpt(str("ABCD"), str("cd"), true));
-    try std.testing.expectEqual(@as(i32, 1), try strIndexOfCharIgnoreCase(str("aBc"), 'B'));
-    // (pairs checked with .NET: accents after the base letter, expansions, ignorable control
-    // chars, letters without a base after their neighbour; the table was also checked against
-    // 3,000 random pairs over U+0000..U+024F, see fable_collation.zig)
-    const pairs = .{
-        .{ "e", "é", -1 },
-        .{ "é", "f", -1 },
-        .{ "z", "é", 1 },
-        .{ "co-op", "coop", -1 },
-        .{ "a-b", "ab", -1 },
-        .{ "Æ", "AE", 1 },
-        .{ "ss", "ß", -1 },
-        .{ "résumé", "resume", 1 },
-        .{ "ı", "z", -1 },
-        .{ "o", "ı", 1 },
-        .{ "\u{1}", "", 0 },
-        .{ "\u{a0}", " ", 1 },
-        .{ "file10", "file9", -1 },
-        .{ "a", "A", -1 },
-    };
-    inline for (pairs) |t| {
-        try std.testing.expectEqual(@as(i32, t[2]), strCompareCulture(str(t[0]), str(t[1]), false));
-    }
-}
-
-test "exception stack trace is null before throw and captured on throw" {
-    const start_stats = thread.stats;
-    {
-        const e0 = Failure.new(.{ .Message = str("unthrown") });
-        defer drop(e0);
-        try std.testing.expect(exnStackTrace(e0) == null);
-
-        throw(dup(e0));
-        const caught = take();
-        defer drop(caught);
-        const trace = exnStackTrace(caught);
-        defer drop(trace);
-        try std.testing.expect(trace != null);
-        try std.testing.expect(unitsOf(trace).len > 0);
-    }
-    try std.testing.expectEqual(start_stats.allocs - start_stats.frees, thread.stats.allocs - thread.stats.frees);
-}
-
-
-// ---- values shared between threads ----
-
-const ShareTestList = List(String);
-const ShareTestRec = *struct { @"$rc": u32 = 1, name: String, items: ShareTestList };
-
-fn shareTestList(n: usize) ShareTestList {
-    var l: ShareTestList = .Empty;
-    var i: usize = 0;
-    while (i < n) : (i += 1) l = ShareTestList{ .Cons = cell(ShareTestList, .Cons, .{ .Head = strConcat(str("x"), str("y")), .Tail = l }) };
-    return l;
-}
-
-fn shareTestReader(r: ShareTestRec, out: *usize) void {
-    var k: usize = 0;
-    var round: usize = 0;
-    while (round < 2000) : (round += 1) {
-        const mine = dup(r);
-        var cur = dup(mine.items);
-        while (true) {
-            switch (cur) {
-                .Empty => break,
-                .Cons => |c| {
-                    k += 1;
-                    const next = dup(c.Tail);
-                    drop(cur);
-                    cur = next;
-                },
-            }
-        }
-        drop(mine);
-    }
-    out.* = k;
-    drop(r);
-}
-
-test "a value shared between threads is counted atomically and freed once" {
-    const before = thread.stats;
-    const r = new(ShareTestRec, .{ .name = strConcat(str("a"), str("b")), .items = shareTestList(100_000) });
-    try markShared(r);
-    var outs: [4]usize = @splat(0);
-    var ts: [4]std.Thread = undefined;
-    for (&ts, &outs) |*t, *o| t.* = try std.Thread.spawn(.{}, shareTestReader, .{ dup(r), o });
-    for (ts) |t| t.join();
-    for (outs) |o| try std.testing.expectEqual(@as(usize, 2000 * 100_000), o);
-    drop(r);
-    // (allocations on this thread; frees happened on whichever thread let go last: this one)
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "native integers and SGC header compile cleanly across pointer widths" {
-    try std.testing.expectEqual(@sizeOf(sgc.Hdr), 3 * @sizeOf(*sgc.Hdr) + 12);
-    const n: isize = -7;
-    const u: usize = 42;
-    try std.testing.expectEqual(@as(i32, -7), conv(i32, n));
-    try std.testing.expectEqual(@as(u32, 42), conv(u32, u));
-    try std.testing.expectEqual(@as(usize, 42), conv(usize, @as(u64, 42)));
-    try std.testing.expectEqual(@as(isize, -7), conv(isize, @as(i64, -7)));
-    try std.testing.expectEqual(@as(i32, 42), hash(u));
-    try std.testing.expectEqual(if (@bitSizeOf(isize) == 64) @as(i32, 6) else @as(i32, -7), hash(n));
-    const big_u: u64 = std.math.maxInt(u64);
-    _ = hash(big_u);
-}
-
-test "fat-pointer interface: zero-alloc class cast, upcast, and round-trip downcast" {
-    const Part = struct { x: i32 };
-    const Chain = struct { own: Part };
-    const cls_ty: ObjType = objType(Chain, "RtTestClass", null, &.{}, null);
-
-    const ISubVt = struct {
-        @"$meta": *const IfaceMeta,
-        Get: *const fn (?*anyopaque, void) Raised!i32,
-    };
-    const ISub = Iface(ISubVt);
-    const IBaseVt = struct {
-        @"$meta": *const IfaceMeta,
-        Get: *const fn (?*anyopaque, void) Raised!i32,
-    };
-    const IBase = Iface(IBaseVt);
-
-    const SubClsImpl = struct {
-        fn get(d: ?*anyopaque, _: void) Raised!i32 {
-            const o: Obj = @ptrCast(@alignCast(d.?));
-            return objPart(*Part, &.{Part}, o).x;
-        }
-        const vt: ISubVt = .{
-            .@"$meta" = &obj_iface_meta,
-            .Get = &get,
-        };
-    };
-    const BaseUpcastImpl = struct {
-        fn get(d: ?*anyopaque, u: void) Raised!i32 {
-            const sub = boxed(ISub, @ptrCast(@alignCast(d.?))).value;
-            return sub.vt.Get(sub.data, u);
-        }
-        const vt: IBaseVt = .{
-            .@"$meta" = upcastIfaceMeta(ISub),
-            .Get = &get,
-        };
-    };
-
-    const before = thread.stats;
-    {
-        const obj = objNew(&cls_ty, Chain{ .own = .{ .x = 42 } });
-        const after_obj = thread.stats.allocs;
-
-        // Zero-alloc class -> interface view
-        const sub: ?ISub = ISub{ .data = @ptrCast(obj), .vt = &SubClsImpl.vt };
-        try std.testing.expectEqual(after_obj, thread.stats.allocs);
-        try std.testing.expectEqual(@as(i32, 42), try sub.?.vt.Get(sub.?.data, {}));
-        try std.testing.expect(ifaceIsClass(sub, &cls_ty));
-
-        // Round-trip class downcast
-        const back_any = try ifaceCastClass(sub, &cls_ty);
-        defer drop(back_any);
-        try std.testing.expectEqual(obj, back_any.?);
-
-        // Upcast ISub -> IBase & round-trip downcasts to both ISub and class
-        const base: ?IBase = ifaceBox(IBase, ISub, sub.?, &BaseUpcastImpl.vt);
-        defer drop(base);
-        try std.testing.expectEqual(@as(i32, 42), try base.?.vt.Get(base.?.data, {}));
-        try std.testing.expect(ifaceIsClass(base, &cls_ty));
-
-        const back_sub = try ifaceUnbox(?ISub, base);
-        defer drop(back_sub);
-        try std.testing.expectEqual(@as(i32, 42), try back_sub.?.vt.Get(back_sub.?.data, {}));
-
-        const back_cls = try ifaceCastClass(base, &cls_ty);
-        defer drop(back_cls);
-        try std.testing.expectEqual(obj, back_cls.?);
-
-        // Boxed interface preserves wrapper for unbox(?ISub) while delegating class identity & refEql
-        const boxed_sub = box(sub);
-        defer drop(boxed_sub);
-        try std.testing.expect(isType(?ISub, boxed_sub));
-        const unboxed_sub = try unbox(?ISub, boxed_sub);
-        defer drop(unboxed_sub);
-        try std.testing.expectEqual(@as(i32, 42), try unboxed_sub.?.vt.Get(unboxed_sub.?.data, {}));
-        try std.testing.expect(anyIsClass(boxed_sub, &cls_ty));
-        const cast_cls = try anyToClass(boxed_sub, &cls_ty);
-        defer drop(cast_cls);
-        try std.testing.expectEqual(obj, cast_cls.?);
-        try std.testing.expect(refEql(sub, sub));
-        try std.testing.expect(refEql(sub, back_sub));
-        try std.testing.expect(refEql(@as(Any, obj), boxed_sub));
-        try std.testing.expect(refEql(@as(?ISub, null), @as(?ISub, null)));
-        try std.testing.expect(!refEql(sub, @as(?ISub, null)));
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "closure2 and apply2: zero intermediate closure alloc and exception-edge drops" {
-    const Inner = Func(*const fn (?*Env, String) Raised!i32);
-    const Outer = Func(*const fn (?*Env, i32) Raised!Inner);
-    const Caps = struct { base: i32 };
-    const Impl = struct {
-        fn innerCode(env: ?*Env, b: String) Raised!i32 {
-            defer drop(b);
-            const c = captured(Caps, env);
-            return c.base + @as(i32, @intCast(unitsOf(b).len));
-        }
-        fn code(env: ?*Env, a: i32) Raised!Inner {
-            const c = captured(Caps, env);
-            return closure(Inner, Caps, .{ .base = c.base + a }, innerCode);
-        }
-        fn code2(env: ?*Env, a: i32, b: String) Raised!i32 {
-            defer drop(b);
-            const c = captured(Caps, env);
-            return c.base + a + @as(i32, @intCast(unitsOf(b).len));
-        }
-        fn raisingFirst(_: ?*Env, _: i32) Raised!Inner {
-            return raise(ArgumentException, str("boom"));
-        }
-    };
-
-    const before = thread.stats;
-    {
-        const f = closure2(Outer, Caps, .{ .base = 10 }, Impl.code, Impl.code2);
-        defer drop(f);
-
-        const s1 = strConcat(str("he"), str("llo"));
-        const after_s1 = thread.stats.allocs;
-        const r1 = try apply2(i32, f, 5, s1);
-        try std.testing.expectEqual(@as(i32, 20), r1);
-        // apply2 invoked code2 directly without allocating an Inner closure Env.
-        try std.testing.expectEqual(after_s1, thread.stats.allocs);
-
-        // Partial application still works through 1-arg code.
-        const g = try f.code(f.env, 5);
-        defer drop(g);
-        const s2 = strConcat(str("wo"), str("rld"));
-        try std.testing.expectEqual(@as(i32, 20), try g.code(g.env, s2));
-
-        // When 1-arg code raises inside apply2, owned second argument b must be dropped.
-        const failing: Outer = .{ .env = null, .code = Impl.raisingFirst };
-        const s3 = strConcat(str("le"), str("ak?"));
-        const res = apply2(i32, failing, 1, s3);
-        try std.testing.expectError(error.Raised, res);
-        drop(take());
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "arraySetAt, dropAll, callM/xcallM, and exn_show" {
-    const before = thread.stats;
-    {
-        const A = Array(String);
-        const arr = arrayOf(A, .{ str("a"), str("b") });
-        const s = strConcat(str("c"), str("d"));
-        arraySetAt(arr, 1, s);
-        drop(s);
-        try expectText("cd", try arrayGet(arr, 1));
-
-        const p1 = strConcat(str("p"), str("1"));
-        const p2 = strConcat(str("p"), str("2"));
-        dropAll(.{ arr, p1, p2 });
-
-        const Nums = Array(i32);
-        const nums = arrayOf(Nums, .{ 1, 2, 3 });
-        arraySetAt(nums, 0, 42);
-        try std.testing.expectEqual(@as(i32, 42), arrayItemAt(nums, 0));
-        drop(nums);
-
-        const Mod = struct {
-            pub fn echo(x: String) Raised!String {
-                if (unitsOf(x).len == 0) return raise(ArgumentException, str("empty"));
-                return dup(x);
-            }
-            pub const @"echo$sig" = .{ .borrows = .{ true }, .result_borrowed = false };
-
-            pub fn plainOk(n: i32) i32 {
-                return n + 1;
-            }
-        };
-
-        const src = strConcat(str("hi"), str("!"));
-        const echoed = try xcallM(Mod, "echo", "k", .{ src }, .{});
-        try expectText("hi!", echoed);
-        try expectText("hi!", dup(src));
-
-        const held = strConcat(str("he"), str("ld"));
-        const fail_arg = str("");
-        try std.testing.expectError(error.Raised, xcallM(Mod, "echo", "g", .{ fail_arg }, .{ src, held }));
-        drop(take());
-
-        try std.testing.expectEqual(@as(i32, 8), try xcallPlain(Mod.plainOk(7), .{}));
-        try std.testing.expect(exn_show);
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "an array that does not fit raises OutOfMemoryException" {
-    const saved = allocator;
-    defer allocator = saved;
-    // (an allocator that refuses what is larger than a page, as a heap does what it cannot fit)
-    const Big = struct {
-        var base: std.mem.Allocator = undefined;
-        fn bigAlloc(_: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
-            if (len > 4096) return null;
-            return base.rawAlloc(len, a, ra);
-        }
-        fn bigResize(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
-            return base.rawResize(m, a, n, ra);
-        }
-        fn bigRemap(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
-            return base.rawRemap(m, a, n, ra);
-        }
-        fn bigFree(_: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
-            base.rawFree(m, a, ra);
-        }
-        const vt: std.mem.Allocator.VTable = .{ .alloc = bigAlloc, .resize = bigResize, .remap = bigRemap, .free = bigFree };
-    };
-    Big.base = saved;
-    allocator = .{ .ptr = undefined, .vtable = &Big.vt };
-    const A = Array(i64);
-    try std.testing.expectError(error.Raised, arrayZero(A, 1000));
-    allocator = saved;
-    const e = take();
-    try std.testing.expectEqualStrings("System.OutOfMemoryException", e.type.name);
-    drop(e);
-}
-
-test "invokeK: Known 1-arg, curried 2-arg with/without call2, borrowing, error drops, and Func fallback" {
-    const before = thread.stats;
-    {
-        const s_prefix = strConcat(str("pre:"), str(""));
-        defer drop(s_prefix);
-
-        const KLen = struct {
-            pub const fable_known = {};
-            caps: struct { c0: String },
-            pub const borrows = .{true};
-            pub const result_borrowed = false;
-            pub inline fn call(self: *const @This(), x: String) i32 {
-                return @as(i32, @intCast(unitsOf(self.caps.c0).len + unitsOf(x).len));
-            }
-        };
-
-        const item1 = strConcat(str("ab"), str("c"));
-        defer drop(item1);
-        const r_keep = try invokeK(i32, KLen{ .caps = .{ .c0 = s_prefix } }, "k", .{item1}, .{});
-        try std.testing.expectEqual(@as(i32, 7), r_keep);
-
-        const item2 = strConcat(str("de"), str("fg"));
-        const r_give = try invokeK(i32, KLen{ .caps = .{ .c0 = s_prefix } }, "g", .{item2}, .{});
-        try std.testing.expectEqual(@as(i32, 8), r_give);
-
-        const Inner = Func(*const fn (?*Env, String) Raised!i32);
-        const Caps = struct { base: i32 };
-        const CurriedImpl = struct {
-            fn inner(env: ?*Env, b: String) Raised!i32 {
-                defer drop(b);
-                const c = captured(Caps, env);
-                return c.base + @as(i32, @intCast(unitsOf(b).len));
-            }
-            fn stage1(a: i32) Inner {
-                return closure(Inner, Caps, .{ .base = a }, inner);
-            }
-        };
-        const KCurried2 = struct {
-            pub const fable_known = {};
-            caps: struct { c0: i32 },
-            pub const borrows = .{false};
-            pub const result_borrowed = false;
-            pub const borrows2 = .{ false, true };
-            pub const result_borrowed2 = false;
-            pub inline fn call(self: *const @This(), a: i32) Inner {
-                return CurriedImpl.stage1(self.caps.c0 + a);
-            }
-            pub inline fn call2(self: *const @This(), a: i32, b: String) i32 {
-                return self.caps.c0 + a + @as(i32, @intCast(unitsOf(b).len));
-            }
-        };
-        const KCurried1 = struct {
-            pub const fable_known = {};
-            caps: struct { c0: i32 },
-            pub const borrows = .{false};
-            pub const result_borrowed = false;
-            pub inline fn call(self: *const @This(), a: i32) Inner {
-                return CurriedImpl.stage1(self.caps.c0 + a);
-            }
-        };
-        const KRaise1 = struct {
-            pub const fable_known = {};
-            pub const borrows = .{true};
-            pub const result_borrowed = false;
-            pub inline fn call(_: *const @This(), x: String) Raised!Inner {
-                _ = x;
-                return raise(ArgumentException, str("boom1"));
-            }
-        };
-
-        const item3 = strConcat(str("x"), str("yz"));
-        const allocs_before = thread.stats.allocs;
-        try std.testing.expectEqual(@as(i32, 18), try invokeK(i32, KCurried2{ .caps = .{ .c0 = 10 } }, "pg", .{ @as(i32, 5), item3 }, .{}));
-        try std.testing.expectEqual(allocs_before, thread.stats.allocs);
-
-        const item4 = strConcat(str("w"), str("xyz"));
-        try std.testing.expectEqual(@as(i32, 19), try invokeK(i32, KCurried1{ .caps = .{ .c0 = 10 } }, "pg", .{ @as(i32, 5), item4 }, .{}));
-
-        const held = strConcat(str("he"), str("ld"));
-        const arg_a = strConcat(str("aa"), str("a"));
-        const arg_b = strConcat(str("bb"), str("b"));
-        try std.testing.expectError(error.Raised, invokeK(i32, KRaise1{}, "gg", .{ arg_a, arg_b }, .{held}));
-        drop(take());
-
-        // Ordinary Func fallback
-        const Fn1 = Func(*const fn (?*Env, String) Raised!i32);
-        const f_fallback: Fn1 = .{ .env = null, .code = struct {
-            fn f(_: ?*Env, s: String) Raised!i32 {
-                defer drop(s);
-                return @as(i32, @intCast(unitsOf(s).len));
-            }
-        }.f };
-        defer drop(f_fallback);
-        try std.testing.expectEqual(@as(i32, 3), try invokeK(i32, f_fallback, "k", .{item1}, .{}));
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "callHofM and callHofG: callK dispatch, noescape mixed args, toFunc fallback with borrow/own" {
-    const before = thread.stats;
-    {
-        const s_cap = strConcat(str("pre:"), str(""));
-        defer drop(s_cap);
-
-        const Fn1 = Func(*const fn (?*Env, String) Raised!i32);
-        const Caps = struct { c0: String };
-        const Kn1 = struct {
-            pub const fable_known = {};
-            pub const FuncType = Fn1;
-            caps: struct { c0: String },
-            pub const borrows = .{true};
-            pub const result_borrowed = false;
-            pub inline fn call(self: *const @This(), x: String) i32 {
-                return @as(i32, @intCast(unitsOf(self.caps.c0).len + unitsOf(x).len));
-            }
-            pub fn toFunc(self: @This()) FuncType {
-                const Adapter = struct {
-                    fn code(env: ?*Env, a0: String) Raised!i32 {
-                        defer drop(a0);
-                        const c = captured(Caps, env);
-                        return @as(i32, @intCast(unitsOf(c.c0).len + unitsOf(a0).len));
-                    }
-                };
-                return closure(FuncType, Caps, .{ .c0 = dup(self.caps.c0) }, Adapter.code);
-            }
-        };
-
-        const Mod = struct {
-            pub fn withK(f: Fn1, s: String) Raised!i32 {
-                defer drop(f);
-                return f.code(f.env, s);
-            }
-            pub fn @"withK$k"(f: anytype, s: String) Raised!i32 {
-                return invokeK(i32, f, "g", .{s}, .{});
-            }
-            pub const @"withK$sig" = .{ .borrows = .{ false, false }, .result_borrowed = false };
-            pub const @"withK$noescape" = .{ true, false };
-
-            pub fn escBorrow(f: Fn1, s: String) Raised!i32 {
-                return f.code(f.env, s);
-            }
-            pub const @"escBorrow$sig" = .{ .borrows = .{ true, false }, .result_borrowed = false };
-
-            pub fn escOwn(f: Fn1, s: String) Raised!i32 {
-                defer drop(f);
-                return f.code(f.env, s);
-            }
-            pub const @"escOwn$sig" = .{ .borrows = .{ false, false }, .result_borrowed = false };
-
-            pub fn escRaise(f: Fn1, s: String) Raised!i32 {
-                _ = f;
-                drop(s);
-                return raise(ArgumentException, str("boom-hof"));
-            }
-            pub const @"escRaise$sig" = .{ .borrows = .{ true, false }, .result_borrowed = false };
-
-            pub fn gen(comptime T: type) type {
-                _ = T;
-                return struct {
-                    pub const sig = .{ .borrows = .{ true, false }, .result_borrowed = false };
-                    pub const noescape = .{ true, false };
-                    pub fn call(f: Fn1, s: String) Raised!i32 {
-                        return f.code(f.env, s);
-                    }
-                    pub fn callK(f: anytype, s: String) Raised!i32 {
-                        return invokeK(i32, f, "g", .{s}, .{});
-                    }
-                };
-            }
-        };
-
-        const k_val = Kn1{ .caps = .{ .c0 = s_cap } };
-
-        // No-escape module call: 0 heap env allocs beyond string arg
-        const s1 = strConcat(str("ab"), str("c"));
-        const a0 = thread.stats.allocs;
-        try std.testing.expectEqual(@as(i32, 7), try xcallHofM(Mod, "withK", "gg", .{ k_val, s1 }, .{}));
-        try std.testing.expectEqual(a0, thread.stats.allocs);
-
-        // No-escape generic call: 0 heap env allocs
-        const s2 = strConcat(str("de"), str("fg"));
-        const a1 = thread.stats.allocs;
-        try std.testing.expectEqual(@as(i32, 8), try callHofG(Mod.gen(String), "gg", .{ k_val, s2 }, .{}));
-        try std.testing.expectEqual(a1, thread.stats.allocs);
-
-        // Escaping callK-less module HOFs: toFunc() fallback (borrows=true and borrows=false), plus error unwind drop
-        const s3 = strConcat(str("hi"), str(""));
-        try std.testing.expectEqual(@as(i32, 6), try callHofM(Mod, "escBorrow", "gg", .{ k_val, s3 }, .{}));
-
-        const s4 = strConcat(str("jk"), str("l"));
-        try std.testing.expectEqual(@as(i32, 7), try callHofM(Mod, "escOwn", "gg", .{ k_val, s4 }, .{}));
-
-        const s5 = strConcat(str("mn"), str("o"));
-        const held = strConcat(str("he"), str("ld"));
-        try std.testing.expectError(error.Raised, xcallHofM(Mod, "escRaise", "gg", .{ k_val, s5 }, .{held}));
-        drop(take());
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "acrossAssumed: borrowed return without dup, generic form, empty result_from, and raise cleanup" {
-    const before = thread.stats;
-    {
-        const s_owned = strConcat(str("hello "), str("world"));
-        defer drop(s_owned);
-
-        const s_extra = strConcat(str("ex"), str("tra"));
-
-        const Mod = struct {
-            pub fn idStr(s: String, n: i32) String {
-                _ = n;
-                return s;
-            }
-            pub const @"idStr$sig" = .{ .borrows = .{ true, false }, .result_borrowed = true, .result_from = .{0} };
-
-            pub fn constStr(s: String) String {
-                _ = s;
-                return str("lit");
-            }
-            pub const @"constStr$sig" = .{ .borrows = .{true}, .result_borrowed = true, .result_from = .{} };
-
-            pub fn borrowAndRaise(s: String) Raised!String {
-                _ = s;
-                return raise(ArgumentException, str("boom-assumed"));
-            }
-            pub const @"borrowAndRaise$sig" = .{ .borrows = .{true}, .result_borrowed = true, .result_from = .{0} };
-
-            pub fn gen(comptime T: type) type {
-                _ = T;
-                return struct {
-                    pub fn call(x: String, drop_me: String) String {
-                        _ = drop_me;
-                        return x;
-                    }
-                    pub const sig = .{ .borrows = .{ true, true }, .result_borrowed = true, .result_from = .{0} };
-                };
-            }
-        };
-
-        // Module callAssumedM: 0 RC dups and 0 allocs on borrowed result
-        const b0 = thread.stats;
-        const r1 = callAssumedM(Mod, "idStr", .{0}, "kp", .{ s_owned, @as(i32, 42) }, .{});
-        try std.testing.expect(strEql(s_owned, r1));
-        try std.testing.expectEqual(b0.allocs, thread.stats.allocs);
-        try std.testing.expectEqual(b0.dups, thread.stats.dups);
-
-        // Empty result_from = .{}
-        const r2 = callAssumedM(Mod, "constStr", .{}, "k", .{s_owned}, .{});
-        try std.testing.expect(strEql(str("lit"), r2));
-
-        // Generic callAssumedG with one 'k' borrowed source and one 'g' borrowed dead arg
-        const r3 = callAssumedG(Mod.gen(String), .{0}, "kg", .{ s_owned, s_extra }, .{});
-        try std.testing.expect(strEql(s_owned, r3));
-
-        // Raise edge drops err_drops even though source arg is 'k'
-        const s_err_drop = strConcat(str("drop"), str("me"));
-        try std.testing.expectError(error.Raised, xcallAssumedM(Mod, "borrowAndRaise", .{0}, "k", .{s_owned}, .{s_err_drop}));
-        drop(take());
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "assertNoRaise and assertNoStore: valid non-raising and field-disjoint store assertions" {
-    const Mod = struct {
-        pub fn pureAdd(a: i32, b: i32) i32 {
-            return a +% b;
-        }
-        pub const @"pureAdd$stores" = .{ .fields = .{}, .calls_callback = false, .calls_ext_store = false };
-
-        pub fn setB() void {}
-        pub const @"setB$stores" = .{ .fields = .{"Mod.Box|B"}, .calls_callback = false, .calls_ext_store = false };
-
-        pub fn genPure(comptime T: type) type {
-            return struct {
-                pub fn call(x: T) T {
-                    return x;
-                }
-            };
-        }
-    };
-    comptime {
-        assertNoRaise(Mod.pureAdd);
-        assertNoRaise(Mod.genPure(i32).call);
-        assertNoStore(Mod, "pureAdd", .{"Mod.Box|A"}, true);
-        assertNoStore(Mod, "setB", .{"Mod.Box|A"}, true);
-        assertNoStore(Mod, "setB", .{}, true);
-    }
-    try std.testing.expectEqual(@as(i32, 5), Mod.pureAdd(2, 3));
-}
-
-test "TailCtx, fitsTailArgs, tailStore/tailLoad, takeSelf, dropEnv, plugRet and chained TailFn" {
-    const before = thread.stats;
-    {
-        const Big = struct { data: [136]u8 };
-        comptime {
-            try std.testing.expect(fitsTailArgs(&.{ i32, String, void, ?i64 }));
-            try std.testing.expect(!fitsTailArgs(&.{Big}));
-            try std.testing.expect(canPlugRet(List(String)));
-            try std.testing.expect(!canPlugRet(void));
-            try std.testing.expect(!canPlugRet(Obj));
-        }
-
-        const s_arg = strConcat(str("he"), str("llo"));
-        const Caps = struct { prefix: String };
-        const Chain = struct {
-            fn step1(ctx: *TailCtx, ret: *anyopaque) TailStatus {
-                const a = tailLoad(&.{ i32, String }, ctx);
-                const ts = takeSelfBorrowed(ctx);
-                const env: ?*Env = @ptrCast(@alignCast(ts.ptr));
-                const c = captured(Caps, env);
-                const joined = strConcat(c.prefix, a[1]);
-                drop(a[1]);
-                if (ts.owned) dropEnv(env);
-                if (a[0] <= 0) {
-                    @as(*String, @ptrCast(@alignCast(ret))).* = joined;
-                    return .ok;
-                }
-                tailStore(&.{ i32, String }, ctx, .{ a[0] - 1, joined });
-                ctx.self = null;
-                ctx.self_owned = true;
-                return @call(tail_call, step2, .{ ctx, ret });
-            }
-            fn step2(ctx: *TailCtx, ret: *anyopaque) TailStatus {
-                const a = tailLoad(&.{ i32, String }, ctx);
-                if (a[0] == 1) {
-                    drop(a[1]);
-                    _ = raise(ArgumentException, str("tc-boom")) catch {};
-                    plugRet(String, ret);
-                    return .raised;
-                }
-                tailStore(&.{ String }, ctx, .{a[1]});
-                ctx.self = null;
-                return @call(tail_call, step3, .{ ctx, ret });
-            }
-            fn step3(ctx: *TailCtx, ret: *anyopaque) TailStatus {
-                const a = tailLoad(&.{String}, ctx);
-                @as(*String, @ptrCast(@alignCast(ret))).* = a[0];
-                return .ok;
-            }
-        };
-
-        const Fn1 = Func(*const fn (?*Env, i32, String) Raised!String);
-        const f = closureTc(Fn1, Caps, .{ .prefix = dup(s_arg) }, struct {
-            fn c(_: ?*Env, n: i32, s: String) Raised!String {
-                _ = n;
-                return s;
-            }
-        }.c, &Chain.step1);
-        drop(s_arg);
-
-        var ctx: TailCtx = undefined;
-        var res: String = undefined;
-        const arg2 = strConcat(str("!"), str("?"));
-        tailStore(&.{ i32, String }, &ctx, .{ @as(i32, 1), arg2 });
-        ctx.self = @ptrCast(f.env);
-        ctx.self_owned = false; // lent from caller: f remains alive with rc=1
-        try std.testing.expectEqual(TailStatus.ok, f.tcode.?(&ctx, @ptrCast(&res)));
-        try std.testing.expect(strEql(str("hello!?"), res));
-        drop(res);
-
-        // Error path with plugRet leaves res droppable
-        var ctx_err: TailCtx = undefined;
-        var res_err: String = undefined;
-        const arg_err = strConcat(str("x"), str("y"));
-        tailStore(&.{ i32, String }, &ctx_err, .{ @as(i32, 2), arg_err });
-        ctx_err.self = @ptrCast(f.env); // moves f's remaining env ownership
-        ctx_err.self_owned = true;
-        try std.testing.expectEqual(TailStatus.raised, f.tcode.?(&ctx_err, @ptrCast(&res_err)));
-        drop(take());
-        drop(res_err);
-
-        // plugRet on List(String) writes .Empty without allocating or leaking
-        var list_plug: List(String) = undefined;
-        plugRet(List(String), @ptrCast(&list_plug));
-        drop(list_plug);
-
-        // Zero-sized non-void parameters (e.g. 1-case fieldless union) round-trip through tailStore/tailLoad
-        const Single = union(enum) { Only };
-        var ctx_z: TailCtx = .{};
-        tailStore(&.{ Single, i32, void }, &ctx_z, .{ Single.Only, @as(i32, 7), {} });
-        const loaded_z = tailLoad(&.{ Single, i32, void }, &ctx_z);
-        try std.testing.expect(loaded_z[0] == .Only);
-        try std.testing.expectEqual(@as(i32, 7), loaded_z[1]);
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "Iface $tc slots, IfaceAdapter nulls $tc, and cross-iface tail chain" {
-    const before = thread.stats;
-    {
-        const IA = Iface(IfaceAnon1(.{"Step"}).of(*const fn (?*anyopaque, i32, *const anyopaque) Raised!i32));
-        const IBoxed = Iface(struct {
-            @"$meta": *const IfaceMeta,
-            Boxed: *const fn (?*anyopaque, Any) Raised!Any,
-            @"Boxed$tc": ?TailFn = null,
-        });
-        const IConc = Iface(struct {
-            @"$meta": *const IfaceMeta,
-            Boxed: *const fn (?*anyopaque, i32) Raised!i32,
-            @"Boxed$tc": ?TailFn = null,
-        });
-
-        const VtA = @typeInfo(@FieldType(IA, "vt")).pointer.child;
-        // Defaulted $tc field on IfaceAnon starts null
-        const default_vt: VtA = .{
-            .@"$meta" = &empty_iface_meta,
-            .Step = struct {
-                fn f(_: ?*anyopaque, x: i32, _: *const anyopaque) Raised!i32 {
-                    return x;
-                }
-            }.f,
-        };
-        try std.testing.expect(default_vt.@"Step$tc" == null);
-
-        // Chaining through interface Step$tc slots with self_owned=false and self_owned=true
-        const Caps = struct { tag: String };
-        const Node = struct {
-            fn callNorm(d: ?*anyopaque, n: i32, other: *const anyopaque) Raised!i32 {
-                _ = d;
-                _ = n;
-                _ = other;
-                return 0;
-            }
-            fn stepTc(ctx: *TailCtx, ret: *anyopaque) TailStatus {
-                const a = tailLoad(&.{ i32, *const anyopaque }, ctx);
-                const ts = takeSelfBorrowed(ctx);
-                const env: ?*Env = @ptrCast(@alignCast(ts.ptr));
-                if (ts.owned) dropEnv(env);
-                if (a[0] <= 0) {
-                    @as(*i32, @ptrCast(@alignCast(ret))).* = 99;
-                    return .ok;
-                }
-                const nxt: *const IA = @ptrCast(@alignCast(a[1]));
-                const nxt_own = dup(nxt.*);
-                tailStore(&.{ i32, *const anyopaque }, ctx, .{ a[0] - 1, a[1] });
-                ctx.self = nxt_own.data;
-                ctx.self_owned = true;
-                return @call(tail_call, nxt.vt.@"Step$tc".?, .{ ctx, ret });
-            }
-            const vt: VtA = .{
-                .@"$meta" = &env_iface_meta,
-                .Step = &callNorm,
-                .@"Step$tc" = &stepTc,
-            };
-        };
-
-        const s = strConcat(str("if"), str("ace"));
-        const ia = ifaceClosure(IA, Caps, .{ .tag = s }, &Node.vt);
-        defer drop(ia);
-
-        var tctx: TailCtx = undefined;
-        var res: i32 = undefined;
-        tailStore(&.{ i32, *const anyopaque }, &tctx, .{ @as(i32, 3), @as(*const anyopaque, @ptrCast(&ia)) });
-        tctx.self = ia.data;
-        tctx.self_owned = false;
-        try std.testing.expectEqual(TailStatus.ok, ia.vt.@"Step$tc".?(&tctx, @ptrCast(&res)));
-        try std.testing.expectEqual(@as(i32, 99), res);
-
-        // IfaceAdapter zeroes $tc fields cleanly
-        const BoxedVt = @typeInfo(@FieldType(IBoxed, "vt")).pointer.child;
-        const boxed_vt: BoxedVt = .{
-            .@"$meta" = &empty_iface_meta,
-            .Boxed = struct {
-                fn f(_: ?*anyopaque, x: Any) Raised!Any {
-                    return x;
-                }
-            }.f,
-        };
-        const ib: IBoxed = .{ .data = null, .vt = &boxed_vt };
-        const ic = ifaceAdapt(IConc, ib);
-        defer drop(ic);
-        try std.testing.expect(ic.vt.@"Boxed$tc" == null);
-        try std.testing.expectEqual(@as(i32, 42), try ic.vt.Boxed(ic.data, 42));
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "callHofAssumedM and callHofAssumedG: Known lambda + borrowed RetFrom without dup" {
-    const before = thread.stats;
-    {
-        const s_owned = strConcat(str("hello "), str("assumed"));
-        defer drop(s_owned);
-
-        const F = Func(*const fn (?*Env, String) Raised!bool);
-        const K = struct {
-            pub const fable_known = {};
-            pub const FuncType = F;
-            pub const sig = .{ .borrows = .{ true, true }, .result_borrowed = false };
-            cap: i32,
-            pub inline fn call(self: *const @This(), x: String) Raised!bool {
-                return strLength(x) > self.cap;
-            }
-            fn adapter(env: ?*Env, x: String) Raised!bool {
-                const c = captured(struct { cap: i32 }, env);
-                defer drop(x);
-                return strLength(x) > c.cap;
-            }
-            pub fn toFunc(self: @This()) F {
-                return closure(F, struct { cap: i32 }, .{ .cap = self.cap }, adapter);
-            }
-        };
-
-        const Mod = struct {
-            pub fn checkOrFallback(k: F, s: String) Raised!String {
-                defer drop(k);
-                _ = try k.code(k.env, dup(s));
-                return s;
-            }
-            pub fn @"checkOrFallback$k"(k: anytype, s: String) Raised!String {
-                if (try k.call(s)) return s;
-                return s;
-            }
-            pub const @"checkOrFallback$sig" = .{ .borrows = .{ false, true }, .result_borrowed = true, .result_from = .{1} };
-            pub const @"checkOrFallback$noescape" = .{ true, false };
-
-            pub fn pickEsc(k: F, s: String) Raised!String {
-                _ = try k.code(k.env, dup(s));
-                return s;
-            }
-            pub const @"pickEsc$sig" = .{ .borrows = .{ true, true }, .result_borrowed = true, .result_from = .{1} };
-
-            pub fn raiseAfter(k: F, s: String) Raised!String {
-                defer drop(k);
-                _ = s;
-                return raise(ArgumentException, str("boom-hof-assumed"));
-            }
-            pub const @"raiseAfter$sig" = .{ .borrows = .{ false, true }, .result_borrowed = true, .result_from = .{1} };
-
-            pub fn gen(comptime T: type) type {
-                _ = T;
-                return struct {
-                    pub fn call(k: F, s: String) Raised!String {
-                        defer drop(k);
-                        _ = try k.code(k.env, dup(s));
-                        return s;
-                    }
-                    pub fn callK(k: anytype, s: String) Raised!String {
-                        _ = try k.call(s);
-                        return s;
-                    }
-                    pub const sig = .{ .borrows = .{ false, true }, .result_borrowed = true, .result_from = .{1} };
-                    pub const noescape = .{ true, false };
-                };
-            }
-        };
-
-        const b0 = thread.stats;
-        const r1 = try xcallHofAssumedM(Mod, "checkOrFallback", .{1}, "gk", .{ K{ .cap = 3 }, s_owned }, .{});
-        try std.testing.expect(strEql(s_owned, r1));
-        try std.testing.expectEqual(b0.allocs, thread.stats.allocs);
-        try std.testing.expectEqual(b0.dups, thread.stats.dups);
-
-        const r2 = try xcallHofAssumedM(Mod, "pickEsc", .{1}, "gk", .{ K{ .cap = 3 }, s_owned }, .{});
-        try std.testing.expect(strEql(s_owned, r2));
-
-        const r3 = try xcallHofAssumedG(Mod.gen(String), .{1}, "gk", .{ K{ .cap = 3 }, s_owned }, .{});
-        try std.testing.expect(strEql(s_owned, r3));
-
-        const s_err = strConcat(str("err"), str("drop"));
-        try std.testing.expectError(error.Raised, xcallHofAssumedM(Mod, "raiseAfter", .{1}, "gk", .{ K{ .cap = 3 }, s_owned }, .{s_err}));
-        drop(take());
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
-}
-
-test "dropEnv: deep 150k multi-capture closure chain frees in O(1) stack" {
-    const before = thread.stats;
-    {
-        const F = Func(*const fn (?*Env, i32) Raised!i32);
-        const Caps = struct { c0: F, c1: F };
-        const H = struct {
-            fn base(_: ?*Env, x: i32) Raised!i32 {
-                return x + 10;
-            }
-            fn step(env: ?*Env, x: i32) Raised!i32 {
-                const c = captured(Caps, env);
-                if (x >= 0) return c.c0.code(c.c0.env, x + 1);
-                return c.c1.code(c.c1.env, x);
-            }
-        };
-        const leaf: F = .{ .env = null, .code = H.base };
-        var cur: F = leaf;
-        for (0..150_000) |_| {
-            cur = closure(F, Caps, .{ .c0 = cur, .c1 = dup(leaf) }, H.step);
-        }
-        defer drop(cur);
-        try std.testing.expectEqual(@as(i32, 9), try cur.code(cur.env, -1));
-    }
-    try std.testing.expectEqual(thread.stats.allocs - before.allocs, thread.stats.frees - before.frees);
+test {
+    _ = @import("fable_rt_tests.zig");
 }

@@ -248,6 +248,15 @@ let private nativeSortInPlaceWith (_comparer: 'T -> 'T -> int) (_array: 'T[]) : 
 
 [<Fable.Core.Emit("fable_rt.arraySortInPlace($0)")>]
 let private nativeSortInPlace (_array: 'T[]) : unit = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.arraySortByKeys($0, $1, false)")>]
+let private nativeSortByKeys (_keys: 'Key[]) (_array: 'T[]) : 'T[] = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.arraySortByKeys($0, $1, true)")>]
+let private nativeSortByKeysDesc (_keys: 'Key[]) (_array: 'T[]) : 'T[] = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("fable_rt.arraySortInPlaceByKeys($0, $1, false)")>]
+let private nativeSortInPlaceByKeys (_keys: 'Key[]) (_array: 'T[]) : unit = Fable.Core.Util.nativeOnly
 #endif
 
 let sortWith<'T> (comparer: 'T -> 'T -> int) (array: 'T[]) : 'T[] =
@@ -265,7 +274,15 @@ let sort<'T when 'T: comparison> (array: 'T[]) : 'T[] =
 #endif
 
 let sortBy<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (array: 'T[]) : 'T[] =
+#if FABLE_COMPILER
+    if array.Length <= 1 then
+        Array.copy array
+    else
+        let keys = Array.map (fun x -> projection x) array
+        nativeSortByKeys keys array
+#else
     sortWith (fun a b -> compare (projection a) (projection b)) array
+#endif
 
 let sortDescending<'T when 'T: comparison> (array: 'T[]) : 'T[] =
 #if FABLE_COMPILER
@@ -275,7 +292,15 @@ let sortDescending<'T when 'T: comparison> (array: 'T[]) : 'T[] =
 #endif
 
 let sortByDescending<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (array: 'T[]) : 'T[] =
+#if FABLE_COMPILER
+    if array.Length <= 1 then
+        Array.copy array
+    else
+        let keys = Array.map (fun x -> projection x) array
+        nativeSortByKeysDesc keys array
+#else
     sortWith (fun a b -> compare (projection b) (projection a)) array
+#endif
 
 /// `Array.sortInPlace`: the array itself, in order.
 let sortInPlaceWith<'T> (comparer: 'T -> 'T -> int) (array: 'T[]) : unit =
@@ -296,7 +321,13 @@ let sortInPlace<'T when 'T: comparison> (array: 'T[]) : unit =
 #endif
 
 let sortInPlaceBy<'Key, 'T when 'Key: comparison> (projection: 'T -> 'Key) (array: 'T[]) : unit =
+#if FABLE_COMPILER
+    if array.Length > 1 then
+        let keys = Array.map (fun x -> projection x) array
+        nativeSortInPlaceByKeys keys array
+#else
     sortInPlaceWith (fun a b -> compare (projection a) (projection b)) array
+#endif
 
 let distinct<'T when 'T: equality> (array: 'T[]) : 'T[] =
     Array.ofList (List.distinct (Array.toList array))

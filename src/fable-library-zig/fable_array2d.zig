@@ -160,12 +160,12 @@ pub fn rowFill(row: anytype, to: anytype) void {
 /// `array2D rows`: rows given as a list or an array of lists or arrays, all of one length.
 pub fn array2DOfRows(comptime A: type, rows: anytype) Raised!A {
     var all: std.ArrayList(RowOf(@TypeOf(rows))) = .empty;
-    defer all.deinit(rt.allocator);
+    defer all.deinit(rt.alloc());
     if (comptime isListType(@TypeOf(rows))) {
         var rest = rows;
-        while (rest == .Cons) : (rest = rest.Cons.Tail) all.append(rt.allocator, rest.Cons.Head) catch rt.oom();
+        while (rest == .Cons) : (rest = rest.Cons.Tail) all.append(rt.alloc(), rest.Cons.Head) catch rt.oom();
     } else {
-        for (rows.items) |r| all.append(rt.allocator, r) catch rt.oom();
+        for (rows.items) |r| all.append(rt.alloc(), r) catch rt.oom();
     }
     const cols: usize = if (all.items.len == 0) 0 else rowCount(all.items[0]);
     for (all.items) |r| {

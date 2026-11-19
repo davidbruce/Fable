@@ -497,9 +497,6 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                     "%s: a record that can be assigned or a type that contains itself is already a counted reference; IResource is for values that stand for something outside the program"
                     entRef.FullName
 
-            if not ent.GenericParameters.IsEmpty then
-                fail r "the Zig target does not support generic resources yet (%s)" entRef.FullName
-
             let hook (member': string) =
                 ent.MembersFunctionsAndValues
                 |> Seq.tryFind (fun m ->
@@ -1056,7 +1053,9 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "TaskOf_1" ->
                 [
                     "fable_task", TOpt(TEnt(resultEnt ctx.State, [ TGen "T"; tExn ]))
+                    "fable_iso", TOpt(TEnt(netEnt ctx.State "Iso", [ TEnt(resultEnt ctx.State, [ TGen "T"; tExn ]) ]))
                     "fable_thread", TOpt(TPrim "fable_rt.ThreadOf")
+                    "fable_owner", tI32
                 ]
             | "TaskSourceOf_1" -> [ "task", TEnt(libRecordEnt ctx "Task" "TaskOf_1", [ TGen "T" ]) ]
             | "ReplyChannelOf_1" -> [ "reply", TFn([ TGen "T" ], tVoid) ]
@@ -1131,7 +1130,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
             | "Timer" -> [ "live" ]
             | "StopwatchOf" -> [ "elapsed"; "startedAt"; "running" ]
             | "TimerOf" -> [ "interval"; "autoReset"; "enabled"; "generation" ]
-            | "TaskOf_1" -> [ "fable_task"; "fable_thread" ]
+            | "TaskOf_1" -> [ "fable_task"; "fable_iso"; "fable_thread" ]
             | "MailboxOf_1" -> [ "waiting"; "started"; "begun"; "running"; "turnToken" ]
             | _ -> []
 
@@ -1343,6 +1342,7 @@ let bindArgsIn (conArgs: bool) (ctx: Ctx) (irs: Expr list) (k: Expr list -> Expr
                 | ECallIface _
                 | EClosure _
                 | EIface _
+                | EKnownIface _
                 | ERt _
                 | EEmit _ -> true
                 // (a constructor argument is an owning position)

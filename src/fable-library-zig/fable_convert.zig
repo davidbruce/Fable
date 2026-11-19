@@ -162,7 +162,7 @@ pub fn convToStringBase(x: anytype, base: i32) Raised!String {
 pub fn bitGetBytes(x: anytype) Array(u8) {
     const T = @TypeOf(x);
     const bytes: []const u8 = if (T == bool) &.{@intFromBool(x)} else std.mem.asBytes(&x);
-    const items = rt.allocator.alloc(u8, bytes.len) catch rt.oom();
+    const items = rt.alloc().alloc(u8, bytes.len) catch rt.oom();
     @memcpy(items, bytes);
     return arrayFrom(Array(u8), items);
 }
@@ -221,14 +221,14 @@ pub fn hexParse(s: String) Raised!Array(u8) {
     if (s == null) return argNull("s");
     const u = unitsOf(s);
     if (u.len % 2 != 0) return raise(FormatException, str("The input is not a valid hex string as its length is not a multiple of 2."));
-    const items = rt.allocator.alloc(u8, u.len / 2) catch rt.oom();
+    const items = rt.alloc().alloc(u8, u.len / 2) catch rt.oom();
     for (items, 0..) |*o, i| {
         const hi = std.fmt.charToDigit(@intCast(@min(u[2 * i], 127)), 16) catch {
-            rt.allocator.free(items);
+            rt.alloc().free(items);
             return raise(FormatException, str("The input is not a valid hex string as it contains a non-hex character."));
         };
         const lo = std.fmt.charToDigit(@intCast(@min(u[2 * i + 1], 127)), 16) catch {
-            rt.allocator.free(items);
+            rt.alloc().free(items);
             return raise(FormatException, str("The input is not a valid hex string as it contains a non-hex character."));
         };
         o.* = hi * 16 + lo;
@@ -239,8 +239,8 @@ pub fn hexParse(s: String) Raised!Array(u8) {
 /// `Convert.ToBase64String bytes`
 pub fn base64Of(bytes: Array(u8)) String {
     const enc = std.base64.standard.Encoder;
-    const buf = rt.allocator.alloc(u8, enc.calcSize(bytes.items.len)) catch rt.oom();
-    defer rt.allocator.free(buf);
+    const buf = rt.alloc().alloc(u8, enc.calcSize(bytes.items.len)) catch rt.oom();
+    defer rt.alloc().free(buf);
     const text = enc.encode(buf, bytes.items);
     var t: TextBuilder = .{};
     t.addAscii(text);
@@ -252,17 +252,17 @@ pub fn base64Parse(s: String) Raised!Array(u8) {
     if (s == null) return argNull("s");
     const u = unitsOf(s);
     var ascii: std.ArrayList(u8) = .empty;
-    defer ascii.deinit(rt.allocator);
+    defer ascii.deinit(rt.alloc());
     for (u) |c| {
         if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
         if (c > 127) return badBase64();
-        ascii.append(rt.allocator, @intCast(c)) catch rt.oom();
+        ascii.append(rt.alloc(), @intCast(c)) catch rt.oom();
     }
     const dec = std.base64.standard.Decoder;
     const n = dec.calcSizeForSlice(ascii.items) catch return badBase64();
-    const items = rt.allocator.alloc(u8, n) catch rt.oom();
+    const items = rt.alloc().alloc(u8, n) catch rt.oom();
     dec.decode(items, ascii.items) catch {
-        rt.allocator.free(items);
+        rt.alloc().free(items);
         return badBase64();
     };
     return arrayFrom(Array(u8), items);

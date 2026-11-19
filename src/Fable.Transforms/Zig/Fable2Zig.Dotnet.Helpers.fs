@@ -10,6 +10,7 @@ open Fable.Transforms.Zig.IR
 open Fable.Transforms.Zig.LowerContext
 open Fable.Transforms.Zig.LowerTypes
 open Fable.Transforms.Zig.LowerHelpers
+open Fable.Transforms.Zig.LowerFormat
 open Fable.Transforms.Zig.Lower
 
 /// a call into the runtime library that can raise

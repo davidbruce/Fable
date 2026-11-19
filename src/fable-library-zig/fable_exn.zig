@@ -35,7 +35,6 @@ const new = rt.new;
 const nullRef = rt.nullRef;
 const oom = rt.oom;
 const overflow = rt.overflow;
-const run = rt.run;
 const sgc = rt.sgc;
 const stack_traces = rt.stack_traces;
 const str = rt.str;
@@ -215,7 +214,7 @@ pub fn ExnUnder(comptime name: []const u8, comptime Payload: type, comptime pare
 
         pub fn new(payload: Payload) Exn {
             if (comptime cyclic) gcTick();
-            const c = rt.allocator.create(Whole) catch oom();
+            const c = rt.alloc().create(Whole) catch oom();
             c.* = .{ .header = .{ .type = &info }, .payload = payload };
             if (comptime cyclic) {
                 c.hdr = thread.collector.hdr(&K.desc, K.isLeaf(c));
@@ -406,7 +405,7 @@ pub fn exnFlatten(e: Exn) Exn {
     var leaves: std.ArrayList(Exn) = .empty;
     collectLeaves(&leaves, e);
     const A = rt.Array(Exn);
-    const list = rt.arrayFrom(A, leaves.toOwnedSlice(rt.allocator) catch rt.oom());
+    const list = rt.arrayFrom(A, leaves.toOwnedSlice(rt.alloc()) catch rt.oom());
     defer drop(list);
     const own: String = if (e.type.inners != null) AggregateException.of(e).Message else null;
     const flat = AggregateException.new(.{ .Message = dup(own) });
@@ -421,7 +420,7 @@ fn collectLeaves(leaves: *std.ArrayList(Exn), e: Exn) void {
         if (AggregateException.is(i)) {
             collectLeaves(leaves, i);
         } else {
-            leaves.append(rt.allocator, dup(i)) catch rt.oom();
+            leaves.append(rt.alloc(), dup(i)) catch rt.oom();
         }
     }
 }
@@ -509,7 +508,7 @@ pub fn exnStackTrace(e: Exn) String {
 
 pub fn traceText(e: Exn) String {
     if (!e.trace_thrown) return null;
-    var aw: std.Io.Writer.Allocating = .init(rt.allocator);
+    var aw: std.Io.Writer.Allocating = .init(rt.alloc());
     defer aw.deinit();
     const st: std.debug.StackTrace = .{
         .return_addresses = e.trace_addrs[0..e.trace_len],
@@ -581,12 +580,17 @@ pub fn testLiveBefore() i64 {
 /// After a test: every cell it made is freed (what it left waiting has run; cycles that died are
 /// freed first). Only in builds that count cells.
 pub fn testNoLeak(before: i64) !void {
+    rt.poolShutdown();
     if (!track) return;
     asyncStateRelease();
     _ = collect();
     const now = live();
     if (now != before) {
         std.debug.print("fable: the test left {d} cell(s) alive\n", .{now - before});
+        const sgc_exit = rt.threadExitSgcStats();
+        if (sgc_exit.remaining_structures_on_exit != 0 or sgc_exit.collected_on_exit != 0) {
+            std.debug.print("fable: thread-exit fable_sgc drain across {d} thread(s): collected {d} cells, {d} live structure(s) remained\n", .{ sgc_exit.threads_drained, sgc_exit.collected_on_exit, sgc_exit.remaining_structures_on_exit });
+        }
         return error.TestLeaked;
     }
 }

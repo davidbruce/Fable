@@ -287,16 +287,204 @@ let allCases (t: Ty) : string list =
 /// fields have the same types. When it is the same case of the same generic type with other
 /// type arguments, the two cells may or may not have the same layout: that is known when the
 /// Zig is compiled, and the runtime only builds in the dead cell if they do.
-let cellsMatch (t1: Ty, case1: string) (t2: Ty, case2: string) : bool =
-    let shape t case =
-        caseFields t case |> List.map (snd >> tyKey) |> String.concat ","
+let rec private hasRuntimeCyclicDep (t: Ty) : bool =
+    match t with
+    | TGen _
+    | TFn _
+    | TPrim("fable_rt.Exn" | "fable_rt.Obj") -> true
+    | TEnt(e, args) ->
+        e.Kind = KIface
+        || e.Kind = KExn
+        || e.ReachesOpaque
+        || List.exists hasRuntimeCyclicDep args
+    | TOpt x
+    | TArr(x, _)
+    | TPtr(x, _)
+    | TSlice(x, _) -> hasRuntimeCyclicDep x
+    | TTuple xs -> List.exists hasRuntimeCyclicDep xs
+    | _ -> false
 
-    shape t1 case1 = shape t2 case2
-    || (
-        match t1, t2 with
-        | TEnt(e1, _), TEnt(e2, _) -> obj.ReferenceEquals(e1, e2) && case1 = case2
-        | _ -> false
-    )
+let private gcHeaderMode (t: Ty) : bool option =
+    match t with
+    | TEnt(e, args) ->
+        if e.Cyclic then
+            Some true
+        elif e.ReachesOpaque then
+            None
+        elif e.TypeParams.IsEmpty then
+            Some false
+        elif List.exists hasRuntimeCyclicDep args then
+            None
+        else
+            Some(List.exists mayHoldCyclic args)
+    | _ -> None
+
+let cellsMatchExact (t1: Ty, case1: string) (t2: Ty, case2: string) : bool =
+    if tyKey t1 = tyKey t2 && case1 = case2 then
+        true
+    else
+        let shape t case =
+            caseFields t case |> List.map (snd >> tyKey) |> List.sort
+
+        let compatGc =
+            tyKey t1 = tyKey t2
+            || (
+                match gcHeaderMode t1, gcHeaderMode t2 with
+                | Some g1, Some g2 -> g1 = g2
+                | _ -> false
+            )
+
+        compatGc && shape t1 case1 = shape t2 case2
+
+let private alignUp (n: int) (a: int) =
+    if a <= 1 then
+        n
+    else
+        ((n + a - 1) / a) * a
+
+let private structLayout (fs: (int * int) list) : int * int =
+    let sized = fs |> List.filter (fun (s, _) -> s > 0)
+
+    if sized.IsEmpty then
+        0, 1
+    else
+        let sorted = sized |> List.sortByDescending snd
+        let total = sorted |> List.sumBy fst
+        let maxA = sorted |> List.map snd |> List.max |> max 1
+        alignUp total maxA, maxA
+
+let rec private tyLayout (seen: Set<string>) (t: Ty) : (int * int) option =
+    match t with
+    | TPrim "void" -> Some(0, 1)
+    | TPrim("bool" | "i8" | "u8") -> Some(1, 1)
+    | TPrim("i16" | "u16" | "c_ushort") -> Some(2, 2)
+    | TPrim("i32" | "u32" | "f32" | "c_int" | "c_uint") -> Some(4, 4)
+    | TPrim("i64" | "u64" | "f64" | "isize" | "usize") -> Some(8, 8)
+    | TPrim("i128" | "u128" | "f128") -> Some(16, 16)
+    | TPrim("fable_rt.String" | "fable_rt.Exn" | "fable_rt.Obj" | "fable_rt.ThreadOf") -> Some(8, 8)
+    | TPtr _ -> Some(8, 8)
+    | TSlice _ -> Some(16, 8)
+    | TArr(elem, n) -> tyLayout seen elem |> Option.map (fun (s, a) -> s * n, a)
+    | TTuple ts ->
+        let ls = ts |> List.map (tyLayout seen)
+
+        if List.exists Option.isNone ls then
+            None
+        else
+            Some(structLayout (List.choose id ls))
+    | TEnt(e, _) when e.Kind = KRefRecord || e.Kind = KExn -> Some(8, 8)
+    | TEnt(e, _) when e.Kind = KIface -> Some(16, 8)
+    | TEnt(e, _) when e.Kind = KHeapUnion ->
+        let anyPayload = e.Cases |> List.exists (fun (_, fs) -> not fs.IsEmpty)
+
+        let tagSz =
+            if e.Cases.Length <= 1 then
+                0
+            elif e.Cases.Length <= 256 then
+                1
+            else
+                2
+
+        if not anyPayload then
+            Some(tagSz, max 1 tagSz)
+        elif tagSz = 0 then
+            Some(8, 8)
+        else
+            Some(16, 8)
+    | TEnt(e, _) when e.Kind = KRecord ->
+        if seen.Contains e.Name then
+            None
+        else
+            let seen' = Set.add e.Name seen
+            let fs = caseFields t "" |> List.map (snd >> tyLayout seen')
+
+            if List.exists Option.isNone fs then
+                None
+            else
+                Some(structLayout (List.choose id fs))
+    | TEnt(e, _) when e.Kind = KValueUnion ->
+        if seen.Contains e.Name then
+            None
+        elif e.Cases.IsEmpty then
+            Some(0, 1)
+        else
+            let seen' = Set.add e.Name seen
+
+            let caseLayouts =
+                e.Cases
+                |> List.map (fun (c, _) ->
+                    let fs = caseFields t c |> List.map (snd >> tyLayout seen')
+
+                    if List.exists Option.isNone fs then
+                        None
+                    else
+                        Some(structLayout (List.choose id fs))
+                )
+
+            if List.exists Option.isNone caseLayouts then
+                None
+            else
+                let ls = List.choose id caseLayouts
+                let maxS = ls |> List.map fst |> List.max
+                let maxPA = ls |> List.map snd |> List.max
+
+                let tagSz =
+                    if e.Cases.Length <= 1 then
+                        0
+                    elif e.Cases.Length <= 256 then
+                        1
+                    else
+                        2
+
+                let maxA = max (max 1 tagSz) maxPA
+                Some(alignUp (maxS + tagSz) maxA, maxA)
+    | TOpt inner ->
+        match inner with
+        | TPtr _
+        | TEnt({ Kind = KRefRecord | KExn }, _) -> Some(8, 8)
+        | _ -> tyLayout seen inner |> Option.map (fun (s, a) -> alignUp (s + 1) a, a)
+    | _ -> None
+
+let private cellLayoutWithGc (hasGc: bool) (t: Ty, case: string) : (int * int) option =
+    let fs = caseFields t case |> List.map (snd >> tyLayout Set.empty)
+
+    if List.exists Option.isNone fs then
+        None
+    else
+        let hdr =
+            if hasGc then
+                [ 4, 4; 36, 4 ]
+            else
+                [ 4, 4 ]
+
+        Some(structLayout (hdr @ List.choose id fs))
+
+let cellsMatch (t1: Ty, case1: string) (t2: Ty, case2: string) : bool =
+    let sameGenericEntCase () =
+        not (freeGens [ t1; t2 ]).IsEmpty
+        && (
+            match t1, t2 with
+            | TEnt(e1, _), TEnt(e2, _) -> obj.ReferenceEquals(e1, e2) && case1 = case2
+            | _ -> false
+        )
+
+    if cellsMatchExact (t1, case1) (t2, case2) then
+        true
+    else
+        match gcHeaderMode t1, gcHeaderMode t2 with
+        | Some g1, Some g2 ->
+            match cellLayoutWithGc g1 (t1, case1), cellLayoutWithGc g2 (t2, case2) with
+            | Some l1, Some l2 -> l1 = l2
+            | _ -> sameGenericEntCase ()
+        | None, None when tyKey t1 = tyKey t2 ->
+            match cellLayoutWithGc false (t1, case1), cellLayoutWithGc false (t2, case2) with
+            | Some l1f, Some l2f when l1f = l2f ->
+                match cellLayoutWithGc true (t1, case1), cellLayoutWithGc true (t2, case2) with
+                | Some l1t, Some l2t -> l1t = l2t
+                | _ -> sameGenericEntCase ()
+            | Some _, Some _ -> false
+            | _ -> sameGenericEntCase ()
+        | _ -> sameGenericEntCase ()
 
 type VarKind =
     | VLocal
@@ -357,6 +545,8 @@ and [<NoEquality; NoComparison>] Expr =
     | EClosure of string * Ty list * Expr list * Ty
     /// stack-allocated known lambda passed to a non-escaping HOF parameter (captures borrowed)
     | EKnown of string * Ty list * Expr list * Ty
+    /// stack-allocated known interface / object expression passed to a non-escaping HOF parameter
+    | EKnownIface of Ty * IfaceSource * (string * (string * Ty list)) list * isOpt: bool
     /// explicit use marker ('p' / 'k' / 'g') recorded by Perceus on a call argument
     | EUse of ArgUse * Expr
     /// cross-file call whose result is assumed to borrow from parameter indices `indices` (acrossAssumed)
@@ -493,6 +683,11 @@ let rec typeOf (e: Expr) : Ty =
     | ERaise(_, t)
     | ETry(_, _, _, t)
     | EDup(_, t) -> t
+    | EKnownIface(t, _, _, isOpt) ->
+        if isOpt then
+            TOpt t
+        else
+            t
     | EUse(_, x)
     | EAssumedRet(_, x)
     | EOnRaise(x, _) -> typeOf x
@@ -558,6 +753,9 @@ let flatKids (e: Expr) : Expr list =
     | EIface(_, ISrcValue x, _)
     | EIface(_, ISrcUpcast x, _) -> [ x ]
     | EIface(_, ISrcCaptures xs, _) -> xs
+    | EKnownIface(_, ISrcValue x, _, _)
+    | EKnownIface(_, ISrcUpcast x, _, _) -> [ x ]
+    | EKnownIface(_, ISrcCaptures xs, _, _) -> xs
     | ECallIface(r, _, xs, _) -> r :: xs
     | EExnTest(x, _)
     | EExnGet(x, _, _, _)
@@ -594,6 +792,9 @@ let withFlatKids (e: Expr) (xs: Expr list) : Expr =
     | EIface(t, ISrcValue _, s), [ x ] -> EIface(t, ISrcValue x, s)
     | EIface(t, ISrcUpcast _, s), [ x ] -> EIface(t, ISrcUpcast x, s)
     | EIface(t, ISrcCaptures _, s), _ -> EIface(t, ISrcCaptures xs, s)
+    | EKnownIface(t, ISrcValue _, s, isOpt), [ x ] -> EKnownIface(t, ISrcValue x, s, isOpt)
+    | EKnownIface(t, ISrcUpcast _, s, isOpt), [ x ] -> EKnownIface(t, ISrcUpcast x, s, isOpt)
+    | EKnownIface(t, ISrcCaptures _, s, isOpt), _ -> EKnownIface(t, ISrcCaptures xs, s, isOpt)
     | ECallIface(_, slot, _, t), r :: rest -> ECallIface(r, slot, rest, t)
     | EGet(_, p, t), [ x ] -> EGet(x, p, t)
     | ETest(_, c, t), [ x ] -> ETest(x, c, t)
@@ -639,6 +840,9 @@ let rec isPure (e: Expr) =
     // (a function value that captures nothing is a constant; one that captures allocates)
     | EClosure(_, _, xs, _) -> xs.IsEmpty
     | EKnown(_, _, xs, _) -> List.forall isPure xs
+    | EKnownIface(_, ISrcValue x, _, _)
+    | EKnownIface(_, ISrcUpcast x, _, _) -> isPure x
+    | EKnownIface(_, ISrcCaptures xs, _, _) -> List.forall isPure xs
     | EUse(_, x) -> isPure x
     | EIface(_, ISrcCaptures [], _) -> true
     // (a constructor that allocates a cell is not pure)
@@ -999,4 +1203,5 @@ let rec zigType (t: Ty) : string =
     | TSlot(args, ret) ->
         let ps = "?*anyopaque" :: (args |> List.map zigType) |> String.concat ", "
         $"*const fn (%s{ps}) fable_rt.Raised!%s{zigType ret}"
+    | TTok(t, "") -> "?" + zigType t
     | TTok(t, c) -> $"?*fable_rt.Cell(%s{zigType t}, .%s{fieldIdent c})"

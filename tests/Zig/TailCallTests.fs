@@ -963,5 +963,27 @@ let ``test Tier 2 pub VGlobal qualification and List Array maxBy minBy groupBy c
     ([ 1; 2; 3; 4 ] |> List.groupBy (fun x -> x % scale)).Length |> equal 3
     ([ 1; 2; 3; 4 ] |> List.countBy (fun x -> x % scale)).Length |> equal 3
 
+let rec private applyOptTc (fOpt: (int -> int) option) (v: int) : int =
+    match fOpt with
+    | Some f -> f v
+    | None -> 0
+
+let rec private buildCpsTc (n: int) (k: int -> int) : int =
+    if n <= 0 then
+        k 0
+    else
+        buildCpsTc (n - 1) (fun a ->
+            let kNext = fun b -> k (b + 1)
+            applyOptTc (Some kNext) (a + 1))
+
+[<Fact>]
+let ``test tc continuation closure reuses Env in CPS loop`` () =
+    let before = Fable.Core.Zig.Counters.reuses ()
+    let res = buildCpsTc 800 id
+    res |> equal 1600
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        (Fable.Core.Zig.Counters.reuses () - before >= 500) |> equal true
+
 
 

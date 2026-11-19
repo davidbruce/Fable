@@ -89,6 +89,45 @@ let fanOut (p: Page) : Fanout =
         Log = p
     }
 
+/// A generic move-only value-type resource.
+[<Struct>]
+type OwnedSlice<'T> =
+    {
+        Tag: int
+        Data: 'T array
+    }
+
+    interface IResource<OwnedSlice<'T>> with
+        static member Destroy(s: OwnedSlice<'T>) = hwRelease s.Tag
+
+/// A generic shared resource and a generic container duplicating it.
+type SharedSlot<'T> =
+    {
+        Id: int
+        Value: 'T
+    }
+
+    interface ISharedResource<SharedSlot<'T>> with
+        static member Dup(s: SharedSlot<'T>) = s
+        static member Destroy(s: SharedSlot<'T>) = hwRelease s.Id
+
+type SlotPair<'T> =
+    {
+        Left: SharedSlot<'T>
+        Right: SharedSlot<'T>
+    }
+
+let sliceScore (s: OwnedSlice<int>) : int = s.Tag + s.Data[0] + s.Data[1]
+
+let sliceTextScore (s: OwnedSlice<string>) : int =
+    s.Tag + s.Data[0].Length + s.Data[1].Length
+
+let pairSlots (s: SharedSlot<'T>) : SlotPair<'T> =
+    {
+        Left = s
+        Right = s
+    }
+
 let rec range (lo: int) (hi: int) : int list =
     if lo > hi then
         []
@@ -169,19 +208,45 @@ let run () : int =
     let t = total q3
     let fan = fanOut { Page = 5 }
     let shared = fan.Tx.Page + fan.Log.Page
+
+    let genInt =
+        sliceScore
+            {
+                Tag = 10
+                Data = [| 3; 4 |]
+            }
+
+    let genStr =
+        sliceTextScore
+            {
+                Tag = 20
+                Data = [| "ab"; "cde" |]
+            }
+
+    let slots =
+        pairSlots
+            {
+                Id = 6
+                Value = 7
+            }
+
+    let genShared =
+        slots.Left.Id + slots.Left.Value + slots.Right.Id + slots.Right.Value
+
     let arena = kernelWork ()
     let nested = outerArena ()
 
     let failed =
         check (a = 11 && b = 11 && t = 33 && shared = 10)
+        + check (genInt = 17 && genStr = 25 && genShared = 26)
         + check (arena = 32034080)
         + check (nested = 210 + 55)
         + (if counting () then
-               // three buffers destroyed once each; the page was copied once, and each of its
-               // two copies is destroyed once
+               // three buffers + OwnedSlice<int> + OwnedSlice<string> destroyed once each;
+               // Page and SharedSlot<int> each copied once and destroyed twice
                check (
-                   Counters.resourceDestroys () - destroyed0 = 5
-                   && Counters.resourceCopies () - copies0 = 1
+                   Counters.resourceDestroys () - destroyed0 = 9
+                   && Counters.resourceCopies () - copies0 = 2
                )
            else
                0)

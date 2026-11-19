@@ -822,4 +822,194 @@ let private packTextFromArena (n: int) : bool =
 
 [<Fact>]
 let ``test Iso.pack refuses a string made in a stack arena`` () = packTextFromArena 1 |> equal true
+
+type private IIsoBase =
+    abstract BaseVal: unit -> int
+
+type private IIsoSub =
+    inherit IIsoBase
+    abstract SubVal: unit -> int
+
+type private IsoCls(x: int) =
+    interface IIsoBase with
+        member _.BaseVal() = x * 2
+
+    interface IIsoSub with
+        member _.SubVal() = x + 10
+
+[<Fact>]
+let ``test Iso.pack moves interfaces across threads for all IfaceMeta kinds`` () =
+    let stateless =
+        { new IIsoBase with
+            member _.BaseVal() = 11 }
+    let capturedStr = sprintf "ok:%d" 22
+    let capturing =
+        { new IIsoBase with
+            member _.BaseVal() = capturedStr.Length + 19 }
+    let cls = IsoCls 7 :> IIsoBase
+    let sub =
+        { new IIsoSub with
+            member _.BaseVal() = 30
+            member _.SubVal() = 4 }
+    let upcastIface = sub :> IIsoBase
+    let iso = Fable.Core.Zig.Iso.pack (stateless, capturing, cls, upcastIface)
+    let out = ref 0
+    let t =
+        Thread(fun () ->
+            let (a, b, c, d) = Fable.Core.Zig.Iso.unpack iso
+            out.Value <- a.BaseVal() + b.BaseVal() + c.BaseVal() + d.BaseVal()
+        )
+    t.Start()
+    t.Join()
+    out.Value |> equal (11 + (5 + 19) + 14 + 30)
+
+type private CycleHolder(node: RingNode) =
+    member _.Node = node
+
+[<Fact>]
+let ``test Iso.tryPack does not partially share an unisolated pair`` () =
+    let clean = Counter()
+    clean.N <- 42
+    let a = { Next = None; V = 1 }
+    let b = { Next = Some a; V = 2 }
+    a.Next <- Some b
+    let bad = CycleHolder(a)
+    match Fable.Core.Zig.Iso.tryPack (clean, bad) with
+    | Ok _ -> failwith "unshareable cyclic holder must reject Iso.tryPack"
+    | Error(cleanBack, _badBack) ->
+        match Fable.Core.Zig.Iso.tryPack cleanBack with
+        | Ok iso ->
+            let unpacked = Fable.Core.Zig.Iso.unpack iso
+            unpacked.N |> equal 42
+        | Error _ -> failwith "clean half must remain packable after failed Iso.tryPack"
+
+[<Fable.Core.Emit("if ($0 == .Cons) fable_rt.isShared($0.Cons) else false")>]
+let private isListShared (_x: 'a list) : bool = Fable.Core.Util.nativeOnly
+
+[<Fact>]
+let ``test Task.Run transfers unique input and isolated output unshared`` () =
+    let xs = [ 1..100 ]
+    let t =
+        System.Threading.Tasks.Task.Run(fun () ->
+            let wasShared = isListShared xs
+            (wasShared, List.map (fun x -> x * 2) xs)
+        )
+    let (inShared, ys) = t.Result
+    let (inShared2, ys2) = t.Result
+    inShared |> equal false
+    inShared2 |> equal false
+    isListShared ys |> equal false
+    isListShared ys2 |> equal false
+    List.sum ys |> equal 10100
+    List.sum ys2 |> equal 10100
+
+[<Fact>]
+let ``test Thread transfers unique input capture unshared`` () =
+    let xs = [ 1..50 ]
+    let inShared = ref true
+    let sumOut = ref 0
+    let t =
+        Thread(fun () ->
+            inShared.Value <- isListShared xs
+            sumOut.Value <- List.sum xs
+        )
+    t.Start()
+    t.Join()
+    inShared.Value |> equal false
+    sumOut.Value |> equal 1275
+
+[<Fact>]
+let ``test Async.Parallel returns isolated results unshared`` () =
+    let arr =
+        [ for i in 1..4 -> async { return [ i; i * 10 ] } ]
+        |> Async.Parallel
+        |> Async.RunSynchronously
+    arr.Length |> equal 4
+    for k in 0..3 do
+        isListShared arr.[k] |> equal false
+        arr.[k] |> equal [ k + 1; (k + 1) * 10 ]
 #endif
+
+[<Fable.Core.Zig.StackArena(2048)>]
+let private nestedArenaInner (n: int) : int =
+    [ 1..n ] |> List.map (fun x -> x * 2) |> List.sum
+
+[<Fable.Core.Zig.StackArena(8192)>]
+let private nestedArenaOuter (seed: int) : int =
+    let xs = [ 1..8 ] |> List.map (fun x -> x + seed)
+    let inner = nestedArenaInner 10
+    List.sum xs + inner
+
+[<Fact>]
+let ``test StackArena executes safely concurrently across multiple threads`` () =
+    let expected = 4 * nestedArenaOuter 3
+    let results = Array.zeroCreate 4
+    let threads =
+        Array.init 4 (fun i ->
+            Thread(fun () ->
+                let mutable acc = 0
+                for _ in 1..20 do
+                    acc <- acc + nestedArenaOuter 3
+                results[i] <- acc
+            )
+        )
+    for t in threads do t.Start()
+    for t in threads do t.Join()
+    Array.sum results |> equal (20 * expected)
+
+[<Fact>]
+let ``test Task.Run burst, nested Task.Run, concurrent Result reads, and IsFaulted`` () =
+    let burst =
+        [| for i in 1..50 -> System.Threading.Tasks.Task.Run(fun () -> [ for j in 1..20 -> i + j ] |> List.sum) |]
+    let burstSum = burst |> Array.sumBy (fun t -> t.Result)
+    burstSum |> equal 36000
+
+    let nested =
+        [| for i in 1..12 ->
+               System.Threading.Tasks.Task.Run(fun () ->
+                   let inner = System.Threading.Tasks.Task.Run(fun () -> i * 3)
+                   inner.Result + 1
+               ) |]
+    nested |> Array.sumBy (fun t -> t.Result) |> equal 246
+
+    let sharedTask = System.Threading.Tasks.Task.Run(fun () -> [ 1..10 ])
+    let readers = Array.init 2 (fun _ -> [])
+    let rThreads =
+        Array.init 2 (fun idx ->
+            Thread(fun () -> readers.[idx] <- sharedTask.Result)
+        )
+    for rt in rThreads do rt.Start()
+    for rt in rThreads do rt.Join()
+    readers.[0] |> equal [ 1..10 ]
+    readers.[1] |> equal [ 1..10 ]
+
+    let faulted = System.Threading.Tasks.Task.Run(fun () -> failwith "boom": int)
+    while not faulted.IsCompleted do
+        Thread.Sleep 1
+    faulted.IsFaulted |> equal true
+    let raisedAgg =
+        try
+            faulted.Result |> ignore
+            false
+        with :? System.AggregateException ->
+            true
+    raisedAgg |> equal true
+
+[<Fact>]
+let ``test Nested Async.Parallel and Task.Run inside Parallel.For do not deadlock`` () =
+    let nestedAsync =
+        [ for i in 1..4 ->
+              Async.Parallel [ for j in 1..4 -> async { return i * 10 + j } ] ]
+        |> Async.Parallel
+        |> Async.RunSynchronously
+    let flatSum = nestedAsync |> Array.sumBy Array.sum
+    flatSum |> equal 440
+
+    let out = Array.zeroCreate<int> 600
+    System.Threading.Tasks.Parallel.For(
+        0,
+        600,
+        fun i -> out.[i] <- System.Threading.Tasks.Task.Run(fun () -> i * 2).Result
+    )
+    |> ignore
+    Array.sum out |> equal 359400

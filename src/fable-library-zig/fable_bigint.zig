@@ -8,7 +8,6 @@ const FormatException = rt.FormatException;
 const OverflowException = rt.OverflowException;
 const Raised = rt.Raised;
 const String = rt.String;
-const expectAny = rt.expectAny;
 const isDecimal = rt.isDecimal;
 const netIntName = rt.netIntName;
 const raise = rt.raise;
@@ -43,11 +42,11 @@ pub fn bigOom(_: anyerror) noreturn {
 }
 
 pub fn bigEmpty() Big {
-    return Big.init(rt.allocator) catch |e| bigOom(e);
+    return Big.init(rt.alloc()) catch |e| bigOom(e);
 }
 
 pub fn bigFrom(m: Big) BigInt {
-    const c = rt.allocator.create(@typeInfo(BigInt).pointer.child) catch rt.oom();
+    const c = rt.alloc().create(@typeInfo(BigInt).pointer.child) catch rt.oom();
     c.* = .{ .value = m };
     if (track) thread.stats.allocs += 1;
     return c;
@@ -159,6 +158,7 @@ pub fn bigShr(a: BigInt, n: i32) BigInt {
 }
 
 test "bigint bitwise" {
+    const expectAny = @import("fable_rt_tests.zig").expectAny;
     try expectAny("2", bigAnd(bigOf(@as(i32, 6)), bigOf(@as(i32, 2))));
     try expectAny("6", bigOr(bigOf(@as(i32, 4)), bigOf(@as(i32, 2))));
     try expectAny("4", bigXor(bigOf(@as(i32, 6)), bigOf(@as(i32, 2))));
@@ -208,7 +208,7 @@ pub fn bigBitLength(a: BigInt) i64 {
     var m = a.value.clone() catch |e| bigOom(e);
     defer m.deinit();
     m.abs();
-    var one = Big.initSet(rt.allocator, 1) catch |e| bigOom(e);
+    var one = Big.initSet(rt.alloc(), 1) catch |e| bigOom(e);
     defer one.deinit();
     m.sub(&m, &one) catch |e| bigOom(e);
     if (m.eqlZero()) return 0;
@@ -223,14 +223,14 @@ pub fn bigToByteArray(a: BigInt) rt.Array(u8) {
     const negative = !a.value.isPositive() and !a.value.eqlZero();
     mag.abs();
     var bytes: std.ArrayList(u8) = .empty;
-    defer bytes.deinit(rt.allocator);
+    defer bytes.deinit(rt.alloc());
     // (the magnitude's bytes, low first)
     const limbs = mag.toConst().limbs;
     for (limbs) |limb| {
         var l = limb;
         var k: usize = 0;
         while (k < @sizeOf(@TypeOf(limb))) : (k += 1) {
-            bytes.append(rt.allocator, @truncate(l)) catch rt.oom();
+            bytes.append(rt.alloc(), @truncate(l)) catch rt.oom();
             l >>= 8;
         }
     }
@@ -242,11 +242,11 @@ pub fn bigToByteArray(a: BigInt) rt.Array(u8) {
             b.* = @truncate(v);
             carry = v >> 8;
         }
-        if (bytes.items[bytes.items.len - 1] & 0x80 == 0) bytes.append(rt.allocator, 0xFF) catch rt.oom();
+        if (bytes.items[bytes.items.len - 1] & 0x80 == 0) bytes.append(rt.alloc(), 0xFF) catch rt.oom();
         // (-1 - ...: no byte of 0xFF more than the sign needs)
         while (bytes.items.len > 1 and bytes.items[bytes.items.len - 1] == 0xFF and bytes.items[bytes.items.len - 2] & 0x80 != 0) _ = bytes.pop();
     } else if (bytes.items[bytes.items.len - 1] & 0x80 != 0) {
-        bytes.append(rt.allocator, 0) catch rt.oom();
+        bytes.append(rt.alloc(), 0) catch rt.oom();
     }
     const A = rt.Array(u8);
     const items = rt.arrays.arrayItems(A, bytes.items.len);
@@ -265,13 +265,13 @@ pub fn bigOfBytes(arr: rt.Array(u8)) BigInt {
         k -= 1;
         const b: u8 = if (negative) ~items[k] else items[k];
         m.shiftLeft(&m, 8) catch |e| bigOom(e);
-        var add = Big.initSet(rt.allocator, b) catch |e| bigOom(e);
+        var add = Big.initSet(rt.alloc(), b) catch |e| bigOom(e);
         defer add.deinit();
         m.add(&m, &add) catch |e| bigOom(e);
     }
     if (negative) {
         // (-(~x) - 1)
-        var one = Big.initSet(rt.allocator, 1) catch |e| bigOom(e);
+        var one = Big.initSet(rt.alloc(), 1) catch |e| bigOom(e);
         defer one.deinit();
         m.add(&m, &one) catch |e| bigOom(e);
         m.negate();
@@ -310,13 +310,13 @@ pub fn bigToFloat(comptime T: type, a: BigInt) T {
 }
 
 pub fn bigDigits(a: BigInt) []u8 {
-    return a.value.toString(rt.allocator, 10, .lower) catch |e| bigOom(e);
+    return a.value.toString(rt.alloc(), 10, .lower) catch |e| bigOom(e);
 }
 
 /// `string x` of a bigint: its digits
 pub fn bigText(a: BigInt) String {
     const d = bigDigits(a);
-    defer rt.allocator.free(d);
+    defer rt.alloc().free(d);
     const s, const u = strNew(d.len);
     for (d, u) |c, *o| o.* = c;
     return s;
@@ -326,8 +326,8 @@ pub fn bigText(a: BigInt) String {
 pub fn bigParse(s: String) Raised!BigInt {
     if (s == null) return raise(rt.ArgumentNullException, str("Value cannot be null. (Parameter 'value')"));
     const u = rt.numberText(s);
-    var buf = rt.allocator.alloc(u8, u.len) catch rt.oom();
-    defer rt.allocator.free(buf);
+    var buf = rt.alloc().alloc(u8, u.len) catch rt.oom();
+    defer rt.alloc().free(buf);
     var n: usize = 0;
     for (u, 0..) |c, i| {
         const ok = (c >= '0' and c <= '9') or (i == 0 and (c == '-' or c == '+'));

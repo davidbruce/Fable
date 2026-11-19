@@ -2277,3 +2277,311 @@ let ``test Array ICollection.CopyTo with typed arrays works`` () =
     coll.CopyTo(ys, 0)
     ys = xs |> equal true
 
+type private ReverseIntComparerClass(offset: int) =
+    interface IComparer<int> with
+        member _.Compare(a, b) = compare (b + offset) (a + offset)
+
+[<Struct>]
+type private ScaleIntComparerStruct =
+    val Scale: int
+    new(scale: int) = { Scale = scale }
+
+    interface IComparer<int> with
+        member this.Compare(a, b) = compare (a * this.Scale) (b * this.Scale)
+
+type private OffsetIntComparerRec =
+    { Bias: int }
+
+    interface IComparer<int> with
+        member this.Compare(a, b) = compare (a + this.Bias) (b + this.Bias)
+
+type private IAdder =
+    abstract Add: int * int -> int
+
+let private countGreater<'T> (xs: 'T[]) (pivot: 'T) (cmp: IComparer<'T>) : int =
+    let mutable acc = 0
+
+    for x in xs do
+        if cmp.Compare(x, pivot) > 0 then
+            acc <- acc + 1
+
+    acc
+
+let private countMatching<'T> (xs: 'T[]) (target: 'T) (eq: IEqualityComparer<'T>) : int =
+    let mutable acc = 0
+
+    for x in xs do
+        if eq.Equals(x, target) && eq.GetHashCode(x) = eq.GetHashCode(target) then
+            acc <- acc + 1
+
+    acc
+
+let private foldWithAdder (xs: int[]) (adder: IAdder) : int =
+    let mutable acc = 0
+
+    for x in xs do
+        acc <- adder.Add(acc, x)
+
+    acc
+
+let private storeAndCallAdder (adder: IAdder) (a: int) (b: int) : int =
+    let boxRef = ref (Some adder)
+    (boxRef.Value.Value).Add(a, b)
+
+[<Fact>]
+let ``test unique Array.map, Array.mapi, and Array.filter pipeline reuses arrays in place`` () =
+    let before1 = Fable.Core.Zig.Counters.reuses ()
+
+    let res =
+        Array.init 16 (fun i -> i)
+        |> Array.map (fun x -> x * 2)
+        |> Array.mapi (fun i x -> x + i)
+        |> Array.filter (fun x -> x % 2 = 0)
+
+    res |> equal [| 0; 6; 12; 18; 24; 30; 36; 42 |]
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        (Fable.Core.Zig.Counters.reuses () - before1 >= 3) |> equal true
+
+    let before2 = Fable.Core.Zig.Counters.reuses ()
+    let f32s = Array.init 8 (fun i -> i) |> Array.map float32
+    f32s |> equal [| 0.0f; 1.0f; 2.0f; 3.0f; 4.0f; 5.0f; 6.0f; 7.0f |]
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        (Fable.Core.Zig.Counters.reuses () - before2 >= 1) |> equal true
+
+    let filtered = Array.init 10 id |> Array.filter (fun x -> x < 3)
+    let fresh = [| 0; 1; 2 |]
+    (filtered = fresh) |> equal true
+    compare filtered fresh |> equal 0
+    hash filtered |> equal (hash fresh)
+
+    let filteredEmpty = Array.init 6 id |> Array.filter (fun _ -> false)
+    let freshEmpty: int[] = [||]
+    (filteredEmpty = freshEmpty) |> equal true
+    compare filteredEmpty freshEmpty |> equal 0
+    hash filteredEmpty |> equal (hash freshEmpty)
+
+[<Fact>]
+let ``test aliased and closure-captured arrays are not corrupted by Array.map and Array.filter`` () =
+    let a = [| 10; 20; 30; 40 |]
+    let m1 = Array.map (fun x -> x + 1) a
+    let m2 = Array.mapi (fun i x -> x + i) a
+    let f1 = Array.filter (fun x -> x >= 25) a
+    a |> equal [| 10; 20; 30; 40 |]
+    m1 |> equal [| 11; 21; 31; 41 |]
+    m2 |> equal [| 10; 21; 32; 43 |]
+    f1 |> equal [| 30; 40 |]
+
+    let b = [| 1; 2; 3; 4 |]
+    let bm = Array.map (fun x -> x + b.[0]) b
+    bm |> equal [| 2; 3; 4; 5 |]
+    b |> equal [| 1; 2; 3; 4 |]
+
+    let c = [| 1; 2; 3; 4 |]
+    let cf = Array.filter (fun x -> x > c.[0]) c
+    cf |> equal [| 2; 3; 4 |]
+    c |> equal [| 1; 2; 3; 4 |]
+
+    let applyMap (f: int -> int) (xs: int[]) = Array.map f xs
+    let applyFilter (f: int -> bool) (xs: int[]) = Array.filter f xs
+
+    let beforeMap = Fable.Core.Zig.Counters.reuses ()
+    applyMap (fun x -> x * 3) (Array.init 8 id) |> equal [| 0; 3; 6; 9; 12; 15; 18; 21 |]
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        (Fable.Core.Zig.Counters.reuses () - beforeMap >= 1) |> equal true
+
+    let beforeFilter = Fable.Core.Zig.Counters.reuses ()
+    applyFilter (fun x -> x % 2 = 1) (Array.init 8 id) |> equal [| 1; 3; 5; 7 |]
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        (Fable.Core.Zig.Counters.reuses () - beforeFilter >= 1) |> equal true
+
+[<Fact>]
+let ``test unique Array.map and Array.filter unwind cleanly on mid-loop exception`` () =
+    throwsError "uniq-map-boom" (fun () ->
+        Array.init 6 (fun i -> "item-" + string i)
+        |> Array.map (fun s -> if s.EndsWith("3") then failwith "uniq-map-boom" else s + "!")
+        |> ignore)
+
+    throwsError "uniq-mapi-boom" (fun () ->
+        Array.init 6 (fun i -> "item-" + string i)
+        |> Array.mapi (fun i s -> if i = 3 then failwith "uniq-mapi-boom" else string i + ":" + s)
+        |> ignore)
+
+    throwsError "uniq-filter-boom" (fun () ->
+        Array.init 6 (fun i -> "item-" + string i)
+        |> Array.filter (fun s -> if s.EndsWith("3") then failwith "uniq-filter-boom" else s.EndsWith("0") || s.EndsWith("2"))
+        |> ignore)
+
+[<Fact>]
+let ``test Array.sortBy, sortByDescending, and sortInPlaceBy evaluate projection O(N) times and are stable`` () =
+    let mutable emptyCalls = 0
+
+    ([||]: int[])
+    |> Array.sortBy (fun x ->
+        emptyCalls <- emptyCalls + 1
+        x)
+    |> equal [||]
+
+    emptyCalls |> equal 0
+
+    let mutable singleCalls = 0
+    let single = [| 42 |]
+
+    Array.sortInPlaceBy
+        (fun x ->
+            singleCalls <- singleCalls + 1
+            x)
+        single
+
+    single |> equal [| 42 |]
+    singleCalls |> equal 0
+
+    let input = [| (2, 0); (1, 1); (3, 2); (1, 3); (2, 4); (0, 5); (3, 6); (2, 7) |]
+
+    let mutable ascCalls = 0
+
+    let asc =
+        input
+        |> Array.sortBy (fun (k, _) ->
+            ascCalls <- ascCalls + 1
+            k)
+
+    asc |> equal [| (0, 5); (1, 1); (1, 3); (2, 0); (2, 4); (2, 7); (3, 2); (3, 6) |]
+    ascCalls |> equal 8
+
+    let inPlace = Array.copy input
+    let mutable inPlaceCalls = 0
+
+    Array.sortInPlaceBy
+        (fun (k, _) ->
+            inPlaceCalls <- inPlaceCalls + 1
+            k)
+        inPlace
+
+    inPlace |> equal [| (0, 5); (1, 1); (1, 3); (2, 0); (2, 4); (2, 7); (3, 2); (3, 6) |]
+    inPlaceCalls |> equal 8
+
+    let mutable descCalls = 0
+
+    let desc =
+        input
+        |> Array.sortByDescending (fun (k, _) ->
+            descCalls <- descCalls + 1
+            k)
+
+    desc |> equal [| (3, 2); (3, 6); (2, 0); (2, 4); (2, 7); (1, 1); (1, 3); (0, 5) |]
+#if FABLE_COMPILER
+    descCalls |> equal 8
+#else
+    (descCalls >= 8) |> equal true
+#endif
+
+    let xs = [| "c"; "a"; "b"; "d" |]
+
+    throwsError "sort-proj-boom" (fun () ->
+        Array.sortInPlaceBy (fun s -> if s = "b" then failwith "sort-proj-boom" else s) xs)
+
+    xs |> equal [| "c"; "a"; "b"; "d" |]
+
+[<Fact>]
+let ``test interface and object-expression HOF specialization`` () =
+    let xs = [| 1; 3; 5; 7; 9 |]
+    let ys = [| 9; 7; 5; 3; 1 |]
+    let bias = 3
+
+    System.Array.BinarySearch(
+        ys,
+        3,
+        { new IComparer<int> with
+            member _.Compare(a, b) = compare b a }
+    )
+    |> equal 3
+
+    System.Array.BinarySearch(
+        xs,
+        5,
+        { new IComparer<int> with
+            member _.Compare(a, b) = compare (a + bias) (b + bias) }
+    )
+    |> equal 2
+
+    System.Array.BinarySearch(ys, 3, ReverseIntComparerClass(2)) |> equal 3
+    System.Array.BinarySearch(xs, 7, ScaleIntComparerStruct(2)) |> equal 3
+    System.Array.BinarySearch(xs, 7, { Bias = 5 }) |> equal 3
+
+    countGreater
+        xs
+        4
+        { new IComparer<int> with
+            member _.Compare(a, b) = compare (a + bias) (b + bias) }
+    |> equal 3
+
+    countGreater ys 4 (ReverseIntComparerClass(1)) |> equal 2
+    countGreater xs 4 (ScaleIntComparerStruct(2)) |> equal 3
+    countGreater xs 4 { Bias = 5 } |> equal 3
+
+    let dupXs = [| 1; 4; 2; 7; 5; 8 |]
+
+    countMatching
+        dupXs
+        (5 + bias)
+        { new IEqualityComparer<int> with
+            member _.Equals(a, b) = (a % bias) = (b % bias)
+            member _.GetHashCode(x) = hash (x % bias) }
+    |> equal 3
+
+    foldWithAdder
+        xs
+        { new IAdder with
+            member _.Add(a, b) = a + b }
+    |> equal 25
+
+    foldWithAdder
+        xs
+        { new IAdder with
+            member _.Add(a, b) = a + b + bias }
+    |> equal 40
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        let beforeAllocs = Fable.Core.Zig.Counters.allocations ()
+        let mutable sum = 0
+
+        for _ in 1 .. 20 do
+            sum <-
+                sum
+                + System.Array.BinarySearch(
+                    xs,
+                    5,
+                    { new IComparer<int> with
+                        member _.Compare(a, b) = compare (a + bias) (b + bias) }
+                )
+
+            sum <-
+                sum
+                + foldWithAdder
+                    xs
+                    { new IAdder with
+                        member _.Add(a, b) = a + b + bias }
+
+        sum |> equal (20 * (2 + 40))
+        (Fable.Core.Zig.Counters.allocations () - beforeAllocs) |> equal 0
+
+    storeAndCallAdder
+        { new IAdder with
+            member _.Add(a, b) = a + b + bias }
+        10
+        20
+    |> equal 33
+
+    let nullRaised =
+        try
+            foldWithAdder xs (Unchecked.defaultof<IAdder>) |> ignore
+            false
+        with :? System.NullReferenceException ->
+            true
+
+    nullRaised |> equal true
+

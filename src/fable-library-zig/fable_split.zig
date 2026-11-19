@@ -37,14 +37,14 @@ pub fn splitPush(parts: *std.ArrayList(String), piece: []const u16, remove_empty
         while (p.len != 0 and unicode.isWhiteSpace(p[p.len - 1])) p = p[0 .. p.len - 1];
     }
     if (remove_empty and p.len == 0) return;
-    parts.append(rt.allocator, strFrom(p)) catch rt.oom();
+    parts.append(rt.alloc(), strFrom(p)) catch rt.oom();
 }
 
 pub fn splitDone(parts: *std.ArrayList(String)) Array(String) {
     const A = Array(String);
     const items = arrayItems(A, parts.items.len);
     @memcpy(items, parts.items);
-    parts.deinit(rt.allocator);
+    parts.deinit(rt.alloc());
     return arrayFrom(A, items);
 }
 
@@ -249,7 +249,7 @@ pub fn strToCharsRange(s: String, start: i32, n: i32) Raised!Array(u16) {
     const p = s orelse return nullRef();
     const u = p.units();
     if (start < 0 or n < 0 or start + n > u.len) return argRange("startIndex", index_range);
-    const items = rt.allocator.alloc(u16, @intCast(n)) catch rt.oom();
+    const items = rt.alloc().alloc(u16, @intCast(n)) catch rt.oom();
     @memcpy(items, u[@intCast(start)..][0..@intCast(n)]);
     return arrayFrom(Array(u16), items);
 }
@@ -343,12 +343,12 @@ pub fn isUnreserved(c: u8) bool {
 pub fn uriEscape(s: String, comptime uri: bool) Raised!String {
     const p = s orelse return argNull("stringToEscape");
     var utf8: std.ArrayList(u8) = .empty;
-    defer utf8.deinit(rt.allocator);
+    defer utf8.deinit(rt.alloc());
     var it = std.unicode.Utf16LeIterator.init(p.units());
     while (it.nextCodepoint() catch null) |cp| {
         var buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(cp, &buf) catch 0;
-        utf8.appendSlice(rt.allocator, buf[0..n]) catch rt.oom();
+        utf8.appendSlice(rt.alloc(), buf[0..n]) catch rt.oom();
     }
     var b: TextBuilder = .{};
     for (utf8.items) |c| {
@@ -373,13 +373,13 @@ pub fn uriUnescape(s: String) Raised!String {
     while (i < u.len) {
         if (u[i] == '%') {
             var bytes: std.ArrayList(u8) = .empty;
-            defer bytes.deinit(rt.allocator);
+            defer bytes.deinit(rt.alloc());
             var j = i;
             while (j + 2 < u.len + 0 and u[j] == '%' and j + 2 < u.len + 1) {
                 if (j + 2 >= u.len) break;
                 const hi = std.fmt.charToDigit(@intCast(@min(u[j + 1], 127)), 16) catch break;
                 const lo = std.fmt.charToDigit(@intCast(@min(u[j + 2], 127)), 16) catch break;
-                bytes.append(rt.allocator, hi * 16 + lo) catch rt.oom();
+                bytes.append(rt.alloc(), hi * 16 + lo) catch rt.oom();
                 j += 3;
             }
             if (bytes.items.len == 0) {
@@ -430,7 +430,7 @@ pub fn sbToStringRange(sb: StringBuilder, start: i32, n: i32) Raised!String {
 /// `sb.Append(c, count)`
 pub fn sbAppendRepeat(sb: StringBuilder, c: u16, n: i32) Raised!StringBuilder {
     if (n < 0) return argRange("repeatCount", "Count cannot be less than zero.");
-    sb.units.appendNTimes(rt.allocator, c, @intCast(n)) catch rt.oom();
+    sb.units.appendNTimes(rt.alloc(), c, @intCast(n)) catch rt.oom();
     return dup(sb);
 }
 
@@ -450,7 +450,7 @@ pub fn sbSetLength(sb: StringBuilder, n: i32) Raised!void {
     if (len <= sb.units.items.len) {
         sb.units.shrinkRetainingCapacity(len);
     } else {
-        sb.units.appendNTimes(rt.allocator, 0, len - sb.units.items.len) catch rt.oom();
+        sb.units.appendNTimes(rt.alloc(), 0, len - sb.units.items.len) catch rt.oom();
     }
 }
 
@@ -471,14 +471,14 @@ pub fn sbReplace(sb: StringBuilder, old: String, new_: String) Raised!StringBuil
     var i: usize = 0;
     while (i < u.len) {
         if (i + o.len <= u.len and std.mem.eql(u16, u[i..][0..o.len], o)) {
-            out.appendSlice(rt.allocator, unitsOf(new_)) catch rt.oom();
+            out.appendSlice(rt.alloc(), unitsOf(new_)) catch rt.oom();
             i += o.len;
         } else {
-            out.append(rt.allocator, u[i]) catch rt.oom();
+            out.append(rt.alloc(), u[i]) catch rt.oom();
             i += 1;
         }
     }
-    sb.units.deinit(rt.allocator);
+    sb.units.deinit(rt.alloc());
     sb.units = out;
     return dup(sb);
 }

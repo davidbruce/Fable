@@ -124,7 +124,7 @@ pub fn strWords(len: usize) usize {
 
 /// A new string of `len` units, to be filled in by the caller. Its count is one.
 pub fn strNew(len: usize) struct { *Str, []u16 } {
-    const words = rt.allocator.alloc(u32, strWords(len)) catch oom();
+    const words = rt.alloc().alloc(u32, strWords(len)) catch oom();
     const s: *Str = @ptrCast(words.ptr);
     s.* = .{ .rc = 1, .len = @intCast(len), .cap = @intCast(len) };
     if (track) thread.stats.allocs += 1;
@@ -161,7 +161,7 @@ pub inline fn strRelease(s: String) void {
         if (@atomicRmw(u32, &m.rc, .Sub, 1, .acq_rel) != shared_bit | 1) return;
         if (track) thread.stats.frees += 1;
         const words: [*]u32 = @ptrCast(@alignCast(m));
-        rt.allocator.free(words[0..strWords(m.cap)]);
+        rt.alloc().free(words[0..strWords(m.cap)]);
         return;
     }
     if (m.rc != 1) {
@@ -171,7 +171,7 @@ pub inline fn strRelease(s: String) void {
     }
     if (track) thread.stats.frees += 1;
     const words: [*]u32 = @ptrCast(@alignCast(m));
-    rt.allocator.free(words[0..strWords(m.cap)]);
+    rt.alloc().free(words[0..strWords(m.cap)]);
 }
 
 /// Text that grows: what the functions below build a string of unknown length in.
@@ -179,11 +179,11 @@ pub const TextBuilder = struct {
     list: std.ArrayList(u16) = .empty,
 
     pub fn add(b: *TextBuilder, u: []const u16) void {
-        b.list.appendSlice(rt.allocator, u) catch oom();
+        b.list.appendSlice(rt.alloc(), u) catch oom();
     }
 
     pub fn addOne(b: *TextBuilder, c: u16) void {
-        b.list.append(rt.allocator, c) catch oom();
+        b.list.append(rt.alloc(), c) catch oom();
     }
 
     pub fn addAscii(b: *TextBuilder, text: []const u8) void {
@@ -191,7 +191,7 @@ pub const TextBuilder = struct {
     }
 
     pub fn deinit(b: *TextBuilder) void {
-        b.list.deinit(rt.allocator);
+        b.list.deinit(rt.alloc());
     }
 
     /// The text as a string; the builder is empty afterwards.
@@ -234,8 +234,8 @@ pub fn encodeUnits(enc: TextEncoding, units: []const u16) Array(u8) {
     var out: std.ArrayList(u8) = .empty;
     switch (enc) {
         .utf16le => for (units) |u| {
-            out.append(rt.allocator, @truncate(u)) catch oom();
-            out.append(rt.allocator, @truncate(u >> 8)) catch oom();
+            out.append(rt.alloc(), @truncate(u)) catch oom();
+            out.append(rt.alloc(), @truncate(u >> 8)) catch oom();
         },
         .utf8 => {
             var i: usize = 0;
@@ -243,11 +243,11 @@ pub fn encodeUnits(enc: TextEncoding, units: []const u16) Array(u8) {
                 const cp = nextCodePoint(units, &i);
                 var buf: [4]u8 = undefined;
                 const n = std.unicode.utf8Encode(cp, &buf) catch 0;
-                out.appendSlice(rt.allocator, buf[0..n]) catch oom();
+                out.appendSlice(rt.alloc(), buf[0..n]) catch oom();
             }
         },
     }
-    return arrayFrom(Array(u8), out.toOwnedSlice(rt.allocator) catch oom());
+    return arrayFrom(Array(u8), out.toOwnedSlice(rt.alloc()) catch oom());
 }
 
 pub fn rangeOf(len: usize, index: i32, count: i32) Raised![2]usize {
@@ -398,6 +398,7 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
             }
             // a cell: a reference record, an array, or what a case of a recursive union holds
             if (a == b) return 0;
+            if (comptime @hasDecl(p.child, "fable_array")) return compare(a.items, b.items);
             inline for (@typeInfo(p.child).@"struct".field_names) |name| {
                 if (comptime !isCount(name) and !std.mem.eql(u8, name, "shape")) {
                     const c = compare(@field(a, name), @field(b, name));
@@ -557,6 +558,7 @@ pub fn hash(x: anytype) i32 {
         .pointer => |p| {
             var h: i32 = 17;
             if (comptime p.size != .slice and @hasDecl(p.child, "fable_identity")) return @truncate(@as(isize, @bitCast(@intFromPtr(x))));
+            if (comptime p.size != .slice and @hasDecl(p.child, "fable_array")) return hashWith(17, hash(x.items));
             if (comptime p.size == .slice) {
                 for (x) |item| h = hashWith(h, hash(item));
                 return h;
@@ -726,7 +728,7 @@ pub fn strAppend(a: String, b: String) String {
     if (need > p.cap) {
         const cap = @max(need, @as(usize, p.cap) * 2);
         const old: [*]u32 = @ptrCast(@alignCast(p));
-        const words = rt.allocator.realloc(old[0..strWords(p.cap)], strWords(cap)) catch oom();
+        const words = rt.alloc().realloc(old[0..strWords(p.cap)], strWords(cap)) catch oom();
         s = @ptrCast(words.ptr);
         s.cap = @intCast(cap);
     }
@@ -1673,7 +1675,6 @@ pub fn defaultOut(bytes: []const u8) void {
 pub fn defaultErr(bytes: []const u8) void {
     posixWrite(2, bytes);
 }
-
 
 pub fn writeText(write: *const fn ([]const u8) void, s: String, newline: bool) void {
     var buf: [512]u8 = undefined;

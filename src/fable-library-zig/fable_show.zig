@@ -268,7 +268,7 @@ pub const Shower = struct {
         if (T == Any) return if (x) |o| b.showShape(o, shape, node_idx, prec, depth) else b.word("null");
         if (comptime isBigInt(T)) {
             const d = bigDigits(x);
-            defer rt.allocator.free(d);
+            defer rt.alloc().free(d);
             return b.word(d);
         }
         if (comptime isDecimal(T)) {
@@ -541,7 +541,7 @@ pub fn anyTextShape(comptime shape: TypeShape, x: anytype) String {
 
 pub fn anyTextAt(comptime shape: TypeShape, node_idx: u16, x: anytype) String {
     if (@TypeOf(x) == String and x == null) return str("<null>");
-    var arena = std.heap.ArenaAllocator.init(rt.allocator);
+    var arena = std.heap.ArenaAllocator.init(rt.alloc());
     defer arena.deinit();
     var b: Shower = .{ .arena = arena.allocator() };
     const layout = b.showShape(x, shape, node_idx, .bracket_if_tuple, print_depth);

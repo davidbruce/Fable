@@ -10,18 +10,27 @@ being moved here stage by stage.
 ## Pipeline
 
 ```text
-Fable AST ─► lower ─► ownership IR ─► borrow inference ─► dup/drop insertion ─► emit ─► Zig text
-            (Fable2Zig.Lower.fs)      (Fable2Zig.Perceus.fs, both passes)     (Fable2Zig.Emit.fs)
+Fable AST ─► lower ─► non-null ─► ownership IR ─► borrow inference ─► dup/drop insertion ─► emit ─► Zig text
+            (Fable2Zig.Lower*.fs)   (NonNull.fs)    (Fable2Zig.Perceus*.fs)                 (Fable2Zig.Emit*.fs)
 ```
 
-- `Zig.IR.fs`: the ownership IR. Flat expressions have no control flow; anything a statement
-  needs is let-bound first, so every later pass looks at one use at a time.
-- `Fable2Zig.Lower.fs`: Fable AST → IR.
-- `Fable2Zig.Perceus.fs`: the ownership passes (see "Ownership" below).
-- `Fable2Zig.Emit.fs`: IR → Zig text. Integer arithmetic wraps, as on .NET. Self tail calls
-  become loops, also when the call is the last field of a new cell (the list is then built
-  top-down through a destination pointer).
-- `Fable2Zig.fs`, `ZigPrinter.fs`: the target's entry point and the file writer.
+Pinned toolchain target: **Zig 0.17.1 stable** (see [fable2-zig-enhancements-r2.md](fable2-zig-enhancements-r2.md) for Round 2 improvements and measurements).
+
+- `Zig.IR.fs` (1,002L): the ownership IR. Flat expressions have no control flow; anything a
+  statement needs is let-bound first, so every later pass looks at one use at a time.
+- `Fable2Zig.Facts.fs` (1,072L): cross-file `.facts.json` cache and import summary graph.
+- `Fable2Zig.Lower*.fs` & `Fable2Zig.Dotnet.*.fs`: Fable AST → IR (`LowerContext` 1,545L,
+  `LowerTypes` 1,594L, `LowerHelpers` 2,836L, `LowerFormat` 626L, `Lower` 2,412L, `LowerDotnet`
+  1,185L, `LowerInterfaces` 1,301L, `LowerControl` 1,153L, `LowerFile` 1,104L, plus domain
+  dispatch modules `Dotnet.{Helpers,HofSpec,Async,Collections,Text,Exceptions,Numbers,Math,Time,Reflection,IoRegex,Misc}.fs`).
+- `Fable2Zig.NonNull.fs` (95L): intra-procedural non-null dominance pass.
+- `Fable2Zig.Perceus*.fs`: ownership passes (`Perceus.Analysis` 1,359L, `Perceus.Insert`
+  1,036L, `Perceus.Hof` 1,255L, `Perceus.Tier2` 1,315L, `Perceus` 400L).
+- `Fable2Zig.Emit*.fs`: IR → Zig text (`Emit.Expr` 1,147L, `Emit.Stmt` 1,664L, `Emit.Decls`
+  1,873L, `Emit.Function` 1,760L, `Emit` 843L). Integer arithmetic wraps, as on .NET (with
+  `Checked` arithmetic checked). Self tail calls and TRMC become loops, and uniform cross-function
+  tail chains use the `$tc` trampoline / LLVM `always_tail`.
+- `Fable2Zig.fs` (227L), `ZigPrinter.fs` (32L): the target's entry point and the file writer.
 
 There is no separate Zig AST: the IR is the last structured form, and the emitter writes text.
 
@@ -62,9 +71,7 @@ value as F# defines them: records and tuples field by field, unions by case then
 Members on records and unions are functions whose first argument is the object: properties,
 methods (also curried, also used as function values), static members, the operators a type
 declares for itself (`static member (+)`), and members of generic types, in the file that
-declares the type or in another. A `ToString` that a type overrides is called where .NET
-calls it: by `x.ToString()`, `string x`, `{x}` and `%O` (`%A` does not use it, as on .NET).
-Not yet: other overrides and interface implementations, classes, object expressions.
+declares the type or in another. A `ToString` that a type overrides is called where .NET calls it: by `x.ToString()`, `string x`, `{x}` and `%O` (`%A` does not use it on records/unions, as on .NET). Classes, overrides, interfaces, and object expressions are described in the next section.
 
 ## Classes, interfaces, object expressions
 
@@ -75,39 +82,36 @@ chain declares, the root class's first. Where the fields of a class are depends 
 classes above it, so a member of a class reads its fields at a constant offset whatever class
 the object really is (no table is consulted). A class's constructor is a function that
 computes the fields in order, its parent's constructor first, and returns them (`Circle__chain`);
-making an object puts them in a new cell. `this` cannot be used in a constructor yet. Members
-are functions whose first argument is the object, as for records.
+making an object puts them in a new cell. Object-first construction (`new() as self`, `type C() as this`,
+and `then` blocks) is supported. Members are functions whose first argument is the object, as for records.
 
 Every class is such an object, because an earlier file cannot know that a later one derives
-from it (a generic class is still a plain counted cell unless it is abstract, derives from a
-class or has virtual members; those generic classes are not supported yet).
+from it; generic classes in inheritance chains, interfaces, and object expressions deriving from classes
+(including generic classes) are supported.
 
 Virtual members (`abstract` with `default`, and `override`) are called through the table of
 function values that the object's class has for the class that introduced the member: each
 class's type (`Circle__type`) holds one table for each class of its chain, filled with the
 most derived implementations. `base.M()` calls the parent's implementation directly. `:?`
 walks the chain of classes; `:?>` raises `InvalidCastException` with .NET's message. A class's
-`ToString` override is in its type too, so `string x` finds it whatever the static type; without
-one the text is .NET's name of the class (`Probe+Circle`). An interface that a base class
+`ToString`, `Equals`, and `GetHashCode` overrides work through its type as on .NET; without
+`ToString` the text is .NET's name of the class (`Probe+Circle`). An interface that a base class
 implements works on objects of derived classes. An object expression that derives from a class
 (`{ new Shape("x") with member _.Area() = k }`) is an object of a class of its own: its fields
 are the function values of its members, which hold what they capture, and its table calls
 them. A secondary constructor gives the fields its primary constructor computes. An interface that inherits interfaces has their
 members too, and is given where one of them is expected by taking those members. Objects are equal only to themselves, as on
-.NET.
+.NET (unless `Equals` is overridden).
 
-An interface value is a struct of function values, one per member (a property is a function of
-unit). A value of a class given where an interface is expected becomes that struct: each member
-is a function value that holds the object and calls the class's implementation
-(`Counter__Probe_IShape_Area`). An object expression is the same struct made of the lambdas of
-its members. A call of an interface member is a call of a function value. So interfaces reuse
-what function values already do: ownership, raising, cycles; the cost is a function value per
-member when a value is made an interface. `use` works with a class that implements
-`IDisposable` (the test and the call are settled from the class's type).
+An interface value is a `{ data, vt }` fat pointer backed by a static comptime vtable
+(`fable_rt.Iface(VTable)`): when a class, boxed value, or object expression is converted to an
+interface, `data` points to the object or captured closure state and `vt` points to the shared
+vtable of functions for that implementation (and interface upcasts re-slice/adapt the vtable).
+Generic interface methods are supported by type-erasing the slot to `obj` (`boxed`/`unboxed`
+at boundaries, with adapters for interface parameters). `:?` and `:?>` type tests/casts against
+interfaces work at run time, and `use` works with `IDisposable` implementations.
 
-Not yet: generic classes that take part in inheritance, overloaded virtual members, `this` in a
-constructor or in an object expression that implements an interface, generic interface members, type tests against interfaces at run time, `%A` of an object using its `ToString`, and
-overrides of `Equals` and `GetHashCode`.
+Not yet: overloaded virtual members on classes.
 
 A module-level value that is not a literal is computed when the program starts: every file
 has an `$init` that first runs those of the files it uses and then fills its own values in
@@ -141,7 +145,7 @@ pub const IntList = union(enum) {
 };
 ```
 
-The passes in `Fable2Zig.Perceus.fs` decide who owns each value, so that most code does no
+The passes in `Fable2Zig.Perceus*.fs` decide who owns each value, so that most code does no
 reference counting at all:
 
 1. **Naming field reads.** Fable inlines a binding that is used once, so
@@ -162,12 +166,16 @@ reference counting at all:
 A variable that can be assigned is treated conservatively: nothing is remembered about what
 it holds, and a name for one of its fields gets its own reference.
 
-The runtime (`src/fable-library-zig/fable_rt.zig`) has no per-type code: `dup`, `drop` and
-`eql` are generic over the type and find the cells through `@typeInfo`. Dropping a list (or
-the right spine of a tree) is a loop, not recursion. Cells come from `fable_rt.allocator`,
-one global that a program may set before it allocates; the allocator is not passed from
-function to function. In Debug and ReleaseSafe builds the runtime counts cells, and a program
-whose entry point returns with cells still allocated says so and exits with code 70.
+The runtime (`src/fable-library-zig/fable_rt.zig` and its companion modules) has no per-type code:
+`dup`, `drop` and `eql` are generic over the type and find the cells through `@typeInfo`.
+Cell headers pack three flag bits into the top of `@"$rc"` (`shared_bit`, `immortal_bit` for
+`.NET` null cells, and per-cell `weak_bit` leaving a 29-bit reference count). Dropping a list
+(or the right spine of a tree) is a loop, not recursion. Cells come from `fable_rt.alloc()`,
+routing to `fable_rt.allocator` with zero TLS check when whole-program `uses_arena` is false,
+and routing to an active `[<StackArena>]` when true; a program may set `fable_rt.allocator`
+before it allocates. In Debug and ReleaseSafe builds the runtime counts cells, and a program
+whose entry point returns with cells still allocated says so (including thread-exit `fable_sgc`
+drain counts) and exits with code 70.
 
 ### Calls between files
 
@@ -250,11 +258,15 @@ arguments and its result; the adapter is where that convention meets whatever th
 itself was inferred to borrow.
 
 `int -> int -> int` as a value is the uncurried form wherever Fable can uncurry it (a
-two-argument function value); where it cannot, it is a function that returns a function.
+two-argument function value); where it cannot, it is a function that returns a function
+(with fast unallocated `code2`/`apply2` paths when called in full).
 Functions cannot capture `let mutable` variables (F# does not allow it either).
 
-Not yet: a higher-order function is not specialised for the lambda it is given, so each call
-through a function value is an indirect call.
+Higher-order specialization: public HOF wrappers in `fable-library-zig` and intra-file HOF
+functions emit non-escaping `$k` / `callK` entry points (`Perceus.Hof.fs`) that fold known
+lambdas (`$kn*`) at Zig comptime via `xcallHofG`, and `Dotnet.HofSpec.fs` (`trySpecListHof` /
+`trySpecArrayHof`) specializes hot `List.*` and `Array.*` pipelines into direct local loops
+without closure allocation.
 
 ## Records that can be assigned
 
@@ -287,22 +299,27 @@ what .NET reads, and `TryParse` in its F# form (`match Int32.TryParse s with | t
 `List.sum`, `sumBy`, `average`, `averageBy`, `Array.sum` and `Array.average` add with the
 item type's `+` (wrapping for whole numbers).
 
-Not yet: `decimal`, `bigint`, `Checked` arithmetic, sums of types with an `+` of their own,
-culture-specific parsing.
+`Checked` arithmetic, `decimal`, `bigint`, and sums over custom types implementing `+`, `Zero`,
+and `DivideByInt` work as on .NET (only culture-specific number parsing defaults to invariant
+culture).
 
 ## The library
 
-The runtime library has two parts. `fable_rt.zig` (with `fable_sgc.zig` and
-`fable_unicode.zig`) is written by hand: cells, counts, the collector, strings, formatting,
-arrays. The rest is F#, in `src/fable-library-zig/*.fs`, compiled by this target like any
-program (`./build.sh fable-library --zig`) and copied next to the hand-written part. `List.fs`
-is F#'s `List` module: `map` is three lines of F#, becomes a loop through tail calls modulo
+The runtime library has two parts. The hand-written Zig runtime sits in `src/fable-library-zig/`
+across `fable_rt.zig` and focused modules (`fable_arena.zig`, `fable_array.zig`, `fable_array2d.zig`,
+`fable_bigint.zig`, `fable_collation.zig`, `fable_convert.zig`, `fable_decimal.zig`, `fable_exn.zig`,
+`fable_iface.zig`, `fable_io.zig`, `fable_iso.zig`, `fable_math.zig`, `fable_netformat.zig`,
+`fable_normalize.zig`, `fable_random.zig`, `fable_reflect.zig`, `fable_sgc.zig`, `fable_show.zig`,
+`fable_split.zig`, `fable_string.zig`, `fable_thread.zig`, `fable_time.zig`, `fable_unicode.zig`,
+`fable_weak.zig`, `fable_rt_tests.zig`). The rest is F#, in `src/fable-library-zig/*.fs`, compiled
+by this target like any program (`./build.sh fable-library --zig`) and copied next to the hand-written
+part. `List.fs` is F#'s `List` module: `map` is three lines of F#, becomes a loop through tail calls modulo
 cons, borrows its list, and raises what FSharp.Core raises because it says `invalidArg` where
 FSharp.Core does.
 
 A call of `List.map` in a program is kept under its .NET name by `Replacements.fs`, and the
-lowering sends it to `m_List.map` (`libraryFunction` in `Fable2Zig.Lower.fs` lists what the
-library has). It is then a call between files like any other: what the function borrows and
+lowering sends it to `m_List.map` (`libraryFunction` in `Fable2Zig.LowerHelpers.fs` lists what the
+library has, resolved by `Fable2Zig.LowerDotnet.fs`). It is then a call between files like any other: what the function borrows and
 whether it raises is settled when the Zig is compiled. The type arguments are found by name
 from the signature of the FSharp.Core function and given in the order of the names, so a
 library function declares its type parameters, with FSharp.Core's names, in that order
@@ -319,13 +336,17 @@ where a sequence is expected is walked as one; a sequence given to a function th
 is the list of what it gives. `for x in s` over a sequence asks it for each item in turn.
 `%A` walks a sequence for its first four items (`seq [1; 2; 3; 4; ...]`), as .NET does.
 
-`Async.fs` is F#'s `async`: a computation is a function given a record of what to do with its
-result and with an exception (continuations). There is one thread and nothing waits:
-`Async.Sleep` returns at once and `Async.Parallel` runs the computations one after the other,
-in order; what a computation gives and raises, and the order of its effects, are .NET's. The
-builder (`async`) has no state; its members, `RunSynchronously`, `StartImmediate`, `Start`,
-`Catch`, `Ignore` and `Parallel` are the library's. A builder of the program's own is a class
-like any other. Not yet: cancellation, `Async.FromContinuations`, `use!`.
+`Async.fs` is F#'s `async`: a computation is a function given continuations and cancellation
+support (`CancellationTokenSource`, `CancellationToken`, `CancellationTokenRegistration`),
+`Async.FromContinuations`, `use!`, `MailboxProcessor`, `Async.AwaitEvent`, and `Async.Sleep`.
+Each thread runs async work on its own scheduler; `Task.Run`, `Async.Parallel`, and
+`Parallel.For` share a lazily started persistent worker thread pool (`fable_thread.zig`),
+transferring uniquely owned captures across without setting `shared_bit` when unaliased and
+returning isolated results through `Iso` (`adoptShared` on receipt); `Async.Parallel` falls back
+to sequential execution if computations capture cycle-collector cells or cancellation is active.
+What a computation gives and raises, and the order of its effects, match .NET. The builder
+(`async`) has no state; synchronous `for`/`while` loops inside `async { }` lower directly to
+library loops (`builderForSync`/`builderWhileSync`). A custom builder is a class like any other.
 
 `Task.fs` is F#'s `task`. With one thread a task runs to its end where it is made (it starts
 there on .NET too), so a task is what it ended with: its result or its exception. `let!` of a
@@ -381,23 +402,22 @@ what an array, a ref cell or any generic cell with assignable fields holds as as
 runtime, and the rest of the module (sorting, `sortInPlace`, `max`, `groupBy`, `zip`, `take`,
 `chunkBySize`, `blit`, ...) in F# in the library (`Array.fs`).
 
-Not yet: `Array.zeroCreate n` for items that have no null here (records, unions, functions:
-only the empty array can be made that way; use `Array.create` or `Array.init`), arrays of
-more than one dimension, the rest of the `Array` module, and reading an item without a
-reference of its own where the array is only looked at.
+`Array.zeroCreate n` supports records, unions, and reference types alongside numbers/strings
+(null arrays and empty/default elements follow .NET semantics, with null/index checks where applicable).
+Not yet: arrays of more than two dimensions (`3D`/`4D`).
 
 A two-dimensional array is an array whose cell also holds its rows and columns (Fable gives it
 the type of a one-dimensional array): its items are row after row. `a.[i, j]`, `GetLength`,
 `Array2D.init`/`create`/`zeroCreate`/`get`/`set`/`length1`/`length2`/`copy`/`map`/`mapi`/
 `iter`/`iteri` work with .NET's errors, `%A` writes it as F# does, and `=` compares the shape
 too. `array2D` of a list or an array of lists or arrays, `Array2D.blit` (item after item, as
-FSharp.Core does) and `rebase`, and slices `a.[1..2, ..]` work. Not yet: `array2D` of other
+FSharp.Core does) and `rebase`, and slices `a.[1..2, ..]` work. Not yet: `array2D` of arbitrary
 sequences, and arrays of more dimensions.
 
 ## .NET's collections, and loops over collections
 
-`ResizeArray`, `Dictionary` and `HashSet` are cells of the runtime library, equal only to
-themselves as on .NET. A dictionary and a hash set are .NET's own design (buckets that chain
+`ResizeArray`, `Dictionary`, `HashSet`, `Stack`, `Queue`, `dict`, and `readOnlyDict` are
+supported (and `ConditionalWeakTable` and `ListCollector`). Dictionaries and hash sets use .NET's own design (buckets that chain
 into an array of entries, and a list of freed entries that the next ones reuse), so they hold
 their entries in the order .NET does: a loop over a dictionary and `%A` of it (`seq [[1, a];
 ...]`, four entries then `...`) give what .NET gives. Keys are hashed with `fable_rt.hash`
@@ -409,7 +429,7 @@ a map (its entries are pairs: `kv.Key`, `kv.Value`), a ResizeArray, a dictionary
 set are walked as the list of what they hold when the loop starts. (On .NET changing a .NET
 collection inside a loop over it raises; here the loop goes on over what it started with.)
 
-Not yet: `dict`, `Stack`, `Queue`, `SortedDictionary`, LINQ, and the rarer members.
+Not yet: `SortedDictionary`, LINQ, and the rarer members.
 
 ## Resources and stack arenas
 
@@ -425,14 +445,21 @@ one. The hooks never run on .NET, so they may not change what the program comput
 read the value and call `[<Emit>]` code (the hardware), and an assignment in one is a compile
 error. `Counters.resourceDestroys` and `resourceCopies` count them.
 
-`[<StackArena(bytes)>]` (Fable.Core.Zig) on a function runs its allocations out of a buffer of
-that size on its stack: the allocator is swapped on entry and back on exit, the collector's and
-the weak table's bookkeeping stay where they were, and running out of the buffer is a panic.
-The function may neither take nor give values that live on the heap; a cell made in it that is
-still alive when it ends is a panic in builds that count.
+`[<StackArena(bytes)>]` (Fable.Core.Zig) on a function routes its `alloc()` calls out of a
+buffer of that size on its stack using per-thread `thread.arena` (gated at compile time by
+whole-program `uses_arena` so programs without stack arenas pay zero overhead); the collector's
+and the weak table's bookkeeping stay on `allocator` via `bookkeeping()`, and running out of
+the buffer is a panic. A function with `[<StackArena>]` may neither take nor give values that
+live on the heap; a cell made in it that is still alive when it ends is a panic in every build.
 
-Not yet: generic resources, `IResource` on classes, hooks that raise (what they raise is
-given up), and a stack arena shared between threads.
+`Iso.pack` / `Iso.tryPack` support interfaces and object expressions (`IfaceMeta.iso_reach`)
+with atomic two-phase validation (`ShareProbe`), and invoke `gc.finishCheck()` before graph
+walking so active collector checks do not cause false failures. Copying a move-only `IResource`
+in generic runtime code fails at compile time (`@compileError` in `retainAll`). Generic value-type
+resources (`type MyRes<'T> ... interface IResource<MyRes<'T>>`) are supported.
+
+Not yet: `IResource` on classes, hooks that raise (what they raise is given up), and a stack
+arena shared between threads.
 
 ## Byrefs and spans
 
@@ -442,12 +469,12 @@ on is the pointer it is, and where F# gives a value for an `inref` its address i
 Reading a byref reads what it points at; assigning to it, or to a field through it, assigns
 there.
 
-`Span<'T>` and `ReadOnlySpan<'T>` are slices (`[]T`, `[]const T`) of the array they view, and
-the array stays alive while a span made of it is in use (the ownership pass takes the span for
-an alias of it). `s.[i]` is the item's place, with .NET's `IndexOutOfRangeException` outside;
-`Slice`, `Length`, `Fill` and the conversion to `ReadOnlySpan` work. Spans of values that are
-counted are not supported yet (an assignment through one could not tell the collector), nor
-`stackalloc`, `Span.ToArray` and spans of strings.
+`Span<'T>` and `ReadOnlySpan<'T>` are slices (`[]T`, `[]const T`) of the array, string, or
+stack-allocated buffer they view, and the array stays alive while a span made of it is in use
+(the ownership pass treats the span as an alias of it). `s.[i]` gives the item's place, with
+.NET's `IndexOutOfRangeException` outside; `Slice`, `Length`, `Fill`, `Clear`, `CopyTo`,
+`TryCopyTo`, `ToArray`, `AsSpan` (on arrays and strings), `MemoryExtensions`, counted element
+types, and `NativePtr.stackalloc` + `Span(ptr, n)` work (`fable_rt.StackAlloc`).
 
 (A fix in the shared `FableTransforms.fs`: `let t = r`, where `r` is a byref, copies the value
 it points at, so Fable no longer inlines `t`; that was wrong for every target.)
@@ -607,22 +634,18 @@ These are calls into the runtime library that return an error union (`ERt` in th
 function that divides by a variable can raise, and its callers have an error edge. A `while`
 condition may raise, and may have `&&` and `||` in it: it is then tested inside the loop.
 
-Not yet: `e.StackTrace` and inner exceptions, the file and line of a `MatchFailureException`,
-structural equality of exceptions, arithmetic that is `Checked`, and other .NET classes than
-those above. An exception that reaches the entry point is printed with its name and message,
-and the program exits with 134, as on .NET on Unix.
-
 Exceptions declared with F#'s `exception` are equal when their fields are, and hash so, as on
 .NET; .NET's classes are equal only to themselves. An incomplete match raises
 `MatchFailureException` with the file, line and column of the match (`MatchFailureException(file,
-line, column)` matches it, and `%A` shows them). `Path.GetFileName` works.
+line, column)` matches it, and `%A` shows them). `Checked` arithmetic raises `OverflowException`.
+An unhandled exception that reaches the entry point is printed with its name and message, and
+the program exits with 134, as on .NET on Unix.
 
 Thirty .NET exception classes are known, with .NET's parents (`:? IOException` catches a
 `FileNotFoundException`) and the messages .NET gives them when made without one.
-`Exception(message, inner)` keeps the inner exception: `InnerException` gives it (and raises
-`NullReferenceException` when there is none, which `isNull e.InnerException` tests without
-raising), and `%A` writes both as .NET's `ToString` does, without the stack trace. `StackTrace`
-is not supported.
+`Exception(message, inner)` and `AggregateException` keep inner exceptions (`InnerException`,
+`InnerExceptions`, `Flatten`, `isNull e.InnerException`), and `e.StackTrace` captures Zig frame
+text in programs that read it (`UsesStackTrace`). `%A` and `.ToString()` format them as on .NET.
 
 ## Strings
 
@@ -728,51 +751,31 @@ F# exception links the `%A` printer, because any exception may be asked for its 
 ## Tail calls
 
 A function that calls itself last is a loop (also when the call is the last field of a new
-cell). A call of *another* function of the file that ends a function is a jump
-(`@call(fable_rt.tail_call, f, .{ ... })`) when both functions have the same parameter and
-result types, all of them are numbers, booleans or chars, and neither can raise; `even`/`odd` and state machines
-over numbers then run in constant stack, as on .NET. Other signatures stay calls: Zig passes
-and returns records and unions through pointers into the caller's frame, which a jump would
-leave dangling (and LLVM rejects the jump when the result is returned that way). So mutual
-recursion over lists or trees still uses stack in proportion to its depth. The jump is only
-forced on the LLVM backend; elsewhere it is an ordinary call.
+cell, TRMC). A call of *another* function that ends a function uses uniform `$tc` tail chains
+(`TailCtx` with `tail_args_cap = 128` bytes, 16-byte alignment; tested on LLVM via `zig test -fllvm TailCallTests.zig`)
+when arguments fit (`fitsTailArgs`, covering 100% of observed test and benchmark signatures up to 64 B),
+or `@call(fable_rt.tail_call, ...)` where Zig's LLVM backend guarantees a tail jump (`[<NoTailCalls>]` opts a function out if needed).
 
 `./build.sh quicktest zig` compiles `src/quicktest-zig` and runs it with `zig run`.
 
 ## What is next, in order
 
-1. ~~Records and unions (value types first), tuples, options~~ (done).
-2. ~~Heap values: recursive unions as reference-counted cells, the runtime library
-   (`src/fable-library-zig`), borrow inference and dup/drop insertion (Perceus), reuse~~
-   (done).
-3. ~~What functions of other files borrow~~ (done, at Zig compile time: see "Calls between
-   files"). Whether a function of another file can raise will be stated the same way.
-4. ~~Closures and function values~~ (done), ~~generics~~ (done), ~~exceptions~~ (done for
-   F# `exception` declarations), byrefs and spans.
-5. ~~Mutable reference records and the cycle collector~~ (done).
-6. ~~Strings, formatting and printing, `%A`, the `String` module, exceptions with messages
-   and classes~~ (done); arrays and the other collections, and the rest of FSharp.Core
-   through `Replacements.fs` and the library.
-7. The test suite (`tests/Zig`), starting from the tests the other targets share.
+See [`Zig_Roadmap.md`](../../../Zig_Roadmap.md) and [`fable2-zig-enhancements-r2.md`](fable2-zig-enhancements-r2.md) for current Round 2 priorities and remaining backlog.
 
 ## Notes for the shared code
 
 - Nothing goes through another target's replacements. `Zig/Replacements.fs` handles every
   entry point of `Replacements.Api`: operators on numbers, booleans and chars become plain
   operation nodes, and every other call into .NET or FSharp.Core is kept as it is, as a call
-  to an import named after the declaring type (`dotnet:System.Math`, `Sqrt`). The lowering
-  resolves those by their .NET names (`dotnetCall` in `Fable2Zig.Lower.fs`) or rejects them
-  by name ("the Zig target does not support System.Math.Sqrt yet"). So far it knows
-  structural equality, `compare`, `ignore`, `id`, `fst`, `snd`, the conversions between
-  numbers, strings and `printf`, the ref cell operators and the functions that raise.
-- Generated files import the hand-written runtime (`fable_rt.zig`, copied into
+  to an import named after the declaring type (`dotnet:System.Math`, `Sqrt`). `Fable2Zig.LowerDotnet.fs`
+  and `Fable2Zig.Dotnet.*.fs` resolve those by their .NET names or reject unsupported members cleanly.
+- Generated files import the hand-written runtime (`fable_rt.zig` and its companion `fable_*.zig` modules, copied into
   `fable_modules/fable-library-zig`) only when they use it. It has its own Zig tests
-  (`zig test src/fable-library-zig/fable_rt.zig`). Its type introspection uses the
-  `field_names` / `field_types` form of `@typeInfo` (Zig 0.17 and later).
-- Two places in `FSharp2Fable.fs` drop information this target needs and will need a
-  Zig-specific branch: the address of anything but a variable or field is discarded, and a
-  store through a byref that is not a plain variable is rejected.
-- `src/Fable.Core/Fable.Core.Zig.fs` is the target's F# API (the collector and the runtime's
-  counters). Its functions have `Emit` attributes and ordinary bodies, which is what makes
-  them usable under .NET too.
+  (`zig test src/fable-library-zig/fable_rt.zig`, 67 tests). Its type introspection targets
+  **Zig 0.17.1 stable**.
+- Shared compiler edits in `FSharp2Fable.fs`, `FableTransforms.fs`, and `Pipeline.fs` are
+  minimal and guarded for Zig (`tests/Js` and `tests/TypeScript` stay green).
+- `src/Fable.Core/Fable.Core.Zig.fs` is the target's F# API (the collector, `Iso<'T>`,
+  `sameCell`, `StackArena`, and `Counters`). Its functions have `Emit` attributes and ordinary
+  bodies, which is what makes them usable under .NET too.
 - The target is not part of the stand-alone (JavaScript-hosted) compiler.

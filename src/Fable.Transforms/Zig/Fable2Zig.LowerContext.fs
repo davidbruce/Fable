@@ -1364,6 +1364,35 @@ let (|DomainCall|_|)
     else
         Some lowered
 
+/// Forward hooks for modules that compile after `Lower.fs` (`LowerDotnet`, `LowerInterfaces`,
+/// `LowerControl`), wired by `Fable2Zig.fs`.
+let mutable dotnetCallHook: Ctx -> SourceLocation option -> string -> string -> Fable.CallInfo -> Fable.Type -> Expr =
+    fun _ _ _ _ _ _ -> Unchecked.defaultof<Expr>
+
+let mutable libraryCallHook
+    : Ctx -> SourceLocation option -> string -> string -> Fable.CallInfo -> Fable.Expr list -> Fable.Type -> Expr =
+    fun _ _ _ _ _ _ _ -> Unchecked.defaultof<Expr>
+
+let mutable forInSourceHook: Ctx -> Fable.Expr -> (Expr * string) option =
+    fun _ _ -> None
+
+let mutable interfaceExprHook: Ctx -> Fable.Expr -> Expr =
+    fun _ _ -> Unchecked.defaultof<Expr>
+
+let (|LowerInterfaceExpr|_|) (ctx: Ctx) (e: Fable.Expr) : Expr option =
+    let lowered = interfaceExprHook ctx e
+
+    if obj.ReferenceEquals(lowered, null) then
+        None
+    else
+        Some lowered
+
+let mutable lowerValueHook: Ctx -> Fable.Expr -> Expr =
+    fun _ _ -> Unchecked.defaultof<Expr>
+
+let mutable lowerExprTailHook: Ctx -> Fable.Expr -> Expr =
+    fun _ _ -> Unchecked.defaultof<Expr>
+
 /// Is the function bound to `name` only given as a value in `e`, never called there? Then it is
 /// one value, made once (a delegate given to `AddHandler` and then to `RemoveHandler` is the
 /// same delegate, as on .NET), rather than a function of the file made into a value at each use.

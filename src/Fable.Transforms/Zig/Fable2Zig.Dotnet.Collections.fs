@@ -10,8 +10,11 @@ open Fable.Transforms.Zig.IR
 open Fable.Transforms.Zig.LowerContext
 open Fable.Transforms.Zig.LowerTypes
 open Fable.Transforms.Zig.LowerHelpers
+open Fable.Transforms.Zig.LowerFormat
 open Fable.Transforms.Zig.Lower
+open Fable.Transforms.Zig.LowerDotnet
 open Fable.Transforms.Zig.DotnetHelpers
+open Fable.Transforms.Zig.DotnetHofSpec
 
 /// The lowered call, or null when the member is not one of this file's.
 let call
@@ -72,6 +75,19 @@ let call
         | Fable.Array(Fable.String, _) -> true
         | _ -> false
 
+    let ownedArrayHof (macro: string) (fArg: Fable.Expr) (aArg: Fable.Expr) =
+        let outTy = mapType ctx r t
+
+        let emitOwned (xs: Fable.Expr list) =
+            ctx.State.UsesRuntime <- true
+
+            match xs with
+            | [ f0; a0 ] -> bindArgs ctx [ lw ctx f0; lw ctx a0 ] (fun ys -> ERt(macro, [ ys[1]; ys[0] ], outTy))
+            | _ -> fail r "internal: expected [f; a]"
+
+        trySpecArrayHof ctx r name args t emitOwned
+        |> Option.defaultWith (fun () -> emitOwned [ fArg; aArg ])
+
     match entity, name, args with
     // ---- arrays ----
     // `Array.BinarySearch`: the library's Array.fs, by the comparer given or the default one (a
@@ -125,15 +141,17 @@ let call
     // `Seq.cast<'T>` of objects (a `System.Array`, an array of `obj`): each unboxed
     | "Microsoft.FSharp.Collections.SeqModule", "Cast", [ Uncast source ] when
         (match t, source.Type with
-         | Fable.DeclaredType(_, [ item ]), Fable.DeclaredType(a, []) ->
-             a.FullName = "System.Array" && item <> Fable.Any
+         | Fable.DeclaredType(_, [ item ]), Fable.DeclaredType(a, []) when
+             a.FullName = "System.Array" || a.FullName = "System.Collections.IEnumerable"
+             ->
+             item <> Fable.Any
          | Fable.DeclaredType(_, [ item ]), Fable.Array(Fable.Any, _) -> item <> Fable.Any
          // (a list or a sequence of objects, and an object that is a collection)
          | Fable.DeclaredType(_, [ item ]), Fable.List Fable.Any -> item <> Fable.Any
-         | Fable.DeclaredType(_, [ item ]), Fable.DeclaredType(e, [ Fable.Any ]) ->
-             e.FullName = "System.Collections.Generic.IEnumerable`1" && item <> Fable.Any
-         | Fable.DeclaredType(_, [ item ]), Fable.DeclaredType(e, []) ->
-             e.FullName = "System.Collections.IEnumerable" && item <> Fable.Any
+         | Fable.DeclaredType(_, [ item ]), Fable.DeclaredType(e, [ Fable.Any ]) when
+             e.FullName = "System.Collections.Generic.IEnumerable`1"
+             ->
+             item <> Fable.Any
          | _ -> false)
         ->
         let item =
@@ -182,6 +200,7 @@ let call
              | Fable.Array(x, _)
              | Fable.List x -> x = item
              | Fable.DeclaredType(e, [ x ]) when e.FullName = "System.Collections.Generic.IEnumerable`1" -> x = item
+             | Fable.DeclaredType(e, []) when e.FullName = "System.Collections.IEnumerable" -> item = Fable.Any
              | Fable.DeclaredType(e, []) when e.FullName = "System.Text.RegularExpressions.MatchCollection" ->
                  (match item with
                   | Fable.DeclaredType(i, []) -> i.FullName = "System.Text.RegularExpressions.Match"
@@ -283,13 +302,7 @@ let call
     | "Microsoft.FSharp.Collections.ArrayModule", "Create", [ n; x ] ->
         rt "fable_rt.arrayCreate($R, $0, $1)" [ n; x ] (mapType ctx r t)
     | "Microsoft.FSharp.Collections.ArrayModule", "Initialize", [ n; f ] ->
-        Fable.Transforms.Zig.Lower.trySpecArrayHof
-            ctx
-            r
-            name
-            args
-            t
-            (fun args' -> rt "fable_rt.arrayInit($R, $0, $1)" args' (mapType ctx r t))
+        trySpecArrayHof ctx r name args t (fun args' -> rt "fable_rt.arrayInit($R, $0, $1)" args' (mapType ctx r t))
         |> Option.defaultWith (fun () -> rt "fable_rt.arrayInit($R, $0, $1)" [ n; f ] (mapType ctx r t))
     | "Microsoft.FSharp.Collections.ArrayModule", "Copy", [ a ] ->
         pure' "fable_rt.arrayCopy($0)" [ a ] (mapType ctx r t)
@@ -317,43 +330,17 @@ let call
     | "Microsoft.FSharp.Collections.ArrayModule.Parallel", "Iterate", [ f; a ] ->
         rt "fable_rt.arrayParallelIter($0, $1)" [ f; a ] tVoid
     | "Microsoft.FSharp.Collections.ArrayModule", "Map", [ f; a ] ->
-        Fable.Transforms.Zig.Lower.trySpecArrayHof
-            ctx
-            r
-            name
-            args
-            t
-            (fun args' -> rt "fable_rt.arrayMap($R, $0, $1)" args' (mapType ctx r t))
-        |> Option.defaultWith (fun () -> rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t))
+        ownedArrayHof "fable_rt.arrayMapInPlace($R, $0, $1)" f a
     | "Microsoft.FSharp.Collections.ArrayModule", "MapIndexed", [ f; a ] ->
-        Fable.Transforms.Zig.Lower.trySpecArrayHof
-            ctx
-            r
-            name
-            args
-            t
-            (fun args' -> rt "fable_rt.arrayMapi($R, $0, $1)" args' (mapType ctx r t))
-        |> Option.defaultWith (fun () -> rt "fable_rt.arrayMapi($R, $0, $1)" [ f; a ] (mapType ctx r t))
+        ownedArrayHof "fable_rt.arrayMapiInPlace($R, $0, $1)" f a
     | "Microsoft.FSharp.Collections.ArrayModule", "Iterate", [ f; a ] ->
-        Fable.Transforms.Zig.Lower.trySpecArrayHof
-            ctx
-            r
-            name
-            args
-            t
-            (fun args' -> rt "fable_rt.arrayIter($0, $1)" args' tVoid)
+        trySpecArrayHof ctx r name args t (fun args' -> rt "fable_rt.arrayIter($0, $1)" args' tVoid)
         |> Option.defaultWith (fun () -> rt "fable_rt.arrayIter($0, $1)" [ f; a ] tVoid)
     | "Microsoft.FSharp.Collections.ArrayModule", "IterateIndexed", [ f; a ] ->
-        Fable.Transforms.Zig.Lower.trySpecArrayHof
-            ctx
-            r
-            name
-            args
-            t
-            (fun args' -> rt "fable_rt.arrayIteri($0, $1)" args' tVoid)
+        trySpecArrayHof ctx r name args t (fun args' -> rt "fable_rt.arrayIteri($0, $1)" args' tVoid)
         |> Option.defaultWith (fun () -> rt "fable_rt.arrayIteri($0, $1)" [ f; a ] tVoid)
     | "Microsoft.FSharp.Collections.ArrayModule", "Fold", [ f; state; a ] ->
-        Fable.Transforms.Zig.Lower.trySpecArrayHof
+        trySpecArrayHof
             ctx
             r
             name
@@ -362,31 +349,12 @@ let call
             (fun args' -> rt "fable_rt.arrayFold($0, @as($R, $1), $2)" args' (mapType ctx r t))
         |> Option.defaultWith (fun () -> rt "fable_rt.arrayFold($0, @as($R, $1), $2)" [ f; state; a ] (mapType ctx r t))
     | "Microsoft.FSharp.Collections.ArrayModule", ("Filter" | "Where"), [ f; a ] ->
-        Fable.Transforms.Zig.Lower.trySpecArrayHof
-            ctx
-            r
-            name
-            args
-            t
-            (fun args' -> rt "fable_rt.arrayFilter($0, $1)" args' (mapType ctx r t))
-        |> Option.defaultWith (fun () -> rt "fable_rt.arrayFilter($0, $1)" [ f; a ] (mapType ctx r t))
+        ownedArrayHof "fable_rt.arrayFilterInPlace($0, $1)" f a
     | "Microsoft.FSharp.Collections.ArrayModule", "Exists", [ f; a ] ->
-        Fable.Transforms.Zig.Lower.trySpecArrayHof
-            ctx
-            r
-            name
-            args
-            t
-            (fun args' -> rt "fable_rt.arrayExists($0, $1)" args' tBool)
+        trySpecArrayHof ctx r name args t (fun args' -> rt "fable_rt.arrayExists($0, $1)" args' tBool)
         |> Option.defaultWith (fun () -> rt "fable_rt.arrayExists($0, $1)" [ f; a ] tBool)
     | "Microsoft.FSharp.Collections.ArrayModule", "ForAll", [ f; a ] ->
-        Fable.Transforms.Zig.Lower.trySpecArrayHof
-            ctx
-            r
-            name
-            args
-            t
-            (fun args' -> rt "fable_rt.arrayForall($0, $1)" args' tBool)
+        trySpecArrayHof ctx r name args t (fun args' -> rt "fable_rt.arrayForall($0, $1)" args' tBool)
         |> Option.defaultWith (fun () -> rt "fable_rt.arrayForall($0, $1)" [ f; a ] tBool)
 
     // ---- .NET's mutable collections ----
@@ -1001,5 +969,57 @@ let call
             )
     // `GC.Collect()`: free every cycle that is dead now
     | "System.GC", "Collect", [] -> pure' "_ = fable_rt.collect()" [] tVoid
+
+    // sums and averages: the runtime adds with `+` of the item type
+    | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] when mapType ctx r t = TPrim "fable_rt.NetDecimal" ->
+        rt "fable_rt.listSumDec($0)" [ xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ListModule", "Sum", [ xs ] -> pure' "fable_rt.listSum($0)" [ xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ListModule", "SumBy", [ f; xs ] ->
+        trySpecListHof
+            ctx
+            r
+            name
+            args
+            t
+            (function
+            | [ f'; xs' ] -> rt "fable_rt.listSumBy($R, $0, $1)" [ f'; xs' ] (mapType ctx r t)
+            | _ -> rt "fable_rt.listSumBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
+            )
+        |> Option.defaultWith (fun () -> rt "fable_rt.listSumBy($R, $0, $1)" [ f; xs ] (mapType ctx r t))
+    | "Microsoft.FSharp.Collections.ListModule", "Average", [ xs ] ->
+        rt "fable_rt.listAverage($0)" [ xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ListModule", "AverageBy", [ f; xs ] ->
+        rt "fable_rt.listAverageBy($R, $0, $1)" [ f; xs ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] when mapType ctx r t = TPrim "fable_rt.NetDecimal" ->
+        rt "fable_rt.arraySumDec($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Sum", [ a ] -> pure' "fable_rt.arraySum($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "Average", [ a ] ->
+        rt "fable_rt.arrayAverage($0)" [ a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Collections.ArrayModule", "SumBy", [ f; a ] ->
+        trySpecArrayHof
+            ctx
+            r
+            name
+            args
+            t
+            (function
+            | [ f'; a' ] -> rt "fable_rt.arraySumBy($R, $0, $1)" [ f'; a' ] (mapType ctx r t)
+            | _ -> rt "fable_rt.arraySumBy($R, $0, $1)" [ f; a ] (mapType ctx r t)
+            )
+        |> Option.defaultWith (fun () -> rt "fable_rt.arraySumBy($R, $0, $1)" [ f; a ] (mapType ctx r t))
+    | "Microsoft.FSharp.Collections.ArrayModule", "AverageBy", [ f; a ] ->
+        rt "fable_rt.arrayAverageBy($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "System.Array", "Copy", [ Uncast src; Uncast dst; n ] ->
+        rt "fable_rt.arrayCopyRange($0, 0, $1, 0, $2)" [ src; dst; n ] tVoid
+    | "System.Array", "Copy", [ Uncast src; si; Uncast dst; di; n ] ->
+        rt "fable_rt.arrayCopyRange($0, $1, $2, $3, $4)" [ src; si; dst; di; n ] tVoid
+    | "System.Array", "IndexOf", [ Uncast a; Uncast x ] -> rt "fable_rt.arrayIndexOf($0, $1, 0, null)" [ a; x ] tI32
+    | "System.Array", "IndexOf", [ Uncast a; Uncast x; start ] ->
+        rt "fable_rt.arrayIndexOf($0, $1, $2, null)" [ a; x; start ] tI32
+    | "System.Array", "IndexOf", [ Uncast a; Uncast x; start; count ] ->
+        rt "fable_rt.arrayIndexOf($0, $1, $2, $3)" [ a; x; start; count ] tI32
+    | "System.Array", "ConvertAll", [ a; f ] -> rt "fable_rt.arrayMap($R, $0, $1)" [ f; a ] (mapType ctx r t)
+    | "Microsoft.FSharp.Core.Operators.OperatorIntrinsics", "SetArraySlice", [ target; lo; hi; source ] ->
+        rt "fable_rt.arraySetSlice($0, $1, $2, $3)" [ target; lo; hi; source ] tVoid
 
     | _ -> Unchecked.defaultof<Expr>

@@ -844,6 +844,14 @@ let ``test Seq.cast works`` () =
     ys |> Seq.head |> equal 1
 
 [<Fact>]
+let ``test Seq.cast works on non-generic IEnumerable`` () =
+    let arrEnum: System.Collections.IEnumerable = upcast [| 10; 20; 30 |]
+    let listEnum: System.Collections.IEnumerable = upcast [box 4; box 5]
+    arrEnum |> Seq.cast<int> |> Seq.sum |> equal 60
+    listEnum |> Seq.cast<int> |> Seq.toList |> equal [4; 5]
+    listEnum |> Seq.cast<obj> |> Seq.length |> equal 2
+
+[<Fact>]
 let ``test Seq.compareWith works`` () =
     let xs = [1; 2; 3; 4]
     let ys = [1; 2; 3; 5]

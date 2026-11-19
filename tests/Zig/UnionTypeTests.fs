@@ -592,3 +592,105 @@ let ``test Union with wrapped type works`` () =
     let b = match a with AString s -> s + " world"
     b |> equal "hello world"
 
+type ReuseDuBox =
+    | ReuseNum of int64
+    | ReuseLabel of string
+    | ReuseLink of int64 * ReuseDuBox
+
+type ReuseMutA = { mutable AVal: int64 }
+type ReuseMutB = { mutable BLabel: string }
+
+let rec private stepReuseDu (x: ReuseDuBox) =
+    match x with
+    | ReuseNum n -> ReuseLabel(sprintf "n:%d" n)
+    | ReuseLabel s -> ReuseNum(int64 s.Length)
+    | ReuseLink(a, next) ->
+        match next with
+        | ReuseNum b -> ReuseNum(a + b)
+        | _ -> ReuseNum a
+
+let rec private zeroLiveMatchReuse (x: ReuseDuBox) =
+    match x with
+    | ReuseNum _ -> ReuseLabel "ok"
+    | ReuseLabel _ -> ReuseNum 42L
+    | ReuseLink _ -> ReuseNum 99L
+
+[<System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)>]
+let private makeWeakAndConvertMutA (x: int64) =
+    let a = { AVal = x }
+    let w = System.WeakReference<ReuseMutA>(a)
+    let v = a.AVal
+    let b = { BLabel = sprintf "v:%d" v }
+    b, w
+
+[<Fact>]
+let ``test cross-constructor DU reuse and zero-live-field match reuse`` () =
+    let before1 = Fable.Core.Zig.Counters.reuses ()
+    let mutable totalLen = 0L
+
+    for i in 1 .. 40 do
+        let a = ReuseNum(int64 i)
+        let b = stepReuseDu a
+
+        match b with
+        | ReuseLabel s -> totalLen <- totalLen + int64 s.Length
+        | _ -> ()
+
+    (totalLen > 0L) |> equal true
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        (Fable.Core.Zig.Counters.reuses () - before1 >= 20) |> equal true
+
+    let before2 = Fable.Core.Zig.Counters.reuses ()
+    let mutable acc = 0L
+
+    for i in 1 .. 40 do
+        let a =
+            if i % 2 = 0 then
+                ReuseNum(int64 i)
+            else
+                ReuseLabel(sprintf "x%d" i)
+
+        let b = zeroLiveMatchReuse a
+
+        match b with
+        | ReuseNum n -> acc <- acc + n
+        | ReuseLabel s -> acc <- acc + int64 s.Length
+        | ReuseLink _ -> ()
+
+    match zeroLiveMatchReuse (ReuseLink(1L, ReuseNum 2L)) with
+    | ReuseNum n -> acc <- acc + n
+    | _ -> ()
+
+    acc |> equal (20L * 2L + 20L * 42L + 99L)
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        (Fable.Core.Zig.Counters.reuses () - before2 >= 20) |> equal true
+
+[<Fact>]
+let ``test KRefRecord cross-type newReuse and WeakReference blocking`` () =
+    let before = Fable.Core.Zig.Counters.reuses ()
+    let mutable total = 0
+
+    for i in 1 .. 40 do
+        let a = { AVal = int64 i }
+        let v = a.AVal
+        let b = { BLabel = sprintf "v:%d" v }
+        total <- total + b.BLabel.Length
+
+    (total > 0) |> equal true
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        (Fable.Core.Zig.Counters.reuses () - before >= 20) |> equal true
+
+    let beforeWeak = Fable.Core.Zig.Counters.reuses ()
+    let b, w = makeWeakAndConvertMutA 10L
+    b.BLabel |> equal "v:10"
+
+    if Fable.Core.Zig.Counters.isCounting () then
+        (Fable.Core.Zig.Counters.reuses () - beforeWeak) |> equal 0
+
+    System.GC.Collect()
+    let mutable target = Unchecked.defaultof<ReuseMutA>
+    w.TryGetTarget(&target) |> equal false
+

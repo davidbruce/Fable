@@ -70,6 +70,10 @@ let handle (args: string list) =
 
         Command.Run("zig", $"test %s{name}%s{libc}", workingDirectory = testsDir)
 
+        if name = "TailCallTests.zig" then
+            // Exercise the 200,000-depth LLVM tail-call path (without -lc so Zig's leak checker runs too)
+            Command.Run("zig", $"test -fllvm %s{name}", workingDirectory = testsDir)
+
     // (in Release: F# makes tail calls only there, and the tail-call tests recurse deeply)
     if not noDotnet then
         Command.Run("dotnet", "test -c Release Fable.Tests.Zig.fsproj", workingDirectory = testsDir)

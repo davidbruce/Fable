@@ -10,7 +10,9 @@ open Fable.Transforms.Zig.IR
 open Fable.Transforms.Zig.LowerContext
 open Fable.Transforms.Zig.LowerTypes
 open Fable.Transforms.Zig.LowerHelpers
+open Fable.Transforms.Zig.LowerFormat
 open Fable.Transforms.Zig.Lower
+open Fable.Transforms.Zig.LowerDotnet
 open Fable.Transforms.Zig.DotnetHelpers
 
 /// (a StringComparison: an enum of that type)
@@ -18,6 +20,167 @@ let private isComparison (x: Fable.Expr) =
     match x.Type with
     | Fable.Number(Int32, Fable.NumberInfo.IsEnum e) -> e.FullName = "System.StringComparison"
     | _ -> false
+
+/// `String.Format("{0} {1:N2}", a, b)`: the format is taken apart here, as an interpolated
+/// string's is: `{i,width:format}` becomes `%widthP(format)` of the value i.
+let private compositeFormat
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (fmt: string)
+    (values: Fable.Expr list)
+    (t: Fable.Type)
+    : Expr
+    =
+    // (`String.Format(fmt, [| a; b |])`, or the values one by one)
+    let values =
+        match values with
+        | [ Fable.Value(Fable.NewArray(Fable.ArrayValues vs, _, _), _) ] -> vs
+        | _ -> values
+        |> List.map (fun v ->
+            match v with
+            | Uncast inner -> inner
+        )
+
+    // each value is evaluated once, in order, whatever the format uses
+    let temps =
+        values
+        |> List.mapi (fun i v ->
+            let name = $"format_arg_%d{i}_%d{ctx.State.Vars.Count}"
+            let var = ctx.State.NewVar(name, mapType ctx r v.Type, VLocal, false)
+
+            let ident: Fable.Ident =
+                {
+                    Name = name
+                    Type = v.Type
+                    IsMutable = false
+                    IsThisArgument = false
+                    IsCompilerGenerated = true
+                    Range = None
+                    IsInlineIfLambda = false
+                }
+
+            ctx.Vars[name] <- var
+            var, lw ctx v, ident
+        )
+
+    let text = System.Text.StringBuilder()
+    let holes = List<Fable.Expr>()
+    let mutable bad = false
+    let mutable i = 0
+
+    while i < fmt.Length do
+        let c = fmt[i]
+
+        if c = '{' && i + 1 < fmt.Length && fmt[i + 1] = '{' then
+            text.Append('{') |> ignore
+            i <- i + 2
+        elif c = '}' && i + 1 < fmt.Length && fmt[i + 1] = '}' then
+            text.Append('}') |> ignore
+            i <- i + 2
+        elif c = '{' then
+            let close = fmt.IndexOf('}', i)
+
+            if close < 0 then
+                fail r "the format of String.Format is not well formed"
+
+            let item = fmt.Substring(i + 1, close - i - 1)
+
+            let head, format =
+                match item.IndexOf ':' with
+                | -1 -> item, ""
+                | k -> item.Substring(0, k), item.Substring(k + 1)
+
+            let index, width =
+                match head.IndexOf ',' with
+                | -1 -> int (head.Trim()), 0
+                | k -> int (head.Substring(0, k).Trim()), int (head.Substring(k + 1).Trim())
+
+            if index >= temps.Length then
+                bad <- true
+            else
+                let _, _, ident = temps[index]
+
+                // (a date, a time or a span with a format: its own ToString(format), .NET's)
+                let dateEntity =
+                    match ident.Type with
+                    | Fable.DeclaredType(e, []) when
+                        format <> ""
+                        && (e.FullName = "System.DateTime"
+                            || e.FullName = "System.DateTimeOffset"
+                            || e.FullName = "System.DateOnly"
+                            || e.FullName = "System.TimeOnly"
+                            || e.FullName = "System.TimeSpan")
+                        ->
+                        Some e.FullName
+                    | _ -> None
+
+                match dateEntity with
+                | Some entity ->
+                    holes.Add(
+                        Fable.Call(
+                            Fable.Import(
+                                {
+                                    Selector = "ToString"
+                                    Path = Replacements.DotnetPrefix + entity
+                                    Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = true))
+                                },
+                                Fable.Any,
+                                None
+                            ),
+                            Fable.CallInfo.Create(
+                                thisArg = Fable.IdentExpr ident,
+                                args = [ Fable.Value(Fable.StringConstant format, None) ],
+                                sigArgTypes = [ Fable.String ]
+                            ),
+                            Fable.String,
+                            r
+                        )
+                    )
+                | None -> holes.Add(Fable.IdentExpr ident)
+
+                let format =
+                    if dateEntity.IsSome then
+                        ""
+                    else
+                        format
+
+                let flags =
+                    if width < 0 then
+                        "-"
+                    else
+                        ""
+
+                let widthText =
+                    if width <> 0 then
+                        string (abs width)
+                    else
+                        ""
+
+                text.Append($"%%%s{flags}%s{widthText}P(%s{format})") |> ignore
+
+            i <- close + 1
+        elif c = '%' then
+            text.Append("%%") |> ignore
+            i <- i + 1
+        else
+            text.Append(c) |> ignore
+            i <- i + 1
+
+    let body =
+        if bad then
+            let message =
+                ELit(
+                    stringLiteral
+                        "Index (zero based) must be greater than or equal to zero and less than the size of the argument list.",
+                    tStr
+                )
+
+            raiseDotnet ctx r "System.FormatException" message t
+        else
+            formatted ctx r "PrintFormatToString" (text.ToString()) (List.ofSeq holes) t
+
+    List.foldBack (fun (var, ir, _) acc -> ELet(var, ir, acc)) temps body
+
 
 /// The lowered call, or null when the member is not one of this file's.
 let call

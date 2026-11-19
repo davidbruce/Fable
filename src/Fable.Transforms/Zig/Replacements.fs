@@ -527,7 +527,9 @@ let tryBaseConstructor
     (args: Expr list)
     : (Expr * Expr list) option
     =
-    None
+    match ent.FullName with
+    | Types.attribute -> Some(Value(UnitConstant, None), [])
+    | _ -> None
 
 /// The .NET type behind a built-in type, for calls the F# compiler resolves by type
 /// (statically resolved type parameters).

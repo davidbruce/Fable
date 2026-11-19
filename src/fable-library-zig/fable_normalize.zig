@@ -48,23 +48,23 @@ fn spanOf(spans: []const u32, items: []const u21, i: usize) []const u21 {
 fn decompose(out: *std.ArrayList(u21), cp: u21, compat: bool) void {
     if (cp >= s_base and cp < s_base + s_count) {
         const s = cp - s_base;
-        out.append(rt.allocator, l_base + s / n_count) catch rt.oom();
-        out.append(rt.allocator, v_base + (s % n_count) / t_count) catch rt.oom();
+        out.append(rt.alloc(), l_base + s / n_count) catch rt.oom();
+        out.append(rt.alloc(), v_base + (s % n_count) / t_count) catch rt.oom();
         const t = s % t_count;
-        if (t != 0) out.append(rt.allocator, t_base + t) catch rt.oom();
+        if (t != 0) out.append(rt.alloc(), t_base + t) catch rt.oom();
         return;
     }
     if (compat) {
         if (find(&data.compat_keys, cp)) |i| {
-            out.appendSlice(rt.allocator, spanOf(&data.compat_spans, &data.compat_items, i)) catch rt.oom();
+            out.appendSlice(rt.alloc(), spanOf(&data.compat_spans, &data.compat_items, i)) catch rt.oom();
             return;
         }
     }
     if (find(&data.canon_keys, cp)) |i| {
-        out.appendSlice(rt.allocator, spanOf(&data.canon_spans, &data.canon_items, i)) catch rt.oom();
+        out.appendSlice(rt.alloc(), spanOf(&data.canon_spans, &data.canon_items, i)) catch rt.oom();
         return;
     }
-    out.append(rt.allocator, cp) catch rt.oom();
+    out.append(rt.alloc(), cp) catch rt.oom();
 }
 
 /// (the canonical order: the marks after a starter sorted by their class, stably)
@@ -161,7 +161,7 @@ fn normalized(units: []const u16, form: i32, replace_lone: bool) []u21 {
     }
     reorder(cps.items);
     if (form == form_c or form == form_kc) cps.items.len = compose(cps.items);
-    return cps.toOwnedSlice(rt.allocator) catch rt.oom();
+    return cps.toOwnedSlice(rt.alloc()) catch rt.oom();
 }
 
 fn checkForm(form: i32) Raised!void {
@@ -191,7 +191,7 @@ fn normalizeWith(s: String, form: i32, replace_lone: bool, comptime param: []con
     } else return rt.dup(s);
     try checkUnits(units, param);
     const cps = normalized(units, form, replace_lone);
-    defer rt.allocator.free(cps);
+    defer rt.alloc().free(cps);
     var b: rt.TextBuilder = .{};
     for (cps) |cp| {
         if (cp >= 0x10000) {

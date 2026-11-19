@@ -89,12 +89,21 @@ let lowerOnBigStack (com: Compiler) (file: Fable.File) : LoweredZigFile =
             | "async" -> DotnetAsync.call
             | "collections" -> DotnetCollections.call
             | "text" -> DotnetText.call
+            | "exceptions" -> DotnetExceptions.call
             | "numbers" -> DotnetNumbers.call
+            | "math" -> DotnetMath.call
             | _ -> DotnetMisc.call
+
+        Fable.Transforms.Zig.LowerContext.dotnetCallHook <- LowerDotnet.dotnetCall
+        Fable.Transforms.Zig.LowerContext.libraryCallHook <- LowerDotnet.libraryCall
+        Fable.Transforms.Zig.LowerContext.forInSourceHook <- LowerDotnet.forInSource
+        Fable.Transforms.Zig.LowerContext.interfaceExprHook <- LowerInterfaces.tryLower
+        Fable.Transforms.Zig.LowerContext.lowerValueHook <- LowerControl.lowerValue
+        Fable.Transforms.Zig.LowerContext.lowerExprTailHook <- LowerControl.lowerTail
 
         let timing = System.Environment.GetEnvironmentVariable "FABLE_ZIG_TIME" = "1"
         let sw = System.Diagnostics.Stopwatch.StartNew()
-        let state = Lower.lowerFile com file
+        let state = LowerFile.lowerFile com file
 
         if timing then
             eprintfn "ZIGTIME lower %s %dms" com.CurrentFile sw.ElapsedMilliseconds

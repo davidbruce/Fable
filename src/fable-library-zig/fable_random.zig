@@ -66,7 +66,7 @@ pub const Random = *struct {
 
 /// `Random(seed)`
 pub fn randomNew(seed: i32) Random {
-    const c = rt.allocator.create(@typeInfo(Random).pointer.child) catch rt.oom();
+    const c = rt.alloc().create(@typeInfo(Random).pointer.child) catch rt.oom();
     c.* = .{};
     const subtraction: i32 = if (seed == std.math.minInt(i32)) mbig else @intCast(@abs(seed));
     var mj: i32 = 161803398 - subtraction;
@@ -119,6 +119,11 @@ const SharedRandom = if (rt.sgc.per_thread) struct {
 
 pub fn randomShared() Random {
     if (SharedRandom.r == null) {
+        const saved_arena = if (comptime rt.uses_arena) thread.arena else null;
+        if (comptime rt.uses_arena) thread.arena = null;
+        defer if (comptime rt.uses_arena) {
+            thread.arena = saved_arena;
+        };
         SharedRandom.r = randomUnseeded();
         rt.uncount();
     }
@@ -170,7 +175,7 @@ pub const StringBuilder = *struct {
     units: std.ArrayList(u16) = .empty,
 
     pub fn fable_free(c: anytype) void {
-        c.units.deinit(rt.allocator);
+        c.units.deinit(rt.alloc());
     }
 
     pub fn fable_show(b: *Shower, x: anytype, depth: i32) *Layout {
@@ -180,9 +185,9 @@ pub const StringBuilder = *struct {
 };
 
 pub fn sbNew(init: String) StringBuilder {
-    const c = rt.allocator.create(@typeInfo(StringBuilder).pointer.child) catch rt.oom();
+    const c = rt.alloc().create(@typeInfo(StringBuilder).pointer.child) catch rt.oom();
     c.* = .{};
-    c.units.appendSlice(rt.allocator, unitsOf(init)) catch rt.oom();
+    c.units.appendSlice(rt.alloc(), unitsOf(init)) catch rt.oom();
     if (track) thread.stats.allocs += 1;
     return c;
 }

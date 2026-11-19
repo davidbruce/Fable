@@ -124,7 +124,11 @@ fn handleOf(target: anytype) *WeakHandle {
         };
         return handleOf(p);
     }
-    if (rt.isShared(target)) return sharedHandle(@intFromPtr(target));
+    if (rt.isShared(target)) {
+        _ = @atomicRmw(u32, &target.@"$rc", .Or, rt.weak_bit, .release);
+        return sharedHandle(@intFromPtr(target));
+    }
+    target.@"$rc" |= rt.weak_bit;
     return weakHandle(@intFromPtr(target));
 }
 
@@ -166,15 +170,17 @@ pub fn Weak(comptime T: type) type {
         pub fn fable_on_share(c: *Self) Raised!void {
             if (c.handle.shared) return;
             const addr = c.handle.target orelse {
-                shared_lock.lock();
-                defer shared_lock.unlock();
-                c.handle.shared = true;
+                if (rt.thread.share_probe == null) {
+                    shared_lock.lock();
+                    defer shared_lock.unlock();
+                    c.handle.shared = true;
+                }
                 return;
             };
             const target: CellOf(T) = @ptrFromInt(addr);
             try rt.markShared(target);
             // (shared already, without a weak reference of this thread's table: none to move)
-            if (!c.handle.shared) shareWeakHandle(addr);
+            if (rt.thread.share_probe == null and !c.handle.shared) shareWeakHandle(addr);
         }
 
         pub fn fable_show(b: *Shower, x: *Self, depth: i32) *Layout {
@@ -187,7 +193,7 @@ pub fn Weak(comptime T: type) type {
 
 /// `WeakReference<'T>(target)`
 pub fn weakNew(comptime W: type, target: @typeInfo(W).pointer.child.fable_weak) Raised!W {
-    const c = rt.allocator.create(@typeInfo(W).pointer.child) catch rt.oom();
+    const c = rt.alloc().create(@typeInfo(W).pointer.child) catch rt.oom();
     c.* = .{ .handle = handleOf(target) };
     if (track) thread.stats.allocs += 1;
     return c;
@@ -203,7 +209,8 @@ pub fn weakTryGet(w: anytype) ?@typeInfo(@TypeOf(w)).pointer.child.fable_weak {
         const target: CellOf(T) = @ptrFromInt(addr);
         // (a reference only while there is one: a count of zero is a cell being freed)
         var rc = @atomicLoad(u32, &target.@"$rc", .monotonic);
-        while (rc & ~rt.shared_bit != 0) {
+        if (rc & rt.immortal_bit != 0) return @as(T, target);
+        while (rc & rt.count_mask != 0) {
             rc = @cmpxchgWeak(u32, &target.@"$rc", rc, rc + 1, .acquire, .monotonic) orelse return @as(T, target);
         }
         return null;

@@ -367,6 +367,39 @@ let waitUntil (finished: unit -> bool) : bool =
     drive finished ignore
     finished ()
 
+/// Run one pending timer (and any trampoline work it leaves); false when none is left
+/// (lets callers like Task.fs drive the scheduler in a loop without capturing a TaskOf in a closure)
+let stepPending () : bool =
+    let st = sched ()
+    let pending = st.pending
+    let saved = st.depth
+    let mark = pending.Count
+    st.depth <- 0
+    st.drives <- st.drives + 1
+
+    let drain () =
+        while pending.Count > mark do
+            let next = pending.[mark]
+            pending.RemoveAt mark
+            st.depth <- 0
+            next ()
+
+    try
+        drain ()
+
+        if runNextTimer () then
+            st.depth <- 0
+            drain ()
+            true
+        else
+            false
+    finally
+        st.depth <- saved
+        st.drives <- st.drives - 1
+
+        if st.drives = 0 && st.timers.Count = 0 && st.pending.Count = 0 then
+            stateSet null
+
 let private make (run: Cont<'T> -> unit) : AsyncOf<'T> = { fable_async = run }
 
 /// Run a computation with these continuations; what it raises before it gets to one of them
@@ -940,10 +973,31 @@ let private holdsNoCycles (_x: 'a) : bool = Fable.Core.Util.nativeOnly
 /// (a message the receiver alone holds now: its own again, see fable_rt.adoptShared)
 [<Fable.Core.Emit("fable_rt.adoptShared($0)")>]
 let private adoptShared (_x: 'a) : unit = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("try fable_rt.poolRunWorkers($0, $1)")>]
+let private poolRunWorkers (_count: int) (_work: unit -> unit) : unit = Fable.Core.Util.nativeOnly
+
+/// (a message or parallel result boxed as it is sent: isolated values stay unshared)
+[<Fable.Core.Emit("$iso_send($0)")>]
+let private sendBox (_x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Util.nativeOnly
+
+[<Fable.Core.Emit("try fable_rt.isoUnpack($0)")>]
+let private unbox' (_x: Fable.Core.Zig.Iso<'a>) : 'a = Fable.Core.Util.nativeOnly
 #else
 let private adoptShared (_x: 'a) : unit = ()
 let private tryShare (_x: 'a) : bool = false
 let private holdsNoCycles (_x: 'a) : bool = false
+let private sendBox (x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Zig.Iso<'a>(x)
+let private unbox' (x: Fable.Core.Zig.Iso<'a>) : 'a = x.Take()
+
+let private poolRunWorkers (count: int) (work: unit -> unit) : unit =
+    let ts = Array.init count (fun _ -> System.Threading.Thread(work))
+
+    for t in ts do
+        t.Start()
+
+    for t in ts do
+        t.Join()
 #endif
 
 /// `Async.Parallel`: the results in order; the first failure is the result, as on .NET. Where
@@ -961,7 +1015,7 @@ let private parallelWith<'T> (computations: SeqOf<AsyncOf<'T>>) (maxDegree: int 
         if n = 0 then
             k.ok [||]
         else
-            let results: Result<'T, exn> option[] = Array.create n None
+            let results: Fable.Core.Zig.Iso<Result<'T, exn>> option[] = Array.create n None
             // (which failed first, in time)
             let firstFail: int[] = [| -1 |]
 
@@ -978,8 +1032,8 @@ let private parallelWith<'T> (computations: SeqOf<AsyncOf<'T>>) (maxDegree: int 
                 && tryShare results
                 && tryShare firstFail
             then
-                // (at most eight threads, as Parallel.For: each takes the next computation that
-                // no thread has taken until none is left)
+                // (at most eight pool workers, as Parallel.For: each takes the next computation that
+                // no worker has taken until none is left)
                 let next: int[] = [| 0 |]
 
                 if not (tryShare next) then
@@ -1003,75 +1057,79 @@ let private parallelWith<'T> (computations: SeqOf<AsyncOf<'T>>) (maxDegree: int 
 
                 let hasFailed () = lock failed (fun () -> failed.[0])
 
-                let threads =
-                    Array.init
-                        (System.Math.Min(System.Math.Min(n, 8), defaultArg maxDegree 8))
-                        (fun _ ->
-                            System.Threading.Thread(fun () ->
-                                let mutable i = take ()
+                let workerCount = System.Math.Min(System.Math.Min(n, 8), defaultArg maxDegree 8)
 
-                                while i < n do
-                                    let local = sourceCreate ()
-                                    let st = sched ()
+                poolRunWorkers
+                    workerCount
+                    (fun () ->
+                        let mutable i = take ()
 
-                                    st.poll <-
-                                        Some(fun () ->
-                                            if not local.cancelled && hasFailed () then
-                                                try
-                                                    sourceCancel local
-                                                with _ ->
-                                                    ()
-                                        )
+                        while i < n do
+                            let local = sourceCreate ()
+                            let st = sched ()
 
-                                    let r, _ =
-                                        if hasFailed () then
-                                            Some(Error(canceled ())), true
-                                        else
-                                            runHere cs.[i] (sourceToken local)
+                            st.poll <-
+                                Some(fun () ->
+                                    if not local.cancelled && hasFailed () then
+                                        try
+                                            sourceCancel local
+                                        with _ ->
+                                            ()
+                                )
 
-                                    // (an exception that reaches what cannot be shared comes back as
-                                    // a new one with its message)
-                                    let r =
-                                        match r with
-                                        | Some(Error e) when not (tryShare e) ->
-                                            Some(Error(System.Exception(e.Message)))
-                                        | _ -> r
+                            let r, _ =
+                                if hasFailed () then
+                                    Some(Error(canceled ())), true
+                                else
+                                    runHere cs.[i] (sourceToken local)
 
-                                    match r with
-                                    | Some(Error e) when not (e :? System.OperationCanceledException) ->
-                                        lock
-                                            firstFail
-                                            (fun () ->
-                                                if firstFail.[0] < 0 then
-                                                    firstFail.[0] <- i
-                                            )
+                            // (an exception that reaches what cannot be shared comes back as
+                            // a new one with its message)
+                            let r =
+                                match r with
+                                | Some(Error e) when not (tryShare e) -> Some(Error(System.Exception(e.Message)))
+                                | _ -> r
 
-                                        lock failed (fun () -> failed.[0] <- true)
-                                    | _ -> ()
+                            match r with
+                            | Some(Error e) when not (e :? System.OperationCanceledException) ->
+                                lock
+                                    firstFail
+                                    (fun () ->
+                                        if firstFail.[0] < 0 then
+                                            firstFail.[0] <- i
+                                    )
 
-                                    results.[i] <- r
-                                    i <- take ()
-                            )
-                        )
+                                lock failed (fun () -> failed.[0] <- true)
+                            | _ -> ()
 
-                for t in threads do
-                    t.Start()
+                            results.[i] <-
+                                match r with
+                                | Some v -> Some(sendBox v)
+                                | None -> None
 
-                for t in threads do
-                    t.Join()
+                            i <- take ()
+                    )
 
                 if isCancelled k then
                     k.cancel (canceled ())
                 elif firstFail.[0] >= 0 then
                     match results.[firstFail.[0]] with
-                    | Some(Error e) -> k.fail e
+                    | Some iso ->
+                        match unbox' iso with
+                        | Error e -> k.fail e
+                        | Ok _ -> k.fail (System.InvalidOperationException "Async.Parallel" :> exn)
                     | _ -> k.fail (System.InvalidOperationException "Async.Parallel" :> exn)
                 elif results |> Array.forall (fun r -> r.IsSome) then
                     k.ok (
                         results
                         |> Array.map (fun r ->
                             match r with
-                            | Some(Ok x) -> x
+                            | Some iso ->
+                                match unbox' iso with
+                                | Ok x ->
+                                    adoptShared x
+                                    x
+                                | _ -> failwith "unreachable"
                             | _ -> failwith "unreachable"
                         )
                     )
@@ -1250,23 +1308,14 @@ let private waitReplyReady (_x: 'a) : unit = Fable.Core.Util.nativeOnly
 [<Fable.Core.Emit("fable_rt.setAndWakeAll(&($0).ready)")>]
 let private wakeReplyReady (_x: 'a) : unit = Fable.Core.Util.nativeOnly
 
-/// (a message boxed as it is sent: see MessageQueue; isolated, it is not marked shared)
-[<Fable.Core.Emit("$iso_send($0)")>]
-let private sendBox (_x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Util.nativeOnly
-
 /// (a message boxed as it is, by the thread that holds it)
 [<Fable.Core.Emit("$iso_hold($0)")>]
 let private holdBox (_x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Util.nativeOnly
 
-[<Fable.Core.Emit("try fable_rt.isoUnpack($0)")>]
-let private unbox' (_x: Fable.Core.Zig.Iso<'a>) : 'a = Fable.Core.Util.nativeOnly
-
 [<Fable.Core.Emit("fable_rt.isoPeek($0)")>]
 let private peekBox (_x: Fable.Core.Zig.Iso<'a>) : 'a = Fable.Core.Util.nativeOnly
 #else
-let private sendBox (x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Zig.Iso<'a>(x)
 let private holdBox (x: 'a) : Fable.Core.Zig.Iso<'a> = Fable.Core.Zig.Iso<'a>(x)
-let private unbox' (x: Fable.Core.Zig.Iso<'a>) : 'a = x.Take()
 
 let private peekBox (_x: Fable.Core.Zig.Iso<'a>) : 'a =
     failwith "the library's .NET build does not run"

@@ -15,12 +15,12 @@ const sys = std.posix.system;
 /// The arguments of `[<EntryPoint>] main argv`: the command line without the program's name, as
 /// .NET gives them
 pub fn programArgs(args: std.process.Args) rt.Array(String) {
-    var it = std.process.Args.Iterator.initAllocator(args, rt.allocator) catch rt.oom();
+    var it = std.process.Args.Iterator.initAllocator(args, rt.alloc()) catch rt.oom();
     defer it.deinit();
     _ = it.skip();
     var items: std.ArrayList(String) = .empty;
-    while (it.next()) |a| items.append(rt.allocator, fromUtf8(a)) catch rt.oom();
-    return rt.arrayFrom(rt.Array(String), items.toOwnedSlice(rt.allocator) catch rt.oom());
+    while (it.next()) |a| items.append(rt.alloc(), fromUtf8(a)) catch rt.oom();
+    return rt.arrayFrom(rt.Array(String), items.toOwnedSlice(rt.alloc()) catch rt.oom());
 }
 
 // ---- the console ----
@@ -36,20 +36,20 @@ pub fn consoleWrite(s: String, to_err: bool, newline: bool) void {
 /// The UTF-8 of `s`, ended by a zero (the caller frees it)
 fn utf8z(s: String) [:0]u8 {
     const units = rt.unitsOf(s);
-    const buf = rt.allocator.allocSentinel(u8, units.len * 3, 0) catch rt.oom();
+    const buf = rt.alloc().allocSentinel(u8, units.len * 3, 0) catch rt.oom();
     const n = std.unicode.wtf16LeToWtf8(buf, units);
     buf[n] = 0;
     return buf[0..n :0];
 }
 
 fn dupeZ(bytes: []const u8) error{OutOfMemory}![:0]u8 {
-    const buf = try rt.allocator.allocSentinel(u8, bytes.len, 0);
+    const buf = try rt.alloc().allocSentinel(u8, bytes.len, 0);
     @memcpy(buf[0..bytes.len], bytes);
     return buf;
 }
 
 fn freeZ(z: [:0]u8) void {
-    rt.allocator.free(z.ptr[0 .. std.mem.len(z.ptr) + 1]);
+    rt.alloc().free(z.ptr[0 .. std.mem.len(z.ptr) + 1]);
 }
 
 /// A string of UTF-8 bytes: what is not UTF-8 is U+FFFD, as .NET decodes it
@@ -128,26 +128,26 @@ fn cwd() []u8 {
     var buf: [4096]u8 = undefined;
     const rc = sys.getcwd(&buf, buf.len);
     if (comptime @TypeOf(rc) == ?[*]u8 or @TypeOf(rc) == [*c]u8) {
-        if (rc == null) return rt.allocator.dupe(u8, "/") catch rt.oom();
-    } else if (std.posix.errno(rc) != .SUCCESS) return rt.allocator.dupe(u8, "/") catch rt.oom();
+        if (rc == null) return rt.alloc().dupe(u8, "/") catch rt.oom();
+    } else if (std.posix.errno(rc) != .SUCCESS) return rt.alloc().dupe(u8, "/") catch rt.oom();
     const n = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
-    return rt.allocator.dupe(u8, buf[0..n]) catch rt.oom();
+    return rt.alloc().dupe(u8, buf[0..n]) catch rt.oom();
 }
 
 /// `Path.GetFullPath(path)`: absolute, without `.`, `..` and repeated separators
 fn fullPathBytes(path: []const u8) []u8 {
     var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(rt.allocator);
+    defer joined.deinit(rt.alloc());
     if (path.len == 0 or path[0] != '/') {
         const dir = cwd();
-        defer rt.allocator.free(dir);
-        joined.appendSlice(rt.allocator, dir) catch rt.oom();
-        joined.append(rt.allocator, '/') catch rt.oom();
+        defer rt.alloc().free(dir);
+        joined.appendSlice(rt.alloc(), dir) catch rt.oom();
+        joined.append(rt.alloc(), '/') catch rt.oom();
     }
-    joined.appendSlice(rt.allocator, path) catch rt.oom();
+    joined.appendSlice(rt.alloc(), path) catch rt.oom();
 
     var parts: std.ArrayList([]const u8) = .empty;
-    defer parts.deinit(rt.allocator);
+    defer parts.deinit(rt.alloc());
     var it = std.mem.splitScalar(u8, joined.items, '/');
     while (it.next()) |p| {
         if (p.len == 0 or std.mem.eql(u8, p, ".")) continue;
@@ -155,16 +155,16 @@ fn fullPathBytes(path: []const u8) []u8 {
             if (parts.items.len > 0) _ = parts.pop();
             continue;
         }
-        parts.append(rt.allocator, p) catch rt.oom();
+        parts.append(rt.alloc(), p) catch rt.oom();
     }
     var out: std.ArrayList(u8) = .empty;
     for (parts.items) |p| {
-        out.append(rt.allocator, '/') catch rt.oom();
-        out.appendSlice(rt.allocator, p) catch rt.oom();
+        out.append(rt.alloc(), '/') catch rt.oom();
+        out.appendSlice(rt.alloc(), p) catch rt.oom();
     }
     // (a path that ends with a separator keeps it, as .NET keeps it)
-    if (out.items.len == 0 or (path.len > 0 and path[path.len - 1] == '/')) out.append(rt.allocator, '/') catch rt.oom();
-    return out.toOwnedSlice(rt.allocator) catch rt.oom();
+    if (out.items.len == 0 or (path.len > 0 and path[path.len - 1] == '/')) out.append(rt.alloc(), '/') catch rt.oom();
+    return out.toOwnedSlice(rt.alloc()) catch rt.oom();
 }
 
 pub fn fullPath(path: String) Raised!String {
@@ -173,7 +173,7 @@ pub fn fullPath(path: String) Raised!String {
     const z = utf8z(path);
     defer freeZ(z);
     const f = fullPathBytes(z);
-    defer rt.allocator.free(f);
+    defer rt.alloc().free(f);
     return fromUtf8(f);
 }
 
@@ -184,7 +184,7 @@ const Errno = std.posix.E;
 /// What a failure on `path` raises on .NET
 fn fail(e: Errno, path: []const u8, comptime is_dir: bool) Raised {
     const full = fullPathBytes(path);
-    defer rt.allocator.free(full);
+    defer rt.alloc().free(full);
     const name = fromUtf8(full);
     defer rt.drop(name);
     switch (e) {
@@ -203,7 +203,7 @@ fn fail(e: Errno, path: []const u8, comptime is_dir: bool) Raised {
 fn parentExists(full: []const u8) bool {
     const slash = std.mem.lastIndexOfScalar(u8, full, '/') orelse return true;
     const parent = dupeZ(if (slash == 0) "/" else full[0..slash]) catch rt.oom();
-    defer rt.allocator.free(parent);
+    defer rt.alloc().free(parent);
     return isDir(parent);
 }
 
@@ -246,15 +246,15 @@ fn readAll(path: [*:0]const u8) ![]u8 {
             .SUCCESS => {},
             .INTR => continue,
             else => |e| {
-                out.deinit(rt.allocator);
+                out.deinit(rt.alloc());
                 return errnoError(e);
             },
         }
         const n: usize = @intCast(r);
         if (n == 0) break;
-        out.appendSlice(rt.allocator, buf[0..n]) catch rt.oom();
+        out.appendSlice(rt.alloc(), buf[0..n]) catch rt.oom();
     }
-    return out.toOwnedSlice(rt.allocator) catch rt.oom();
+    return out.toOwnedSlice(rt.alloc()) catch rt.oom();
 }
 
 /// (an errno carried as a Zig error, to be turned into .NET's exception)
@@ -301,7 +301,7 @@ pub fn readAllText(path: String) Raised!String {
     const z = utf8z(path);
     defer freeZ(z);
     const bytes = readAll(z) catch return fail(io_thread.last_errno, z, false);
-    defer rt.allocator.free(bytes);
+    defer rt.alloc().free(bytes);
     if (bytes.len >= 3 and bytes[0] == 0xEF and bytes[1] == 0xBB and bytes[2] == 0xBF) return fromUtf8(bytes[3..]);
     if (bytes.len >= 2 and bytes[0] == 0xFF and bytes[1] == 0xFE) return fromUtf16(bytes[2..], false);
     if (bytes.len >= 2 and bytes[0] == 0xFE and bytes[1] == 0xFF) return fromUtf16(bytes[2..], true);
@@ -371,7 +371,7 @@ pub fn deleteFile(path: String) Raised!void {
         .SUCCESS => {},
         .NOENT => {
             const full = fullPathBytes(z);
-            defer rt.allocator.free(full);
+            defer rt.alloc().free(full);
             if (!parentExists(full)) return fail(.NOENT, z, true);
         },
         else => |e| return fail(e, z, false),
@@ -426,12 +426,12 @@ pub fn createDirectory(path: String) Raised!void {
     const z = utf8z(path);
     defer freeZ(z);
     const full = fullPathBytes(z);
-    defer rt.allocator.free(full);
+    defer rt.alloc().free(full);
     var i: usize = 1;
     while (i <= full.len) : (i += 1) {
         if (i == full.len or full[i] == '/') {
             const part = dupeZ(full[0..i]) catch rt.oom();
-            defer rt.allocator.free(part);
+            defer rt.alloc().free(part);
             if (isDir(part)) continue;
             const rc = sys.mkdir(part, 0o777);
             switch (std.posix.errno(rc)) {
@@ -457,7 +457,7 @@ pub fn deleteDirectory(path: String) Raised!void {
 /// `Directory.GetCurrentDirectory()` and `Environment.CurrentDirectory`
 pub fn currentDirectory() String {
     const d = cwd();
-    defer rt.allocator.free(d);
+    defer rt.alloc().free(d);
     return fromUtf8(d);
 }
 
@@ -468,9 +468,9 @@ pub fn tempPath() String {
     const dir = envBytes("TMPDIR") orelse "/tmp/";
     if (dir.len > 0 and dir[dir.len - 1] == '/') return fromUtf8(dir);
     var b: std.ArrayList(u8) = .empty;
-    defer b.deinit(rt.allocator);
-    b.appendSlice(rt.allocator, dir) catch rt.oom();
-    b.append(rt.allocator, '/') catch rt.oom();
+    defer b.deinit(rt.alloc());
+    b.appendSlice(rt.alloc(), dir) catch rt.oom();
+    b.append(rt.alloc(), '/') catch rt.oom();
     return fromUtf8(b.items);
 }
 
@@ -498,14 +498,14 @@ pub fn tempFileName() Raised!String {
     var tries: usize = 0;
     while (tries < 100) : (tries += 1) {
         var b: std.ArrayList(u8) = .empty;
-        defer b.deinit(rt.allocator);
-        b.appendSlice(rt.allocator, dir) catch rt.oom();
-        if (dir.len == 0 or dir[dir.len - 1] != '/') b.append(rt.allocator, '/') catch rt.oom();
-        b.appendSlice(rt.allocator, "tmp") catch rt.oom();
-        for (0..6) |_| b.append(rt.allocator, randomChar()) catch rt.oom();
-        b.appendSlice(rt.allocator, ".tmp") catch rt.oom();
+        defer b.deinit(rt.alloc());
+        b.appendSlice(rt.alloc(), dir) catch rt.oom();
+        if (dir.len == 0 or dir[dir.len - 1] != '/') b.append(rt.alloc(), '/') catch rt.oom();
+        b.appendSlice(rt.alloc(), "tmp") catch rt.oom();
+        for (0..6) |_| b.append(rt.alloc(), randomChar()) catch rt.oom();
+        b.appendSlice(rt.alloc(), ".tmp") catch rt.oom();
         const z = dupeZ(b.items) catch rt.oom();
-        defer rt.allocator.free(z);
+        defer rt.alloc().free(z);
         const rc = sys.open(z, openFlags(.create_new), @as(std.posix.mode_t, 0o600));
         switch (std.posix.errno(rc)) {
             .SUCCESS => {

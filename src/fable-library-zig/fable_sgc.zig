@@ -105,6 +105,7 @@ const root = @import("root");
 const assert = std.debug.assert;
 
 pub const unlimited: usize = std.math.maxInt(usize);
+pub const rc_count_mask: u32 = (1 << 29) - 1;
 
 pub const State = enum(u2) {
     /// Not being looked at.
@@ -867,6 +868,18 @@ pub const Gc = struct {
         return @intCast(gc.counters.freed + gc.counters.freed_by_count - before);
     }
 
+    /// Drive any active local check to `.idle`, unpinning `F_STACKED` cells and clearing
+    /// `gc.check` without starting new checks or draining unrelated dying queues.
+    /// Respects `noCollectEnter()` (`gc.no_collect > 0`).
+    pub fn finishCheck(gc: *Gc) void {
+        if (gc.phase == .idle) return;
+        if (gc.no_collect > 0) {
+            gc.counters.suppressed += 1;
+            return;
+        }
+        gc.work(unlimited);
+    }
+
     /// For a caller that wants a full round in bounded steps: startRound(),
     /// then startNextInRound() each time the collector is idle, until it
     /// returns false.
@@ -1066,6 +1079,10 @@ pub const Gc = struct {
         return @ptrFromInt(addr);
     }
 
+    inline fn rcCount(h: *const Hdr) u32 {
+        return rcPtr(h).* & rc_count_mask;
+    }
+
     // =====================================================================
     // membership
     // =====================================================================
@@ -1105,7 +1122,7 @@ pub const Gc = struct {
         h.st = r.index;
         r.refs += 1;
         r.members += 1;
-        r.ext += rcPtr(h).*; // all of them from outside, until its edges are looked at
+        r.ext += rcCount(h); // all of them from outside, until its edges are looked at
         append(&r.ring, h);
         gc.counters.joined += 1;
         r.grow += 1;
@@ -1273,7 +1290,7 @@ pub const Gc = struct {
         var n: usize = 0;
         while (it != &r.ring) : (it = it.next) {
             n += 1;
-            if (it != zeroed_cell) sum += rcPtr(it).*;
+            if (it != zeroed_cell) sum += rcCount(it);
             it.desc().trace(it, &v);
         }
         assert(n == r.members);
@@ -1400,7 +1417,7 @@ pub const Gc = struct {
                 // releases can lead back here. (isGarbage counts what it
                 // holds inside.)
                 if (check_deaths) {
-                    if (c != d.zeroed) d.v_sum += rcPtr(c).*;
+                    if (c != d.zeroed) d.v_sum += rcCount(c);
                     tl.dying_now = d;
                 }
                 c.desc().release_outside(c, gc.ctx);
@@ -1445,6 +1462,7 @@ pub const Gc = struct {
         if (h.meta.flags & F_PASSED != 0) {
             h.meta.flags = (h.meta.flags & ~F_PASSED) | F_STACKED;
             gc.n_passed -= 1;
+            assert(rcCount(h) < rc_count_mask);
             rcPtr(h).* += 1;
             gc.root(h).ext += 1;
             h.u.work = gc.grey_top;
@@ -1453,7 +1471,7 @@ pub const Gc = struct {
     }
 
     inline fn whiten(h: *Hdr) void {
-        h.u.refs = rcPtr(h).*;
+        h.u.refs = rcCount(h);
         h.meta.state = .white;
     }
 
@@ -1600,7 +1618,7 @@ pub const Gc = struct {
                     r.ext -= 1;
                     if (r.ext == 0) {
                         gc.die(r); // the pin was the structure's last outside reference
-                    } else if (rc.* == 0) {
+                    } else if ((rc.* & rc_count_mask) == 0) {
                         // the mutator let go of it while it waited
                         gc.counters.died_pinned += 1;
                         gc.detach(g, r);

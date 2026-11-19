@@ -15,12 +15,13 @@ three runs of each in milliseconds (.NET's time includes the start of the runtim
 - `messages`: four threads post batches (a ResizeArray, a list) to a MailboxProcessor, which
   changes and sums them; the total comes back with PostAndReply
 
-On an Apple M-series machine (Zig 0.18, .NET 10), 2026-11-13:
+Toolchain baseline: **Zig 0.17.1 stable** and **.NET 10.0.111** (measured 2026-11-19 with `src/benchmarks-zig/run.sh`, `-OReleaseFast`):
 
-| benchmark | Zig ms | .NET ms |
-|-----------|-------:|--------:|
-| nbody     |    260 |     271 |
-| lists     |    392 |     762 |
-| maps      |    173 |     306 |
-| strings   |     19 |     628 |
-| virtual   |     90 |      93 |
+| benchmark | Zig ms | .NET ms | output summary           | ReleaseFast B (`__TEXT`) | ReleaseSmall B (`__TEXT`) |
+|-----------|-------:|--------:|--------------------------|-------------------------:|--------------------------:|
+| nbody     |    259 |     239 | `-0.169075164`           |        423,480 (309,248) |         183,872 (108,920) |
+| lists     |    452 |     758 | `84617894480`            |        423,048 (306,352) |         184,304 (107,856) |
+| maps      |    242 |     315 | `19999900000 100000 ...` |        469,912 (343,112) |         223,376 (136,400) |
+| strings   |     25 |    1153 | `1988895 1988895 ...`    |        423,000 (309,480) |         184,256 (108,416) |
+| virtual   |     65 |      76 | `9980020000000.0 ...`    |        424,168 (309,656) |         183,968 (108,544) |
+| messages  |    250 |     394 | `508240000`              |        848,712 (600,728) |         342,960 (244,760) |

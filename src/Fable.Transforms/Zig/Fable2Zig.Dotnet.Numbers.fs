@@ -10,7 +10,9 @@ open Fable.Transforms.Zig.IR
 open Fable.Transforms.Zig.LowerContext
 open Fable.Transforms.Zig.LowerTypes
 open Fable.Transforms.Zig.LowerHelpers
+open Fable.Transforms.Zig.LowerFormat
 open Fable.Transforms.Zig.Lower
+open Fable.Transforms.Zig.LowerDotnet
 open Fable.Transforms.Zig.DotnetHelpers
 
 /// The lowered call, or null when the member is not one of this file's.

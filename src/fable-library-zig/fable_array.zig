@@ -48,6 +48,8 @@ pub fn Array(comptime T: type) type {
         @"$rc": u32 = 1,
         @"$gc": GcHdr(fable_cyclic) = undefined,
         items: []T,
+        /// allocated slice length in `items.ptr[0..capacity]`, allowing O(1) in-place shrink
+        capacity: usize = 0,
         /// a two-dimensional array: its rows and columns, the items row after row
         shape: ?[2]usize = null,
     };
@@ -59,21 +61,21 @@ pub fn ItemOf(comptime A: type) type {
 }
 
 pub fn arrayItems(comptime A: type, n: usize) []ItemOf(A) {
-    return rt.allocator.alloc(ItemOf(A), n) catch rt.oom();
+    return rt.alloc().alloc(ItemOf(A), n) catch rt.oom();
 }
 
 /// The items of an array of a length the program computed: OutOfMemoryException when they do
 /// not fit (see `rt.oom_policy`)
 pub fn arrayItemsOrRaise(comptime A: type, n: usize) Raised![]ItemOf(A) {
-    return rt.allocator.alloc(ItemOf(A), n) catch return rt.oomRaise();
+    return rt.alloc().alloc(ItemOf(A), n) catch return rt.oomRaise();
 }
 
 /// A new array that owns `items`.
 pub fn arrayFrom(comptime A: type, items: []ItemOf(A)) A {
     const C = @typeInfo(A).pointer.child;
     if (comptime hasGc(C)) gcTick();
-    const c = rt.allocator.create(C) catch rt.oom();
-    c.* = .{ .items = items };
+    const c = rt.alloc().create(C) catch rt.oom();
+    c.* = .{ .items = items, .capacity = items.len };
     if (comptime hasGc(C)) c.@"$gc" = gcHeader(C, c);
     if (track) thread.stats.allocs += 1;
     return c;
@@ -92,8 +94,14 @@ fn NullOf(comptime A: type) type {
 
         fn get() A {
             if (made) |c| return c;
-            const c = arrayFrom(A, &.{});
+            // Allocate thread-lifetime null array cells on the global heap (`rt.allocator`),
+            // never inside a stack arena that may return before the thread exits.
+            rt.gcTick();
+            const c = rt.allocator.create(C) catch rt.oom();
+            c.* = .{ .items = &.{}, .capacity = 0 };
             c.@"$rc" = null_count;
+            c.@"$gc" = gcHeader(C, c);
+            if (track) thread.stats.allocs += 1;
             rt.thread.null_arrays.append(rt.bookkeeping(), .{ .cell = c, .free = free }) catch rt.oom();
             rt.uncount();
             made = c;
@@ -108,13 +116,13 @@ fn NullOf(comptime A: type) type {
                 made = null;
                 return;
             }
-            c.@"$rc" = 1;
+            c.@"$rc" = (c.@"$rc" & rt.weak_bit) | 1;
             rt.recount();
             rt.drop(c);
             made = null;
         }
     } else struct {
-        var static: C = .{ .@"$rc" = null_count, .items = &.{} };
+        var static: C = .{ .@"$rc" = null_count | rt.shared_bit, .items = &.{}, .capacity = 0 };
 
         fn get() A {
             return &static;
@@ -122,8 +130,8 @@ fn NullOf(comptime A: type) type {
     };
 }
 
-/// (far from one and from overflowing either way)
-pub const null_count: u32 = 1 << 30;
+/// Null array marker reusing `rt.immortal_bit` so null arrays never contend on `$rc` atomics.
+pub const null_count: u32 = rt.immortal_bit;
 
 /// The null of an array type (a reference of its own)
 pub fn arrayNull(comptime A: type) A {
@@ -131,8 +139,8 @@ pub fn arrayNull(comptime A: type) A {
 }
 
 /// Is an array .NET's null?
-pub fn arrayIsNull(a: anytype) bool {
-    return a == NullOf(@TypeOf(a)).get();
+pub inline fn arrayIsNull(a: anytype) bool {
+    return rt.isCellNull(a);
 }
 
 /// `xs :> System.Array`: the items as objects (a new array: what is set through it is not seen
@@ -178,7 +186,7 @@ pub fn arrayZero(comptime A: type, n: i32) Raised!A {
     if (n < 0) return countNegative(n);
     const items = try arrayItemsOrRaise(A, @intCast(n));
     fillDefault(A, items) catch |e| {
-        rt.allocator.free(items);
+        rt.alloc().free(items);
         return e;
     };
     return arrayFrom(A, items);
@@ -208,7 +216,7 @@ pub fn arrayResize(place: anytype, n: i32) Raised!void {
     for (items[0..kept], 0..) |*x, i| x.* = arrayItemAt(old, i);
     fillDefault(A, items[kept..]) catch |e| {
         for (items[0..kept]) |x| rt.drop(x);
-        rt.allocator.free(items);
+        rt.alloc().free(items);
         return e;
     };
     place.* = arrayFrom(A, items);
@@ -226,7 +234,7 @@ pub fn arrayCreate(comptime A: type, n: i32, x: ItemOf(A)) Raised!A {
 /// Give up the first `n` of the items that were being made for an array.
 pub fn arrayAbandon(items: anytype, n: usize) void {
     for (items[0..n]) |item| drop(item);
-    rt.allocator.free(items);
+    rt.alloc().free(items);
 }
 
 /// `Array.init n f`
@@ -445,6 +453,344 @@ pub fn arrayMap(comptime A: type, f: anytype, a: anytype) Raised!A {
     return arrayFrom(A, items);
 }
 
+/// Whether two array types have identical element size, element alignment, cyclic status,
+/// and cell header layout so an in-place map can reuse the source array cell and slice.
+pub fn canReuseArrayMap(comptime A_in: type, comptime A_out: type) bool {
+    const C_in = @typeInfo(A_in).pointer.child;
+    const C_out = @typeInfo(A_out).pointer.child;
+    const T_in = ItemOf(A_in);
+    const T_out = ItemOf(A_out);
+    return @sizeOf(T_in) == @sizeOf(T_out) and
+        @alignOf(T_in) == @alignOf(T_out) and
+        holdsCyclic(T_in) == holdsCyclic(T_out) and
+        @sizeOf(C_in) == @sizeOf(C_out) and
+        @alignOf(C_in) == @alignOf(C_out);
+}
+
+/// Progressive fill buffer for specialized `Array.map` / `Array.mapi` loops:
+/// reuses a uniquely owned, unshaped input array cell and buffer in place when layouts match,
+/// falling back to fresh allocation and clean unwinding on error otherwise.
+pub fn MapBuf(comptime A_in: type, comptime A_out: type) type {
+    return struct {
+        src: A_in,
+        in_place: bool,
+        items: []ItemOf(A_out),
+        filled: usize = 0,
+        next: usize = 0,
+    };
+}
+
+pub inline fn arrayMapBufNew(a: anytype, comptime A_out: type) MapBuf(@TypeOf(a), A_out) {
+    const A_in = @TypeOf(a);
+    const C_in = @typeInfo(A_in).pointer.child;
+    const T_out = ItemOf(A_out);
+    if (comptime canReuseArrayMap(A_in, A_out)) {
+        if (rt.isUnique(a) and a.shape == null) {
+            if (comptime hasGc(C_in)) rt.forget(a);
+            if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(a));
+            const out_ptr: [*]T_out = @ptrCast(@alignCast(a.items.ptr));
+            return .{ .src = a, .in_place = true, .items = out_ptr[0..a.items.len], .filled = 0, .next = 0 };
+        }
+    }
+    return .{ .src = a, .in_place = false, .items = arrayItems(A_out, a.items.len), .filled = 0, .next = 0 };
+}
+
+pub inline fn arrayMapBufLen(b: anytype) i32 {
+    return @intCast(b.items.len);
+}
+
+pub inline fn arrayMapBufTake(b: anytype, i: usize) ItemOf(@TypeOf(b.src)) {
+    const MB = @typeInfo(@TypeOf(b)).pointer.child;
+    const A_in = @FieldType(MB, "src");
+    const T_out = @typeInfo(@FieldType(MB, "items")).pointer.child;
+    const T_in = ItemOf(A_in);
+    if (comptime canReuseArrayMap(A_in, Array(T_out))) {
+        if (b.in_place) {
+            b.next = i + 1;
+            const x = b.src.items[i];
+            if (comptime holdsCyclic(T_in)) rt.touch(x);
+            return x;
+        }
+    }
+    return arrayItemAt(b.src, i);
+}
+
+pub inline fn arrayMapBufPush(x: anytype, b: anytype) void {
+    b.items[b.filled] = x;
+    b.filled += 1;
+}
+
+pub fn arrayMapBufFinish(comptime A_out: type, b: anytype) A_out {
+    const MB = @typeInfo(@TypeOf(b)).pointer.child;
+    const A_in = @FieldType(MB, "src");
+    const C_out = @typeInfo(A_out).pointer.child;
+    if (comptime canReuseArrayMap(A_in, A_out)) {
+        if (b.in_place) {
+            const out: A_out = @ptrCast(@alignCast(b.src));
+            const cap = b.src.capacity;
+            out.* = .{ .items = b.items, .capacity = cap };
+            if (comptime hasGc(C_out)) {
+                if (!thread.collector_ready) rt.collectorSetup();
+                thread.collector.allocs += 1;
+                out.@"$gc" = gcHeader(C_out, out);
+            }
+            if (track) thread.stats.reuses += 1;
+            return out;
+        }
+    }
+    drop(b.src);
+    return arrayFrom(A_out, b.items);
+}
+
+pub fn arrayMapBufAbandon(b: anytype) void {
+    const MB = @typeInfo(@TypeOf(b)).pointer.child;
+    const A_in = @FieldType(MB, "src");
+    const T_out = @typeInfo(@FieldType(MB, "items")).pointer.child;
+    if (comptime canReuseArrayMap(A_in, Array(T_out))) {
+        if (b.in_place) {
+            for (b.items[0..b.filled]) |x| drop(x);
+            for (b.src.items[b.next..b.src.items.len]) |x| drop(x);
+            if (b.src.capacity != 0) rt.alloc().free(b.src.items.ptr[0..b.src.capacity]);
+            b.src.capacity = 0;
+            b.src.items = &.{};
+            rt.free(b.src);
+            return;
+        }
+    }
+    arrayAbandon(b.items, b.filled);
+    drop(b.src);
+}
+
+/// Owned-input `Array.map`: reuses a uniquely owned, unshaped input array in place when layouts match.
+pub fn arrayMapInPlace(comptime A_out: type, a: anytype, f: anytype) Raised!A_out {
+    const A_in = @TypeOf(a);
+    const C_in = @typeInfo(A_in).pointer.child;
+    const C_out = @typeInfo(A_out).pointer.child;
+    const T_in = ItemOf(A_in);
+    const T_out = ItemOf(A_out);
+    if (comptime canReuseArrayMap(A_in, A_out)) {
+        if (rt.isUnique(a) and a.shape == null) {
+            if (comptime hasGc(C_in)) rt.forget(a);
+            if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(a));
+            const n = a.items.len;
+            const out_ptr: [*]T_out = @ptrCast(@alignCast(a.items.ptr));
+            const out_items = out_ptr[0..n];
+            for (0..n) |i| {
+                const x = a.items[i];
+                if (comptime holdsCyclic(T_in)) rt.touch(x);
+                out_items[i] = f.code(f.env, x) catch |e| {
+                    for (out_items[0..i]) |oy| drop(oy);
+                    for (a.items[i + 1 .. n]) |rem| drop(rem);
+                    if (a.capacity != 0) rt.alloc().free(a.items.ptr[0..a.capacity]);
+                    a.capacity = 0;
+                    a.items = &.{};
+                    rt.free(a);
+                    return e;
+                };
+            }
+            const out: A_out = @ptrCast(@alignCast(a));
+            const cap = a.capacity;
+            out.* = .{ .items = out_items, .capacity = cap };
+            if (comptime hasGc(C_out)) {
+                if (!thread.collector_ready) rt.collectorSetup();
+                thread.collector.allocs += 1;
+                out.@"$gc" = gcHeader(C_out, out);
+            }
+            if (track) thread.stats.reuses += 1;
+            return out;
+        }
+    }
+    defer drop(a);
+    return arrayMap(A_out, f, a);
+}
+
+/// Owned-input `Array.mapi`: reuses a uniquely owned, unshaped input array in place when layouts match.
+pub fn arrayMapiInPlace(comptime A_out: type, a: anytype, f: anytype) Raised!A_out {
+    const A_in = @TypeOf(a);
+    const C_in = @typeInfo(A_in).pointer.child;
+    const C_out = @typeInfo(A_out).pointer.child;
+    const T_in = ItemOf(A_in);
+    const T_out = ItemOf(A_out);
+    if (comptime canReuseArrayMap(A_in, A_out)) {
+        if (rt.isUnique(a) and a.shape == null) {
+            if (comptime hasGc(C_in)) rt.forget(a);
+            if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(a));
+            const n = a.items.len;
+            const out_ptr: [*]T_out = @ptrCast(@alignCast(a.items.ptr));
+            const out_items = out_ptr[0..n];
+            for (0..n) |i| {
+                const x = a.items[i];
+                if (comptime holdsCyclic(T_in)) rt.touch(x);
+                out_items[i] = apply2(T_out, f, @as(i32, @intCast(i)), x) catch |e| {
+                    for (out_items[0..i]) |oy| drop(oy);
+                    for (a.items[i + 1 .. n]) |rem| drop(rem);
+                    if (a.capacity != 0) rt.alloc().free(a.items.ptr[0..a.capacity]);
+                    a.capacity = 0;
+                    a.items = &.{};
+                    rt.free(a);
+                    return e;
+                };
+            }
+            const out: A_out = @ptrCast(@alignCast(a));
+            const cap = a.capacity;
+            out.* = .{ .items = out_items, .capacity = cap };
+            if (comptime hasGc(C_out)) {
+                if (!thread.collector_ready) rt.collectorSetup();
+                thread.collector.allocs += 1;
+                out.@"$gc" = gcHeader(C_out, out);
+            }
+            if (track) thread.stats.reuses += 1;
+            return out;
+        }
+    }
+    defer drop(a);
+    return arrayMapi(A_out, f, a);
+}
+
+/// Filter buffer for specialized `Array.filter` / `Array.where` loops:
+/// compacts a uniquely owned, unshaped array in place using `capacity` to free safely,
+/// falling back to a `keep` bitmap otherwise.
+pub fn FilterReuseBuf(comptime A: type) type {
+    return struct {
+        src: A,
+        in_place: bool,
+        keep: []bool,
+        out_len: usize = 0,
+        next: usize = 0,
+    };
+}
+
+pub inline fn arrayFilterBufNew(a: anytype) FilterReuseBuf(@TypeOf(a)) {
+    const A = @TypeOf(a);
+    const C = @typeInfo(A).pointer.child;
+    if (rt.isUnique(a) and a.shape == null) {
+        if (comptime hasGc(C)) rt.forget(a);
+        if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(a));
+        return .{ .src = a, .in_place = true, .keep = &.{}, .out_len = 0, .next = 0 };
+    }
+    return .{
+        .src = a,
+        .in_place = false,
+        .keep = rt.alloc().alloc(bool, a.items.len) catch rt.oom(),
+        .out_len = 0,
+        .next = 0,
+    };
+}
+
+pub inline fn arrayFilterBufLen(b: anytype) i32 {
+    return @intCast(b.src.items.len);
+}
+
+pub inline fn arrayFilterBufItem(b: anytype, i: usize) ItemOf(@TypeOf(b.src)) {
+    const T = ItemOf(@TypeOf(b.src));
+    if (b.in_place) {
+        const x = b.src.items[i];
+        if (comptime holdsCyclic(T)) rt.touch(x);
+        return dup(x);
+    }
+    return arrayItemAt(b.src, i);
+}
+
+pub inline fn arrayFilterBufStep(b: anytype, i: usize, keep: bool) void {
+    if (b.in_place) {
+        const item = b.src.items[i];
+        b.next = i + 1;
+        if (keep) {
+            b.src.items[b.out_len] = item;
+            b.out_len += 1;
+        } else {
+            drop(item);
+        }
+    } else {
+        b.keep[i] = keep;
+        b.out_len += @intFromBool(keep);
+    }
+}
+
+pub fn arrayFilterBufFinish(b: anytype) @TypeOf(b.src) {
+    const A = @TypeOf(b.src);
+    const C = @typeInfo(A).pointer.child;
+    if (b.in_place) {
+        const a = b.src;
+        const cap = a.capacity;
+        a.* = .{ .items = a.items.ptr[0..b.out_len], .capacity = cap };
+        if (comptime hasGc(C)) {
+            if (!thread.collector_ready) rt.collectorSetup();
+            thread.collector.allocs += 1;
+            a.@"$gc" = gcHeader(C, a);
+        }
+        if (track) thread.stats.reuses += 1;
+        return a;
+    }
+    defer rt.alloc().free(b.keep);
+    defer drop(b.src);
+    const items = arrayItems(A, b.out_len);
+    var at: usize = 0;
+    for (b.keep, 0..) |k, i| {
+        if (k and i < b.src.items.len and at < b.out_len) {
+            items[at] = arrayItemAt(b.src, i);
+            at += 1;
+        }
+    }
+    return arrayFrom(A, items);
+}
+
+pub fn arrayFilterBufAbandon(b: anytype) void {
+    if (b.in_place) {
+        for (b.src.items[0..b.out_len]) |x| drop(x);
+        for (b.src.items[b.next..b.src.items.len]) |x| drop(x);
+        if (b.src.capacity != 0) rt.alloc().free(b.src.items.ptr[0..b.src.capacity]);
+        b.src.capacity = 0;
+        b.src.items = &.{};
+        rt.free(b.src);
+        return;
+    }
+    rt.alloc().free(b.keep);
+    drop(b.src);
+}
+
+/// Owned-input `Array.filter`: compacts a uniquely owned, unshaped array in place.
+pub fn arrayFilterInPlace(a: anytype, f: anytype) Raised!@TypeOf(a) {
+    const A = @TypeOf(a);
+    const C = @typeInfo(A).pointer.child;
+    if (rt.isUnique(a) and a.shape == null) {
+        if (comptime hasGc(C)) rt.forget(a);
+        if (thread.stamps.count() != 0) _ = thread.stamps.remove(@intFromPtr(a));
+        const n = a.items.len;
+        var out_len: usize = 0;
+        for (0..n) |i| {
+            const cur = a.items[i];
+            if (comptime holdsCyclic(ItemOf(A))) rt.touch(cur);
+            const k = f.code(f.env, dup(cur)) catch |e| {
+                for (a.items[0..out_len]) |x| drop(x);
+                for (a.items[i..n]) |x| drop(x);
+                if (a.capacity != 0) rt.alloc().free(a.items.ptr[0..a.capacity]);
+                a.capacity = 0;
+                a.items = &.{};
+                rt.free(a);
+                return e;
+            };
+            if (k) {
+                a.items[out_len] = cur;
+                out_len += 1;
+            } else {
+                drop(cur);
+            }
+        }
+        const cap = a.capacity;
+        a.* = .{ .items = a.items.ptr[0..out_len], .capacity = cap };
+        if (comptime hasGc(C)) {
+            if (!thread.collector_ready) rt.collectorSetup();
+            thread.collector.allocs += 1;
+            a.@"$gc" = gcHeader(C, a);
+        }
+        if (track) thread.stats.reuses += 1;
+        return a;
+    }
+    defer drop(a);
+    return arrayFilter(f, a);
+}
+
 /// Progressive fill buffer used by specialized `Array.init` / `map` / `mapi` loops.
 pub fn ArrayBuf(comptime A: type) type {
     return struct {
@@ -478,7 +824,7 @@ pub const FilterBuf = struct {
 
 pub inline fn arrayFilterNew(n: usize) FilterBuf {
     return .{
-        .keep = rt.allocator.alloc(bool, n) catch rt.oom(),
+        .keep = rt.alloc().alloc(bool, n) catch rt.oom(),
         .count = 0,
     };
 }
@@ -489,7 +835,7 @@ pub inline fn arrayFilterSet(b: *FilterBuf, i: usize, keep: bool) void {
 }
 
 pub fn arrayFilterFinish(a: anytype, b: FilterBuf) @TypeOf(a) {
-    defer rt.allocator.free(b.keep);
+    defer rt.alloc().free(b.keep);
     const A = @TypeOf(a);
     const items = arrayItems(A, b.count);
     var at: usize = 0;
@@ -503,7 +849,7 @@ pub fn arrayFilterFinish(a: anytype, b: FilterBuf) @TypeOf(a) {
 }
 
 pub inline fn arrayFilterAbandon(b: *FilterBuf) void {
-    rt.allocator.free(b.keep);
+    rt.alloc().free(b.keep);
 }
 
 // ---- `Array.Parallel`: on threads (fable_rt.parallelFor); the function and the array are
@@ -515,8 +861,8 @@ fn parallelItems(comptime A: type, n: usize, f: anytype, a: anytype, comptime ma
     const items = arrayItems(A, n);
     const T = ItemOf(A);
     // (an item not made yet is all zero: what an exception leaves is given up as far as made)
-    const done = rt.allocator.alloc(bool, n) catch rt.oom();
-    defer rt.allocator.free(done);
+    const done = rt.alloc().alloc(bool, n) catch rt.oom();
+    defer rt.alloc().free(done);
     @memset(done, false);
     const Ctx = struct { f: @TypeOf(f), a: @TypeOf(a), items: []T, done: []bool };
     const S = struct {
@@ -529,7 +875,7 @@ fn parallelItems(comptime A: type, n: usize, f: anytype, a: anytype, comptime ma
     };
     rt.parallelFor(n, Ctx{ .f = f, .a = a, .items = items, .done = done }, S.step) catch |e| {
         for (items, done) |x, d| if (d) rt.drop(x);
-        rt.allocator.free(items);
+        rt.alloc().free(items);
         return e;
     };
     return arrayFrom(A, items);
@@ -615,8 +961,8 @@ pub fn arrayFold(f: anytype, state: anytype, a: anytype) Raised!@TypeOf(state) {
 /// `Array.filter f a`
 pub fn arrayFilter(f: anytype, a: anytype) Raised!@TypeOf(a) {
     const A = @TypeOf(a);
-    const keep = rt.allocator.alloc(bool, a.items.len) catch rt.oom();
-    defer rt.allocator.free(keep);
+    const keep = rt.alloc().alloc(bool, a.items.len) catch rt.oom();
+    defer rt.alloc().free(keep);
     var n: usize = 0;
     for (keep, 0..) |*k, i| {
         k.* = try f.code(f.env, arrayItemAt(a, i));
@@ -668,8 +1014,8 @@ fn sortSliceCore(
 ) Raised!void {
     if (items.len <= 1) return;
     const n = items.len;
-    const tmp = rt.allocator.alloc(T, n) catch rt.oom();
-    defer rt.allocator.free(tmp);
+    const tmp = rt.alloc().alloc(T, n) catch rt.oom();
+    defer rt.alloc().free(tmp);
     var src: []T = items;
     var dst: []T = tmp;
     var width: usize = 1;
@@ -760,11 +1106,11 @@ pub fn arraySortInPlace(a: anytype) void {
         return;
     }
     const n = a.items.len;
-    const work = rt.allocator.alloc(T, n) catch rt.oom();
+    const work = rt.alloc().alloc(T, n) catch rt.oom();
     for (work, 0..) |*to, i| to.* = arrayItemAt(a, i);
     sortSliceCmp(T, work, false);
     for (work, 0..) |x, i| arrayPut(a, i, x);
-    rt.allocator.free(work);
+    rt.alloc().free(work);
 }
 
 /// `Array.sortInPlaceWith f a`
@@ -775,14 +1121,97 @@ pub fn arraySortInPlaceWith(f: anytype, a: anytype) Raised!void {
         return sortSliceWith(T, a.items, f);
     }
     const n = a.items.len;
-    const work = rt.allocator.alloc(T, n) catch rt.oom();
+    const work = rt.alloc().alloc(T, n) catch rt.oom();
     for (work, 0..) |*to, i| to.* = arrayItemAt(a, i);
     sortSliceWith(T, work, f) catch |e| {
         arrayAbandon(work, n);
         return e;
     };
     for (work, 0..) |x, i| arrayPut(a, i, x);
-    rt.allocator.free(work);
+    rt.alloc().free(work);
+}
+
+fn sortSliceByKeys(comptime T: type, comptime K: type, items: []T, keys: []K, comptime desc: bool) void {
+    const n = items.len;
+    std.debug.assert(keys.len == n);
+    if (n <= 1) return;
+    const tmp_v = rt.alloc().alloc(T, n) catch rt.oom();
+    defer rt.alloc().free(tmp_v);
+    const tmp_k = rt.alloc().alloc(K, n) catch rt.oom();
+    defer rt.alloc().free(tmp_k);
+    var src_v: []T = items;
+    var dst_v: []T = tmp_v;
+    var src_k: []K = keys;
+    var dst_k: []K = tmp_k;
+    var width: usize = 1;
+    while (width < n) {
+        const step = width *| 2;
+        var lo: usize = 0;
+        while (lo < n) : (lo +|= step) {
+            const mid = @min(lo +| width, n);
+            const hi = @min(lo +| step, n);
+            if (mid == hi) {
+                @memcpy(dst_v[lo..hi], src_v[lo..hi]);
+                @memcpy(dst_k[lo..hi], src_k[lo..hi]);
+                continue;
+            }
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (i < mid and j < hi) : (k += 1) {
+                const take_left = if (desc) rt.compare(src_k[j], src_k[i]) <= 0 else rt.compare(src_k[i], src_k[j]) <= 0;
+                if (take_left) {
+                    dst_v[k] = src_v[i];
+                    dst_k[k] = src_k[i];
+                    i += 1;
+                } else {
+                    dst_v[k] = src_v[j];
+                    dst_k[k] = src_k[j];
+                    j += 1;
+                }
+            }
+            const rem = mid - i;
+            @memcpy(dst_v[k .. k + rem], src_v[i..mid]);
+            @memcpy(dst_v[k + rem .. hi], src_v[j..hi]);
+            @memcpy(dst_k[k .. k + rem], src_k[i..mid]);
+            @memcpy(dst_k[k + rem .. hi], src_k[j..hi]);
+        }
+        const prev_v = src_v;
+        src_v = dst_v;
+        dst_v = prev_v;
+        const prev_k = src_k;
+        src_k = dst_k;
+        dst_k = prev_k;
+        width = step;
+    }
+    if (src_v.ptr != items.ptr) {
+        @memcpy(items, src_v);
+        @memcpy(keys, src_k);
+    }
+}
+
+/// `Array.sortBy` / `Array.sortByDescending` over precomputed `keys`: stable, zero RC moves.
+pub fn arraySortByKeys(keys: anytype, a: anytype, comptime desc: bool) @TypeOf(a) {
+    const out = arrayCopy(a);
+    sortSliceByKeys(ItemOf(@TypeOf(a)), ItemOf(@TypeOf(keys)), out.items, keys.items, desc);
+    return out;
+}
+
+/// `Array.sortInPlaceBy` over precomputed `keys`: stable, zero RC moves.
+pub fn arraySortInPlaceByKeys(keys: anytype, a: anytype, comptime desc: bool) void {
+    if (a.items.len <= 1) return;
+    const T = ItemOf(@TypeOf(a));
+    const K = ItemOf(@TypeOf(keys));
+    if (!rt.isShared(a)) {
+        sortSliceByKeys(T, K, a.items, keys.items, desc);
+        return;
+    }
+    const n = a.items.len;
+    const work = rt.alloc().alloc(T, n) catch rt.oom();
+    for (work, 0..) |*to, i| to.* = arrayItemAt(a, i);
+    sortSliceByKeys(T, K, work, keys.items, desc);
+    for (work, 0..) |x, i| arrayPut(a, i, x);
+    rt.alloc().free(work);
 }
 
 test "array merge sort: zero RC moves, stable, exception-safe" {

@@ -155,6 +155,30 @@ let ``test A resource gives up a Zig handle after its last use`` () =
     total |> equal 6
     countersLive () |> equal before
 
+type OwnedHandle<'T> =
+    { C: ICounter; Tag: 'T }
+
+    interface IResource<OwnedHandle<'T>> with
+        static member Destroy(h: OwnedHandle<'T>) = counterFree h.C
+
+let useHandle (h: OwnedHandle<'T>) = h.C.add 4
+
+[<Fact>]
+let ``test A generic IResource gives up a Zig handle after its last use`` () =
+    let before = countersLive ()
+    let n =
+        let h = { C = counterNew 10; Tag = 7 }
+        countersLive () |> equal (before + 1)
+        useHandle h
+    n |> equal 14
+    countersLive () |> equal before
+    let s =
+        let h = { C = counterNew 20; Tag = "ok" }
+        countersLive () |> equal (before + 1)
+        h.Tag.Length + useHandle h
+    s |> equal 26
+    countersLive () |> equal before
+
 let twiceText (s: string) = s + s
 
 [<Import("call_twice_text", "./native/interop.zig")>]

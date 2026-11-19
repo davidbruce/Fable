@@ -63,6 +63,14 @@ let rec private go (known: Set<int>) (e: Expr) : Expr * Set<int> =
             | ISrcUpcast x -> ISrcUpcast(sub x)
 
         same (EIface(ty, src', slots))
+    | EKnownIface(ty, src, slots, isOpt) ->
+        let src' =
+            match src with
+            | ISrcValue x -> ISrcValue(sub x)
+            | ISrcCaptures xs -> ISrcCaptures(subs xs)
+            | ISrcUpcast x -> ISrcUpcast(sub x)
+
+        same (EKnownIface(ty, src', slots, isOpt))
     | ECallIface(i, slot, xs, ty) -> same (ECallIface(sub i, slot, subs xs, ty))
     | ECon(ty, case, xs, token) -> same (ECon(ty, case, subs xs, token))
     | EGet(x, p, ty) -> same (EGet(sub x, p, ty))

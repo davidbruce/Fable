@@ -400,7 +400,7 @@ fn declared(comptime T: type, comptime C: type, comptime d: anytype) TypeInfo {
             info.make = &struct {
                 fn f(vals: []const Any) Raised!Any {
                     const v: T = if (C == T) try fill(T, vals) else blk: {
-                        const cell = rt.allocator.create(C) catch rt.oom();
+                        const cell = rt.alloc().create(C) catch rt.oom();
                         cell.* = try fill(C, vals);
                         break :blk cell;
                     };
@@ -465,7 +465,7 @@ fn CaseMake(comptime T: type, comptime cname: []const u8, comptime P: type) type
                 break :blk @unionInit(T, cname, {});
             } else if (@typeInfo(P) == .pointer) blk: {
                 const S = @typeInfo(P).pointer.child;
-                const cell = rt.allocator.create(S) catch rt.oom();
+                const cell = rt.alloc().create(S) catch rt.oom();
                 cell.* = try fill(S, vals);
                 break :blk @unionInit(T, cname, cell);
             } else @unionInit(T, cname, try fill(P, vals));
@@ -598,11 +598,11 @@ pub fn genericArguments(t: Type) rt.Array(Type) {
 /// A Type known only by its name (a quotation's types)
 pub fn typeNamed(name_: String) Type {
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(rt.allocator);
+    defer buf.deinit(rt.alloc());
     var tmp: [4]u8 = undefined;
     for (rt.unitsOf(name_)) |u| {
         const n = std.unicode.utf8Encode(u, &tmp) catch 1;
-        buf.appendSlice(rt.allocator, tmp[0..n]) catch rt.oom();
+        buf.appendSlice(rt.alloc(), tmp[0..n]) catch rt.oom();
     }
     rt.lockField(&reflect_lock);
     defer rt.unlockField(&reflect_lock);
@@ -632,14 +632,14 @@ pub fn makeGenericType(def: Type, args: rt.Array(Type)) Raised!Type {
         return rt.raise(rt.ArgumentException, rt.str("The number of generic arguments provided doesn't equal the arity of the generic type definition. (Parameter 'instantiation')"));
     const base = if (std.mem.indexOfScalar(u8, d.full_name, '[')) |i| d.full_name[0..i] else d.full_name;
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(rt.allocator);
-    buf.appendSlice(rt.allocator, base) catch rt.oom();
-    buf.append(rt.allocator, '[') catch rt.oom();
+    defer buf.deinit(rt.alloc());
+    buf.appendSlice(rt.alloc(), base) catch rt.oom();
+    buf.append(rt.alloc(), '[') catch rt.oom();
     for (items, 0..) |a, i| {
-        if (i > 0) buf.append(rt.allocator, ',') catch rt.oom();
-        buf.appendSlice(rt.allocator, a.full_name) catch rt.oom();
+        if (i > 0) buf.append(rt.alloc(), ',') catch rt.oom();
+        buf.appendSlice(rt.alloc(), a.full_name) catch rt.oom();
     }
-    buf.append(rt.allocator, ']') catch rt.oom();
+    buf.append(rt.alloc(), ']') catch rt.oom();
     rt.lockField(&reflect_lock);
     defer rt.unlockField(&reflect_lock);
     if (named_types.get(buf.items)) |existing| return existing;
@@ -986,13 +986,13 @@ pub fn functionElements(t: Type) Raised!struct { Type, Type } {
 /// `FSharpType.MakeTupleType(types)`: a tuple type of these (equal to `typeof` of it)
 pub fn makeTupleType(types: rt.Array(Type)) Type {
     var names: std.ArrayList(u8) = .empty;
-    defer names.deinit(rt.allocator);
-    names.print(rt.allocator, "System.Tuple`{d}[", .{types.items.len}) catch rt.oom();
+    defer names.deinit(rt.alloc());
+    names.print(rt.alloc(), "System.Tuple`{d}[", .{types.items.len}) catch rt.oom();
     for (types.items, 0..) |e, i| {
-        if (i > 0) names.append(rt.allocator, ',') catch rt.oom();
-        names.appendSlice(rt.allocator, e.full_name) catch rt.oom();
+        if (i > 0) names.append(rt.alloc(), ',') catch rt.oom();
+        names.appendSlice(rt.alloc(), e.full_name) catch rt.oom();
     }
-    names.append(rt.allocator, ']') catch rt.oom();
+    names.append(rt.alloc(), ']') catch rt.oom();
     rt.lockField(&reflect_lock);
     defer rt.unlockField(&reflect_lock);
     if (tuple_types.get(names.items)) |existing| return existing;
