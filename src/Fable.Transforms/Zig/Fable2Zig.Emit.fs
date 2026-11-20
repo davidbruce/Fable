@@ -242,12 +242,24 @@ let emitFile (state: FileState) : string =
                 )
                 |> ignore
         | KRecord ->
-            out.AppendLine(opening "struct") |> ignore
+            let container =
+                match e.Layout with
+                | LayoutAuto -> "struct"
+                | LayoutExtern _ -> "extern struct"
+                | LayoutUnion -> "extern union"
+
+            out.AppendLine(opening container) |> ignore
             out.Append(hookDecls e ind) |> ignore
             out.Append(netTypeDecl e ind) |> ignore
 
-            for f in fields (snd e.Cases.Head) do
-                out.AppendLine($"%s{ind}    %s{f},") |> ignore
+            for (fname, fty) in snd e.Cases.Head do
+                let ts = zigType fty
+
+                match e.Layout with
+                | LayoutExtern(Some p) when p > 0 ->
+                    out.AppendLine($"%s{ind}    %s{fieldIdent fname}: %s{ts} align(@min(%d{p}, @alignOf(%s{ts}))),")
+                    |> ignore
+                | _ -> out.AppendLine($"%s{ind}    %s{fieldIdent fname}: %s{ts},") |> ignore
         | KValueUnion ->
             out.AppendLine(opening "union(enum)") |> ignore
             out.Append(hookDecls e ind) |> ignore

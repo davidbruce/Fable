@@ -1140,6 +1140,33 @@ let private transformExpr (com: IFableCompiler) (ctx: Context) appliedGenArgs fs
                     "This explicit constructor uses a self identifier (`new() as x`), which Fable only supports on JavaScript, TypeScript and Python, in a class with no base class and without [<AttachMembers>]."
                     |> addErrorAndReturnNull com ctx.InlinePath r
 
+        // Array element address (`use p = fixed arr`, `&arr.[i]`) for Zig
+        | FSharpExprPatterns.ILAsm(op, [ elemTy ], [ arrExpr; idxExpr ]) when
+            com.Options.Language = Zig
+            && op.StartsWith("[I_ldelema", System.StringComparison.Ordinal)
+            ->
+            let r = makeRangeFrom fsExpr
+            let! arr = transformExpr com ctx [] arrExpr
+            let! idx = transformExpr com ctx [] idxExpr
+            let elem = makeType ctx.GenericArgs elemTy
+            let retTy = makeType ctx.GenericArgs fsExpr.Type
+
+            return
+                Fable.Call(
+                    Fable.Import(
+                        {
+                            Selector = "ArrayElemAddress"
+                            Path = "dotnet:Microsoft.FSharp.NativeInterop.NativePtrModule"
+                            Kind = Fable.LibraryImport(Fable.LibraryImportInfo.Create(isInstanceMember = false))
+                        },
+                        Fable.Any,
+                        None
+                    ),
+                    Fable.CallInfo.Create(args = [ arr; idx ], genArgs = [ elem ]),
+                    retTy,
+                    r
+                )
+
         | FSharpExprPatterns.Value var ->
             let r = makeRangeFrom fsExpr
 

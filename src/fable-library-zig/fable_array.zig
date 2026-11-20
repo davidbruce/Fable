@@ -165,17 +165,21 @@ pub fn arrayOf(comptime A: type, values: anytype) A {
 
 /// Is all-zero memory a value of this type? (It is .NET's null, zero, false and None.)
 pub fn hasZero(comptime T: type) bool {
-    if (T == String) return true;
-    return switch (@typeInfo(T)) {
-        .int, .float, .bool, .void, .optional => true,
-        .@"struct" => |s| blk: {
-            if (@hasDecl(T, "fable_func") or @hasDecl(T, "fable_iface")) break :blk false;
-            for (s.field_types) |F| {
-                if (!hasZero(F)) break :blk false;
-            }
-            break :blk true;
-        },
-        else => false,
+    return comptime blk: {
+        if (T == String) break :blk true;
+        break :blk switch (@typeInfo(T)) {
+            .int, .float, .bool, .void, .optional => true,
+            .array => |a| hasZero(a.child),
+            .@"union" => |u| u.tag_type == null,
+            .@"struct" => |s| inner: {
+                if (@hasDecl(T, "fable_func") or @hasDecl(T, "fable_iface")) break :inner false;
+                for (s.field_types) |F| {
+                    if (!hasZero(F)) break :inner false;
+                }
+                break :inner true;
+            },
+            else => false,
+        };
     };
 }
 

@@ -2255,7 +2255,11 @@ let rec hasDefault (ctx: Ctx) (t: Fable.Type) : bool =
     | Fable.DelegateType _ -> true
     | Fable.Tuple(ts, _) -> List.forall (hasDefault ctx) ts
     | Fable.DeclaredType(entRef, _) when
-        entRef.FullName = "System.Span`1"
+        entRef.FullName = "nativeptr`1"
+        || entRef.FullName = "Microsoft.FSharp.Core.nativeptr`1"
+        || entRef.FullName = "voidptr"
+        || entRef.FullName = "System.Void*"
+        || entRef.FullName = "System.Span`1"
         || entRef.FullName = "System.ReadOnlySpan`1"
         || entRef.FullName = "System.DateOnly"
         || entRef.FullName = "System.TimeOnly"
@@ -2344,7 +2348,58 @@ let rec coerceTy (ctx: Ctx) (expectedTy: Ty) (expr: Expr) : Expr =
                             EIf(ETest(xs.Head, "None", actualTy), nv, EGet(xs.Head, PSome, expectedTy), expectedTy)
                         )
                 | None -> expr
+            | TPrim "isize", TPrim p when p.StartsWith("?[*]", System.StringComparison.Ordinal) || p = "?*anyopaque" ->
+                bindArgs
+                    ctx
+                    [ expr ]
+                    (fun xs -> EEmit("@as($R, @ptrFromInt(@as(usize, @bitCast($0))))", xs, expectedTy))
+            | TPrim "fable_rt.String", TPrim "isize" ->
+                ctx.State.UsesRuntime <- true
+
+                bindArgs
+                    ctx
+                    [ expr ]
+                    (fun xs ->
+                        EEmit(
+                            "if ($0 == null) @as(isize, 0) else @as(isize, @bitCast(@intFromPtr(fable_rt.stringPinnableRef($0))))",
+                            xs,
+                            expectedTy
+                        )
+                    )
             | _ -> expr
+
+/// True when `ty` is a raw C pointer (`?*anyopaque` or `?[*]T`).
+let isRawPtrTy (ty: Ty) : bool =
+    match ty with
+    | TPrim s -> s = "?*anyopaque" || s.StartsWith("?[*]", System.StringComparison.Ordinal)
+    | _ -> false
+
+/// Managed non-global variables referenced by `expr` that must stay pinned across a raw-pointer use.
+let pinnedVarsOf (ctx: Ctx) (expr: Expr) : Var list =
+    let ids = fv expr
+
+    ctx.Vars.Values
+    |> Seq.filter (fun v -> ids.Contains v.Id && isManaged v.Ty && v.Kind <> VGlobal)
+    |> Seq.distinctBy (fun v -> v.Id)
+    |> Seq.toList
+
+/// Emit `fable_rt.keepAlive` on `pinned` after `bodyIr` so Perceus does not drop pinned storage early.
+let wrapPinned (ctx: Ctx) (pinned: Var list) (bodyIr: Expr) : Expr =
+    if pinned.IsEmpty then
+        bodyIr
+    else
+        ctx.State.UsesRuntime <- true
+
+        let keeps =
+            pinned |> List.map (fun v -> EEmit("fable_rt.keepAlive($0)", [ EVar v ], tVoid))
+
+        let bt = typeOf bodyIr
+
+        if isVoid bt then
+            List.fold (fun acc k -> ESeq(acc, k)) bodyIr keeps
+        else
+            let res = ctx.State.NewVar("pin_res", bt, VLocal, false)
+            ELet(res, bodyIr, List.foldBack (fun k acc -> ESeq(k, acc)) keeps (EVar res))
 
 /// Unwrap an interface struct option, raising NullReferenceException when null.
 let unwrapIface (ctx: Ctx) (x: Expr) : Expr =

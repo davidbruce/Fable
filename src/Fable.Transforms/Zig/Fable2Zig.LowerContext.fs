@@ -678,6 +678,7 @@ let listEnt (state: FileState) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         e.Cases <- [ "Empty", []; "Cons", [ "Head", TGen "T"; "Tail", TEnt(e, [ TGen "T" ]) ] ]
@@ -822,6 +823,7 @@ let dotnetExnEntIn (state: FileState) (fullName: string) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         state.Ents[key] <- e
@@ -860,6 +862,7 @@ let resultEnt (state: FileState) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         state.Ents[resultName] <- e
@@ -895,6 +898,7 @@ let choiceEnt (state: FileState) (fullName: string) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         state.Ents[fullName] <- e
@@ -925,6 +929,7 @@ let arrayEnt (state: FileState) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         state.Ents["$array"] <- e
@@ -977,6 +982,7 @@ let netEnt (state: FileState) (name: string) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         state.Ents[key] <- e
@@ -1013,6 +1019,7 @@ let anonEnt (state: FileState) (names: string[]) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         state.Ents[key] <- e
@@ -1056,6 +1063,7 @@ let ifaceAnonEnt (state: FileState) (names: string[]) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         state.Ents[key] <- e
@@ -1086,6 +1094,7 @@ let lazyEnt (state: FileState) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         state.Ents["$lazy"] <- e
@@ -1120,6 +1129,7 @@ let refEnt (state: FileState) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         state.Ents[refName] <- e

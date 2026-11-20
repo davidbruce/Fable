@@ -1492,15 +1492,21 @@ let rec lw (ctx: Ctx) (e: Fable.Expr) : Expr =
                 else
                     let rhs = coerceTy ctx ty rhs
 
+                    let pinned =
+                        if isRawPtrTy ty then
+                            pinnedVarsOf ctx rhs
+                        else
+                            []
+
                     match rhs with
                     // an immutable name for an immutable variable is that variable
                     | EVar x when not id.IsMutable && not x.FMutable && x.Kind <> VGlobal ->
                         ctx.Vars[id.Name] <- x
-                        lowerBody ()
+                        wrapPinned ctx pinned (lowerBody ())
                     | _ ->
                         let v = ctx.State.NewVar(id.Name, ty, VLocal, id.IsMutable)
                         ctx.Vars[id.Name] <- v
-                        ELet(v, rhs, lowerBody ())
+                        ELet(v, rhs, wrapPinned ctx pinned (lowerBody ()))
             )
 
     // (`ExceptionDispatchInfo.Capture(e).Throw()`, as F# rethrows in an `async` handler, then a

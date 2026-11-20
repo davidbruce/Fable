@@ -828,7 +828,12 @@ and ex (em: Em) (e: Expr) : string =
 
             // (a `System.Type`: compared by what it stands for, as one made when the program
             // runs is another pointer)
-            if isManaged argT || holdsDecimal argT || argT = TPrim "fable_rt.reflect.Type" then
+            if
+                isManaged argT
+                || holdsDecimal argT
+                || holdsLayoutUnion argT
+                || argT = TPrim "fable_rt.reflect.Type"
+            then
                 $"fable_rt.eql(%s{x}, %s{y})"
             else
                 $"std.meta.eql(%s{x}, %s{y})"
@@ -1125,6 +1130,13 @@ and ex (em: Em) (e: Expr) : string =
             match tok with
             | Some tk -> $"fable_rt.newReuse(%s{zigType t}, &%s{vname em tk}, %s{init})"
             | None -> $"fable_rt.new(%s{zigType t}, %s{init})"
+        | TEnt(e, _) when e.Kind = KRecord && e.Layout = LayoutUnion ->
+            let fs = caseFields t case
+
+            if fs.Length <= 1 then
+                $"%s{zigType t}{{ %s{inits fs} }}"
+            else
+                $"std.mem.zeroes(%s{zigType t})"
         | TEnt(e, _) when e.Kind = KRecord -> $"%s{zigType t}{{ %s{inits (caseFields t case)} }}"
         | TEnt _ when args.IsEmpty -> $"@as(%s{zigType t}, .%s{fieldIdent case})"
         | TEnt(e, _) when e.Kind = KHeapUnion ->

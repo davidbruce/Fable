@@ -613,6 +613,7 @@ let call
     | SubDomain DotnetTime.call res -> res
     | SubDomain DotnetReflection.call res -> res
     | SubDomain DotnetIoRegex.call res -> res
+    | SubDomain DotnetInterop.call res -> res
     // (`type C() as this`: F#'s checks that the object is made before it is used)
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "CheckThis", [ x ] -> lw ctx x
     | "Microsoft.FSharp.Core.LanguagePrimitives.IntrinsicFunctions", "FailInit", _ ->

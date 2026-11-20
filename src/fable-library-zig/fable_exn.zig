@@ -497,7 +497,7 @@ pub fn exnToString(e: Exn) Raised!String {
 pub fn exnMessage(e: Exn) String {
     if (e.type.message) |message| return message(e);
     if (comptime exn_show) return anyText(e);
-    return str(e.type.name);
+    return rt.io.fromUtf8(e.type.name);
 }
 
 /// `e.StackTrace`: null until the exception is thrown, then the captured frames.

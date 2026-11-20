@@ -36,25 +36,42 @@ pub const Options = struct {
     link_libc: bool = false,
     /// system libraries linked: `&.{"sqlite3"}`
     system_libraries: []const []const u8 = &.{},
+    /// library search directories (`-L`)
+    library_paths: []const []const u8 = &.{},
+    /// C header search directories (`-I`, applied to both the module and `c_headers`)
+    include_paths: []const []const u8 = &.{},
+    /// macOS/Darwin frameworks (`&.{"CoreVideo", "IOKit"}`)
+    frameworks: []const []const u8 = &.{},
+    /// macOS/Darwin framework search directories (`-F`)
+    framework_paths: []const []const u8 = &.{},
     c_headers: []const CHeader = &.{},
 };
 
+fn buildLazyPath(b: *std.Build, p: []const u8) std.Build.LazyPath {
+    return if (std.fs.path.isAbsolute(p)) .{ .cwd_relative = p } else b.path(p);
+}
+
 /// The program's module, with what the options ask for
 pub fn addModule(b: *std.Build, o: Options) *std.Build.Module {
-    const libc = o.link_libc or o.system_libraries.len > 0 or o.c_headers.len > 0;
+    const libc = o.link_libc or o.system_libraries.len > 0 or o.c_headers.len > 0 or o.frameworks.len > 0;
     const m = b.createModule(.{
         .root_source_file = b.path(o.root),
         .target = o.target,
         .optimize = o.optimize,
         .link_libc = if (libc) true else null,
     });
+    for (o.library_paths) |p| m.addLibraryPath(buildLazyPath(b, p));
+    for (o.include_paths) |p| m.addIncludePath(buildLazyPath(b, p));
+    for (o.framework_paths) |p| m.addFrameworkPath(buildLazyPath(b, p));
     for (o.system_libraries) |lib| m.linkSystemLibrary(lib, .{});
+    for (o.frameworks) |fw| m.linkFramework(fw, .{});
     for (o.c_headers) |h| {
         const tc = b.addTranslateC(.{
             .root_source_file = b.path(h.header),
             .target = o.target,
             .optimize = o.optimize orelse .Debug,
         });
+        for (o.include_paths) |p| tc.addIncludePath(buildLazyPath(b, p));
         m.addImport(h.name, tc.createModule());
     }
     return m;

@@ -1,0 +1,8 @@
+bin/
+obj/
+zig-out/
+.zig-cache/
+fable_modules/
+*.zig
+!build.zig
+*.facts.json

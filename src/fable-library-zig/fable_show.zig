@@ -291,12 +291,30 @@ pub const Shower = struct {
             return b.word("<iface>");
         }
         if (comptime isFunc(T)) return b.word("<fun>");
+        if (comptime rt.isRawPtr(T)) {
+            const addr: usize = if (@typeInfo(T) == .optional) (if (x) |p| @intFromPtr(p) else 0) else @intFromPtr(x);
+            if (addr == 0) return b.word("null");
+            const txt = std.fmt.allocPrint(b.arena, "0x{x}", .{addr}) catch oom();
+            return b.word(txt);
+        }
         const node: ShowNode = if (node_idx < shape.nodes.len) shape.nodes[node_idx] else .{};
         switch (@typeInfo(T)) {
             .void => return b.word("()"),
             .bool => return b.word(if (x) "true" else "false"),
             .int => return if (T == u16 and node.kind != .u16_num) b.char(x) else b.number(x),
             .float => return b.number(x),
+            .array => {
+                if (x.len == 0) return b.word("[||]");
+                var items: std.ArrayList(*Layout) = .empty;
+                for (x) |item| {
+                    if (items.items.len == print_length) {
+                        items.append(b.arena, b.word("...")) catch oom();
+                        break;
+                    }
+                    items.append(b.arena, b.showShape(item, shape, ShowNode.auto, .bracket_if_tuple, depth - 1)) catch oom();
+                }
+                return b.tight(b.tight(b.ascii(false, "[|", true), b.separated(items.items, ";")), b.ascii(true, "|]", false));
+            },
             .optional => {
                 const is_vopt = node.kind == .vopt;
                 const child: u16 = if (is_vopt or node.kind == .opt) node.a else ShowNode.auto;
@@ -418,6 +436,7 @@ pub const Shower = struct {
                     }
                     return b.tight(b.tight(b.ascii(false, "[", true), b.separated(items.items, ";")), b.ascii(true, "]", false));
                 }
+                if (comptime @typeInfo(T).@"union".tag_type == null) return b.word(@typeName(T));
                 switch (x) {
                     inline else => |payload, tag| {
                         const tag_idx = comptime blk: {

@@ -852,27 +852,14 @@ let call
         rt "fable_rt.lazyForce($0)" [ l ] (mapType ctx r valueType)
     | "System.Lazy`1", "get_IsValueCreated", [ l ] -> pure' "fable_rt.lazyIsCreated($0)" [ l ] tBool
 
-    // ---- native pointers: `stackalloc` (memory of the function, see fable_rt.StackAlloc) ----
-    | "Microsoft.FSharp.NativeInterop.NativePtrModule", "StackAllocate", [ n ] ->
-        let item = mapType ctx r info.GenericArgs.Head
-        rt $"fable_stack.alloc(%s{zigType item}, $0)" [ n ] (TPrim("[*]" + zigType item))
-    | "Microsoft.FSharp.NativeInterop.NativePtrModule", ("ToVoidPtrInlined" | "ToVoidPtr"), [ p ] ->
-        pure' "@as(*anyopaque, @ptrCast($0))" [ p ] (TPrim "*anyopaque")
-    | "Microsoft.FSharp.NativeInterop.NativePtrModule", ("OfVoidPtrInlined" | "OfVoidPtr"), [ p ] ->
-        pure' "@as($R, @ptrCast(@alignCast($0)))" [ p ] (mapType ctx r t)
-    | "Microsoft.FSharp.NativeInterop.NativePtrModule", ("GetPointerInlined" | "Get"), [ p; i ] ->
-        pure' "$0[@intCast($1)]" [ p; i ] (mapType ctx r t)
-    | "Microsoft.FSharp.NativeInterop.NativePtrModule", ("SetPointerInlined" | "Set"), [ p; i; x ] ->
-        pure' "$0[@intCast($1)] = $2" [ p; i; x ] tVoid
-    | "Microsoft.FSharp.NativeInterop.NativePtrModule", ("ReadPointerInlined" | "Read"), [ p ] ->
-        pure' "$0[0]" [ p ] (mapType ctx r t)
-    | "Microsoft.FSharp.NativeInterop.NativePtrModule", ("WritePointerInlined" | "Write"), [ p; x ] ->
-        pure' "$0[0] = $1" [ p; x ] tVoid
+    // ---- spans: slices of arrays, strings, or native pointers ----
     | ("System.Span`1" | "System.ReadOnlySpan`1"), ".ctor", [ p; n ] when
         (match unwrapNullness p.Type with
          | Fable.DeclaredType(e, _) ->
              e.FullName = "voidptr"
+             || e.FullName = "System.Void*"
              || e.FullName.StartsWith("nativeptr", System.StringComparison.Ordinal)
+             || e.FullName = "Microsoft.FSharp.Core.nativeptr`1"
          | Fable.Any -> true
          | _ -> false)
         ->

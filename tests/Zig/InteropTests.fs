@@ -1,5 +1,11 @@
 module Fable.Tests.Zig.InteropTests
 
+#nowarn "9"
+
+open System
+open System.Runtime.CompilerServices
+open System.Runtime.InteropServices
+open FSharp.NativeInterop
 open Fable.Core
 open Fable.Tests.Util
 open Fable.Tests.Util.Testing
@@ -309,4 +315,286 @@ let ``test Byrefs, MarshalAs and callbacks cross to C as on .NET`` () =
     let seen = ResizeArray<string>()
     eachName (NameFn(fun name n -> seen.Add(sprintf "%s=%d" name n)))
     List.ofSeq seen |> equal [ "one=1"; "two=2" ]
+
+[<Struct; StructLayout(LayoutKind.Sequential, Pack = 1)>]
+type ZigPackedRec =
+    {
+        tag: byte
+        val_: int64
+        tail: uint16
+    }
+
+[<Struct; StructLayout(LayoutKind.Explicit)>]
+type ZigIntFloat =
+    [<FieldOffset(0)>]
+    val mutable i: int32
+
+    [<FieldOffset(0)>]
+    val mutable f: float32
+
+type Del6 = delegate of int * int * int * int * int * int -> int
+type RoIntSpan = ReadOnlySpan<int>
+type IntPtrT = nativeptr<int>
+
+[<DllImport("libc", EntryPoint = "fable_test_packed_sum")>]
+extern int64 packedSum (ZigPackedRec p)
+
+[<DllImport("libc", EntryPoint = "fable_test_packed_ptr")>]
+extern int64 packedPtr ([<In>] ZigPackedRec& p)
+
+[<DllImport("libc", EntryPoint = "fable_test_union_as_bits")>]
+extern int unionAsBits (ZigIntFloat u)
+
+[<DllImport("libc", EntryPoint = "fable_test_9args")>]
+extern int sum9 (int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8, int a9)
+
+[<DllImport("libc", EntryPoint = "fable_test_inref_vec")>]
+extern float32 inrefVec ([<In>] Vec2& v)
+
+[<DllImport("libc", EntryPoint = "fable_test_byref_bool_ptr")>]
+[<return: MarshalAs(UnmanagedType.I1)>]
+extern bool toggleBoolAndBump ([<MarshalAs(UnmanagedType.I1)>] bool& b, IntPtrT p, int idx)
+
+[<DllImport("libc", EntryPoint = "fable_test_null_array_span")>]
+extern int sumNullArrAndSpan (int[] arr, RoIntSpan sp, int n)
+
+[<DllImport("libc", EntryPoint = "fable_test_opt_callback")>]
+extern int optCallback (int x, IntFn cb)
+
+[<DllImport("libc", EntryPoint = "fable_test_callback6")>]
+extern int callCb6 (Del6 cb)
+
+[<UnmanagedCallersOnly(EntryPoint = "fable_test_uco_struct")>]
+let ucoStruct (v: Vec2) (p: nativeptr<int>) (r: inref<int>) : Vec2 =
+    NativePtr.write p (NativePtr.read p + r)
+    { x = v.x * float32 r; y = v.y + 1.0f }
+
+[<Import("fable_test_call_uco_struct", "c:./native/interop.zig")>]
+let callUcoStruct (x: float32) (y: float32) (factor: int) : float32 = nativeOnly
+
+let private readInrefVec (r: inref<Vec2>) = r.x * r.x + r.y * r.y
+
+[<Fact>]
+let ``test extern struct Pack, extern union, 9+ args, inref, null array/delegate, Span, and UnmanagedCallersOnly structs`` () =
+    let mutable p: ZigPackedRec = { tag = 3uy; val_ = 100L; tail = 7us }
+    Marshal.SizeOf<ZigPackedRec>() |> equal 11
+    packedSum p |> equal 110L
+    packedPtr &p |> equal 210L
+
+    let mutable u = ZigIntFloat()
+    u.f <- 1.0f
+    unionAsBits u |> equal 0x3F800000
+
+    sum9 (1, 2, 3, 4, 5, 6, 7, 8, 9) |> equal 45
+
+    let mutable v: Vec2 = { x = 3.0f; y = 4.0f }
+    inrefVec &v |> equal 34.0f
+    let vImmut: Vec2 = { x = 3.0f; y = 4.0f }
+    readInrefVec &vImmut |> equal 25.0f
+
+    let arr = [| 10; 20; 30 |]
+    use ptr = fixed arr
+    let mutable flag = true
+    let prev = toggleBoolAndBump (&flag, ptr, 1)
+    prev |> equal true
+    flag |> equal false
+    arr.[1] |> equal 25
+
+    let ro = ReadOnlySpan<int>(arr)
+    sumNullArrAndSpan (Unchecked.defaultof<int[]>, ro, 3) |> equal 65
+
+    optCallback (12, Unchecked.defaultof<IntFn>) |> equal -12
+    optCallback (12, IntFn(fun x -> x + 5)) |> equal 17
+    callCb6 (Del6(fun a b c d e f -> a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6)) |> equal 91
+
+    callUcoStruct 2.0f 5.0f 4 |> equal 28.0f
 #endif
+
+// ---- Cross-platform (.NET + Fable-Zig) standard FFI parity tests ----
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type CrossVec3 =
+    {
+        x: float32
+        y: float32
+        z: float32
+    }
+    override this.ToString() = sprintf "(%.1f, %.1f, %.1f)" this.x this.y this.z
+
+[<Struct; StructLayout(LayoutKind.Sequential, Pack = 2)>]
+type CrossPack2 =
+    val mutable a: byte
+    val mutable b: int32
+
+[<Struct; StructLayout(LayoutKind.Explicit)>]
+type CrossUnion =
+    [<FieldOffset(0)>]
+    val mutable i: int32
+
+    [<FieldOffset(0)>]
+    val mutable f: float32
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type CrossLinkedNode =
+    val mutable next: nativeptr<CrossLinkedNode>
+    val mutable value: int32
+
+type CrossAddDel = delegate of int -> int
+
+[<Fact>]
+let ``test StructLayout, Pack, Explicit union, node pointers, and NativePtr parity`` () =
+    Marshal.SizeOf<CrossVec3>() |> equal 12
+    Marshal.SizeOf<CrossPack2>() |> equal 6
+    Marshal.OffsetOf<CrossPack2>("b") |> equal 2n
+
+    let v = { x = 1.0f; y = 2.0f; z = 3.0f }
+    v.ToString() |> equal "(1.0, 2.0, 3.0)"
+
+    let mutable cu = CrossUnion()
+    cu.f <- 2.0f
+    cu.i |> equal 0x40000000
+
+    let mutable tail = Unchecked.defaultof<CrossLinkedNode>
+    tail.value <- 99
+    let mutable head = Unchecked.defaultof<CrossLinkedNode>
+    use pTail = fixed &tail
+    head.next <- pTail
+    head.value <- 11
+    NativePtr.isNullPtr (NativePtr.nullPtr<CrossLinkedNode>) |> equal true
+    NativePtr.isNullPtr head.next |> equal false
+    (NativePtr.read head.next).value |> equal 99
+
+    let buf = NativePtr.stackalloc<int> 5
+    NativePtr.write buf 10
+    NativePtr.set buf 1 20
+    NativePtr.set buf 2 30
+    let mid = NativePtr.add buf 2
+    NativePtr.get mid -1 |> equal 20
+    NativePtr.read buf |> equal 10
+    let dst = NativePtr.stackalloc<int> 5
+    NativePtr.copyBlock dst buf 3
+    NativePtr.get dst 2 |> equal 30
+    NativePtr.copy dst mid
+    NativePtr.get dst 0 |> equal 30
+    let bPtr = NativePtr.ofVoidPtr<byte> (NativePtr.toVoidPtr dst)
+    NativePtr.initBlock bPtr 0x7Fuy 4u
+    NativePtr.get dst 0 |> equal 0x7F7F7F7F
+    NativePtr.clear dst
+    NativePtr.get dst 0 |> equal 0
+    NativePtr.toNativeInt (NativePtr.nullPtr<int>) |> equal 0n
+    NativePtr.isNullPtr (NativePtr.ofNativeInt<int> 0n) |> equal true
+
+[<Fact>]
+let ``test IntPtr, UIntPtr, Marshal, NativeMemory, MemoryMarshal, Unsafe, fixed, and NativeLibrary`` () =
+    IntPtr.Zero |> equal 0n
+    UIntPtr.Zero |> equal 0un
+    (IntPtr.Size = 4 || IntPtr.Size = 8) |> equal true
+    let ip = IntPtr 100
+    (IntPtr.Add(ip, 24)).ToInt32() |> equal 124
+    (IntPtr.Subtract(ip, 10)).ToInt64() |> equal 90L
+    let uip = UIntPtr 64u
+    uip.ToUInt64() |> equal 64UL
+
+    let mutable h = Marshal.AllocHGlobal 32
+    try
+        h <- Marshal.ReAllocHGlobal(h, 64n)
+        Marshal.WriteByte(h, 0, 0xAAuy)
+        Marshal.ReadByte(h, 0) |> equal 0xAAuy
+        Marshal.WriteInt16(h, 2, -1234s)
+        Marshal.ReadInt16(h, 2) |> equal -1234s
+        Marshal.WriteInt32(h, 4, 0x12345678)
+        Marshal.ReadInt32(h, 4) |> equal 0x12345678
+        Marshal.WriteInt64(h, 16, 1234567890123L)
+        Marshal.ReadInt64(h, 16) |> equal 1234567890123L
+        Marshal.WriteIntPtr(h, 24, 777n)
+        Marshal.ReadIntPtr(h, 24) |> equal 777n
+
+        let sv: CrossVec3 = { x = 1.25f; y = -3.5f; z = 9.0f }
+        Marshal.StructureToPtr(sv, h, false)
+        Marshal.PtrToStructure<CrossVec3>(h) |> equal sv
+
+        let srcArr = [| 10; 20; 30; 40 |]
+        Marshal.Copy(srcArr, 1, h, 2)
+        let dstArr = Array.zeroCreate<int> 4
+        Marshal.Copy(h, dstArr, 1, 2)
+        dstArr |> equal [| 0; 20; 30; 0 |]
+    finally
+        Marshal.FreeHGlobal h
+
+    let pU8 = Marshal.StringToCoTaskMemUTF8 "Hello UTF8"
+    Marshal.PtrToStringUTF8 pU8 |> equal "Hello UTF8"
+    Marshal.PtrToStringUTF8(pU8, 5) |> equal "Hello"
+    Marshal.ZeroFreeCoTaskMemUTF8 pU8
+
+    let pAnsi = Marshal.StringToHGlobalAnsi "Hello Ansi"
+    Marshal.PtrToStringAnsi pAnsi |> equal "Hello Ansi"
+    Marshal.ZeroFreeGlobalAllocAnsi pAnsi
+
+    let pU16 = Marshal.StringToHGlobalUni "Hi Uni"
+    Marshal.PtrToStringUni pU16 |> equal "Hi Uni"
+    Marshal.PtrToStringUni(pU16, 2) |> equal "Hi"
+    Marshal.ZeroFreeGlobalAllocUnicode pU16
+
+    let bias = 10
+    let del = CrossAddDel(fun x -> x + bias)
+    let fnPtr = Marshal.GetFunctionPointerForDelegate(del)
+    let back = Marshal.GetDelegateForFunctionPointer<CrossAddDel>(fnPtr)
+    back.Invoke(32) |> equal 42
+
+    let nm = NativeMemory.AllocZeroed(32un)
+    NativeMemory.Fill(nm, 8un, 5uy)
+    let nm2 = NativeMemory.Alloc(32un)
+    NativeMemory.Copy(nm, nm2, 16un)
+    NativeMemory.Clear(nm, 32un)
+    let np1 = NativePtr.ofVoidPtr<byte> nm
+    let np2 = NativePtr.ofVoidPtr<byte> nm2
+    NativePtr.read np1 |> equal 0uy
+    NativePtr.get np2 7 |> equal 5uy
+    NativePtr.get np2 8 |> equal 0uy
+    NativeMemory.Free nm
+    NativeMemory.Free nm2
+
+    let al = NativeMemory.AlignedAlloc(24un, 64un)
+    (UIntPtr(al).ToUInt64() % 64UL) |> equal 0UL
+    NativePtr.write (NativePtr.ofVoidPtr<int> al) 4242
+    let al2 = NativeMemory.AlignedRealloc(al, 128un, 128un)
+    (UIntPtr(al2).ToUInt64() % 128UL) |> equal 0UL
+    NativePtr.read (NativePtr.ofVoidPtr<int> al2) |> equal 4242
+    NativeMemory.AlignedFree al2
+
+    let ints = [| 0x04030201; 0x08070605 |]
+    let sp = Span<int>(ints)
+    let bytes = MemoryMarshal.Cast<int, byte>(sp)
+    bytes.Length |> equal 8
+    bytes.[0] |> equal 1uy
+    let refData = &MemoryMarshal.GetArrayDataReference(ints)
+    Unsafe.Add(&refData, 1) |> equal 0x08070605
+    Unsafe.SizeOf<CrossVec3>() |> equal 12
+    let pBytes = Unsafe.AsPointer(&MemoryMarshal.GetReference(bytes))
+    Unsafe.WriteUnaligned<uint16>(NativePtr.toVoidPtr (NativePtr.add (NativePtr.ofVoidPtr<byte> pBytes) 1), 0xBEEFus)
+    Unsafe.ReadUnaligned<uint16>(NativePtr.toVoidPtr (NativePtr.add (NativePtr.ofVoidPtr<byte> pBytes) 1)) |> equal 0xBEEFus
+
+    use pArr = fixed ints
+    use pElem = fixed &ints.[1]
+    use pStr = fixed "XYZ"
+    let mutable localVal = 77
+    use pLocal = fixed &localVal
+    let emptyArr: int[] = [||]
+    use pEmpty = fixed emptyArr
+    NativePtr.isNullPtr pEmpty |> equal true
+    NativePtr.read pArr |> equal 0x04BEEF01
+    NativePtr.read pElem |> equal 0x08070605
+    int (NativePtr.read pStr) |> equal (int 'X')
+    NativePtr.read pLocal |> equal 77
+
+    try
+        NativeLibrary.SetDllImportResolver(typeof<CrossVec3>.Assembly, DllImportResolver(fun _ _ _ -> 0n))
+    with _ -> ()
+
+    let mutable libHandle = 0n
+    if NativeLibrary.TryLoad("libSystem.B.dylib", &libHandle) then
+        let mutable absPtr = 0n
+        NativeLibrary.TryGetExport(libHandle, "abs", &absPtr) |> equal true
+        (absPtr <> 0n) |> equal true
+        NativeLibrary.Free libHandle
+

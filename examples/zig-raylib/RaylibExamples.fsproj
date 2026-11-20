@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Raylib.fs" />
+    <Compile Include="Raymath.fs" />
+    <Compile Include="Examples/CoreBasicWindow.fs" />
+    <Compile Include="Examples/CoreInputKeys.fs" />
+    <Compile Include="Examples/CoreInputMouse.fs" />
+    <Compile Include="Examples/Core2DCamera.fs" />
+    <Compile Include="Examples/Core3DCameraFree.fs" />
+    <Compile Include="Examples/Core3DPicking.fs" />
+    <Compile Include="Examples/CoreCustomLogging.fs" />
+    <Compile Include="Examples/ShapesBouncingBall.fs" />
+    <Compile Include="Examples/ShapesCollisionArea.fs" />
+    <Compile Include="Examples/ShapesSplinesDrawing.fs" />
+    <Compile Include="Examples/TexturesImageGeneration.fs" />
+    <Compile Include="Examples/TexturesImageDrawing.fs" />
+    <Compile Include="Examples/TexturesRawData.fs" />
+    <Compile Include="Examples/TextFontLoading.fs" />
+    <Compile Include="Examples/ModelsGeometricShapes.fs" />
+    <Compile Include="Examples/ShadersJuliaSet.fs" />
+    <Compile Include="Examples/AudioRawStream.fs" />
+    <Compile Include="HeadlessParity.fs" />
+    <Compile Include="Benchmarks.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+</Project>

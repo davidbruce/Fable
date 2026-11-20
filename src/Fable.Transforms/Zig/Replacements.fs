@@ -499,6 +499,7 @@ let tryField (com: ICompiler) (returnTyp: Type) (ownerTyp: Type) (fieldName: str
         let owner =
             match ownerTyp with
             | Number(Decimal, _) -> Some "System.Decimal"
+            | Number((NativeInt | UNativeInt) as kind, _) -> numberInfo kind |> Option.map fst
             | DeclaredType(ent, _) -> Some ent.FullName
             | _ -> None
 

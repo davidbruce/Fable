@@ -22,6 +22,7 @@
     <Compile Include="Fable2Zig.Dotnet.Time.fs" />
     <Compile Include="Fable2Zig.Dotnet.Reflection.fs" />
     <Compile Include="Fable2Zig.Dotnet.IoRegex.fs" />
+    <Compile Include="Fable2Zig.Dotnet.Interop.fs" />
     <Compile Include="Fable2Zig.Dotnet.Misc.fs" />
     <Compile Include="Fable2Zig.LowerFile.fs" />
     <Compile Include="Fable2Zig.NonNull.fs" />

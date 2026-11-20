@@ -771,6 +771,7 @@ let tryLower (ctx: Ctx) (e: Fable.Expr) : Expr =
                 IsLocal = true
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         let part = synth "part" (slots |> List.map (fun (slot, ty, _) -> slot, ty))

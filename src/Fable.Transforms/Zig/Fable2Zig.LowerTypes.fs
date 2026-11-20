@@ -14,6 +14,117 @@ let rec unwrapNullness (t: Fable.Type) : Fable.Type =
     | Fable.Nullable(inner, false) -> unwrapNullness inner
     | _ -> t
 
+/// Whether a lowered field type has a C-compatible ABI representation allowed inside Zig `extern struct` / `extern union`.
+let rec isCAbiField (t: Ty) =
+    match t with
+    | TPrim("i8" | "u8" | "i16" | "u16" | "c_ushort" | "i32" | "u32" | "i64" | "u64" | "isize" | "usize" | "f32" | "f64" | "bool" | "?*anyopaque" | "*anyopaque") ->
+        true
+    | TPrim s when
+        s.StartsWith("?[*]", System.StringComparison.Ordinal)
+        || s.StartsWith("[*]", System.StringComparison.Ordinal)
+        ->
+        true
+    | TArr(elem, _) -> isCAbiField elem
+    | TEnt(nested, []) when nested.Kind = KRecord && nested.Layout <> LayoutAuto -> true
+    | _ -> false
+
+/// Determine `StructLayout` for a non-generic value-type `KRecord` from `.NET` `[<StructLayout>]` and `[<FieldOffset>]`.
+let private resolveStructLayout
+    (r: SourceLocation option)
+    (entRef: Fable.EntityRef)
+    (ent: Fable.Entity)
+    (e: Ent)
+    : StructLayout
+    =
+    let fields =
+        match e.Cases with
+        | [ "", fs ] -> fs
+        | _ -> []
+
+    if
+        not (
+            ent.IsValueType
+            && not ent.IsFSharpUnion
+            && not ent.IsInterface
+            && e.TypeParams.IsEmpty
+            && e.Hooks.IsNone
+            && not fields.IsEmpty
+        )
+    then
+        LayoutAuto
+    else
+        let structLayoutAtt =
+            ent.Attributes
+            |> Seq.tryFind (fun a -> a.Entity.FullName = "System.Runtime.InteropServices.StructLayoutAttribute")
+
+        let layoutKind =
+            match structLayoutAtt with
+            | Some att ->
+                match att.ConstructorArgs with
+                | v :: _ when v <> null -> System.Convert.ToInt32 v
+                | _ -> 0
+            | None -> 0 // Default F# value structs are sequential
+
+        let pack =
+            match structLayoutAtt with
+            | Some(:? Fable.Transforms.FSharp2Fable.FsAtt as att) ->
+                att.NamedArguments
+                |> List.tryPick (fun (n, v) ->
+                    if n = "Pack" && v <> null then
+                        let p = System.Convert.ToInt32 v
+
+                        if p > 0 then
+                            Some p
+                        else
+                            None
+                    else
+                        None
+                )
+            | _ -> None
+
+        if layoutKind = 3 then
+            // LayoutKind.Auto
+            LayoutAuto
+        elif layoutKind = 2 then
+            // LayoutKind.Explicit -> C union when all non-static fields sit at FieldOffset(0)
+            let fieldOffsets =
+                match ent with
+                | :? Fable.Transforms.FSharp2Fable.FsEnt as fe ->
+                    fe.FSharpEntity.FSharpFields
+                    |> Seq.filter (fun f -> not f.IsStatic)
+                    |> Seq.map (fun f ->
+                        f.FieldAttributes
+                        |> Seq.tryPick (fun a ->
+                            if
+                                a.AttributeType.TryFullName =
+                                    Some "System.Runtime.InteropServices.FieldOffsetAttribute"
+                            then
+                                match Seq.tryHead a.ConstructorArguments with
+                                | Some(_, v) when v <> null -> Some(System.Convert.ToInt32 v)
+                                | _ -> None
+                            else
+                                None
+                        )
+                    )
+                    |> Seq.toList
+                | _ -> []
+
+            if
+                fieldOffsets.Length = fields.Length
+                && fieldOffsets |> List.forall (fun o -> o = Some 0)
+                && fields |> List.forall (snd >> isCAbiField)
+            then
+                LayoutUnion
+            else
+                fail
+                    r
+                    "%s: LayoutKind.Explicit currently only supports C unions where every field has FieldOffset(0) and a C-compatible type"
+                    entRef.FullName
+        elif fields |> List.forall (snd >> isCAbiField) then
+            LayoutExtern pack
+        else
+            LayoutAuto
+
 let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
     match t with
     | Fable.Unit -> tVoid
@@ -67,6 +178,12 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
         | Fable.Any
         | Fable.MetaType -> inner
         | Fable.Array(_, (Fable.MutableArray | Fable.ImmutableArray)) -> inner
+        | Fable.DeclaredType(ent, [ _ ]) when
+            ent.FullName = "nativeptr`1"
+            || ent.FullName = "Microsoft.FSharp.Core.nativeptr`1"
+            ->
+            inner
+        | Fable.DeclaredType(ent, []) when ent.FullName = "voidptr" || ent.FullName = "System.Void*" -> inner
         | _ when (objOfType ctx r t).IsSome -> inner
         | Fable.DeclaredType(ent, _) when
             (match ctx.Com.TryGetEntity ent with
@@ -119,13 +236,13 @@ let rec mapType (ctx: Ctx) (r: SourceLocation option) (t: Fable.Type) : Ty =
             | _ -> false
 
         TPtr(mapType ctx r t, isIn)
-    // a native pointer (`NativePtr.stackalloc`): a many-item pointer; `voidptr`: an opaque one
+    // a native pointer (`NativePtr.stackalloc`): a nullable many-item pointer; `voidptr`: nullable opaque
     | Fable.DeclaredType(ent, [ t ]) when
         ent.FullName = "nativeptr`1"
         || ent.FullName = "Microsoft.FSharp.Core.nativeptr`1"
         ->
-        TPrim("[*]" + zigType (mapType ctx r t))
-    | Fable.DeclaredType(ent, []) when ent.FullName = "voidptr" || ent.FullName = "System.Void*" -> TPrim "*anyopaque"
+        TPrim("?[*]" + zigType (mapType ctx r t))
+    | Fable.DeclaredType(ent, []) when ent.FullName = "voidptr" || ent.FullName = "System.Void*" -> TPrim "?*anyopaque"
     // a span: a slice of what it views
     | Fable.DeclaredType(ent, [ t ]) when ent.FullName = "System.Span`1" || ent.FullName = "System.ReadOnlySpan`1" ->
         TSlice(mapType ctx r t, ent.FullName = "System.ReadOnlySpan`1")
@@ -421,11 +538,11 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
         // reference: a pointer to a counted cell.
         let isReference =
             ent.IsFSharpRecord
+            && not ent.IsValueType
             && (byReference
                 || (recursive && reachesSelf ctx.Com false ent)
-                || (not ent.IsValueType
-                    && (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
-                       |> List.exists (fun f -> f.IsMutable)))
+                || (ent.FSharpFields |> List.filter (fun f -> not f.IsStatic))
+                   |> List.exists (fun f -> f.IsMutable))
 
         // a name in this file, or `alias.name` for a type another file declares
         let name, isLocal =
@@ -465,6 +582,7 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
                 IsLocal = isLocal
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         if ent.IsInterface then
@@ -606,6 +724,9 @@ and entOf (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ent 
 
         ctx.State.EntDepth <- ctx.State.EntDepth - 1
 
+        if e.Kind = KRecord then
+            e.Layout <- resolveStructLayout r entRef ent e
+
         if isLocal then
             ctx.State.LocalEnts.Add e
 
@@ -702,6 +823,7 @@ and objInfo (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : Ob
                     IsLocal = isLocal
                     Hooks = None
                     Overrides = []
+                    Layout = LayoutAuto
                 }
 
             let part = synth "part"
@@ -835,6 +957,7 @@ and tryExnEnt (ctx: Ctx) (r: SourceLocation option) (entRef: Fable.EntityRef) : 
                     IsLocal = isLocal
                     Hooks = None
                     Overrides = []
+                    Layout = LayoutAuto
                 }
 
             ctx.State.Ents[entRef.FullName] <- e
@@ -1007,6 +1130,7 @@ and seqEnt (ctx: Ctx) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         ctx.State.Ents["$seq"] <- e
@@ -1167,6 +1291,7 @@ and libRecordEnt (ctx: Ctx) (file: string) (name: string) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         ctx.State.Ents[key] <- e
@@ -1204,6 +1329,7 @@ and walkEnt (ctx: Ctx) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         ctx.State.Ents["$walk"] <- e
@@ -1265,6 +1391,7 @@ and treeEnt (ctx: Ctx) (isMap: bool) : Ent =
                 IsLocal = false
                 Hooks = None
                 Overrides = []
+                Layout = LayoutAuto
             }
 
         let self = TEnt(e, e.TypeParams |> List.map TGen)

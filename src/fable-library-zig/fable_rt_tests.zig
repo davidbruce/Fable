@@ -3981,3 +3981,195 @@ test "poolShutdown drains local fable_sgc cycles on workers" {
     try std.testing.expectEqual(before_stats.remaining_structures_on_exit, after_stats.remaining_structures_on_exit);
     try std.testing.expectEqual(before_live, rt.live());
 }
+
+test "ffi NativePtr, StackAlloc, and spanOfPtr" {
+    var stack: rt.StackAlloc = .{};
+    defer stack.deinit();
+    const p: ?[*]i32 = try stack.alloc(i32, 4);
+    try std.testing.expect(p != null);
+    rt.ptrWrite(p, 10);
+    rt.ptrSet(p, 1, 20);
+    const p2 = rt.ptrAdd(p, 2);
+    rt.ptrWrite(p2, 30);
+    try std.testing.expectEqual(@as(i32, 20), rt.ptrGet(p2, -1));
+    try std.testing.expectEqual(@as(i32, 10), rt.ptrRead(p));
+    rt.ptrSet(p, 3, 40);
+    // Overlapping forward & backward copies
+    rt.ptrCopy(rt.ptrAdd(p, 1), p, 2);
+    try std.testing.expectEqual(@as(i32, 10), rt.ptrGet(p, 1));
+    try std.testing.expectEqual(@as(i32, 20), rt.ptrGet(p, 2));
+    rt.ptrInitBlock(@as(?[*]u8, @ptrCast(p.?)), 0xAB, 4);
+    try std.testing.expectEqual(@as(u8, 0xAB), @as([*]const u8, @ptrCast(p.?))[3]);
+    rt.ptrClear(p, 2);
+    try std.testing.expectEqual(@as(i32, 0), rt.ptrGet(p, 0));
+    rt.ptrCopyBlock(@as(?[*]u8, @ptrCast(p.?)), @as(?[*]const u8, @ptrCast(rt.ptrAdd(p, 3))), 4);
+    try std.testing.expectEqual(@as(i32, 40), rt.ptrGet(p, 0));
+
+    const empty_span = try rt.spanOfPtr([]u8, @as(?[*]u8, null), 0);
+    try std.testing.expectEqual(@as(usize, 0), empty_span.len);
+    try std.testing.expectError(error.Raised, rt.spanOfPtr([]u8, @as(?[*]u8, null), 3));
+    drop(rt.take());
+}
+
+test "ffi NativeMemory and AlignedAlloc" {
+    const p = try rt.nativeAllocZeroed(32);
+    defer rt.nativeFree(p);
+    rt.nativeFill(p, 8, 7);
+    const slice: [*]const u8 = @ptrCast(p.?);
+    try std.testing.expectEqual(@as(u8, 7), slice[0]);
+    try std.testing.expectEqual(@as(u8, 0), slice[8]);
+    rt.nativeCopy(p, @ptrFromInt(@intFromPtr(p.?) + 4), 8);
+    try std.testing.expectEqual(@as(u8, 7), slice[11]);
+    rt.nativeClear(p, 16);
+    try std.testing.expectEqual(@as(u8, 0), slice[11]);
+
+    const q = try rt.nativeAllocElem(4, @sizeOf(i32));
+    const q2 = try rt.nativeRealloc(q, 32);
+    rt.nativeFree(q2);
+
+    const z = try rt.nativeAllocZeroedElem(4, @sizeOf(i32));
+    rt.nativeFree(z);
+
+    const al = try rt.nativeAlignedAlloc(24, 64);
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(al.?) % 64);
+    @as([*]u8, @ptrCast(al.?))[0] = 0x5A;
+    @as([*]u8, @ptrCast(al.?))[23] = 0xC3;
+    const al2 = try rt.nativeAlignedRealloc(al, 128, 128);
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(al2.?) % 128);
+    try std.testing.expectEqual(@as(u8, 0x5A), @as([*]const u8, @ptrCast(al2.?))[0]);
+    try std.testing.expectEqual(@as(u8, 0xC3), @as([*]const u8, @ptrCast(al2.?))[23]);
+    rt.nativeAlignedFree(al2);
+
+    try std.testing.expectError(error.Raised, rt.nativeAlignedAlloc(16, 3));
+    drop(rt.take());
+}
+
+test "ffi Marshal strings, structs, arrays, read/write, and CallbackPool" {
+    const Vec = extern struct { x: f32, y: f32, z: i32 };
+    try std.testing.expectEqual(@as(i32, 12), rt.marshalSizeOf(Vec));
+    try std.testing.expectEqual(@as(i32, 4), rt.marshalSizeOf(bool));
+    const field_y = str("y");
+    try std.testing.expectEqual(@as(isize, 4), try rt.marshalOffsetOf(Vec, field_y));
+
+    const mem = try rt.marshalAllocHGlobal(24);
+    const mem2 = try rt.marshalReAllocHGlobal(mem, 48);
+    defer rt.marshalFreeHGlobal(mem2);
+
+    const orig = Vec{ .x = 1.5, .y = -2.25, .z = 99 };
+    try rt.marshalStructureToPtr(orig, mem2);
+    const round = try rt.marshalPtrToStructure(Vec, mem2);
+    try std.testing.expectEqual(orig, round);
+
+    try rt.marshalWrite(i32, mem2, 16, 0x12345678);
+    try std.testing.expectEqual(@as(i32, 0x12345678), try rt.marshalRead(i32, mem2, 16));
+
+    const s_in = str("Raylib \u{03BB}");
+    const u8p = try rt.marshalStringToHGlobalUTF8(s_in);
+    defer rt.marshalFreeHGlobal(u8p);
+    const u8s = rt.marshalPtrToStringUTF8(u8p);
+    defer drop(u8s);
+    try std.testing.expect(rt.strEql(s_in, u8s));
+
+    const u16p = try rt.marshalStringToHGlobalUni(s_in);
+    defer rt.marshalFreeHGlobal(u16p);
+    const u16s = rt.marshalPtrToStringUni(u16p);
+    defer drop(u16s);
+    try std.testing.expect(rt.strEql(s_in, u16s));
+
+    const arr = rt.arrays.arrayOf(Array(i32), .{ @as(i32, 3), @as(i32, 6), @as(i32, 9) });
+    defer drop(arr);
+    try rt.marshalCopyFromArray(arr, 0, mem2, 3);
+    const out_arr = try rt.arrays.arrayZero(Array(i32), 3);
+    defer drop(out_arr);
+    try rt.marshalCopyToArray(mem2, out_arr, 0, 3);
+    try std.testing.expectEqual(@as(i32, 9), out_arr.items[2]);
+
+    const Del = Func(*const fn (?*Env, i32) Raised!i32);
+    const before_live = rt.live();
+    const f = closure(
+        Del,
+        struct { bias: i32 },
+        .{ .bias = 7 },
+        struct {
+            fn call(env: ?*Env, x: i32) Raised!i32 {
+                const cap = rt.captured(struct { bias: i32 }, env);
+                return x + cap.bias;
+            }
+        }.call,
+    );
+    const c_ptr = try rt.marshalGetFunctionPointerForDelegate(f);
+    const raw_fn: *const fn (i32) callconv(.c) i32 = @ptrFromInt(@as(usize, @bitCast(c_ptr)));
+    try std.testing.expectEqual(@as(i32, 42), raw_fn(35));
+
+    const back = try rt.marshalGetDelegateForFunctionPointer(Del, c_ptr);
+    try std.testing.expectEqual(@as(i32, 50), try back.code(back.env, 43));
+    drop(back);
+
+    const ext_c = struct {
+        fn mul3(x: i32) callconv(.c) i32 {
+            return x * 3;
+        }
+    }.mul3;
+    const ext_del = try rt.marshalGetDelegateForFunctionPointer(Del, @bitCast(@intFromPtr(&ext_c)));
+    try std.testing.expectEqual(@as(i32, 21), try ext_del.code(ext_del.env, 7));
+    drop(ext_del);
+    drop(f);
+    try std.testing.expectEqual(before_live, rt.live());
+}
+
+test "ffi MemoryMarshal, Unsafe, and NativeLibrary" {
+    const arr = rt.arrays.arrayOf(Array(i32), .{ @as(i32, 0x04030201), @as(i32, 0x08070605) });
+    defer drop(arr);
+    const sp: []i32 = arr.items;
+    const bytes = rt.spanCast([]u8, sp);
+    try std.testing.expectEqual(@as(usize, 8), bytes.len);
+    const b2 = rt.spanAsBytes([]const u8, sp);
+    try std.testing.expectEqual(@as(usize, 8), b2.len);
+    const ref_head = rt.spanGetRef(sp);
+    try std.testing.expectEqual(@as(i32, 0x04030201), ref_head.*);
+    const ref_arr = rt.arrayGetDataRef(arr);
+    const ref_next = rt.unsafeAdd(ref_arr, 1);
+    try std.testing.expectEqual(@as(i32, 0x08070605), ref_next.*);
+    const sp2 = rt.spanCreateFromRef([]const i32, ref_arr, 2);
+    try std.testing.expectEqual(@as(usize, 2), sp2.len);
+    rt.unsafeWriteUnaligned(u16, @ptrCast(bytes.ptr + 1), 0xBEEF);
+    try std.testing.expectEqual(@as(u16, 0xBEEF), rt.unsafeReadUnaligned(u16, @ptrCast(bytes.ptr + 1)));
+    try std.testing.expectEqual(@as(u32, 0x3F800000), rt.unsafeAs(u32, @as(f32, 1.0)));
+
+    if (comptime builtin.link_libc and builtin.os.tag == .macos) {
+        const lib = try rt.nativeLibLoad(str("libSystem.B.dylib"));
+        defer rt.nativeLibFree(lib);
+        const sym = try rt.nativeLibGetExport(lib, str("abs"));
+        const abs_fn: *const fn (i32) callconv(.c) i32 = @ptrFromInt(@as(usize, @bitCast(sym)));
+        try std.testing.expectEqual(@as(i32, 99), abs_fn(-99));
+        var h_out: isize = 0;
+        var a_out: isize = 0;
+        try std.testing.expect(rt.nativeLibTryLoad(str("libSystem.B.dylib"), &h_out));
+        defer rt.nativeLibFree(h_out);
+        try std.testing.expect(rt.nativeLibTryGetExport(h_out, str("abs"), &a_out));
+        try std.testing.expect(a_out != 0);
+    }
+}
+
+test "ffi eql, hash, show, hasZero, hasNull on raw ptrs and extern unions" {
+    const U = extern union { i: i32, f: f32 };
+    const un1: U = .{ .i = 0x3F800000 };
+    const un2: U = .{ .f = 1.0 };
+    try std.testing.expect(rt.eql(un1, un2));
+    try std.testing.expectEqual(rt.hash(un1), rt.hash(un2));
+    try std.testing.expectEqual(@as(i32, 0), rt.compare(un1, un2));
+    try std.testing.expect(rt.hasNull(U));
+    try std.testing.expect(rt.arrays.hasZero(U));
+    const u_null = rt.nullOf(U);
+    try std.testing.expectEqual(@as(i32, 0), u_null.i);
+
+    const S = extern struct { ptr: ?*anyopaque, data: [4]f32, u: U };
+    try std.testing.expect(rt.hasNull(S));
+    try std.testing.expect(rt.arrays.hasZero(S));
+    const s1 = rt.nullOf(S);
+    const s2 = S{ .ptr = null, .data = .{ 0, 0, 0, 0 }, .u = u_null };
+    try std.testing.expect(rt.eql(s1, s2));
+    const txt = rt.anyText(s1);
+    defer drop(txt);
+    try std.testing.expect(rt.unitsOf(txt).len > 0);
+}

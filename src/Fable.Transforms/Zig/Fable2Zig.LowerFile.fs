@@ -44,7 +44,10 @@ let externBody (com: Compiler) (m: Fable.MemberDecl) : Fable.Expr =
 
     let entryPoint =
         info
-        |> Option.bind (attEntryPoint "System.Runtime.InteropServices.DllImportAttribute")
+        |> Option.bind (fun i ->
+            attEntryPoint "System.Runtime.InteropServices.DllImportAttribute" i
+            |> Option.orElseWith (fun () -> attEntryPoint "System.Runtime.InteropServices.LibraryImportAttribute" i)
+        )
 
     let name =
         entryPoint
@@ -53,19 +56,26 @@ let externBody (com: Compiler) (m: Fable.MemberDecl) : Fable.Expr =
 
     // How each value crosses (fable_rt.CKind): `[<MarshalAs>]` of a parameter or the result,
     // else by its type: a bool as .NET's 4-byte `BOOL`, a string as UTF-8, or UTF-16 under
-    // DllImport's `CharSet = CharSet.Unicode`
+    // DllImport's `CharSet = CharSet.Unicode` / LibraryImport's `StringMarshalling.Utf16`
     let dllImport =
         info
         |> Option.bind (fun i ->
             i.Attributes
-            |> Seq.tryFind (fun a -> a.Entity.FullName = "System.Runtime.InteropServices.DllImportAttribute")
+            |> Seq.tryFind (fun a ->
+                a.Entity.FullName = "System.Runtime.InteropServices.DllImportAttribute"
+                || a.Entity.FullName = "System.Runtime.InteropServices.LibraryImportAttribute"
+            )
         )
 
     let unicode =
         match dllImport with
         | Some(:? Fable.Transforms.FSharp2Fable.FsAtt as a) ->
             a.NamedArguments
-            |> List.exists (fun (n, v) -> n = "CharSet" && v <> null && System.Convert.ToInt32 v = 3)
+            |> List.exists (fun (n, v) ->
+                v <> null
+                && ((n = "CharSet" && System.Convert.ToInt32 v = 3)
+                    || (n = "StringMarshalling" && System.Convert.ToInt32 v = 2))
+            )
         | _ -> false
 
     let marshalAs (atts: Fable.Attribute seq) =
@@ -99,7 +109,7 @@ let externBody (com: Compiler) (m: Fable.MemberDecl) : Fable.Expr =
                 else
                     "utf8"
             | Fable.Boolean -> "bool4"
-            | Fable.DeclaredType(e, v :: _) when e.FullName = "Microsoft.FSharp.Core.byref`2" -> kindOf v []
+            | Fable.DeclaredType(e, v :: _) when e.FullName = "Microsoft.FSharp.Core.byref`2" -> kindOf v atts
             | _ -> "plain"
 
     let args = m.Args |> List.filter (fun a -> a.Type <> Fable.Unit)
@@ -1036,10 +1046,22 @@ let lowerFile (com: Compiler) (file: Fable.File) : FileState =
                     if not typeParams.IsEmpty then
                         fail d.Body.Range "%s: a function given to C cannot be generic" d.Name
 
-                    if isManaged ret || ps |> List.exists (fun p -> isManaged p.Ty && p.Ty <> tStr) then
+                    let nonCAbi allowStr t =
+                        if allowStr && t = tStr then
+                            false
+                        elif isManaged t then
+                            true
+                        else
+                            match t with
+                            | TEnt(e, _) when e.Kind = KRecord && e.Layout = LayoutAuto -> true
+                            | TEnt(e, _) when e.Kind = KValueUnion -> true
+                            | TTuple _ -> true
+                            | _ -> false
+
+                    if nonCAbi false ret || ps |> List.exists (fun p -> nonCAbi true p.Ty) then
                         fail
                             d.Body.Range
-                            "%s: a function given to C takes numbers, bools and strings and gives numbers, bools or nothing"
+                            "%s: a function given to C takes C ABI primitives, pointers, extern structs/unions, or strings"
                             d.Name
 
                     let symbol =

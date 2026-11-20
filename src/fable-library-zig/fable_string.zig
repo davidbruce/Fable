@@ -373,6 +373,11 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
         @panic("fable: At least one object must implement IComparable.");
     }
     if (comptime isFunc(T)) @compileError("fable: function values cannot be compared");
+    if (comptime rt.isRawPtr(T)) {
+        const ax: usize = if (@typeInfo(T) == .optional) (if (a) |p| @intFromPtr(p) else 0) else @intFromPtr(a);
+        const bx: usize = if (@typeInfo(T) == .optional) (if (b) |p| @intFromPtr(p) else 0) else @intFromPtr(b);
+        return if (ax < bx) -1 else if (ax > bx) 1 else 0;
+    }
     switch (@typeInfo(T)) {
         .int, .float, .comptime_int, .comptime_float => {
             if (a < b) return -1;
@@ -381,6 +386,13 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
             // (not a number: it comes before every number, and equals itself)
             if (a == a) return 1;
             return if (b == b) -1 else 0;
+        },
+        .array => {
+            for (a, b) |x, y| {
+                const c = compare(x, y);
+                if (c != 0) return c;
+            }
+            return 0;
         },
         .optional => {
             const x = a orelse return if (b == null) 0 else -1;
@@ -414,7 +426,14 @@ pub fn compare(a: anytype, b: @TypeOf(a)) i32 {
             }
             return 0;
         },
-        .@"union" => {
+        .@"union" => |u| {
+            if (comptime u.tag_type == null) {
+                return switch (std.mem.order(u8, std.mem.asBytes(&a), std.mem.asBytes(&b))) {
+                    .lt => -1,
+                    .gt => 1,
+                    .eq => 0,
+                };
+            }
             if (comptime isCollection(T)) return treeCompare(a, b);
             if (comptime @hasDecl(T, "fable_list")) {
                 var x = a;
@@ -541,9 +560,18 @@ pub fn hash(x: anytype) i32 {
         if (ifaceToObjBorrow(x)) |o| return hash(o);
         return @truncate(@as(isize, @bitCast(@intFromPtr(x.data) ^ @intFromPtr(x.vt))));
     }
+    if (comptime rt.isRawPtr(T)) {
+        const addr: usize = if (@typeInfo(T) == .optional) (if (x) |p| @intFromPtr(p) else 0) else @intFromPtr(x);
+        return @truncate(@as(isize, @bitCast(addr)));
+    }
     switch (@typeInfo(T)) {
         .void => return 0,
         .bool => return @intFromBool(x),
+        .array => {
+            var h: i32 = 17;
+            for (x) |item| h = hashWith(h, hash(item));
+            return h;
+        },
         .int => |info| {
             if (info.bits <= 32) return if (info.signedness == .signed) @as(i32, @intCast(x)) else @bitCast(@as(u32, @intCast(x)));
             // (as .NET folds a 64-bit number)
@@ -573,7 +601,10 @@ pub fn hash(x: anytype) i32 {
             inline for (st.field_names) |name| h = hashWith(h, hash(@field(x, name)));
             return h;
         },
-        .@"union" => {
+        .@"union" => |u| {
+            if (comptime u.tag_type == null) {
+                return @bitCast(@as(u32, @truncate(std.hash.Wyhash.hash(0, std.mem.asBytes(&x)))));
+            }
             if (comptime isCollection(T)) return treeHash(x);
             if (comptime @hasDecl(T, "fable_list")) {
                 var h: i32 = 17;

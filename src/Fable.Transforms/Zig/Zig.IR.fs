@@ -34,6 +34,12 @@ type EntKind =
     /// an interface: fat pointer `{ data, vt }` with static vtable
     | KIface
 
+/// ABI memory layout for value records (`KRecord`).
+type StructLayout =
+    | LayoutAuto
+    | LayoutExtern of pack: int option
+    | LayoutUnion
+
 [<ReferenceEquality>]
 type Ent =
     {
@@ -63,6 +69,8 @@ type Ent =
         /// the `Equals`, `GetHashCode` and `IComparable.CompareTo` the type declares, which
         /// `=`, `hash` and `compare` call: the runtime's name of the hook, and the function
         mutable Overrides: (string * string) list
+        /// C-compatible ABI layout when emitted (`struct`, `extern struct`, or `extern union`)
+        mutable Layout: StructLayout
     }
 
 type Ty =
@@ -141,6 +149,24 @@ let holdsDecimal (t: Ty) : bool =
         | TTuple ts -> List.exists go ts
         | TEnt(e, args) ->
             List.exists go args
+            || (seen.Add e.Name
+                && e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> go)))
+        | _ -> false
+
+    go t
+
+/// Does a value hold an untagged C union (`extern union`, where `std.meta.eql` is illegal)?
+let holdsLayoutUnion (t: Ty) : bool =
+    let seen = HashSet<string>()
+
+    let rec go (t: Ty) =
+        match t with
+        | TOpt t
+        | TArr(t, _) -> go t
+        | TTuple ts -> List.exists go ts
+        | TEnt(e, args) ->
+            e.Layout = LayoutUnion
+            || List.exists go args
             || (seen.Add e.Name
                 && e.Cases |> List.exists (fun (_, fs) -> fs |> List.exists (snd >> go)))
         | _ -> false
@@ -361,7 +387,13 @@ let rec private tyLayout (seen: Set<string>) (t: Ty) : (int * int) option =
     | TPrim("i32" | "u32" | "f32" | "c_int" | "c_uint") -> Some(4, 4)
     | TPrim("i64" | "u64" | "f64" | "isize" | "usize") -> Some(8, 8)
     | TPrim("i128" | "u128" | "f128") -> Some(16, 16)
-    | TPrim("fable_rt.String" | "fable_rt.Exn" | "fable_rt.Obj" | "fable_rt.ThreadOf") -> Some(8, 8)
+    | TPrim("fable_rt.String" | "fable_rt.Exn" | "fable_rt.Obj" | "fable_rt.ThreadOf" | "?*anyopaque" | "*anyopaque") ->
+        Some(8, 8)
+    | TPrim s when
+        s.StartsWith("?[*]", System.StringComparison.Ordinal)
+        || s.StartsWith("[*]", System.StringComparison.Ordinal)
+        ->
+        Some(8, 8)
     | TPtr _ -> Some(8, 8)
     | TSlice _ -> Some(16, 8)
     | TArr(elem, n) -> tyLayout seen elem |> Option.map (fun (s, a) -> s * n, a)
@@ -400,6 +432,15 @@ let rec private tyLayout (seen: Set<string>) (t: Ty) : (int * int) option =
 
             if List.exists Option.isNone fs then
                 None
+            elif e.Layout = LayoutUnion then
+                let chosen = List.choose id fs
+
+                if chosen.IsEmpty then
+                    Some(0, 1)
+                else
+                    let maxS = chosen |> List.map fst |> List.max
+                    let maxA = chosen |> List.map snd |> List.max |> max 1
+                    Some(alignUp maxS maxA, maxA)
             else
                 Some(structLayout (List.choose id fs))
     | TEnt(e, _) when e.Kind = KValueUnion ->

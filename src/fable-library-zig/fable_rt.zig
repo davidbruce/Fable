@@ -605,6 +605,45 @@ pub fn isSlice(comptime T: type) bool {
     return info == .pointer and info.pointer.size == .slice;
 }
 
+/// A raw unmanaged pointer (`nativeptr<'T>` = `?[*]T`, `voidptr` = `?*anyopaque`, `[*c]T`, etc.),
+/// distinct from managed `String` (`?[*:0]const u16`) and single-cell pointers.
+pub fn isRawPtr(comptime T: type) bool {
+    if (T == String) return false;
+    return switch (@typeInfo(T)) {
+        .optional => |o| isRawPtrPtr(o.child),
+        .pointer => isRawPtrPtr(T),
+        else => false,
+    };
+}
+
+fn isRawPtrPtr(comptime P: type) bool {
+    const info = @typeInfo(P);
+    if (info != .pointer) return false;
+    return info.pointer.size == .many or info.pointer.size == .c or info.pointer.child == anyopaque;
+}
+
+/// Does a value hold or contain an untagged union (`extern union`, where `std.meta.eql` is illegal)?
+fn hasUntaggedUnion(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"union" => |u| blk: {
+            if (u.tag_type == null) break :blk true;
+            for (u.field_types) |F| {
+                if (hasUntaggedUnion(F)) break :blk true;
+            }
+            break :blk false;
+        },
+        .@"struct" => |s| blk: {
+            for (s.field_types) |F| {
+                if (hasUntaggedUnion(F)) break :blk true;
+            }
+            break :blk false;
+        },
+        .optional => |o| hasUntaggedUnion(o.child),
+        .array => |a| hasUntaggedUnion(a.child),
+        else => false,
+    };
+}
+
 /// The count and the collector's header are not part of what a cell holds.
 pub fn isCount(comptime field_name: []const u8) bool {
     return std.mem.eql(u8, field_name, "$rc") or std.mem.eql(u8, field_name, "$gc");
@@ -628,6 +667,7 @@ pub fn isManaged(comptime T: type) bool {
     if (isSlice(T)) return isManaged(@typeInfo(T).pointer.child);
     switch (@typeInfo(T)) {
         .optional => |o| return isManaged(o.child),
+        .array => |a| return isManaged(a.child),
         .@"struct" => |s| {
             inline for (s.field_types) |F| {
                 if (isManaged(F)) return true;
@@ -939,7 +979,7 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_identity")) return a == b;
     // (an array is equal to another with equal items, as F#'s `=` has it)
     if (comptime isCellPtr(T) and @hasDecl(@typeInfo(T).pointer.child, "fable_array")) return a == b or (!arrayIsNull(a) and !arrayIsNull(b) and eql(a.items, b.items) and std.meta.eql(a.shape, b.shape));
-    if (comptime !isManaged(T) and !holdsDecimal(T)) return std.meta.eql(a, b);
+    if (comptime !isManaged(T) and !holdsDecimal(T) and !hasUntaggedUnion(T)) return std.meta.eql(a, b);
     // (a sequence is an object on .NET: equal only to itself, here the same walk and what it holds)
     if (comptime @typeInfo(T) == .@"struct" and @hasField(T, "fable_seq")) return a.fable_seq.env == b.fable_seq.env and a.fable_seq.code == b.fable_seq.code;
     // (F# does not compare function values; what does is an interface value, a struct of them
@@ -972,13 +1012,22 @@ pub fn eql(a: anytype, b: @TypeOf(a)) bool {
             }
             return b == null;
         },
+        .array => {
+            for (a, b) |x, y| {
+                if (!eql(x, y)) return false;
+            }
+            return true;
+        },
         .@"struct" => |s| {
             inline for (s.field_names) |name| {
                 if (!eql(@field(a, name), @field(b, name))) return false;
             }
             return true;
         },
-        .@"union" => {
+        .@"union" => |u| {
+            if (comptime u.tag_type == null) {
+                return std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
+            }
             // (a recursive union is compared along its last field of its own type in a loop,
             // as `dropHeap` gives it up: a long list does not use the stack)
             var x = a;
@@ -3463,438 +3512,71 @@ pub fn physicalHash(x: anytype) i32 {
     return hash(x);
 }
 
-// ---- C functions of the program's (`[<DllImport("lib")>] extern int f(string s)`): called
-// directly, as Zig calls C. F#'s values are given as C's: a string as its UTF-8 ended by a zero
-// (in a buffer of the call's stack when it fits, made for the call only), an array as a pointer
-// to its items, anything else (numbers, bool, nativeint) as it is; a string C gives back is
-// copied (C still owns it). The library is linked by the build (`-lc`, `-lsqlite3`). ----
-
-/// A string given to C for one call
-const CString = struct {
-    small: [256]u8 = undefined,
-    big: ?[]u8 = null,
-
-    fn init(c: *CString, s: String) [*:0]const u8 {
-        const units = unitsOf(s);
-        const need = units.len * 3 + 1;
-        const buf: []u8 = if (need <= c.small.len) &c.small else blk: {
-            const b = alloc().alloc(u8, need) catch oom();
-            c.big = b;
-            break :blk b;
-        };
-        const n = std.unicode.wtf16LeToWtf8(buf, units);
-        buf[n] = 0;
-        return @ptrCast(buf.ptr);
-    }
-
-    fn deinit(c: *CString) void {
-        if (c.big) |b| alloc().free(b);
-    }
-};
-
-/// How a value crosses to C (`[<MarshalAs>]`, DllImport's `CharSet`; the compiler gives one for
-/// each parameter and for the result): `.plain` as it is; a bool as a 4-byte `BOOL` (`.bool4`,
-/// .NET's default) or C's 1-byte `bool` (`.bool1`, `UnmanagedType.I1`/`U1`); a string as UTF-8
-/// (`.utf8`, the default) or UTF-16 (`.utf16`, `LPWStr`, `CharSet.Unicode`)
-pub const CKind = enum { plain, bool4, bool1, utf8, utf16 };
-
-/// What C is given for a value of type T, crossing as `kind`
-fn CArg(comptime T: type, comptime kind: CKind) type {
-    if (T == String) return if (kind == .utf16) ?[*:0]const u16 else ?[*:0]const u8;
-    if (T == bool) return if (kind == .bool1) bool else i32;
-    if (comptime isArrayPtr(T)) return [*]@typeInfo(@FieldType(@typeInfo(T).pointer.child, "items")).pointer.child;
-    if (comptime isPlainStruct(T)) return CStruct(T);
-    if (comptime isFunc(T)) return CallbackFn(T);
-    if (comptime isByref(T)) {
-        const V = @typeInfo(T).pointer.child;
-        if (V == bool) return if (kind == .bool1) *bool else *i32;
-        if (comptime isPlainStruct(V)) return *CStruct(V);
-        if (comptime @typeInfo(V) == .int or @typeInfo(V) == .float) return T;
-        @compileError("fable: a [<DllImport>] function's byref (out, ref) parameter is of a number, a bool or a struct of them; not " ++ @typeName(V));
-    }
-    if (comptime isManaged(T)) @compileError("fable: a [<DllImport>] function takes and gives numbers, bools, strings, arrays, delegates, byrefs and structs of numbers and bools (by value); not " ++ @typeName(T));
-    return T;
-}
-
-/// (a byref: `*T` of a value, not a counted cell)
-fn isByref(comptime T: type) bool {
-    const info = @typeInfo(T);
-    return info == .pointer and info.pointer.size == .one and !isCellPtr(T) and @typeInfo(info.pointer.child) != .@"fn" and @typeInfo(info.pointer.child) != .@"opaque";
-}
-
-/// What a byref's value is copied into for the call (and back after): a C struct, a `BOOL`
-fn CTemp(comptime T: type, comptime kind: CKind) type {
-    if (!isByref(T)) return void;
-    const V = @typeInfo(T).pointer.child;
-    if (V == bool) return if (kind == .bool1) void else i32;
-    if (isPlainStruct(V)) return CStruct(V);
-    return void;
-}
-
-/// A string given to C as UTF-16 for one call
-const CWString = struct {
-    small: [128]u16 = undefined,
-    big: ?[]u16 = null,
-
-    fn init(c: *CWString, s: String) [*:0]const u16 {
-        const units = unitsOf(s);
-        const buf: []u16 = if (units.len + 1 <= c.small.len) &c.small else blk: {
-            const b = alloc().alloc(u16, units.len + 1) catch oom();
-            c.big = b;
-            break :blk b;
-        };
-        @memcpy(buf[0..units.len], units);
-        buf[units.len] = 0;
-        return @ptrCast(buf.ptr);
-    }
-
-    fn deinit(c: *CWString) void {
-        if (c.big) |b| alloc().free(b);
-    }
-};
-
-/// A result of C as F#'s `R`
-fn fromC(comptime R: type, comptime kind: CKind, r: anytype) R {
-    if (R == String) {
-        if (kind == .utf16) {
-            const p: ?[*:0]const u16 = r;
-            return if (p) |q| strFrom(std.mem.span(q)) else null;
-        }
-        const p: ?[*:0]const u8 = r;
-        return if (p) |q| io.fromUtf8(std.mem.span(q)) else null;
-    }
-    if (R == bool) return if (kind == .bool1) r else r != 0;
-    if (comptime isPlainStruct(R)) return fromCStruct(R, r);
-    return r;
-}
-
-/// An F# value as C's (a callback's result)
-fn toC(comptime T: type, comptime kind: CKind, x: T) CArg(T, kind) {
-    if (T == bool) return if (kind == .bool1) x else @intFromBool(x);
-    if (comptime isPlainStruct(T)) return toCStruct(CStruct(T), x);
-    return x;
-}
-
-// ---- structs given to C by value: an F# struct of numbers, bools and such structs (a
-// `[<Struct>]` record, or a struct of `val` fields) is copied, field by field, into a struct of
-// the same fields laid out as C lays them out (an `extern struct`), and back for a result ----
-
-/// Is T a struct of numbers, bools and such structs (no tuple, nothing counted)?
-fn isPlainStruct(comptime T: type) bool {
-    return comptime blk: {
-        const info = @typeInfo(T);
-        if (info != .@"struct") break :blk false;
-        if (info.@"struct".is_tuple or isManaged(T)) break :blk false;
-        if (info.@"struct".layout == .@"packed") break :blk false;
-        for (info.@"struct".field_types) |F| {
-            switch (@typeInfo(F)) {
-                .int, .float, .bool => {},
-                .@"struct" => if (!isPlainStruct(F)) break :blk false,
-                else => break :blk false,
-            }
-        }
-        break :blk info.@"struct".field_names.len != 0;
-    };
-}
-
-/// The C layout of a plain struct (see above)
-fn CStruct(comptime T: type) type {
-    const st = @typeInfo(T).@"struct";
-    if (st.layout == .@"extern") return T;
-    var types: [st.field_names.len]type = undefined;
-    for (st.field_types, 0..) |F, i| types[i] = if (@typeInfo(F) == .@"struct") CStruct(F) else F;
-    return @Struct(.@"extern", null, st.field_names, &types, &@splat(.{}));
-}
-
-/// `x` as the struct `C` (a C struct of the same field names: `CStruct(T)`, or one of a header)
-fn toCStruct(comptime C: type, x: anytype) C {
-    var c: C = undefined;
-    inline for (@typeInfo(C).@"struct".field_names) |name| {
-        if (!@hasField(@TypeOf(x), name)) @compileError("fable: the C struct " ++ @typeName(C) ++ " has a field `" ++ name ++ "` that " ++ @typeName(@TypeOf(x)) ++ " has not");
-        const F = @FieldType(C, name);
-        const v = @field(x, name);
-        @field(c, name) = if (@typeInfo(F) == .@"struct") toCStruct(F, v) else if (@typeInfo(F) == .float and @TypeOf(v) != F) @floatCast(v) else if (@typeInfo(F) == .int and @TypeOf(v) != F) @intCast(v) else v;
-    }
-    return c;
-}
-
-/// A C struct `c` as the F# struct T
-fn fromCStruct(comptime T: type, c: anytype) T {
-    var x: T = undefined;
-    inline for (@typeInfo(T).@"struct".field_names) |name| {
-        const F = @FieldType(T, name);
-        const v = @field(c, name);
-        @field(x, name) = if (@typeInfo(F) == .@"struct") fromCStruct(F, v) else if (@typeInfo(F) == .float and @TypeOf(v) != F) @floatCast(v) else if (@typeInfo(F) == .int and @TypeOf(v) != F) @intCast(v) else v;
-    }
-    return x;
-}
-
-fn CFn(comptime P: []const type, comptime R: type) type {
-    return switch (P.len) {
-        0 => *const fn () callconv(.c) R,
-        1 => *const fn (P[0]) callconv(.c) R,
-        2 => *const fn (P[0], P[1]) callconv(.c) R,
-        3 => *const fn (P[0], P[1], P[2]) callconv(.c) R,
-        4 => *const fn (P[0], P[1], P[2], P[3]) callconv(.c) R,
-        5 => *const fn (P[0], P[1], P[2], P[3], P[4]) callconv(.c) R,
-        6 => *const fn (P[0], P[1], P[2], P[3], P[4], P[5]) callconv(.c) R,
-        else => @compileError("fable: a C function of more than six arguments"),
-    };
-}
-
-// ---- callbacks: a delegate given to C is a function of C's calling convention made for it
-// (one for each callback parameter of each C function), which turns C's arguments into F#'s,
-// calls the delegate and gives its result back as C's. The delegate it calls: the one given to
-// the call that is running on this thread (`qsort`'s comparison), or else the one given last
-// (a callback C keeps and calls later, from any thread). As on .NET, the program keeps that
-// delegate alive while C may call it (no reference is taken here, as .NET's thunk does not keep
-// the delegate alive either); an exception that leaves it ends the program, as on .NET. ----
-
-fn Callback(comptime name: []const u8, comptime index: usize, comptime F: type) type {
-    _ = name;
-    _ = index;
-    const Code = @typeInfo(@FieldType(F, "code")).pointer.child;
-    const Fn = @typeInfo(Code).@"fn";
-    const P = Fn.param_types[1..];
-    const RR = Fn.return_type.?;
-    const R = if (isRaised(RR)) Unraised(RR) else RR;
-    const CR = CArg(R, .plain);
-    return struct {
-        threadlocal var current: ?F = null;
-        var latest: ?F = null;
-        var guard = std.atomic.Value(u32).init(0);
-
-        fn setLatest(f: F) void {
-            while (guard.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-            latest = f;
-            guard.store(0, .release);
-        }
-
-        fn delegate() F {
-            if (current) |f| return f;
-            while (guard.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-            const f = latest;
-            guard.store(0, .release);
-            return f orelse @panic("fable: a C callback was called with no delegate given for it");
-        }
-
-        fn invoke(c_args: anytype) CR {
-            const f = delegate();
-            var f_args: std.meta.ArgsTuple(Code) = undefined;
-            f_args[0] = f.env;
-            inline for (P, 0..) |A, i| {
-                const a = c_args[i];
-                f_args[i + 1] = if (A.? == String) strFromCStr(a) else fromC(A.?, .plain, a);
-            }
-            const result = @call(.auto, f.code, f_args);
-            const value = if (comptime isRaised(RR)) result catch {
-                uncaught();
-                std.process.abort();
-            } else result;
-            return toC(R, .plain, value);
-        }
-
-        const C = blk: {
-            var ps: [P.len]type = undefined;
-            for (P, 0..) |A, i| ps[i] = if (A.? == String) ?[*:0]const u8 else CArg(A.?, .plain);
-            break :blk ps;
-        };
-
-        const code = switch (P.len) {
-            0 => struct {
-                fn f() callconv(.c) CR {
-                    return invoke(.{});
-                }
-            }.f,
-            1 => struct {
-                fn f(a: C[0]) callconv(.c) CR {
-                    return invoke(.{a});
-                }
-            }.f,
-            2 => struct {
-                fn f(a: C[0], b: C[1]) callconv(.c) CR {
-                    return invoke(.{ a, b });
-                }
-            }.f,
-            3 => struct {
-                fn f(a: C[0], b: C[1], c: C[2]) callconv(.c) CR {
-                    return invoke(.{ a, b, c });
-                }
-            }.f,
-            4 => struct {
-                fn f(a: C[0], b: C[1], c: C[2], d: C[3]) callconv(.c) CR {
-                    return invoke(.{ a, b, c, d });
-                }
-            }.f,
-            5 => struct {
-                fn f(a: C[0], b: C[1], c: C[2], d: C[3], e: C[4]) callconv(.c) CR {
-                    return invoke(.{ a, b, c, d, e });
-                }
-            }.f,
-            else => @compileError("fable: a callback of more than five arguments"),
-        };
-    };
-}
-
-/// The C type of a callback for a delegate of type F
-fn CallbackFn(comptime F: type) type {
-    const Code = @typeInfo(@FieldType(F, "code")).pointer.child;
-    const Fn = @typeInfo(Code).@"fn";
-    const P = Fn.param_types[1..];
-    const RR = Fn.return_type.?;
-    const R = if (isRaised(RR)) Unraised(RR) else RR;
-    var ps: [P.len]type = undefined;
-    for (P, 0..) |A, i| ps[i] = if (A.? == String) ?[*:0]const u8 else CArg(A.?, .plain);
-    return CFn(&ps, CArg(R, .plain));
-}
-
-/// `f args` of `[<DllImport>] extern R f(...)`: the C function `name`, each argument crossing as
-/// its kind in `kinds`, the result as `ret`
-pub fn callC(comptime R: type, comptime name: []const u8, comptime kinds: anytype, comptime ret: CKind, args: anytype) R {
-    const fields = @typeInfo(@TypeOf(args)).@"struct".field_types;
-    const n = fields.len;
-    const params = comptime blk: {
-        var ps: [n]type = undefined;
-        for (fields, 0..) |F, i| ps[i] = CArg(F, kinds[i]);
-        break :blk ps;
-    };
-    const temp_types = comptime blk: {
-        var ts: [n]type = undefined;
-        for (fields, 0..) |F, i| ts[i] = CTemp(F, kinds[i]);
-        break :blk ts;
-    };
-    var c_args: @Tuple(&params) = undefined;
-    var temps: @Tuple(&temp_types) = undefined;
-    var strings: [n]CString = undefined;
-    var wide: [n]CWString = undefined;
-    inline for (0..n) |i| {
-        const F = fields[i];
-        const kind: CKind = kinds[i];
-        if (F == String) {
-            if (kind == .utf16) {
-                wide[i] = .{};
-                c_args[i] = if (args[i] == null) null else wide[i].init(args[i]);
-            } else {
-                strings[i] = .{};
-                c_args[i] = if (args[i] == null) null else strings[i].init(args[i]);
-            }
-        } else if (comptime isArrayPtr(F)) {
-            c_args[i] = args[i].items.ptr;
-        } else if (comptime isPlainStruct(F)) {
-            c_args[i] = toCStruct(CStruct(F), args[i]);
-        } else if (comptime isFunc(F)) {
-            const Cb = Callback(name, i, F);
-            Cb.setLatest(args[i]);
-            c_args[i] = &Cb.code;
-        } else if (comptime temp_types[i] != void) {
-            const V = @typeInfo(F).pointer.child;
-            temps[i] = if (V == bool) @intFromBool(args[i].*) else toCStruct(temp_types[i], args[i].*);
-            c_args[i] = &temps[i];
-        } else if (F == bool) {
-            c_args[i] = if (kind == .bool1) args[i] else @intFromBool(args[i]);
-        } else {
-            c_args[i] = args[i];
-        }
-    }
-    // (the delegates of this call, for callbacks that come while it runs on this thread)
-    const saved_types = comptime blk: {
-        var ts: [n]type = undefined;
-        for (fields, 0..) |F, i| ts[i] = if (isFunc(F)) ?F else void;
-        break :blk ts;
-    };
-    var saved: @Tuple(&saved_types) = undefined;
-    inline for (0..n) |i| {
-        if (comptime isFunc(fields[i])) {
-            const Cb = Callback(name, i, fields[i]);
-            saved[i] = Cb.current;
-            Cb.current = args[i];
-        }
-    }
-    defer inline for (0..n) |i| {
-        if (fields[i] == String) {
-            if (kinds[i] == .utf16) wide[i].deinit() else strings[i].deinit();
-        }
-        if (comptime isFunc(fields[i])) Callback(name, i, fields[i]).current = saved[i];
-    };
-    const CR = comptime if (R == String) (if (ret == .utf16) ?[*:0]const u16 else ?[*:0]const u8) else CArg(R, ret);
-    const f = @extern(CFn(&params, CR), .{ .name = name });
-    const r = @call(.auto, f, c_args);
-    // (what C wrote into the byrefs' copies, back into them)
-    inline for (0..n) |i| {
-        if (comptime temp_types[i] != void) {
-            const V = @typeInfo(fields[i]).pointer.child;
-            args[i].* = if (V == bool) temps[i] != 0 else fromCStruct(V, temps[i]);
-        }
-    }
-    return fromC(R, ret, r);
-}
-
-/// `f args` of a C function imported with `[<Import("f", "c:module")>]` (a module of C's
-/// declarations: translated from a header by the build, or `extern` functions written in Zig):
-/// F#'s values given as the function's parameter types ask, as `callC` gives them; a string or
-/// a number of another size given back as F#'s type `R`
-pub fn cCall(comptime R: type, f: anytype, args: anytype) R {
-    const P = @typeInfo(@TypeOf(f)).@"fn".param_types;
-    const fields = @typeInfo(@TypeOf(args)).@"struct".field_types;
-    if (P.len != fields.len) @compileError("fable: the C function takes " ++ std.fmt.comptimePrint("{d}", .{P.len}) ++ " arguments");
-    const params = comptime blk: {
-        var ps: [P.len]type = undefined;
-        for (P, 0..) |p, i| ps[i] = p.?;
-        break :blk ps;
-    };
-    var c_args: @Tuple(&params) = undefined;
-    var strings: [fields.len]CString = undefined;
-    inline for (0..fields.len) |i| {
-        const F = fields[i];
-        if (F == String) {
-            strings[i] = .{};
-            c_args[i] = if (args[i] == null) @ptrFromInt(0) else @ptrCast(strings[i].init(args[i]));
-        } else if (comptime isArrayPtr(F)) {
-            c_args[i] = @ptrCast(args[i].items.ptr);
-        } else if (comptime @typeInfo(F) == .int and @typeInfo(params[i]) == .int) {
-            c_args[i] = @intCast(args[i]);
-        } else if (comptime @typeInfo(F) == .float and @typeInfo(params[i]) == .float) {
-            c_args[i] = @floatCast(args[i]);
-        } else if (comptime isPlainStruct(F) and @typeInfo(params[i]) == .@"struct") {
-            c_args[i] = toCStruct(params[i], args[i]);
-        } else {
-            c_args[i] = args[i];
-        }
-    }
-    defer inline for (0..fields.len) |i| {
-        if (fields[i] == String) strings[i].deinit();
-    };
-    const r = @call(.auto, f, c_args);
-    const T = @TypeOf(r);
-    if (R == String) {
-        const p: ?[*:0]const u8 = @ptrCast(r);
-        return if (p) |q| io.fromUtf8(std.mem.span(q)) else null;
-    }
-    if (comptime T == R) return r;
-    if (comptime isPlainStruct(R) and @typeInfo(T) == .@"struct") return fromCStruct(R, r);
-    if (comptime @typeInfo(T) == .int and @typeInfo(R) == .int) return @intCast(r);
-    if (comptime @typeInfo(T) == .float and @typeInfo(R) == .float) return @floatCast(r);
-    if (comptime @typeInfo(T) == .bool and @typeInfo(R) == .bool) return r;
-    return r;
-}
-
-/// For Zig code of the program's: the UTF-8 of a string, ended by a zero, which the caller frees
-/// (`fable_rt.allocator`); and a string of UTF-8 bytes or of a C string (copied)
-pub fn strToUtf8Z(s: String) [:0]u8 {
-    const units = unitsOf(s);
-    const buf = allocator.allocSentinel(u8, std.unicode.calcWtf8Len(units), 0) catch oom();
-    _ = std.unicode.wtf16LeToWtf8(buf, units);
-    return buf;
-}
-
-pub fn strFromUtf8(bytes: []const u8) String {
-    return io.fromUtf8(bytes);
-}
-
-pub fn strFromCStr(p: ?[*:0]const u8) String {
-    const q = p orelse return null;
-    return io.fromUtf8(std.mem.span(q));
-}
+pub const ffi = @import("fable_ffi.zig");
+pub const CKind = ffi.CKind;
+pub const CallbackPool = ffi.CallbackPool;
+pub const callC = ffi.callC;
+pub const cCall = ffi.cCall;
+pub const strToUtf8Z = ffi.strToUtf8Z;
+pub const strFromUtf8 = ffi.strFromUtf8;
+pub const strFromCStr = ffi.strFromCStr;
+pub const ptrAdd = ffi.ptrAdd;
+pub const ptrGet = ffi.ptrGet;
+pub const ptrSet = ffi.ptrSet;
+pub const ptrRead = ffi.ptrRead;
+pub const ptrWrite = ffi.ptrWrite;
+pub const ptrCopy = ffi.ptrCopy;
+pub const ptrCopyBlock = ffi.ptrCopyBlock;
+pub const ptrInitBlock = ffi.ptrInitBlock;
+pub const ptrClear = ffi.ptrClear;
+pub const nativeAlloc = ffi.nativeAlloc;
+pub const nativeAllocElem = ffi.nativeAllocElem;
+pub const nativeAllocZeroed = ffi.nativeAllocZeroed;
+pub const nativeAllocZeroedElem = ffi.nativeAllocZeroedElem;
+pub const nativeRealloc = ffi.nativeRealloc;
+pub const nativeFree = ffi.nativeFree;
+pub const nativeAlignedAlloc = ffi.nativeAlignedAlloc;
+pub const nativeAlignedRealloc = ffi.nativeAlignedRealloc;
+pub const nativeAlignedFree = ffi.nativeAlignedFree;
+pub const nativeCopy = ffi.nativeCopy;
+pub const nativeFill = ffi.nativeFill;
+pub const nativeClear = ffi.nativeClear;
+pub const marshalSizeOf = ffi.marshalSizeOf;
+pub const marshalOffsetOf = ffi.marshalOffsetOf;
+pub const marshalAllocHGlobal = ffi.marshalAllocHGlobal;
+pub const marshalReAllocHGlobal = ffi.marshalReAllocHGlobal;
+pub const marshalFreeHGlobal = ffi.marshalFreeHGlobal;
+pub const marshalPtrToStringUTF8 = ffi.marshalPtrToStringUTF8;
+pub const marshalPtrToStringUTF8Len = ffi.marshalPtrToStringUTF8Len;
+pub const marshalPtrToStringUni = ffi.marshalPtrToStringUni;
+pub const marshalPtrToStringUniLen = ffi.marshalPtrToStringUniLen;
+pub const marshalStringToHGlobalUTF8 = ffi.marshalStringToHGlobalUTF8;
+pub const marshalStringToHGlobalUni = ffi.marshalStringToHGlobalUni;
+pub const marshalPtrToStructure = ffi.marshalPtrToStructure;
+pub const marshalStructureToPtr = ffi.marshalStructureToPtr;
+pub const marshalCopyToArray = ffi.marshalCopyToArray;
+pub const marshalCopyFromArray = ffi.marshalCopyFromArray;
+pub const marshalRead = ffi.marshalRead;
+pub const marshalWrite = ffi.marshalWrite;
+pub const marshalGetFunctionPointerForDelegate = ffi.marshalGetFunctionPointerForDelegate;
+pub const marshalGetDelegateForFunctionPointer = ffi.marshalGetDelegateForFunctionPointer;
+pub const spanCast = ffi.spanCast;
+pub const spanAsBytes = ffi.spanAsBytes;
+pub const spanGetRef = ffi.spanGetRef;
+pub const arrayGetDataRef = ffi.arrayGetDataRef;
+pub const spanCreateFromRef = ffi.spanCreateFromRef;
+pub const unsafeReadUnaligned = ffi.unsafeReadUnaligned;
+pub const unsafeWriteUnaligned = ffi.unsafeWriteUnaligned;
+pub const unsafeAdd = ffi.unsafeAdd;
+pub const unsafeAs = ffi.unsafeAs;
+pub const nativeLibLoad = ffi.nativeLibLoad;
+pub const nativeLibTryLoad = ffi.nativeLibTryLoad;
+pub const nativeLibFree = ffi.nativeLibFree;
+pub const nativeLibGetExport = ffi.nativeLibGetExport;
+pub const nativeLibTryGetExport = ffi.nativeLibTryGetExport;
+pub const arrayElemPtr = ffi.arrayElemPtr;
+pub const stringPinnableRef = ffi.stringPinnableRef;
+pub const keepAlive = ffi.keepAlive;
 
 /// `Fable.Core.Zig.sameCell a b`: are both the same cell (one reference type's object, a
 /// list's first cell, a function's environment)? A value (a number, a struct, a record or a union
@@ -4447,7 +4129,7 @@ fn hasNullDepth(comptime T: type, comptime depth: u8) bool {
     if (depth == 0) return true;
     if (T == String or T == Any or T == BigInt or T == NetDecimal) return true;
     if (isArrayPtr(T)) return true;
-    if (isFunc(T)) return @typeInfo(@typeInfo(@FieldType(T, "code")).pointer.child).@"fn".param_types.len <= 4;
+    if (isFunc(T)) return @typeInfo(@typeInfo(@FieldType(T, "code")).pointer.child).@"fn".param_types.len <= 9;
     if (isIface(T)) return false;
     if (isCellPtr(T)) {
         const C = @typeInfo(T).pointer.child;
@@ -4464,13 +4146,14 @@ fn hasNullDepth(comptime T: type, comptime depth: u8) bool {
     }
     return switch (@typeInfo(T)) {
         .int, .float, .bool, .void, .optional, .@"enum" => true,
+        .array => |a| hasNullDepth(a.child, depth - 1),
         .@"struct" => |st| blk: {
             for (st.field_types) |F| {
                 if (!hasNullDepth(F, depth - 1)) break :blk false;
             }
             break :blk true;
         },
-        .@"union" => |u| u.tag_type != null and hasNullDepth(u.field_types[0], depth - 1),
+        .@"union" => |u| if (u.tag_type == null) true else hasNullDepth(u.field_types[0], depth - 1),
         else => false,
     };
 }
@@ -4484,12 +4167,18 @@ pub fn nullOf(comptime T: type) T {
     if (T == BigInt or T == NetDecimal) return defaultOf(T);
     return switch (@typeInfo(T)) {
         .optional => null,
+        .array => |a| blk: {
+            var out: T = undefined;
+            for (&out) |*item| item.* = nullOf(a.child);
+            break :blk out;
+        },
         .@"struct" => |st| blk: {
             var x: T = undefined;
             inline for (st.field_names) |name| @field(x, name) = nullOf(@FieldType(T, name));
             break :blk x;
         },
         .@"union" => |u| blk: {
+            if (u.tag_type == null) break :blk std.mem.zeroes(T);
             const F = u.field_types[0];
             break :blk @unionInit(T, u.field_names[0], if (F == void) {} else nullOf(F));
         },
@@ -4613,7 +4302,32 @@ fn nullCode(comptime Code: type) Code {
                 return nullCall(R);
             }
         }.f,
-        else => @compileError("nullCode: a function of more than three arguments"),
+        5 => &struct {
+            fn f(_: p[0].?, _: p[1].?, _: p[2].?, _: p[3].?, _: p[4].?) R {
+                return nullCall(R);
+            }
+        }.f,
+        6 => &struct {
+            fn f(_: p[0].?, _: p[1].?, _: p[2].?, _: p[3].?, _: p[4].?, _: p[5].?) R {
+                return nullCall(R);
+            }
+        }.f,
+        7 => &struct {
+            fn f(_: p[0].?, _: p[1].?, _: p[2].?, _: p[3].?, _: p[4].?, _: p[5].?, _: p[6].?) R {
+                return nullCall(R);
+            }
+        }.f,
+        8 => &struct {
+            fn f(_: p[0].?, _: p[1].?, _: p[2].?, _: p[3].?, _: p[4].?, _: p[5].?, _: p[6].?, _: p[7].?) R {
+                return nullCall(R);
+            }
+        }.f,
+        9 => &struct {
+            fn f(_: p[0].?, _: p[1].?, _: p[2].?, _: p[3].?, _: p[4].?, _: p[5].?, _: p[6].?, _: p[7].?, _: p[8].?) R {
+                return nullCall(R);
+            }
+        }.f,
+        else => @compileError("nullCode: a function of more than eight arguments"),
     };
 }
 
@@ -7194,60 +6908,8 @@ pub inline fn invokeIfaceK(
     }
 }
 
-// ---- `NativePtr.stackalloc`: memory of the function that asks for it ----
-//
-// .NET's `stackalloc` (F#'s `NativePtr.stackalloc`, then `Span(ptr, n)` over it) gives memory
-// that lives until the function returns, zeroed (F# compiles with `localsinit`). A function that
-// asks for it has a `StackAlloc` on its own stack: small requests come from its buffer, larger
-// ones from the heap, and all of it is given up when the function returns. (Its items are
-// unmanaged, as `stackalloc` requires: nothing to count.)
-
-pub const StackAlloc = struct {
-    buf: [1024]u8 align(16) = undefined,
-    used: usize = 0,
-    blocks: ?*Block = null,
-
-    const Block = struct { next: ?*Block, bytes: []align(16) u8 };
-
-    pub fn alloc(self: *StackAlloc, comptime T: type, n: i32) Raised![*]T {
-        if (n < 0) return raise(OverflowException, str("Arithmetic operation resulted in an overflow."));
-        const size = @as(usize, @intCast(n)) * @sizeOf(T);
-        const start = std.mem.alignForward(usize, self.used, @max(@alignOf(T), 1));
-        if (start + size <= self.buf.len) {
-            self.used = start + size;
-            const bytes = self.buf[start .. start + size];
-            @memset(bytes, 0);
-            return @ptrCast(@alignCast(bytes.ptr));
-        }
-        const bytes = @import("fable_rt.zig").alloc().alignedAlloc(u8, .@"16", @max(size, 1)) catch return raise(OutOfMemoryException, str("Insufficient memory to continue the execution of the program."));
-        @memset(bytes, 0);
-        const b = @import("fable_rt.zig").alloc().create(Block) catch {
-            @import("fable_rt.zig").alloc().free(bytes);
-            return raise(OutOfMemoryException, str("Insufficient memory to continue the execution of the program."));
-        };
-        b.* = .{ .next = self.blocks, .bytes = bytes };
-        self.blocks = b;
-        return @ptrCast(@alignCast(bytes.ptr));
-    }
-
-    pub fn deinit(self: *StackAlloc) void {
-        var b = self.blocks;
-        while (b) |x| {
-            b = x.next;
-            @import("fable_rt.zig").alloc().free(x.bytes);
-            @import("fable_rt.zig").alloc().destroy(x);
-        }
-        self.blocks = null;
-    }
-};
-
-/// `Span<T>(ptr, n)` of what `stackalloc` (or another pointer) gives
-pub fn spanOfPtr(comptime S: type, p: anytype, n: i32) Raised!S {
-    if (n < 0) return raise(ArgumentOutOfRangeException, str("Specified argument was out of the range of valid values. (Parameter 'length')"));
-    const T = @typeInfo(S).pointer.child;
-    const items: [*]T = @ptrCast(@alignCast(@constCast(p)));
-    return items[0..@intCast(n)];
-}
+pub const StackAlloc = ffi.StackAlloc;
+pub const spanOfPtr = ffi.spanOfPtr;
 
 /// Cells that were allocated and not freed (0 when counters are not kept).
 pub fn live() i64 {

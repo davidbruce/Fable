@@ -136,3 +136,67 @@ export fn fable_test_each_name(cb: *const fn (?[*:0]const u8, i32) callconv(.c) 
     cb("one", 1);
     cb("two", 2);
 }
+
+pub const PackedRec = extern struct {
+    tag: u8 align(@min(1, @alignOf(u8))),
+    val: i64 align(@min(1, @alignOf(i64))),
+    tail: u16 align(@min(1, @alignOf(u16))),
+};
+
+export fn fable_test_packed_sum(p: PackedRec) i64 {
+    return @as(i64, p.tag) + p.val + @as(i64, p.tail);
+}
+
+export fn fable_test_packed_ptr(p: *const PackedRec) i64 {
+    return @as(i64, p.tag) + p.val * 2 + @as(i64, p.tail);
+}
+
+pub const IntFloatUnion = extern union {
+    i: i32,
+    f: f32,
+};
+
+export fn fable_test_union_as_bits(u: IntFloatUnion) i32 {
+    return u.i;
+}
+
+export fn fable_test_9args(a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32, a8: i32, a9: i32) i32 {
+    return a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9;
+}
+
+export fn fable_test_inref_vec(v: *const CVec2) f32 {
+    return v.x * 10.0 + v.y;
+}
+
+export fn fable_test_byref_bool_ptr(flag: *bool, ptr: ?[*]i32, idx: i32) bool {
+    const prev = flag.*;
+    flag.* = !prev;
+    if (ptr) |p| p[@intCast(idx)] += 5;
+    return prev;
+}
+
+export fn fable_test_null_array_span(arr: ?[*]const i32, sp: ?[*]const i32, n: i32) i32 {
+    var sum: i32 = 0;
+    if (arr != null) sum += 1000;
+    if (sp) |p| {
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(n))) : (i += 1) sum += p[i];
+    }
+    return sum;
+}
+
+export fn fable_test_opt_callback(x: i32, cb: ?*const fn (i32) callconv(.c) i32) i32 {
+    return if (cb) |f| f(x) else -x;
+}
+
+export fn fable_test_callback6(cb: *const fn (i32, i32, i32, i32, i32, i32) callconv(.c) i32) i32 {
+    return cb(1, 2, 3, 4, 5, 6);
+}
+
+extern fn fable_test_uco_struct(v: CVec2, p: ?[*]i32, r: *const i32) CVec2;
+
+pub export fn fable_test_call_uco_struct(x: f32, y: f32, factor: i32) f32 {
+    var buf: [2]i32 = .{ 10, 20 };
+    const res = fable_test_uco_struct(.{ .x = x, .y = y }, &buf, &factor);
+    return res.x + res.y + @as(f32, @floatFromInt(buf[0]));
+}

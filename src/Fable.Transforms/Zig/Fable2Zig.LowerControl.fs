@@ -14,6 +14,33 @@ open Fable.Transforms.Zig.LowerFormat
 open Fable.Transforms.Zig.Lower
 open Fable.Transforms.Zig.LowerDotnet
 
+/// True when `t` is an F# `byref<'T,'Kind>` type.
+let private isByrefType (t: Fable.Type) : bool =
+    match t with
+    | Fable.DeclaredType(ent, _) -> ent.FullName = "Microsoft.FSharp.Core.byref`2"
+    | _ -> false
+
+/// Coerce an inlined `isize` argument (`fixed`) to a raw C pointer (`paramTy`) and return its pinned vars.
+let private coerceRawPtrTo (ctx: Ctx) (paramTy: Ty) (argIr: Expr) : Expr * Var list =
+    if typeOf argIr = TPrim "isize" && isRawPtrTy paramTy then
+        coerceTy ctx paramTy argIr, pinnedVarsOf ctx argIr
+    else
+        argIr, []
+
+/// Coerce an `isize` call argument to a raw C pointer when the F# parameter expects `nativeptr`/`voidptr`.
+let private coerceRawPtrArg
+    (ctx: Ctx)
+    (r: SourceLocation option)
+    (subst: Map<string, Ty>)
+    (p: Fable.Type)
+    (argIr: Expr)
+    : Expr * Var list
+    =
+    if isByrefType p then
+        argIr, []
+    else
+        coerceRawPtrTo ctx (substTy subst (mapType ctx r p)) argIr
+
 let lowerValue (ctx: Ctx) (e: Fable.Expr) : Expr =
     match e with
     | Fable.Value(kind, r) ->
@@ -522,44 +549,90 @@ let lowerTail (ctx: Ctx) (e: Fable.Expr) : Expr =
             let typeArgs, subst =
                 typeArgsOf ctx r c (Some info.GenericArgs) (allArgs |> List.map (fun a -> a.Type)) (Some t)
 
-            // (F# gives a value, not its address, where an `inref` is expected)
-            let isByref (t: Fable.Type) =
-                match t with
-                | Fable.DeclaredType(ent, _) -> ent.FullName = "Microsoft.FSharp.Core.byref`2"
-                | _ -> false
+            let crossFileMember =
+                match callee with
+                | Fable.Import({ Kind = Fable.MemberImport memberRef }, _, _) when
+                    info.ThisArg.IsSome && c.ArgTypes.Length + 1 = allArgs.Length
+                    ->
+                    Some memberRef
+                | _ -> None
 
-            let args =
-                if c.ArgTypes.Length = allArgs.Length then
-                    List.map3
-                        (fun (p: Fable.Type) (a: Fable.Expr) (argIr: Expr) ->
-                            if isByref p && isByref a.Type then
-                                defaultArg (tryAddress argIr) argIr
-                            else
-                                argIr
-                        )
-                        c.ArgTypes
-                        allArgs
-                        args
+            let resolveArg (p: Fable.Type) (a: Fable.Expr) (argIr: Expr) =
+                if isByrefType p && isByrefType a.Type then
+                    defaultArg (tryAddress argIr) argIr, []
                 else
-                    args
+                    coerceRawPtrArg ctx r subst p argIr
+
+            let args, pinned =
+                if c.ArgTypes.Length = allArgs.Length then
+                    let items = List.map3 resolveArg c.ArgTypes allArgs args
+                    List.map fst items, items |> List.collect snd
+                elif crossFileMember.IsSome then
+                    let headIr =
+                        if isByrefType allArgs.Head.Type then
+                            defaultArg (tryAddress args.Head) args.Head
+                        else
+                            args.Head
+
+                    let tailItems = List.map3 resolveArg c.ArgTypes allArgs.Tail args.Tail
+                    headIr :: List.map fst tailItems, tailItems |> List.collect snd
+                else
+                    args, []
+
+            let pinned = pinned |> List.distinctBy (fun v -> v.Id)
 
             // (whether a value is given by its address, and whether the callee may change it
             // through it: `byref`, as the `this` of a struct with mutable fields, or `inref`)
             let wantsAddress =
-                if c.ArgTypes.Length = allArgs.Length then
+                let mapRest ps rest =
                     List.map2
                         (fun (p: Fable.Type) (a: Fable.Expr) ->
-                            if isByref p && not (isByref a.Type) then
+                            if isByrefType p && not (isByrefType a.Type) then
                                 match mapType ctx r p with
                                 | TPtr(_, isConst) -> Some isConst
                                 | _ -> Some true
                             else
                                 None
                         )
-                        c.ArgTypes
-                        allArgs
+                        ps
+                        rest
+
+                if c.ArgTypes.Length = allArgs.Length then
+                    mapRest c.ArgTypes allArgs
                 else
-                    allArgs |> List.map (fun _ -> None)
+                    match crossFileMember with
+                    | Some memberRef ->
+                        let hasReadOnlyAttr (atts: Fable.Attribute seq) =
+                            atts
+                            |> Seq.exists (fun att ->
+                                att.Entity.FullName = "System.Runtime.CompilerServices.IsReadOnlyAttribute"
+                            )
+
+                        let thisWant =
+                            if isByrefType allArgs.Head.Type then
+                                None
+                            else
+                                match unwrapNullness allArgs.Head.Type with
+                                | Fable.DeclaredType(entRef, _) ->
+                                    match ctx.Com.TryGetEntity entRef with
+                                    | Some ent when ent.IsValueType ->
+                                        let mReadOnly =
+                                            match ctx.Com.TryGetMember memberRef with
+                                            | Some m -> hasReadOnlyAttr m.Attributes
+                                            | None -> false
+
+                                        let isReadOnly =
+                                            hasReadOnlyAttr ent.Attributes
+                                            || mReadOnly
+                                            || ((ent.IsFSharpRecord || ent.IsFSharpUnion)
+                                                && not (ent.FSharpFields |> List.exists (fun f -> f.IsMutable)))
+
+                                        Some isReadOnly
+                                    | _ -> None
+                                | _ -> None
+
+                        thisWant :: mapRest c.ArgTypes allArgs.Tail
+                    | None -> allArgs |> List.map (fun _ -> None)
 
             bindArgs
                 ctx
@@ -572,7 +645,7 @@ let lowerTail (ctx: Ctx) (e: Fable.Expr) : Expr =
                         List.map2
                             (fun x want ->
                                 match x, want with
-                                | EVar v, Some isConst -> EAddr(EVar v, isConst)
+                                | EVar v, Some isConst when isConst || v.Kind <> VParam -> EAddr(EVar v, isConst)
                                 | EEmit("fable_rt.dup($0)", [ EVar v ], _), Some isConst when
                                     v.Kind = VGlobal && v.FMutable
                                     ->
@@ -604,18 +677,30 @@ let lowerTail (ctx: Ctx) (e: Fable.Expr) : Expr =
                             temps
                             (ECall(c.Target, typeArgs, c.Captures @ xs, callRetTy))
 
-                    if ty = tVoid then
-                        callExpr
-                    else
-                        coerceTy ctx ty callExpr
+                    let result =
+                        if ty = tVoid then
+                            callExpr
+                        else
+                            coerceTy ctx ty callExpr
+
+                    wrapPinned ctx pinned result
                 )
         | None, Fable.Import(imp, _, _) ->
             fail r "the Zig target does not support this library call yet (%s from %s)" imp.Selector imp.Path
         // a function value: all its arguments at once
         | None, _ ->
+            let calleeIr = lw ctx callee
+
+            let args, pinned =
+                match typeOf calleeIr with
+                | TFn(ps, _) when ps.Length = args.Length ->
+                    let items = List.map2 (coerceRawPtrTo ctx) ps args
+                    List.map fst items, items |> List.collect snd |> List.distinctBy (fun v -> v.Id)
+                | _ -> args, []
+
             bindArgs
                 ctx
-                (lw ctx callee :: args)
+                (calleeIr :: args)
                 (fun xs ->
                     let callRetTy =
                         match typeOf xs.Head with
@@ -624,6 +709,7 @@ let lowerTail (ctx: Ctx) (e: Fable.Expr) : Expr =
 
                     ECallClo(xs.Head, xs.Tail, callRetTy)
                 )
+            |> wrapPinned ctx pinned
 
     | Fable.CurriedApply(applied, args, t, r) ->
         let rec wrapApplyArgs (fnTy: Fable.Type) (xs: Fable.Expr list) =
@@ -654,6 +740,14 @@ let lowerTail (ctx: Ctx) (e: Fable.Expr) : Expr =
                      else
                          None)
 
+            let nowIr, pinned =
+                if c.ArgTypes.Length >= nowIr.Length then
+                    let ps = List.take nowIr.Length c.ArgTypes
+                    let items = List.map2 (coerceRawPtrArg ctx r subst) ps nowIr
+                    List.map fst items, items |> List.collect snd |> List.distinctBy (fun v -> v.Id)
+                else
+                    nowIr, []
+
             if rest.IsEmpty then
                 let callRetTy =
                     if targetTy = tVoid then
@@ -677,6 +771,7 @@ let lowerTail (ctx: Ctx) (e: Fable.Expr) : Expr =
                         else
                             coerceTy ctx targetTy ce
                     )
+                |> wrapPinned ctx pinned
             else
                 // the function returns a function, which gets the other arguments
                 let first =
@@ -684,6 +779,7 @@ let lowerTail (ctx: Ctx) (e: Fable.Expr) : Expr =
                         ctx
                         nowIr
                         (fun xs -> ECall(c.Target, typeArgs, c.Captures @ xs, substTy subst (mapType ctx r c.Ret)))
+                    |> wrapPinned ctx pinned
 
                 coerceTy ctx targetTy (applyValue ctx r subst first c.Ret rest t)
         | Some c ->

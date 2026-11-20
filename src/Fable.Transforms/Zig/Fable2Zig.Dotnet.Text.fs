@@ -771,10 +771,17 @@ let call
                     inner
         | Fable.Nullable(_, true) -> ECon(mapType ctx r t, "None", [], None)
         | Fable.DeclaredType(entRef, [ _ ]) when
+            entRef.FullName = "nativeptr`1"
+            || entRef.FullName = "Microsoft.FSharp.Core.nativeptr`1"
+            ->
+            ELit("null", mapType ctx r t)
+        | Fable.DeclaredType(entRef, []) when entRef.FullName = "voidptr" || entRef.FullName = "System.Void*" ->
+            ELit("null", mapType ctx r t)
+        | Fable.DeclaredType(entRef, [ _ ]) when
             entRef.FullName = "System.Span`1" || entRef.FullName = "System.ReadOnlySpan`1"
             ->
             pure' "fable_rt.spanEmpty($R)" [] (mapType ctx r t)
-        // (a struct: each field's default, as .NET zeroes it)
+        // (a struct: each field's default, as .NET zeroes it; extern unions use std.mem.zeroes)
         | Fable.DeclaredType(entRef, genArgs) when
             (match ctx.Com.TryGetEntity entRef with
              | Some ent ->
@@ -790,31 +797,36 @@ let call
                 | _ -> false
             )
             ->
-            let ent = ctx.Com.GetEntity entRef
+            let ty = mapType ctx r t
 
-            let sub =
-                if ent.GenericParameters.Length = genArgs.Length then
-                    List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) genArgs
-                    |> Map.ofList
-                else
-                    Map.empty
+            match ty with
+            | TEnt({ Layout = LayoutUnion }, _) -> ELit($"std.mem.zeroes(%s{zigType ty})", ty)
+            | _ ->
+                let ent = ctx.Com.GetEntity entRef
 
-            let defaults =
-                ent.FSharpFields
-                |> List.filter (fun f -> not f.IsStatic)
-                |> List.map (fun f ->
-                    let ft = substFableType sub f.FieldType
+                let sub =
+                    if ent.GenericParameters.Length = genArgs.Length then
+                        List.zip (ent.GenericParameters |> List.map (fun g -> g.Name)) genArgs
+                        |> Map.ofList
+                    else
+                        Map.empty
 
-                    dotnetCall
-                        ctx
-                        r
-                        "Microsoft.FSharp.Core.Operators.Unchecked"
-                        "DefaultOf"
-                        { info with GenericArgs = [ ft ] }
-                        ft
-                )
+                let defaults =
+                    ent.FSharpFields
+                    |> List.filter (fun f -> not f.IsStatic)
+                    |> List.map (fun f ->
+                        let ft = substFableType sub f.FieldType
 
-            ECon(mapType ctx r t, "", defaults, None)
+                        dotnetCall
+                            ctx
+                            r
+                            "Microsoft.FSharp.Core.Operators.Unchecked"
+                            "DefaultOf"
+                            { info with GenericArgs = [ ft ] }
+                            ft
+                    )
+
+                ECon(ty, "", defaults, None)
         | Fable.DeclaredType(entRef, []) when entRef.FullName = "System.DateOnly" || entRef.FullName = "System.TimeOnly" ->
             libraryCall
                 ctx
@@ -1261,7 +1273,7 @@ let call
             match x.Type with
             | Fable.DeclaredType(e, _) ->
                 match ctx.Com.TryGetEntity e with
-                | Some ent -> ent.IsValueType && not (ent.IsFSharpRecord || ent.IsFSharpUnion)
+                | Some ent -> ent.IsValueType
                 | None -> false
             | _ -> false
 
